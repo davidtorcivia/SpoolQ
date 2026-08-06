@@ -12,10 +12,11 @@ pub fn open_tmpfile(dir_fd: RawFd) -> io::Result<OwnedFd> {
     // Use libc::O_TMPFILE which correctly includes O_DIRECTORY on all arches.
     // Fall back to the defined constant if libc does not expose it.
     let o_tmpfile = libc::O_TMPFILE;
+    let dot = CString::new(".").unwrap();
     let fd = unsafe {
         libc::openat(
             dir_fd,
-            b".\0".as_ptr() as *const _,
+            dot.as_ptr(),
             o_tmpfile | libc::O_RDWR | libc::O_CLOEXEC,
             0o600,
         )
@@ -154,11 +155,12 @@ pub fn renameat(
 pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::Result<()> {
     const AT_EMPTY_PATH: i32 = 0x1000;
     let c_dest = cstr_from_name(dest_name)?;
+    let empty = CString::new("").unwrap();
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
             fd,
-            b"\0".as_ptr() as *const _,
+            empty.as_ptr(),
             dest_dir_fd,
             c_dest.as_ptr(),
             AT_EMPTY_PATH,

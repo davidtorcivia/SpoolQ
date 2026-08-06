@@ -180,8 +180,7 @@ impl Queue {
                                 stats.errors.push(RecoveryError {
                                     operation: "reap_parse".into(),
                                     relative_path: format!(
-                                        "leased/{}/{}/{}/{}",
-                                        boot_dir_name, bucket_name, shard_name, entry
+                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
                                     ),
                                     error: "malformed leased filename".into(),
                                 });

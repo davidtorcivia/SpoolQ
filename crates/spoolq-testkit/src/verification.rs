@@ -223,8 +223,7 @@ mod tests {
             let result2 = run_mutation_test(*mutation, 42);
             assert_eq!(
                 result.detected, result2.detected,
-                "mutation {:?} must be deterministic",
-                mutation
+                "mutation {mutation:?} must be deterministic"
             );
         }
     }

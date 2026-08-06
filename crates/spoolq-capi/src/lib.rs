@@ -5,14 +5,13 @@
 // Opaque handles wrap Rust types. All strings are null-terminated UTF-8.
 
 use std::cell::Cell;
-/// B-08: Last error message for C callers.
-use std::sync::Mutex;
 
 thread_local! {
     static LAST_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
 /// Set the last error message (thread-local).
+#[allow(dead_code)]
 fn set_last_error(msg: &'static str) {
     LAST_ERROR.with(|cell| cell.set(Some(msg)));
 }

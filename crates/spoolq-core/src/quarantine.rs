@@ -238,7 +238,7 @@ impl Queue {
         if parsed_ok {
             // C-40: Also verify the file is a regular file and check header
             if let Ok(stat) = fs::fstatat(shard_fd, filename) {
-                if stat.st_mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+                if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
                     report.findings.push(CorruptionFinding {
                         relative_path: full_path.to_string(),
                         finding_type: "non_regular_file".into(),
@@ -265,7 +265,7 @@ impl Queue {
                 relative_path: full_path.to_string(),
                 finding_type: "filename_parse_failed".into(),
                 severity: FindingSeverity::Error,
-                details: format!("filename does not match {} state grammar", state_name),
+                details: format!("filename does not match {state_name} state grammar"),
             });
 
             // B-10: In repair mode, quarantine corrupt objects
@@ -310,7 +310,7 @@ impl Queue {
             relative_path: full_path.to_string(),
             finding_type: "quarantined".into(),
             severity: FindingSeverity::Warning,
-            details: format!("moved to quarantine as {}", q_name),
+            details: format!("moved to quarantine as {q_name}"),
         });
         Ok(())
     }

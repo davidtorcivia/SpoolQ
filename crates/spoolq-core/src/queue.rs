@@ -283,7 +283,7 @@ impl Queue {
         // B-11: Validate root is a directory
         let root_stat =
             fs::fstat(root_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
-        if root_stat.st_mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+        if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(Error::QueueCorrupt("root path is not a directory".into()));
         }
 
@@ -357,8 +357,7 @@ impl Queue {
             if let Ok(stat) = fs::fstatat(root_fd.as_raw_fd(), state_dir) {
                 if stat.st_dev != root_stat.st_dev {
                     return Err(Error::QueueCorrupt(format!(
-                        "state directory '{}' is on a different device than root",
-                        state_dir
+                        "state directory '{state_dir}' is on a different device than root"
                     )));
                 }
             }
@@ -485,10 +484,7 @@ impl Queue {
         let (new_bucket, new_seq) = match current {
             Some(wm) => {
                 let max_bucket = wm.highest_observed_bucket.max(observed_bucket);
-                let new_seq = wm
-                    .sequence
-                    .checked_add(1)
-                    .ok_or_else(|| Error::StateExhausted)?;
+                let new_seq = wm.sequence.checked_add(1).ok_or(Error::StateExhausted)?;
                 (max_bucket, new_seq)
             }
             None => (observed_bucket, 1),
@@ -1781,8 +1777,7 @@ impl Queue {
         for part in &parts {
             if part.is_empty() || *part == ".." || *part == "." || part.starts_with('/') {
                 return Err(Error::InvalidInput(format!(
-                    "invalid path component: {}",
-                    part
+                    "invalid path component: {part}"
                 )));
             }
         }
@@ -1802,7 +1797,7 @@ impl Queue {
         };
 
         // B-04: Verify regular file type
-        if src_stat.st_mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+        if src_stat.st_mode & libc::S_IFMT != libc::S_IFREG {
             return Err(Error::QueueCorrupt("source is not a regular file".into()));
         }
 
@@ -1868,10 +1863,10 @@ impl Queue {
         let ext_len = header.extension_header_length as usize;
         if ext_len > 0 && ext_len <= 65536 {
             let mut ext_buf = vec![0u8; ext_len];
-            if fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128).is_ok() {
-                if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-                    return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-                }
+            if fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128).is_ok()
+                && !spoolq_format::verify_envelope_digest(&header, &ext_buf)
+            {
+                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
             }
         }
 
@@ -3523,8 +3518,7 @@ mod tests {
                 result,
                 Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))
             ),
-            "corrupted payload should be detected, got: {:?}",
-            result
+            "corrupted payload should be detected, got: {result:?}"
         );
     }
 
@@ -3636,8 +3630,7 @@ mod tests {
             assert_eq!(
                 mode & 0o777,
                 0o400,
-                "FORMAT should be mode 0400, got {:o}",
-                mode
+                "FORMAT should be mode 0400, got {mode:o}"
             );
         }
     }
