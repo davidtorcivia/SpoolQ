@@ -1514,6 +1514,208 @@ impl Queue {
 
         Ok(())
     }
+    /// Diagnostic lookup: find all states for a job_id.
+    /// Scans active and terminal states for the computed shard.
+    pub fn inspect(&self, job_id: &[u8; 16]) -> Vec<Snapshot> {
+        let mut results = Vec::new();
+        let shard = compute_shard(&self.format.queue_id, job_id, self.format.shard_count);
+        let shard_str = shard_hex(shard);
+
+        // Check ready
+        let ready_dir = format!("ready/{}", shard_str);
+        if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
+            if let Ok(entries) = fs::read_dir_entries_owned(dir_fd.as_raw_fd()) {
+                for entry in entries {
+                    if let Ok(parsed) = spoolq_names::parse_ready(&entry) {
+                        if parsed.common.job_id == *job_id {
+                            results.push(Snapshot {
+                                job_id: *job_id,
+                                state: "ready".into(),
+                                generation: parsed.common.generation,
+                                attempt: parsed.common.attempt,
+                                maximum_attempts: parsed.common.maximum_attempts,
+                                shard,
+                                relative_path: format!("{}/{}", ready_dir, entry),
+                                size: 0,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check leased (scan boot dirs)
+        if let Ok(leased_root) = fs::open_directory(self.root_fd.as_raw_fd(), "leased") {
+            if let Ok(boot_dirs) = fs::read_dir_entries_owned(leased_root.as_raw_fd()) {
+                for boot_dir in boot_dirs {
+                    let boot_path = format!("leased/{}", boot_dir);
+                    if let Ok(boot_fd) = open_relative(self.root_fd.as_raw_fd(), &boot_path) {
+                        if let Ok(bucket_dirs) = fs::read_dir_entries_owned(boot_fd.as_raw_fd()) {
+                            for bucket_dir in bucket_dirs {
+                                let shard_path =
+                                    format!("{}/{}/{}", boot_path, bucket_dir, shard_str);
+                                if let Ok(shard_fd) =
+                                    open_relative(self.root_fd.as_raw_fd(), &shard_path)
+                                {
+                                    if let Ok(entries) =
+                                        fs::read_dir_entries_owned(shard_fd.as_raw_fd())
+                                    {
+                                        for entry in entries {
+                                            if let Ok(parsed) = spoolq_names::parse_leased(&entry) {
+                                                if parsed.common.job_id == *job_id {
+                                                    results.push(Snapshot {
+                                                        job_id: *job_id,
+                                                        state: "leased".into(),
+                                                        generation: parsed.common.generation,
+                                                        attempt: parsed.common.attempt,
+                                                        maximum_attempts: parsed
+                                                            .common
+                                                            .maximum_attempts,
+                                                        shard,
+                                                        relative_path: format!(
+                                                            "{}/{}",
+                                                            shard_path, entry
+                                                        ),
+                                                        size: 0,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check delayed
+        if let Ok(delayed_root) = fs::open_directory(self.root_fd.as_raw_fd(), "delayed") {
+            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(delayed_root.as_raw_fd()) {
+                for bucket_dir in bucket_dirs {
+                    let shard_path = format!("delayed/{}/{}", bucket_dir, shard_str);
+                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
+                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                            for entry in entries {
+                                if let Ok(parsed) = spoolq_names::parse_delayed(&entry) {
+                                    if parsed.common.job_id == *job_id {
+                                        results.push(Snapshot {
+                                            job_id: *job_id,
+                                            state: "delayed".into(),
+                                            generation: parsed.common.generation,
+                                            attempt: parsed.common.attempt,
+                                            maximum_attempts: parsed.common.maximum_attempts,
+                                            shard,
+                                            relative_path: format!("{}/{}", shard_path, entry),
+                                            size: 0,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check dead
+        if let Ok(dead_root) = fs::open_directory(self.root_fd.as_raw_fd(), "dead") {
+            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(dead_root.as_raw_fd()) {
+                for bucket_dir in bucket_dirs {
+                    let shard_path = format!("dead/{}/{}", bucket_dir, shard_str);
+                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
+                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                            for entry in entries {
+                                if let Ok(parsed) = spoolq_names::parse_dead(&entry) {
+                                    if parsed.common.job_id == *job_id {
+                                        results.push(Snapshot {
+                                            job_id: *job_id,
+                                            state: "dead".into(),
+                                            generation: parsed.common.generation,
+                                            attempt: parsed.common.attempt,
+                                            maximum_attempts: parsed.common.maximum_attempts,
+                                            shard,
+                                            relative_path: format!("{}/{}", shard_path, entry),
+                                            size: 0,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check receipts
+        if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
+            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(receipts_root.as_raw_fd()) {
+                for bucket_dir in bucket_dirs {
+                    let shard_path = format!("receipts/{}/{}", bucket_dir, shard_str);
+                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
+                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                            for entry in entries {
+                                if let Ok(parsed) = spoolq_names::parse_receipt(&entry) {
+                                    if parsed.common.job_id == *job_id {
+                                        results.push(Snapshot {
+                                            job_id: *job_id,
+                                            state: "receipt".into(),
+                                            generation: parsed.common.generation,
+                                            attempt: parsed.common.attempt,
+                                            maximum_attempts: parsed.common.maximum_attempts,
+                                            shard,
+                                            relative_path: format!("{}/{}", shard_path, entry),
+                                            size: 0,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Duplicate acknowledgment probe: check if a receipt exists for this lease.
+    /// Probes exact receipt filenames across retained terminal buckets.
+    pub fn check_duplicate_ack(&self, lease: &LeaseInfo) -> AckOutcome {
+        let shard = compute_shard(
+            &self.format.queue_id,
+            &lease.job_id,
+            self.format.shard_count,
+        );
+        let shard_str = shard_hex(shard);
+
+        // Scan receipt buckets
+        if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
+            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(receipts_root.as_raw_fd()) {
+                for bucket_dir in bucket_dirs {
+                    let shard_path = format!("receipts/{}/{}", bucket_dir, shard_str);
+                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
+                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                            for entry in entries {
+                                if let Ok(parsed) = spoolq_names::parse_receipt(&entry) {
+                                    if parsed.common.job_id == lease.job_id
+                                        && parsed.token == lease.token
+                                        && parsed.common.generation
+                                            == lease.generation.wrapping_add(1)
+                                    {
+                                        return AckOutcome::AlreadyAcked;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        AckOutcome::LeaseLost
+    }
 }
 
 /// Open a relative path from a directory fd.
@@ -1893,5 +2095,73 @@ mod tests {
         };
         let result = queue.retry_with_policy(&lease, &policy);
         assert!(matches!(result, TransitionOutcome::Committed));
+    }
+    #[test]
+    fn inspect_finds_ready_job() {
+        let (_tmp, mut queue) = create_test_queue();
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let ticket = match outcome {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+
+        let snapshots = queue.inspect(&ticket.job_id);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, "ready");
+        assert_eq!(snapshots[0].generation, 0);
+    }
+
+    #[test]
+    fn inspect_finds_leased_job() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+
+        let snapshots = queue.inspect(&lease.job_id);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, "leased");
+    }
+
+    #[test]
+    fn duplicate_ack_returns_already_acked() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+
+        // First ack succeeds
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+
+        // Source is gone, so check_duplicate_ack should find the receipt
+        let result = queue.check_duplicate_ack(&lease);
+        assert!(matches!(result, AckOutcome::AlreadyAcked));
+    }
+
+    #[test]
+    fn inspect_returns_empty_for_unknown() {
+        let (_tmp, queue) = create_test_queue();
+        let unknown_id = [0xFF; 16];
+        let snapshots = queue.inspect(&unknown_id);
+        assert!(snapshots.is_empty());
     }
 }
