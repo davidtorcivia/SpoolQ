@@ -356,15 +356,11 @@ pub fn leased_context(
     shard_hex: &str,
     filename_without_tag_ext: &str,
 ) -> String {
-    format!(
-        "leased/{boot_id}/{bucket}/{shard_hex}/{filename_without_tag_ext}"
-    )
+    format!("leased/{boot_id}/{bucket}/{shard_hex}/{filename_without_tag_ext}")
 }
 
 pub fn delayed_context(bucket: &str, shard_hex: &str, filename_without_tag_ext: &str) -> String {
-    format!(
-        "delayed/-/{bucket}/{shard_hex}/{filename_without_tag_ext}"
-    )
+    format!("delayed/-/{bucket}/{shard_hex}/{filename_without_tag_ext}")
 }
 
 pub fn terminal_context(
@@ -605,7 +601,11 @@ pub fn parse_dead(filename: &str) -> Result<DeadName, ParseError> {
     }
     let reason = parse_tagged_hex_u16(rest[0], b'x')?;
     let tag = parse_tag(rest[1])?;
-    Ok(DeadName { common, reason, tag })
+    Ok(DeadName {
+        common,
+        reason,
+        tag,
+    })
 }
 
 /// Receipt: job_id.g{gen}.a{att}.m{max}.t{token}.k{tag}.rct
@@ -1067,9 +1067,11 @@ mod tests {
         };
         let tag = [0xFF; 8];
         let token = [0xEE; 16];
-        let leased_name =
-            leased_filename(&common, 1_000_000_000, 2_000_000_000, &token, &tag);
-        assert!(parse_ready(&leased_name).is_err(), "should reject leased name as ready");
+        let leased_name = leased_filename(&common, 1_000_000_000, 2_000_000_000, &token, &tag);
+        assert!(
+            parse_ready(&leased_name).is_err(),
+            "should reject leased name as ready"
+        );
     }
 
     #[test]
@@ -1082,7 +1084,10 @@ mod tests {
         };
         let tag = [0xFF; 8];
         let ready_name = ready_filename(&common, &tag);
-        assert!(parse_leased(&ready_name).is_err(), "should reject ready name as leased");
+        assert!(
+            parse_leased(&ready_name).is_err(),
+            "should reject ready name as leased"
+        );
     }
 
     // C-44: non-ASCII must not panic

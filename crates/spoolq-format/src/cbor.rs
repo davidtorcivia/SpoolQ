@@ -329,9 +329,8 @@ impl<'a> CborParser<'a> {
                 if self.pos > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let v = u16::from_be_bytes(
-                    self.data[self.pos - 2..self.pos].try_into().unwrap(),
-                ) as u64;
+                let v = u16::from_be_bytes(self.data[self.pos - 2..self.pos].try_into().unwrap())
+                    as u64;
                 if v < 256 {
                     return Err(CborError::IntOverflow); // non-canonical
                 }
@@ -342,9 +341,8 @@ impl<'a> CborParser<'a> {
                 if self.pos > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let v = u32::from_be_bytes(
-                    self.data[self.pos - 4..self.pos].try_into().unwrap(),
-                ) as u64;
+                let v = u32::from_be_bytes(self.data[self.pos - 4..self.pos].try_into().unwrap())
+                    as u64;
                 if v < 65536 {
                     return Err(CborError::IntOverflow); // non-canonical
                 }
@@ -355,9 +353,7 @@ impl<'a> CborParser<'a> {
                 if self.pos > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let v = u64::from_be_bytes(
-                    self.data[self.pos - 8..self.pos].try_into().unwrap(),
-                );
+                let v = u64::from_be_bytes(self.data[self.pos - 8..self.pos].try_into().unwrap());
                 if v < 4_294_967_296 {
                     return Err(CborError::IntOverflow); // non-canonical
                 }
@@ -814,7 +810,10 @@ mod tests {
         // C-47: deterministic CBOR sorts by encoded key bytes.
         // "done" (text(4) = 0x64...) sorts before "active" (text(6) = 0x66...)
         let expected = hex_to_bytes("a202617803a264646f6e65f466616374697665f5");
-        assert_eq!(encoded, expected, "boolean metadata mismatch (C-47 ordering)");
+        assert_eq!(
+            encoded, expected,
+            "boolean metadata mismatch (C-47 ordering)"
+        );
     }
 
     #[test]

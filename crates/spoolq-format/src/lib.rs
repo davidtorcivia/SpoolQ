@@ -331,7 +331,9 @@ pub fn payload_digest(payload: &[u8]) -> [u8; 32] {
 }
 
 pub fn envelope_digest(fixed_header: &FixedHeader, extension: &[u8]) -> [u8; 32] {
-    let mut header_with_zero_digest = fixed_header.encode(extension).expect("extension length mismatch in envelope_digest");
+    let mut header_with_zero_digest = fixed_header
+        .encode(extension)
+        .expect("extension length mismatch in envelope_digest");
     // Zero out bytes 96..128 (envelope_digest field)
     header_with_zero_digest[96..128].fill(0);
 
@@ -517,7 +519,6 @@ pub enum WatermarkError {
     WrongSize { expected: usize, actual: usize },
 }
 
-
 // ---------- Job envelope reader/validator (C-53) ----------
 
 /// Errors from envelope validation.
@@ -607,7 +608,6 @@ impl<'a> ValidatedEnvelope<'a> {
         cbor::ExtensionHeader::decode(self.extension)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -907,6 +907,4 @@ mod tests {
         let ext: &[u8] = &[];
         assert!(header.encode(ext).is_err());
     }
-
-
 }

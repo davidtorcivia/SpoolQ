@@ -210,7 +210,10 @@ mod tests {
         // T-01: Each mutation must have a test that detects it.
         // The RemoveFileSyncBeforePublish mutation is detected by the crash test.
         let file_sync_result = run_mutation_test(Mutation::RemoveFileSyncBeforePublish, 42);
-        assert!(file_sync_result.detected, "RemoveFileSyncBeforePublish must be detected");
+        assert!(
+            file_sync_result.detected,
+            "RemoveFileSyncBeforePublish must be detected"
+        );
 
         // T-01: Other mutations should also be testable. For each mutation,
         // verify the scenario produces a deterministic result.
@@ -220,7 +223,8 @@ mod tests {
             let result2 = run_mutation_test(*mutation, 42);
             assert_eq!(
                 result.detected, result2.detected,
-                "mutation {:?} must be deterministic", mutation
+                "mutation {:?} must be deterministic",
+                mutation
             );
         }
     }
@@ -292,10 +296,7 @@ mod tests {
 
         // Write the target receipt
         let target = "deadbeefdeadbeefdeadbeefdeadbeef.g0000000000000001.a00000001.m00000003.tcafebabe000000000000000000000000.k0123456789abcdef.rct";
-        sim.write_file(
-            &format!("receipts/bucket1/0000/{target}"),
-            vec![0x42; 128],
-        );
+        sim.write_file(&format!("receipts/bucket1/0000/{target}"), vec![0x42; 128]);
 
         // Direct name probe should find it
         assert!(sim.exists(&format!("receipts/bucket1/0000/{target}")));

@@ -56,7 +56,8 @@ impl Queue {
         let wall_now = self.effective_wall_floor_ns();
         // C-31: Use CLOCK_MONOTONIC for budget enforcement
         let start_mono = fs::clock_monotonic_ns().unwrap_or(0);
-        let _deadline_mono = start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
+        let _deadline_mono =
+            start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
 
         // 1. Reap expired leases
         self.reap_expired_leases(boottime_now, wall_now, budget, &mut stats);
@@ -130,7 +131,8 @@ impl Queue {
                         let current_bucket = spoolq_math::bucket_number(
                             boottime_now,
                             self.format.lease_bucket_width_ns,
-                        ).unwrap_or(0);
+                        )
+                        .unwrap_or(0);
                         if bucket_num > current_bucket {
                             continue; // Not yet eligible
                         }
@@ -177,7 +179,10 @@ impl Queue {
                             Err(_) => {
                                 stats.errors.push(RecoveryError {
                                     operation: "reap_parse".into(),
-                                    relative_path: format!("leased/{}/{}/{}/{}", boot_dir_name, bucket_name, shard_name, entry),
+                                    relative_path: format!(
+                                        "leased/{}/{}/{}/{}",
+                                        boot_dir_name, bucket_name, shard_name, entry
+                                    ),
                                     error: "malformed leased filename".into(),
                                 });
                                 continue;
@@ -238,9 +243,10 @@ impl Queue {
         let src_dir = format!("leased/{boot_dir}/{bucket}/{shard}");
         let dest_dir = format!("ready/{shard}");
 
-        let new_gen = common.generation.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "generation overflow")
-        })?;
+        let new_gen = common
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "generation overflow"))?;
         let ready_common = spoolq_names::CommonFields {
             job_id: common.job_id,
             generation: new_gen,
@@ -290,9 +296,10 @@ impl Queue {
         let bucket_str = bucket_hex(terminal_bucket);
         let dest_dir = format!("dead/{bucket_str}/{shard}");
 
-        let new_gen = common.generation.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "generation overflow")
-        })?;
+        let new_gen = common
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "generation overflow"))?;
         let dead_common = spoolq_names::CommonFields {
             job_id: common.job_id,
             generation: new_gen,
@@ -353,7 +360,8 @@ impl Queue {
 
             // Read effective wall floor
             let current_wall_bucket =
-                spoolq_math::bucket_number(wall_now, self.format.delayed_bucket_width_ns).unwrap_or(0);
+                spoolq_math::bucket_number(wall_now, self.format.delayed_bucket_width_ns)
+                    .unwrap_or(0);
 
             // Only promote buckets at or below the current wall bucket
             if bucket_num > current_wall_bucket {
@@ -449,7 +457,9 @@ impl Queue {
                         } else {
                             stats.errors.push(RecoveryError {
                                 operation: "promote_sync".into(),
-                                relative_path: format!("delayed/{bucket_name}/{shard_name}/{entry}"),
+                                relative_path: format!(
+                                    "delayed/{bucket_name}/{shard_name}/{entry}"
+                                ),
                                 error: "directory sync failed after promotion".into(),
                             });
                         }
@@ -594,7 +604,8 @@ impl Queue {
                     stats.operations_attempted += 1;
 
                     // C-35: Open with write-capable mode for OFD write lock
-                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, libc::O_RDWR, 0) {
+                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, libc::O_RDWR, 0)
+                    {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
@@ -777,7 +788,8 @@ impl Queue {
                     stats.operations_attempted += 1;
 
                     // C-35: Open with write-capable mode for lock
-                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, libc::O_RDWR, 0) {
+                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, libc::O_RDWR, 0)
+                    {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
@@ -791,7 +803,9 @@ impl Queue {
                         if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_err() {
                             stats.errors.push(RecoveryError {
                                 operation: "receipt_delete_sync".into(),
-                                relative_path: format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                                relative_path: format!(
+                                    "receipts/{bucket_name}/{shard_name}/{entry}"
+                                ),
                                 error: "shard dir sync failed after receipt deletion".into(),
                             });
                         }

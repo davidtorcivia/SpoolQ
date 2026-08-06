@@ -234,15 +234,13 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                Some(f) => {
-                    match std::fs::read(f) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            eprintln!("file read failed: {e}");
-                            return ExitCode::FAILURE;
-                        }
+                Some(f) => match std::fs::read(f) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("file read failed: {e}");
+                        return ExitCode::FAILURE;
                     }
-                }
+                },
             };
 
             let queue = match Queue::open(&path, &OpenOptions::default()) {
@@ -303,7 +301,9 @@ fn main() -> ExitCode {
             match queue.lease(0, duration_ns) {
                 LeaseOutcome::Leased(lease) => {
                     if let Some(ref hf) = handle_file {
-                        if let Err(e) = save_handle_to_file(&path, &queue.format().queue_id, hf, &lease) {
+                        if let Err(e) =
+                            save_handle_to_file(&path, &queue.format().queue_id, hf, &lease)
+                        {
                             eprintln!("warning: failed to write handle file: {e}");
                         }
                     }
@@ -332,7 +332,8 @@ fn main() -> ExitCode {
             match Queue::open(&path, &OpenOptions::default()) {
                 Ok(_queue) => {
                     let root = &path;
-                    let mut stats_map: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                    let mut stats_map: std::collections::BTreeMap<String, usize> =
+                        std::collections::BTreeMap::new();
                     for state in [
                         "ready",
                         "leased",
@@ -408,11 +409,7 @@ fn main() -> ExitCode {
                         } else {
                             "unknown_refused"
                         };
-                        results.push((
-                            "filesystem",
-                            format!("{fs_name} (magic {ft:#x})"),
-                            true,
-                        ));
+                        results.push(("filesystem", format!("{fs_name} (magic {ft:#x})"), true));
                     }
                     Err(e) => results.push(("filesystem", e.to_string(), false)),
                 }
@@ -549,7 +546,9 @@ fn main() -> ExitCode {
             let outcome = match after_seconds {
                 Some(s) => queue.retry_at(
                     &lease,
-                    spoolq_fs_linux::clock_realtime_ns().unwrap_or(0).saturating_add(s.saturating_mul(1_000_000_000)),
+                    spoolq_fs_linux::clock_realtime_ns()
+                        .unwrap_or(0)
+                        .saturating_add(s.saturating_mul(1_000_000_000)),
                 ),
                 None => queue.retry_now(&lease),
             };
@@ -1219,9 +1218,12 @@ fn load_handle(path: &std::path::Path) -> std::io::Result<spoolq_core::LeaseInfo
     let token = spoolq_names::hex_decode_16(&handle.token)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad token"))?;
     // C-57: Use hex_decode_32 directly, reject any other length
-    let envelope_digest = spoolq_names::hex_decode_32(&handle.envelope_digest)
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad envelope_digest: expected 64 lowercase hex chars")
+    let envelope_digest =
+        spoolq_names::hex_decode_32(&handle.envelope_digest).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad envelope_digest: expected 64 lowercase hex chars",
+            )
         })?;
     Ok(spoolq_core::LeaseInfo {
         job_id,

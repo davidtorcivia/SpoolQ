@@ -41,7 +41,6 @@ impl Default for CreateOptions {
     }
 }
 
-
 /// Validate all CreateOptions before any filesystem mutation (C-01).
 /// Same validation used in encoding and tests.
 pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
@@ -49,13 +48,19 @@ pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
         return Err(Error::InvalidInput("invalid shard count".into()));
     }
     if opts.lease_bucket_width_ns == 0 {
-        return Err(Error::InvalidInput("lease bucket width must be non-zero".into()));
+        return Err(Error::InvalidInput(
+            "lease bucket width must be non-zero".into(),
+        ));
     }
     if opts.delayed_bucket_width_ns == 0 {
-        return Err(Error::InvalidInput("delayed bucket width must be non-zero".into()));
+        return Err(Error::InvalidInput(
+            "delayed bucket width must be non-zero".into(),
+        ));
     }
     if opts.terminal_bucket_width_ns == 0 {
-        return Err(Error::InvalidInput("terminal bucket width must be non-zero".into()));
+        return Err(Error::InvalidInput(
+            "terminal bucket width must be non-zero".into(),
+        ));
     }
     if !(60_000_000_000..=86_400_000_000_000).contains(&opts.terminal_bucket_width_ns) {
         return Err(Error::InvalidInput("invalid terminal bucket width".into()));
@@ -109,9 +114,8 @@ impl Queue {
     /// Initialize a new queue at the given path.
     pub fn init(root: &Path, opts: &CreateOptions) -> io::Result<FormatRecord> {
         // C-01: Validate all options before any filesystem mutation
-        validate_create_options(opts).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
-        })?;
+        validate_create_options(opts)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
         // Create root directory if needed
         if !root.exists() {
@@ -217,7 +221,10 @@ impl Queue {
 
         // Write initial wall watermark
         let wall_now = fs::clock_realtime_ns()?;
-        let wall_bucket = bucket_number(wall_now, opts.delayed_bucket_width_ns).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "zero bucket width in init"))?;
+        let wall_bucket =
+            bucket_number(wall_now, opts.delayed_bucket_width_ns).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "zero bucket width in init")
+            })?;
         let wm = WatermarkRecord {
             highest_observed_bucket: wall_bucket,
             sequence: 0,
@@ -225,7 +232,10 @@ impl Queue {
         let wm_bytes = wm.encode();
         // Write via temp file then rename
         // C-03: Use unique temp name to avoid collision on partial init rerun
-        let wm_tmp_name = format!(".wm.tmp.{}", spoolq_names::hex_encode(&fs::random_128bit()?));
+        let wm_tmp_name = format!(
+            ".wm.tmp.{}",
+            spoolq_names::hex_encode(&fs::random_128bit()?)
+        );
         let wm_tmp = fs::create_exclusive(control_fd.as_raw_fd(), &wm_tmp_name, 0o600)?;
         fs::write_all(wm_tmp.as_raw_fd(), &wm_bytes)?;
         fs::fsync(wm_tmp.as_raw_fd())?;
@@ -240,7 +250,10 @@ impl Queue {
         // Write FORMAT file
         let format_bytes = format_rec.encode();
         // C-03: Unique temp name for partial init recovery
-        let fmt_tmp_name = format!(".format.tmp.{}", spoolq_names::hex_encode(&fs::random_128bit()?));
+        let fmt_tmp_name = format!(
+            ".format.tmp.{}",
+            spoolq_names::hex_encode(&fs::random_128bit()?)
+        );
         let fmt_tmp = fs::create_exclusive(root_fd.as_raw_fd(), &fmt_tmp_name, 0o600)?;
         fs::write_all(fmt_tmp.as_raw_fd(), &format_bytes)?;
         fs::fsync(fmt_tmp.as_raw_fd())?;
@@ -268,7 +281,8 @@ impl Queue {
         let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         // B-11: Validate root is a directory
-        let root_stat = fs::fstat(root_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let root_stat =
+            fs::fstat(root_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         if root_stat.st_mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
             return Err(Error::QueueCorrupt("root path is not a directory".into()));
         }
@@ -302,7 +316,9 @@ impl Queue {
         let probe_count = ceiling_bucket(
             opts.receipt_retention_ns,
             format_rec.terminal_bucket_width_ns,
-        ).unwrap_or(0).saturating_add(2);
+        )
+        .unwrap_or(0)
+        .saturating_add(2);
         if probe_count > 4096 {
             return Err(Error::InvalidInput(
                 "receipt retention exceeds duplicate-ack probe bound".into(),
@@ -328,12 +344,22 @@ impl Queue {
         }
 
         // B-11: Verify state directories exist and are on the same device
-        for state_dir in &["control", "ready", "leased", "delayed", "receipts", "dead", "quarantine", "tmp"] {
+        for state_dir in &[
+            "control",
+            "ready",
+            "leased",
+            "delayed",
+            "receipts",
+            "dead",
+            "quarantine",
+            "tmp",
+        ] {
             if let Ok(stat) = fs::fstatat(root_fd.as_raw_fd(), state_dir) {
                 if stat.st_dev != root_stat.st_dev {
-                    return Err(Error::QueueCorrupt(
-                        format!("state directory '{}' is on a different device than root", state_dir),
-                    ));
+                    return Err(Error::QueueCorrupt(format!(
+                        "state directory '{}' is on a different device than root",
+                        state_dir
+                    )));
                 }
             }
         }
@@ -410,7 +436,8 @@ impl Queue {
                 clock,
                 wm.highest_observed_bucket,
                 self.format.delayed_bucket_width_ns,
-            ).unwrap_or(clock),
+            )
+            .unwrap_or(clock),
             None => clock,
         }
     }
@@ -436,8 +463,13 @@ impl Queue {
             .map_err(|e| Error::IoFailure(e.to_string()))?;
 
         // Acquire exclusive write lock on wall-watermark.lock
-        let lock_fd = fs::openat(control_fd.as_raw_fd(), "wall-watermark.lock", libc::O_RDWR, 0o600)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let lock_fd = fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark.lock",
+            libc::O_RDWR,
+            0o600,
+        )
+        .map_err(|e| Error::IoFailure(e.to_string()))?;
         let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         if !locked {
@@ -446,17 +478,17 @@ impl Queue {
 
         // Re-read current watermark under lock
         let current = self.read_wall_watermark();
-        let observed_bucket = spoolq_math::bucket_number(
-            observed_ns,
-            self.format.delayed_bucket_width_ns,
-        ).unwrap_or(0);
+        let observed_bucket =
+            spoolq_math::bucket_number(observed_ns, self.format.delayed_bucket_width_ns)
+                .unwrap_or(0);
 
         let (new_bucket, new_seq) = match current {
             Some(wm) => {
                 let max_bucket = wm.highest_observed_bucket.max(observed_bucket);
-                let new_seq = wm.sequence.checked_add(1).ok_or_else(|| {
-                    Error::StateExhausted
-                })?;
+                let new_seq = wm
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| Error::StateExhausted)?;
                 (max_bucket, new_seq)
             }
             None => (observed_bucket, 1),
@@ -469,18 +501,25 @@ impl Queue {
         let wm_bytes = new_wm.encode();
 
         // Write via unique temp, then atomic rename, then sync
-        let tmp_name = format!(".wm.adv.{}", spoolq_names::hex_encode(&fs::random_128bit()
-            .map_err(|e| Error::IoFailure(e.to_string()))?));
+        let tmp_name = format!(
+            ".wm.adv.{}",
+            spoolq_names::hex_encode(
+                &fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?
+            )
+        );
         let tmp_fd = fs::create_exclusive(control_fd.as_raw_fd(), &tmp_name, 0o600)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::write_all(tmp_fd.as_raw_fd(), &wm_bytes)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync(tmp_fd.as_raw_fd())
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::renameat(control_fd.as_raw_fd(), &tmp_name, control_fd.as_raw_fd(), "wall-watermark")
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync_dir_fd(control_fd.as_raw_fd())
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync(tmp_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::renameat(
+            control_fd.as_raw_fd(),
+            &tmp_name,
+            control_fd.as_raw_fd(),
+            "wall-watermark",
+        )
+        .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync_dir_fd(control_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         Ok(())
     }
@@ -712,7 +751,9 @@ impl Queue {
         match fs::open_tmpfile(dest_fd.as_raw_fd()) {
             Ok(tmp_fd) => {
                 // Write header (zeroed placeholder)
-                let header_bytes = header.encode(ext_bytes).map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
+                let header_bytes = header
+                    .encode(ext_bytes)
+                    .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
                 fs::write_all(tmp_fd.as_raw_fd(), &header_bytes)
                     .map_err(PublishError::classify_write)?;
                 // Write extension
@@ -730,13 +771,15 @@ impl Queue {
                 fs::fsync(tmp_fd.as_raw_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
                 // Publish via linkat - C-09: capture errors for capability classification
-                let link1 = fs::linkat_empty_path(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
+                let link1 =
+                    fs::linkat_empty_path(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
                 if link1.is_ok() {
                     fs::fsync_dir_fd(dest_fd.as_raw_fd())
                         .map_err(PublishError::classify_post_fsync)?;
                     return Ok(());
                 }
-                let link2 = fs::linkat_proc_self_fd(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
+                let link2 =
+                    fs::linkat_proc_self_fd(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
                 if link2.is_ok() {
                     fs::fsync_dir_fd(dest_fd.as_raw_fd())
                         .map_err(PublishError::classify_post_fsync)?;
@@ -784,8 +827,10 @@ impl Queue {
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // Create temp file name
-        let boottime = fs::clock_boottime_ns().map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let random = fs::random_128bit().map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let boottime = fs::clock_boottime_ns()
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let random = fs::random_128bit()
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
         let temp_name = temp_filename(boottime, &random);
 
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_raw_fd(), &temp_name, 0o600)
@@ -811,7 +856,9 @@ impl Queue {
         };
 
         // Write header
-        let header_bytes = header.encode(ext_bytes).map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
+        let header_bytes = header
+            .encode(ext_bytes)
+            .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
         fs::write_all(tmp_file.as_raw_fd(), &header_bytes).map_err(PublishError::classify_write)?;
         if !ext_bytes.is_empty() {
             fs::write_all(tmp_file.as_raw_fd(), ext_bytes).map_err(PublishError::classify_write)?;
@@ -836,7 +883,7 @@ impl Queue {
         ) {
             Ok(()) => {
                 temp_guard.armed = false; // C-10: disarm on success
-                // Sync destination first, then source
+                                          // Sync destination first, then source
                 fs::fsync_dir_fd(dest_fd.as_raw_fd()).map_err(PublishError::classify_post_fsync)?;
                 fs::fsync_dir_fd(tmp_dir_fd.as_raw_fd())
                     .map_err(PublishError::classify_post_fsync)?;
@@ -845,9 +892,7 @@ impl Queue {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 Err(PublishError::NotCommitted(Error::IdentityCollision))
             }
-            Err(e) => {
-                Err(PublishError::classify_write(e))
-            }
+            Err(e) => Err(PublishError::classify_write(e)),
         }
     }
 
@@ -917,13 +962,19 @@ impl Queue {
             let ready_dir = format!("ready/{shard_str}");
             let shard_fd = match open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
                 Ok(fd) => fd,
-                Err(_) => { scan_had_error = true; continue; }
+                Err(_) => {
+                    scan_had_error = true;
+                    continue;
+                }
             };
 
             // List entries
             let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => { scan_had_error = true; continue; }
+                Err(_) => {
+                    scan_had_error = true;
+                    continue;
+                }
             };
 
             for entry in &entries {
@@ -984,9 +1035,9 @@ impl Queue {
                 };
                 // Attempt claim: rename ready -> leased
                 let lease_token = match fs::random_128bit() {
-                            Ok(t) => t,
-                            Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
-                        };
+                    Ok(t) => t,
+                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+                };
                 let boottime_deadline = match boottime_claim.checked_add(lease_duration_ns) {
                     Some(d) => d,
                     None => continue, // deadline overflow, skip this candidate
@@ -996,7 +1047,8 @@ impl Queue {
                     None => continue,
                 };
                 let lease_bucket =
-                    spoolq_math::lease_bucket(boottime_deadline, self.format.lease_bucket_width_ns).unwrap_or(0);
+                    spoolq_math::lease_bucket(boottime_deadline, self.format.lease_bucket_width_ns)
+                        .unwrap_or(0);
                 let bucket_str = bucket_hex(lease_bucket);
 
                 // Checked generation increment: a source at u64::MAX cannot transition.
@@ -1231,11 +1283,7 @@ impl Queue {
                             && header.extension_header_length <= 65536
                         {
                             let mut ext_buf = vec![0u8; header.extension_header_length as usize];
-                            if fs::pread_exact(
-                                leased_file.as_raw_fd(),
-                                &mut ext_buf,
-                                128,
-                            ).is_ok() {
+                            if fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf, 128).is_ok() {
                                 spoolq_format::cbor::ExtensionHeader::decode(&ext_buf)
                                     .map(|e| e.content_type)
                                     .unwrap_or_default()
@@ -1650,17 +1698,13 @@ impl Queue {
         let new_boottime_dl = match boottime_now.checked_add(lease_duration_ns) {
             Some(d) => d,
             None => {
-                return RenewOutcome::NotCommitted(Error::InvalidInput(
-                    "deadline overflow".into(),
-                ))
+                return RenewOutcome::NotCommitted(Error::InvalidInput("deadline overflow".into()))
             }
         };
         let new_wall_dl = match wall_now.checked_add(lease_duration_ns) {
             Some(d) => d,
             None => {
-                return RenewOutcome::NotCommitted(Error::InvalidInput(
-                    "deadline overflow".into(),
-                ))
+                return RenewOutcome::NotCommitted(Error::InvalidInput("deadline overflow".into()))
             }
         };
         let new_gen = match lease.generation.checked_add(1) {
@@ -1669,7 +1713,8 @@ impl Queue {
         };
 
         let lease_bucket =
-            spoolq_math::lease_bucket(new_boottime_dl, self.format.lease_bucket_width_ns).unwrap_or(0);
+            spoolq_math::lease_bucket(new_boottime_dl, self.format.lease_bucket_width_ns)
+                .unwrap_or(0);
         let bucket_str = bucket_hex(lease_bucket);
         let shard = compute_shard(
             &self.format.queue_id,
@@ -1720,7 +1765,6 @@ impl Queue {
         }
     }
 
-
     /// B-04: Open and validate the current leased source object.
     /// Validates the source path, filename, header, and identity against the handle.
     /// Returns the opened source directory fd and source filename on success.
@@ -1736,7 +1780,10 @@ impl Queue {
         // B-04: Reject absolute paths, .., empty components
         for part in &parts {
             if part.is_empty() || *part == ".." || *part == "." || part.starts_with('/') {
-                return Err(Error::InvalidInput(format!("invalid path component: {}", part)));
+                return Err(Error::InvalidInput(format!(
+                    "invalid path component: {}",
+                    part
+                )));
             }
         }
 
@@ -1775,12 +1822,15 @@ impl Queue {
 
         // B-04: Verify link count is exactly 1
         if src_stat.st_nlink != 1 {
-            return Err(Error::QueueCorrupt("source has unexpected hard links".into()));
+            return Err(Error::QueueCorrupt(
+                "source has unexpected hard links".into(),
+            ));
         }
 
         // B-04: Parse the leased filename canonically
-        let parsed = spoolq_names::parse_leased(&src_name)
-            .map_err(|_| Error::QueueCorrupt("source filename is not a valid leased name".into()))?;
+        let parsed = spoolq_names::parse_leased(&src_name).map_err(|_| {
+            Error::QueueCorrupt("source filename is not a valid leased name".into())
+        })?;
 
         // B-04: Verify filename fields match the handle
         if parsed.common.job_id != lease.job_id {
@@ -1809,7 +1859,9 @@ impl Queue {
             .map_err(|e| Error::QueueCorrupt(format!("header decode: {e}")))?;
 
         if header.job_id != lease.job_id {
-            return Err(Error::QueueCorrupt("header job_id does not match handle".into()));
+            return Err(Error::QueueCorrupt(
+                "header job_id does not match handle".into(),
+            ));
         }
 
         // B-04: Verify envelope digest
@@ -1829,13 +1881,16 @@ impl Queue {
             &lease.job_id,
             self.format.shard_count,
         );
-        let shard_from_path = parts.iter()
+        let shard_from_path = parts
+            .iter()
             .rev()
             .find(|p| p.starts_with("000") || p.len() == 4)
             .and_then(|s| spoolq_names::shard_from_hex(s));
         if let Some(shard) = shard_from_path {
             if shard != computed_shard {
-                return Err(Error::QueueCorrupt("source shard does not match queue derivation".into()));
+                return Err(Error::QueueCorrupt(
+                    "source shard does not match queue derivation".into(),
+                ));
             }
         }
 
@@ -1957,9 +2012,10 @@ impl Queue {
             spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(terminal_bucket);
 
-        let new_gen = common.generation.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "generation overflow")
-        })?;
+        let new_gen = common
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "generation overflow"))?;
         let dead_common = CommonFields {
             job_id: common.job_id,
             generation: new_gen,
@@ -2036,8 +2092,8 @@ impl Queue {
         }
 
         // B-09: Verify exact file size (no trailing data)
-        let file_stat = fs::fstat(file_fd.as_raw_fd())
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let file_stat =
+            fs::fstat(file_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
         if file_stat.st_size as u64 != expected_size {
             return Err(Error::QueueCorrupt(format!(
@@ -2112,8 +2168,7 @@ impl Queue {
                     if let Ok(boot_fd) = open_relative(self.root_fd.as_raw_fd(), &boot_path) {
                         if let Ok(bucket_dirs) = fs::read_dir_entries_owned(boot_fd.as_raw_fd()) {
                             for bucket_dir in bucket_dirs {
-                                let shard_path =
-                                    format!("{boot_path}/{bucket_dir}/{shard_str}");
+                                let shard_path = format!("{boot_path}/{bucket_dir}/{shard_str}");
                                 if let Ok(shard_fd) =
                                     open_relative(self.root_fd.as_raw_fd(), &shard_path)
                                 {
@@ -2285,7 +2340,11 @@ impl Queue {
         let now_bucket = spoolq_math::bucket_number(wall_now, width).unwrap_or(0);
         let retention_buckets = spoolq_math::ceiling_bucket(retention, width).unwrap_or(0);
         let min_bucket = now_bucket.saturating_sub(retention_buckets + 2);
-        let shard = compute_shard(&self.format.queue_id, &lease.job_id, self.format.shard_count);
+        let shard = compute_shard(
+            &self.format.queue_id,
+            &lease.job_id,
+            self.format.shard_count,
+        );
         let shard_str = shard_hex(shard);
         let new_generation = lease.generation.checked_add(1).unwrap_or(u64::MAX);
         let receipt_common = CommonFields {
@@ -2311,7 +2370,8 @@ impl Queue {
                 &receipt_base,
             );
             let receipt_tag = compute_name_tag(&self.format.queue_id, &receipt_ctx);
-            let receipt_name = spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
+            let receipt_name =
+                spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
             let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
             if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &receipt_dir) {
                 if fs::fstatat(dir_fd.as_raw_fd(), &receipt_name).is_ok() {
@@ -3328,7 +3388,10 @@ mod tests {
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
         // Second init must fail
         let result = Queue::init(tmp.path(), &CreateOptions::default());
-        assert!(result.is_err(), "init must refuse to overwrite existing queue");
+        assert!(
+            result.is_err(),
+            "init must refuse to overwrite existing queue"
+        );
     }
 
     // ===== C-01: All options validated before mutation =====
@@ -3456,8 +3519,12 @@ mod tests {
         std::fs::write(&src_path, data).unwrap();
         let result = queue.verify_lease_payload(&lease);
         assert!(
-            matches!(result, Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))),
-            "corrupted payload should be detected, got: {:?}", result
+            matches!(
+                result,
+                Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))
+            ),
+            "corrupted payload should be detected, got: {:?}",
+            result
         );
     }
 
@@ -3566,7 +3633,12 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = meta.permissions().mode();
-            assert_eq!(mode & 0o777, 0o400, "FORMAT should be mode 0400, got {:o}", mode);
+            assert_eq!(
+                mode & 0o777,
+                0o400,
+                "FORMAT should be mode 0400, got {:o}",
+                mode
+            );
         }
     }
 

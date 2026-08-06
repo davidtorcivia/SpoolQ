@@ -4,9 +4,9 @@
 // Exposes the core queue operations through a stable C interface.
 // Opaque handles wrap Rust types. All strings are null-terminated UTF-8.
 
+use std::cell::Cell;
 /// B-08: Last error message for C callers.
 use std::sync::Mutex;
-use std::cell::Cell;
 
 thread_local! {
     static LAST_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
@@ -210,9 +210,13 @@ pub extern "C" fn spoolq_enqueue(
         }
         EnqueueOutcome::NotCommitted(_, e) => match e {
             spoolq_core::Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
-            spoolq_core::Error::UnsupportedFilesystem | spoolq_core::Error::UnsupportedFormat => SPOOLQ_UNSUPPORTED,
+            spoolq_core::Error::UnsupportedFilesystem | spoolq_core::Error::UnsupportedFormat => {
+                SPOOLQ_UNSUPPORTED
+            }
             spoolq_core::Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
-            spoolq_core::Error::ResourceExhausted | spoolq_core::Error::StateExhausted => SPOOLQ_RESOURCE_EXHAUSTED,
+            spoolq_core::Error::ResourceExhausted | spoolq_core::Error::StateExhausted => {
+                SPOOLQ_RESOURCE_EXHAUSTED
+            }
             _ => SPOOLQ_NOT_COMMITTED,
         },
         EnqueueOutcome::OutcomeUnknown(ticket, _) => {
@@ -249,9 +253,13 @@ pub extern "C" fn spoolq_lease(
         }
         LeaseOutcome::NotCommitted(e) => match e {
             spoolq_core::Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
-            spoolq_core::Error::UnsupportedFilesystem | spoolq_core::Error::UnsupportedFormat => SPOOLQ_UNSUPPORTED,
+            spoolq_core::Error::UnsupportedFilesystem | spoolq_core::Error::UnsupportedFormat => {
+                SPOOLQ_UNSUPPORTED
+            }
             spoolq_core::Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
-            spoolq_core::Error::ResourceExhausted | spoolq_core::Error::StateExhausted => SPOOLQ_RESOURCE_EXHAUSTED,
+            spoolq_core::Error::ResourceExhausted | spoolq_core::Error::StateExhausted => {
+                SPOOLQ_RESOURCE_EXHAUSTED
+            }
             _ => SPOOLQ_NOT_COMMITTED,
         },
         LeaseOutcome::OutcomeUnknown(_) => SPOOLQ_INDETERMINATE,

@@ -111,7 +111,14 @@ impl Queue {
                     // C-41: Carry full root-relative path
                     report.total_objects += 1;
                     let full_path = format!("{state_name}/{entry}/{sub_entry}");
-                    self.fsck_file(sub_fd.as_raw_fd(), state_name, &full_path, sub_entry, opts, report);
+                    self.fsck_file(
+                        sub_fd.as_raw_fd(),
+                        state_name,
+                        &full_path,
+                        sub_entry,
+                        opts,
+                        report,
+                    );
                 } else {
                     // Another directory level (shard under bucket)
                     let shard_fd = match fs::open_directory(sub_fd.as_raw_fd(), sub_entry) {
@@ -127,7 +134,14 @@ impl Queue {
                             report.total_objects += 1;
                             // C-41: Full path includes all directory levels
                             let full_path = format!("{state_name}/{entry}/{sub_entry}/{file}");
-                            self.fsck_file(shard_fd.as_raw_fd(), state_name, &full_path, file, opts, report);
+                            self.fsck_file(
+                                shard_fd.as_raw_fd(),
+                                state_name,
+                                &full_path,
+                                file,
+                                opts,
+                                report,
+                            );
                         }
                     }
                 }
@@ -177,8 +191,16 @@ impl Queue {
                     for file in &files {
                         if file.ends_with(".sqj") {
                             report.total_objects += 1;
-                            let full_path = format!("leased/{boot_dir}/{bucket_dir}/{shard_dir}/{file}");
-                            self.fsck_file(shard_fd.as_raw_fd(), "leased", &full_path, file, opts, report);
+                            let full_path =
+                                format!("leased/{boot_dir}/{bucket_dir}/{shard_dir}/{file}");
+                            self.fsck_file(
+                                shard_fd.as_raw_fd(),
+                                "leased",
+                                &full_path,
+                                file,
+                                opts,
+                                report,
+                            );
                         }
                     }
                 }
@@ -203,9 +225,13 @@ impl Queue {
         let parsed_ok = match state_name {
             "ready" => filename.ends_with(".sqj") && spoolq_names::parse_ready(filename).is_ok(),
             "leased" => filename.ends_with(".sqj") && spoolq_names::parse_leased(filename).is_ok(),
-            "delayed" => filename.ends_with(".sqj") && spoolq_names::parse_delayed(filename).is_ok(),
+            "delayed" => {
+                filename.ends_with(".sqj") && spoolq_names::parse_delayed(filename).is_ok()
+            }
             "dead" => filename.ends_with(".sqj") && spoolq_names::parse_dead(filename).is_ok(),
-            "receipts" => filename.ends_with(".rct") && spoolq_names::parse_receipt(filename).is_ok(),
+            "receipts" => {
+                filename.ends_with(".rct") && spoolq_names::parse_receipt(filename).is_ok()
+            }
             _ => false,
         };
 
@@ -244,8 +270,13 @@ impl Queue {
 
             // B-10: In repair mode, quarantine corrupt objects
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(shard_fd, filename, full_path,
-                    crate::QuarantineReason::FilenameParseFailed, report);
+                let _ = self.quarantine_object(
+                    shard_fd,
+                    filename,
+                    full_path,
+                    crate::QuarantineReason::FilenameParseFailed,
+                    report,
+                );
             }
         }
     }

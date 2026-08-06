@@ -38,12 +38,8 @@ fn cstr_from_name(name: &str) -> io::Result<CString> {
 
 /// Convert a byte slice (OsStr on Linux) to CString, returning InvalidInput on embedded NUL.
 fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CString> {
-    CString::new(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path contains NUL byte",
-        )
-    })
+    CString::new(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
 }
 
 /// Open a directory for reading.
@@ -366,13 +362,8 @@ pub fn pwrite(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
 pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < buf.len() {
-        let rc = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const _,
-                buf.len() - written,
-            )
-        };
+        let rc =
+            unsafe { libc::write(fd, buf[written..].as_ptr() as *const _, buf.len() - written) };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -430,8 +421,7 @@ pub fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 /// Read at a specific offset using pread.
 pub fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     loop {
-        let rc =
-            unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), offset as i64) };
+        let rc = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), offset as i64) };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
