@@ -482,6 +482,111 @@ pub fn fchmodat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Durable no-overwrite move: renameat2 with RENAME_NOREPLACE, then sync directories.
+/// If source and destination are the same directory, sync once.
+pub fn durable_move_noreplace(
+    src_dir_fd: RawFd,
+    src_name: &str,
+    dest_dir_fd: RawFd,
+    dest_name: &str,
+) -> io::Result<()> {
+    renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name)?;
+
+    // Check if same directory by comparing device and inode
+    let src_stat = fstat(src_dir_fd)?;
+    let dest_stat = fstat(dest_dir_fd)?;
+
+    if src_stat.st_dev == dest_stat.st_dev && src_stat.st_ino == dest_stat.st_ino {
+        // Same directory: sync once
+        fsync_dir_fd(dest_dir_fd)?;
+    } else {
+        // Different directories: sync destination first, then source
+        fsync_dir_fd(dest_dir_fd)?;
+        fsync_dir_fd(src_dir_fd)?;
+    }
+    Ok(())
+}
+
+/// Replacing rename: for receipt compaction and wall-watermark replacement only.
+/// Performs a standard rename (overwrites destination), then syncs the directory.
+pub fn durable_move_replace(
+    src_dir_fd: RawFd,
+    src_name: &str,
+    dest_dir_fd: RawFd,
+    dest_name: &str,
+) -> io::Result<()> {
+    renameat(src_dir_fd, src_name, dest_dir_fd, dest_name)?;
+
+    let src_stat = fstat(src_dir_fd)?;
+    let dest_stat = fstat(dest_dir_fd)?;
+
+    if src_stat.st_dev == dest_stat.st_dev && src_stat.st_ino == dest_stat.st_ino {
+        fsync_dir_fd(dest_dir_fd)?;
+    } else {
+        fsync_dir_fd(dest_dir_fd)?;
+        fsync_dir_fd(src_dir_fd)?;
+    }
+    Ok(())
+}
+
+/// Stabilization sync: sync a verified destination and its parent directories.
+/// Non-mutating: only performs fsync, no rename or write.
+pub fn stabilize(fd: RawFd) -> io::Result<()> {
+    fsync(fd)
+}
+
+/// Stabilize a directory by its fd.
+pub fn stabilize_dir(fd: RawFd) -> io::Result<()> {
+    fsync_dir_fd(fd)
+}
+
+/// syncfs: sync an entire filesystem. Caller must assert the queue owns the mount.
+pub fn syncfs(fd: RawFd) -> io::Result<()> {
+    let rc = unsafe { libc::syscall(libc::SYS_syncfs, fd) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Error classification: did a failure occur before or after the linearization point?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailurePoint {
+    /// Before the rename/link: the transition did not occur.
+    PreLinearization,
+    /// After the rename/link: the transition may have occurred.
+    PostLinearization,
+}
+
+/// Classify an io::Error by whether linearization may have occurred.
+pub fn classify_error(err: &io::Error) -> FailurePoint {
+    match err.raw_os_error() {
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) => FailurePoint::PreLinearization,
+        Some(libc::EIO) | Some(libc::ESTALE) => FailurePoint::PreLinearization,
+        _ => FailurePoint::PreLinearization,
+    }
+}
+
+/// Check if an error indicates the source is gone (ENOENT).
+pub fn is_source_gone(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ENOENT)
+}
+
+/// Check if an error indicates a collision (EEXIST).
+pub fn is_collision(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EEXIST)
+}
+
+/// Check if an error indicates resource exhaustion (ENOSPC, EDQUOT).
+pub fn is_resource_exhausted(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+}
+
+/// Check if an error is a sync failure that should poison the handle.
+pub fn is_sync_failure(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EIO) | Some(libc::ESTALE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
