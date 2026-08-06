@@ -579,8 +579,7 @@ impl Queue {
         // Ensure tmp/<boot-id>/<shard>/ exists
         // Extract shard from dest_dir
         let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
-        let boot_short = self.boot_id.replace('-', "");
-        let tmp_dir = format!("tmp/{}/{}", &boot_short[..8], shard_part);
+        let tmp_dir = format!("tmp/{}/{}", self.boot_id, shard_part);
 
         self.ensure_dir(&tmp_dir)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
