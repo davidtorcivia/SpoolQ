@@ -325,6 +325,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spoolq-capi"
+version = "0.1.0"
+dependencies = [
+ "spoolq-core",
+ "spoolq-format",
+ "spoolq-names",
+]
+
+[[package]]
 name = "spoolq-cli"
 version = "0.1.0"
 dependencies = [

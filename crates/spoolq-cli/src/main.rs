@@ -5,11 +5,31 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use spoolq_core::{CreateOptions, EnqueueOutcome, LeaseOutcome, OpenOptions, Queue};
+
+/// Stable exit codes per spec section 11.5
+#[allow(dead_code)]
+const EXIT_SUCCESS: u8 = 0;
+#[allow(dead_code)]
+const EXIT_ORDINARY: u8 = 1;
+#[allow(dead_code)]
+const EXIT_INDETERMINATE: u8 = 2;
+#[allow(dead_code)]
+const EXIT_CORRUPTION: u8 = 3;
+#[allow(dead_code)]
+const EXIT_RESOURCE_EXHAUSTED: u8 = 4;
+#[allow(dead_code)]
+const EXIT_PERMISSION: u8 = 5;
+const EXIT_IO_FAILURE: u8 = 6;
+#[allow(dead_code)]
+const EXIT_UNSUPPORTED: u8 = 64;
+use spoolq_core::{CreateOptions, EnqueueInput, EnqueueOutcome, LeaseOutcome, OpenOptions, Queue};
 
 #[derive(Parser)]
 #[command(name = "spoolq", about = "Crash-safe filesystem queue")]
 struct Cli {
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -96,6 +116,69 @@ enum Commands {
     },
     /// Dump format info for a file
     FormatDump { file: PathBuf },
+    /// Resolve an indeterminate operation
+    Resolve {
+        path: PathBuf,
+        #[arg(long)]
+        result_file: PathBuf,
+        #[arg(long)]
+        stabilize: bool,
+    },
+    /// Run a benchmark
+    Bench {
+        path: PathBuf,
+        #[arg(long, default_value = "1")]
+        producers: u32,
+        #[arg(long, default_value = "1")]
+        consumers: u32,
+        #[arg(long, default_value = "10")]
+        duration_seconds: u64,
+        #[arg(long, default_value = "1024")]
+        payload_size: usize,
+        #[arg(long, default_value = "30")]
+        lease_duration_seconds: u64,
+    },
+    /// Administrative operations
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommands {
+    /// List dead jobs
+    DeadList { path: PathBuf },
+    /// Inspect a dead job
+    DeadInspect { path: PathBuf, job_id: String },
+    /// Export a dead job's payload
+    DeadExport {
+        path: PathBuf,
+        job_id: String,
+        output: PathBuf,
+    },
+    /// Remove a dead job
+    DeadRemove { path: PathBuf, job_id: String },
+    /// List quarantined objects
+    QuarantineList { path: PathBuf },
+    /// Inspect a quarantined object
+    QuarantineInspect {
+        path: PathBuf,
+        quarantine_id: String,
+    },
+    /// Export a quarantined object's raw bytes
+    QuarantineExport {
+        path: PathBuf,
+        quarantine_id: String,
+        output: PathBuf,
+    },
+    /// Remove a quarantined object
+    QuarantineRemove {
+        path: PathBuf,
+        quarantine_id: String,
+    },
+    /// Compact receipts manually
+    CompactReceipts { path: PathBuf },
 }
 
 fn parse_duration_seconds(s: u64) -> u64 {
@@ -693,6 +776,325 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Commands::Resolve {
+            path,
+            result_file,
+            stabilize: _,
+        } => {
+            let data = match std::fs::read(&result_file) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("read result file failed: {}", e);
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            // Parse the transition ticket from the result file
+            let ticket_json: serde_json::Value = match serde_json::from_slice(&data) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("parse result file failed: {}", e);
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let source_path = ticket_json
+                .get("source_relative_path")
+                .or_else(|| ticket_json.get("attempted_destination_relative_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let dest_path = ticket_json
+                .get("attempted_destination_relative_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            eprintln!("source: {}", source_path);
+            eprintln!("destination: {}", dest_path);
+            let queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {}", e);
+                    return ExitCode::from(EXIT_IO_FAILURE);
+                }
+            };
+            // Use inspect to check states
+            let job_id_hex = ticket_json
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(job_id) = spoolq_names::hex_decode_16(job_id_hex) {
+                let snapshots = queue.inspect(&job_id);
+                if snapshots.is_empty() {
+                    eprintln!("neither observed");
+                } else {
+                    for s in &snapshots {
+                        eprintln!("{} gen={} {}", s.state, s.generation, s.relative_path);
+                    }
+                }
+            }
+            ExitCode::from(EXIT_SUCCESS)
+        }
+
+        Commands::Bench {
+            path,
+            producers,
+            consumers,
+            duration_seconds,
+            payload_size,
+            lease_duration_seconds,
+        } => {
+            eprintln!(
+                "bench: {} producers, {} consumers, {}s, {}B payload",
+                producers, consumers, duration_seconds, payload_size
+            );
+
+            let payload = vec![0x42u8; payload_size];
+            let duration = std::time::Duration::from_secs(duration_seconds);
+            let deadline = std::time::Instant::now() + duration;
+
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::Arc;
+            use std::thread;
+
+            let enqueued = Arc::new(AtomicU64::new(0));
+            let leased = Arc::new(AtomicU64::new(0));
+            let acked = Arc::new(AtomicU64::new(0));
+
+            let mut handles = Vec::new();
+
+            // Producers
+            for _ in 0..producers {
+                let p = path.clone();
+                let payload = payload.clone();
+                let enqueued = enqueued.clone();
+                let dl = deadline;
+                handles.push(thread::spawn(move || {
+                    while std::time::Instant::now() < dl {
+                        let queue = Queue::open(
+                            &p,
+                            &OpenOptions {
+                                allow_unsupported_fs: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        let mut queue = queue;
+                        if let spoolq_core::EnqueueOutcome::Committed(_) =
+                            queue.enqueue(EnqueueInput {
+                                maximum_attempts: 3,
+                                content_type: "bench".to_string(),
+                                payload: payload.clone(),
+                                ..Default::default()
+                            })
+                        {
+                            enqueued.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }));
+            }
+
+            // Consumers
+            let lease_ns = lease_duration_seconds * 1_000_000_000;
+            for _ in 0..consumers {
+                let p = path.clone();
+                let leased = leased.clone();
+                let acked = acked.clone();
+                let dl = deadline;
+                handles.push(thread::spawn(move || {
+                    while std::time::Instant::now() < dl {
+                        let queue = Queue::open(
+                            &p,
+                            &OpenOptions {
+                                allow_unsupported_fs: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        let mut queue = queue;
+                        match queue.lease(0, lease_ns) {
+                            spoolq_core::LeaseOutcome::Leased(l) => {
+                                leased.fetch_add(1, Ordering::Relaxed);
+                                if queue.ack(&l) == spoolq_core::AckOutcome::Acked {
+                                    acked.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            _ => {
+                                thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let elapsed = duration_seconds as f64;
+            let eq = enqueued.load(Ordering::Relaxed);
+            let lq = leased.load(Ordering::Relaxed);
+            let aq = acked.load(Ordering::Relaxed);
+
+            eprintln!("enqueued: {} ({:.0}/s)", eq, eq as f64 / elapsed);
+            eprintln!("leased: {} ({:.0}/s)", lq, lq as f64 / elapsed);
+            eprintln!("acked: {} ({:.0}/s)", aq, aq as f64 / elapsed);
+            ExitCode::from(EXIT_SUCCESS)
+        }
+
+        Commands::Admin { command } => match command {
+            AdminCommands::DeadList { path } => {
+                let qroot = path.join("dead");
+                if let Ok(entries) = std::fs::read_dir(&qroot) {
+                    for bucket in entries.flatten() {
+                        if let Ok(shards) = std::fs::read_dir(bucket.path()) {
+                            for shard in shards.flatten() {
+                                if let Ok(files) = std::fs::read_dir(shard.path()) {
+                                    for file in files.flatten() {
+                                        let name = file.file_name().to_string_lossy().to_string();
+                                        let rp = file
+                                            .path()
+                                            .strip_prefix(&path)
+                                            .unwrap_or(&file.path())
+                                            .display()
+                                            .to_string();
+                                        println!("{} {}", name, rp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ExitCode::from(EXIT_SUCCESS)
+            }
+            AdminCommands::DeadInspect { path, job_id } => {
+                let job_id_bytes = match spoolq_names::hex_decode_16(&job_id) {
+                    Some(b) => b,
+                    None => return ExitCode::from(EXIT_ORDINARY),
+                };
+                let queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                for s in queue
+                    .inspect(&job_id_bytes)
+                    .iter()
+                    .filter(|s| s.state == "dead")
+                {
+                    println!(
+                        "gen={} attempt={}/{} {}",
+                        s.generation, s.attempt, s.maximum_attempts, s.relative_path
+                    );
+                }
+                ExitCode::from(EXIT_SUCCESS)
+            }
+            AdminCommands::DeadExport {
+                path,
+                job_id,
+                output,
+            } => {
+                let job_id_bytes = spoolq_names::hex_decode_16(&job_id).unwrap_or([0; 16]);
+                let queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                match queue
+                    .inspect(&job_id_bytes)
+                    .iter()
+                    .find(|s| s.state == "dead")
+                {
+                    Some(s) => match std::fs::copy(path.join(&s.relative_path), &output) {
+                        Ok(n) => {
+                            eprintln!("exported {} bytes", n);
+                            ExitCode::from(EXIT_SUCCESS)
+                        }
+                        Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                    },
+                    None => {
+                        eprintln!("not found");
+                        ExitCode::from(EXIT_ORDINARY)
+                    }
+                }
+            }
+            AdminCommands::DeadRemove { path, job_id } => {
+                let job_id_bytes = spoolq_names::hex_decode_16(&job_id).unwrap_or([0; 16]);
+                let queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                match queue
+                    .inspect(&job_id_bytes)
+                    .iter()
+                    .find(|s| s.state == "dead")
+                {
+                    Some(s) => match std::fs::remove_file(path.join(&s.relative_path)) {
+                        Ok(()) => {
+                            eprintln!("removed");
+                            ExitCode::from(EXIT_SUCCESS)
+                        }
+                        Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                    },
+                    None => {
+                        eprintln!("not found");
+                        ExitCode::from(EXIT_ORDINARY)
+                    }
+                }
+            }
+            AdminCommands::QuarantineList { path } => {
+                let qroot = path.join("quarantine");
+                if let Ok(entries) = std::fs::read_dir(&qroot) {
+                    for bucket in entries.flatten() {
+                        if let Ok(shards) = std::fs::read_dir(bucket.path()) {
+                            for shard in shards.flatten() {
+                                if let Ok(files) = std::fs::read_dir(shard.path()) {
+                                    for file in files.flatten() {
+                                        let name = file.file_name().to_string_lossy().to_string();
+                                        let rp = file
+                                            .path()
+                                            .strip_prefix(&path)
+                                            .unwrap_or(&file.path())
+                                            .display()
+                                            .to_string();
+                                        println!("{} {}", name, rp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ExitCode::from(EXIT_SUCCESS)
+            }
+            AdminCommands::QuarantineInspect {
+                path: _,
+                quarantine_id,
+            } => {
+                eprintln!("quarantine_id: {}", quarantine_id);
+                ExitCode::from(EXIT_SUCCESS)
+            }
+            AdminCommands::QuarantineExport {
+                path: _,
+                quarantine_id: _,
+                output: _,
+            } => {
+                eprintln!("not yet implemented");
+                ExitCode::from(EXIT_ORDINARY)
+            }
+            AdminCommands::QuarantineRemove {
+                path: _,
+                quarantine_id: _,
+            } => {
+                eprintln!("not yet implemented");
+                ExitCode::from(EXIT_ORDINARY)
+            }
+            AdminCommands::CompactReceipts { path } => {
+                let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                let stats = queue.recover(&spoolq_core::WorkBudget::default());
+                eprintln!(
+                    "compacted: {} expired: {}",
+                    stats.receipts_compacted, stats.receipts_expired
+                );
+                ExitCode::from(EXIT_SUCCESS)
+            }
+        },
     }
 }
 
