@@ -3,31 +3,56 @@
 
 use std::ffi::CString;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 /// Open or create a file with O_TMPFILE.
 pub fn open_tmpfile(dir_fd: RawFd) -> io::Result<OwnedFd> {
-    // O_TMPFILE = 020000000 | O_RDWR
-    const O_TMPFILE: i32 = 0o20000000;
-    const O_RDWR: i32 = 0o2;
-    const O_CLOEXEC: i32 = 0o2000000;
-
+    // Use libc::O_TMPFILE which correctly includes O_DIRECTORY on all arches.
+    // Fall back to the defined constant if libc does not expose it.
+    let o_tmpfile = libc::O_TMPFILE;
     let dot = CString::new(".").unwrap();
-    let fd = unsafe { libc::openat(dir_fd, dot.as_ptr(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0o600) };
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            dot.as_ptr(),
+            o_tmpfile | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Convert a name string to CString, returning InvalidInput on embedded NUL.
+fn cstr_from_name(name: &str) -> io::Result<CString> {
+    CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path component contains NUL byte",
+        )
+    })
+}
+
+/// Convert a byte slice (OsStr on Linux) to CString, returning InvalidInput on embedded NUL.
+fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CString> {
+    CString::new(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
+}
+
 /// Open a directory for reading.
 pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
-    const O_RDONLY: i32 = 0o0;
-    const O_DIRECTORY: i32 = 0o200000;
-    const O_CLOEXEC: i32 = 0o2000000;
-    let c_name = CString::new(name).unwrap();
-    let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
+    let c_name = cstr_from_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -36,7 +61,7 @@ pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
 
 /// Open a path relative to a directory fd with given flags.
 pub fn openat(dir_fd: RawFd, name: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
-    let c_name = CString::new(name).unwrap();
+    let c_name = cstr_from_name(name)?;
     let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), flags, mode) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -46,7 +71,7 @@ pub fn openat(dir_fd: RawFd, name: &str, flags: i32, mode: u32) -> io::Result<Ow
 
 /// Create a directory.
 pub fn mkdirat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
-    let c_name = CString::new(name).unwrap();
+    let c_name = cstr_from_name(name)?;
     let rc = unsafe { libc::mkdirat(dir_fd, c_name.as_ptr(), mode) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -55,6 +80,7 @@ pub fn mkdirat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
 }
 
 /// Create a directory, treating EEXIST as Ok.
+/// Returns true if the directory was newly created, false if it already existed.
 pub fn mkdirat_eexist_ok(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<bool> {
     match mkdirat(dir_fd, name, mode) {
         Ok(()) => Ok(true),
@@ -91,8 +117,8 @@ pub fn renameat2_noreplace(
     new_name: &str,
 ) -> io::Result<()> {
     const RENAME_NOREPLACE: u32 = 1 << 0;
-    let c_old = CString::new(old_name).unwrap();
-    let c_new = CString::new(new_name).unwrap();
+    let c_old = cstr_from_name(old_name)?;
+    let c_new = cstr_from_name(new_name)?;
     let rc = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -116,8 +142,8 @@ pub fn renameat(
     new_dir_fd: RawFd,
     new_name: &str,
 ) -> io::Result<()> {
-    let c_old = CString::new(old_name).unwrap();
-    let c_new = CString::new(new_name).unwrap();
+    let c_old = cstr_from_name(old_name)?;
+    let c_new = cstr_from_name(new_name)?;
     let rc = unsafe { libc::renameat(old_dir_fd, c_old.as_ptr(), new_dir_fd, c_new.as_ptr()) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -128,12 +154,13 @@ pub fn renameat(
 /// linkat with AT_EMPTY_PATH for O_TMPFILE publication.
 pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::Result<()> {
     const AT_EMPTY_PATH: i32 = 0x1000;
-    let c_dest = CString::new(dest_name).unwrap();
+    let c_dest = cstr_from_name(dest_name)?;
+    let empty = CString::new("").unwrap();
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
             fd,
-            CString::new("").unwrap().as_ptr(),
+            empty.as_ptr(),
             dest_dir_fd,
             c_dest.as_ptr(),
             AT_EMPTY_PATH,
@@ -148,8 +175,9 @@ pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::
 /// linkat via /proc/self/fd for unprivileged O_TMPFILE publication.
 pub fn linkat_proc_self_fd(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::Result<()> {
     const AT_SYMLINK_FOLLOW: i32 = 0x400;
-    let proc_path = format!("/proc/self/fd/{}\0", fd);
-    let c_dest = CString::new(dest_name).unwrap();
+    #[allow(clippy::manual_c_str_literals)]
+    let proc_path = format!("/proc/self/fd/{fd}\0");
+    let c_dest = cstr_from_name(dest_name)?;
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
@@ -168,7 +196,7 @@ pub fn linkat_proc_self_fd(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io
 
 /// unlinkat - remove a file.
 pub fn unlinkat(dir_fd: RawFd, name: &str) -> io::Result<()> {
-    let c_name = CString::new(name).unwrap();
+    let c_name = cstr_from_name(name)?;
     let rc = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -179,7 +207,7 @@ pub fn unlinkat(dir_fd: RawFd, name: &str) -> io::Result<()> {
 /// Remove a directory (must be empty).
 pub fn unlinkat_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
     const AT_REMOVEDIR: i32 = 0x200;
-    let c_name = CString::new(name).unwrap();
+    let c_name = cstr_from_name(name)?;
     let rc = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), AT_REMOVEDIR) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -187,9 +215,9 @@ pub fn unlinkat_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// stat a file relative to a directory fd.
+/// stat a file relative to a directory fd using AT_SYMLINK_NOFOLLOW.
 pub fn fstatat(dir_fd: RawFd, name: &str) -> io::Result<libc::stat> {
-    let c_name = CString::new(name).unwrap();
+    let c_name = cstr_from_name(name)?;
     let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::fstatat(
@@ -215,9 +243,9 @@ pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     Ok(statbuf)
 }
 
-/// Get filesystem stats.
+/// Get filesystem stats using OsStrExt for byte-safe paths.
 pub fn statfs(path: &Path) -> io::Result<libc::statfs> {
-    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+    let c_path = cstr_from_bytes(path.as_os_str().as_bytes())?;
     let mut statbuf: libc::statfs = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut statbuf) };
     if rc < 0 {
@@ -258,13 +286,58 @@ pub fn clock_realtime_ns() -> io::Result<u64> {
     Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
 }
 
-/// Generate random bytes from the OS crypto source.
-pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; bytes];
-    // Use getrandom syscall
-    let rc = unsafe { libc::syscall(libc::SYS_getrandom, buf.as_mut_ptr(), bytes, 0) };
+/// CLOCK_MONOTONIC in nanoseconds (for budget enforcement).
+pub fn clock_monotonic_ns() -> io::Result<u64> {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
+    }
+    Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+/// Generate random bytes from the OS crypto source.
+/// Loops until the entire buffer is filled. Handles short reads, EINTR,
+/// and EAGAIN. Returns an error (not zero data) on any failure.
+pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
+    if bytes == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; bytes];
+    let mut filled = 0usize;
+    loop {
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                buf[filled..].as_mut_ptr(),
+                bytes - filled,
+                0,
+            )
+        };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue; // EINTR: retry
+            }
+            // EAGAIN should not happen with flags=0, but handle defensively
+            if e.raw_os_error() == Some(libc::EAGAIN) {
+                continue;
+            }
+            return Err(e);
+        }
+        let n = rc as usize;
+        if n == 0 {
+            // A zero-byte successful return is anomalous for getrandom
+            // with a non-zero length request. Treat as an error.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "getrandom returned zero bytes",
+            ));
+        }
+        filled += n;
+        if filled >= bytes {
+            break;
+        }
     }
     Ok(buf)
 }
@@ -286,7 +359,8 @@ pub fn pwrite(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
     Ok(rc as usize)
 }
 
-/// Write all bytes, retrying on partial writes.
+/// Write all bytes, retrying on partial writes. Rejects zero progress.
+/// Returns an error if write returns 0 (no progress) rather than looping forever.
 pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < buf.len() {
@@ -299,17 +373,32 @@ pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
             }
             return Err(e);
         }
+        if rc == 0 {
+            // Zero progress on a write: this indicates an error condition
+            // (e.g., full filesystem returning 0, or broken pipe).
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write returned zero bytes (no progress)",
+            ));
+        }
         written += rc as usize;
     }
     Ok(())
 }
 
 /// Write all bytes at a given offset using pwrite, retrying on partial writes.
+/// Returns an error if pwrite returns 0 (no progress).
 pub fn pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
     let mut written = 0;
     let mut current_offset = offset;
     while written < buf.len() {
         let n = pwrite(fd, &buf[written..], current_offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "pwrite returned zero bytes (no progress)",
+            ));
+        }
         written += n;
         current_offset += n as u64;
     }
@@ -346,13 +435,34 @@ pub fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     }
 }
 
+/// Read exactly `buf.len()` bytes at `offset`, or return an error.
+pub fn pread_exact(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut filled = 0;
+    let mut cur = offset;
+    while filled < buf.len() {
+        let n = pread(fd, &mut buf[filled..], cur)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pread hit EOF before filling buffer",
+            ));
+        }
+        filled += n;
+        cur += n as u64;
+    }
+    Ok(())
+}
+
 /// Open a directory path (absolute) and return an OwnedFd.
+/// Uses OsStrExt for byte-safe path handling.
 pub fn open_dir_absolute(path: &Path) -> io::Result<OwnedFd> {
-    const O_RDONLY: i32 = 0o0;
-    const O_DIRECTORY: i32 = 0o200000;
-    const O_CLOEXEC: i32 = 0o2000000;
-    let c_path = CString::new(path.to_str().unwrap()).unwrap();
-    let fd = unsafe { libc::open(c_path.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
+    let c_path = cstr_from_bytes(path.as_os_str().as_bytes())?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -361,15 +471,10 @@ pub fn open_dir_absolute(path: &Path) -> io::Result<OwnedFd> {
 
 /// Create a file with O_CREAT | O_EXCL | O_NOFOLLOW.
 pub fn create_exclusive(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<OwnedFd> {
-    const O_RDWR: i32 = 0o2;
-    const O_CREAT: i32 = 0o100;
-    const O_EXCL: i32 = 0o200;
-    const O_NOFOLLOW: i32 = 0o400000;
-    const O_CLOEXEC: i32 = 0o2000000;
     openat(
         dir_fd,
         name,
-        O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         mode,
     )
 }
@@ -412,15 +517,13 @@ pub fn try_ofd_read_lock(fd: RawFd) -> io::Result<bool> {
 }
 
 /// Read directory entries.
-pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<String>> {
+/// Consumes the fd via fdopendir.
+fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
     let mut entries = Vec::new();
     let dir = unsafe { libc::fdopendir(dir_fd) };
     if dir.is_null() {
         return Err(io::Error::last_os_error());
     }
-
-    // Save the fd so we don't double-close
-    let dir_fd_saved = dir_fd;
 
     loop {
         let entry = unsafe { libc::readdir(dir) };
@@ -440,12 +543,13 @@ pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<String>> {
 
     unsafe { libc::closedir(dir) };
 
-    // Prevent double-close: fdopendir takes ownership, so we need to forget our OwnedFd
-    // But since we pass RawFd, the caller must be aware.
-    // Mark the fd as consumed to prevent use-after-close.
-    let _ = dir_fd_saved;
-
     Ok(entries)
+}
+
+/// Read directory entries. Consumes the fd (fdopendir takes ownership).
+/// Prefer read_dir_entries_owned which dups the fd first.
+pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<String>> {
+    read_dir_entries_impl(dir_fd)
 }
 
 /// Get the filesystem type magic number.
@@ -469,13 +573,22 @@ pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<String>> {
     if dup_fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    read_dir_entries(dup_fd)
+    read_dir_entries_impl(dup_fd)
 }
 
 /// Change file mode relative to a directory fd.
 pub fn fchmodat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
-    let c_name = CString::new(name).unwrap();
+    let c_name = cstr_from_name(name)?;
     let rc = unsafe { libc::fchmodat(dir_fd, c_name.as_ptr(), mode, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Change file mode on an open fd.
+pub fn fchmod(fd: RawFd, mode: u32) -> io::Result<()> {
+    let rc = unsafe { libc::fchmod(fd, mode) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -587,6 +700,27 @@ pub fn is_sync_failure(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EIO) | Some(libc::ESTALE))
 }
 
+/// Check if an error is a capability/permission error (should not fall back).
+pub fn is_capability_error(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS)
+    )
+}
+
+/// Check if an error should suppress publication fallback.
+pub fn should_propagate_on_fallback(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EIO)
+            | Some(libc::ENOSPC)
+            | Some(libc::EDQUOT)
+            | Some(libc::ESTALE)
+            | Some(libc::EPERM)
+            | Some(libc::EACCES)
+    )
+}
+
 /// Probe unnamed-file publication modes. Returns which mode is available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicationMode {
@@ -606,11 +740,10 @@ pub fn probe_publication_mode(dir_fd: RawFd) -> io::Result<PublicationMode> {
     // Write a byte so it's not empty
     write_all(tmp.as_raw_fd(), b"x")?;
 
+    let rand = random_128bit()?;
     let probe_name = format!(
         ".pubprobe-{}\0",
-        random_128bit()
-            .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
-            .unwrap_or_default()
+        rand.iter().map(|x| format!("{x:02x}")).collect::<String>()
     );
 
     // Try AT_EMPTY_PATH first
@@ -631,17 +764,15 @@ pub fn probe_publication_mode(dir_fd: RawFd) -> io::Result<PublicationMode> {
 
 /// Probe no-overwrite rename support.
 pub fn probe_rename_noreplace(dir_fd: RawFd) -> io::Result<bool> {
+    let rand1 = random_128bit()?;
+    let rand2 = random_128bit()?;
     let name1 = format!(
         ".rnprobe1-{}\0",
-        random_128bit()
-            .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
-            .unwrap_or_default()
+        rand1.iter().map(|x| format!("{x:02x}")).collect::<String>()
     );
     let name2 = format!(
         ".rnprobe2-{}\0",
-        random_128bit()
-            .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
-            .unwrap_or_default()
+        rand2.iter().map(|x| format!("{x:02x}")).collect::<String>()
     );
     let n1 = name1.trim_end_matches('\0');
     let n2 = name2.trim_end_matches('\0');
@@ -671,6 +802,50 @@ pub fn probe_dir_fsync(dir_fd: RawFd) -> io::Result<bool> {
     }
 }
 
+/// Check if a path is absolute (starts with '/').
+pub fn is_absolute_path(s: &str) -> bool {
+    s.starts_with('/')
+}
+
+/// Validate a relative path component for safety:
+/// rejects absolute paths, '..', empty components, and NUL.
+pub fn validate_path_component(comp: &str) -> io::Result<()> {
+    if comp.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty path component",
+        ));
+    }
+    if comp == ".." || comp == "." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path component is '.' or '..'",
+        ));
+    }
+    if comp.starts_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "absolute path component in relative path",
+        ));
+    }
+    if comp.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NUL byte in path component",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a relative path for safety: split into components and validate each.
+pub fn validate_relative_path(path: &str) -> io::Result<Vec<&str>> {
+    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for comp in &components {
+        validate_path_component(comp)?;
+    }
+    Ok(components)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,9 +869,55 @@ mod tests {
     }
 
     #[test]
+    fn clock_monotonic_positive() {
+        let now = clock_monotonic_ns().unwrap();
+        assert!(now > 0);
+    }
+
+    #[test]
     fn random_128_bit_is_random() {
         let a = random_128bit().unwrap();
         let b = random_128bit().unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn random_is_not_all_zero() {
+        // Verify randomness is never all-zero (regression for B-07)
+        for _ in 0..100 {
+            let r = random_128bit().unwrap();
+            assert_ne!(r, [0u8; 16], "random_128bit returned all zeros");
+        }
+    }
+
+    #[test]
+    fn get_random_fills_buffer() {
+        // Verify the full buffer is filled (regression for B-07)
+        let buf = get_random(256).unwrap();
+        assert_eq!(buf.len(), 256);
+        // Extremely unlikely that 256 random bytes are all zero
+        assert!(buf.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn get_random_zero_returns_empty() {
+        let buf = get_random(0).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn nul_in_name_returns_error() {
+        // C-06: embedded NUL must return error, not panic
+        let result = cstr_from_name("hello\0world");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn path_validation_rejects_dotdot() {
+        assert!(validate_path_component("..").is_err());
+        assert!(validate_path_component(".").is_err());
+        assert!(validate_path_component("").is_err());
+        assert!(validate_path_component("/abs").is_err());
+        assert!(validate_path_component("ok").is_ok());
     }
 }

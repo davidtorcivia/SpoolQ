@@ -10,3 +10,6 @@ pub use quarantine::{
 };
 pub use queue::*;
 pub use recovery::{RecoveryStats, WorkBudget};
+
+/// Re-export RetryPolicy from spoolq_math so callers don't need two types.
+pub use spoolq_math::RetryPolicy;

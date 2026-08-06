@@ -207,7 +207,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("init failed: {}", e);
+                    eprintln!("init failed: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -221,20 +221,32 @@ fn main() -> ExitCode {
             not_before,
             producer_id,
         } => {
+            // C-54: Fail on read error instead of silently enqueueing empty payload
             let payload = match file.as_deref() {
                 Some("-") | None => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf).unwrap_or(0);
-                    buf
+                    match std::io::stdin().read_to_end(&mut buf) {
+                        Ok(_) => buf,
+                        Err(e) => {
+                            eprintln!("stdin read failed: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 }
-                Some(f) => std::fs::read(f).unwrap_or_default(),
+                Some(f) => match std::fs::read(f) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("file read failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
             };
 
             let queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -256,14 +268,14 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 EnqueueOutcome::NotCommitted(ticket, err) => {
-                    eprintln!("not committed: {}", err);
+                    eprintln!("not committed: {err}");
                     if ticket.job_id != [0; 16] {
                         eprintln!("job_id: {}", spoolq_names::hex_encode(&ticket.job_id));
                     }
                     ExitCode::FAILURE
                 }
                 EnqueueOutcome::OutcomeUnknown(ticket, err) => {
-                    eprintln!("outcome unknown: {}", err);
+                    eprintln!("outcome unknown: {err}");
                     eprintln!("job_id: {}", spoolq_names::hex_encode(&ticket.job_id));
                     eprintln!("path: {}", ticket.expected_relative_path);
                     ExitCode::from(2)
@@ -279,7 +291,7 @@ fn main() -> ExitCode {
             let queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -289,8 +301,10 @@ fn main() -> ExitCode {
             match queue.lease(0, duration_ns) {
                 LeaseOutcome::Leased(lease) => {
                     if let Some(ref hf) = handle_file {
-                        if let Err(e) = save_handle_to_file(&path, hf, &lease) {
-                            eprintln!("warning: failed to write handle file: {}", e);
+                        if let Err(e) =
+                            save_handle_to_file(&path, &queue.format().queue_id, hf, &lease)
+                        {
+                            eprintln!("warning: failed to write handle file: {e}");
                         }
                     }
                     println!("job_id: {}", spoolq_names::hex_encode(&lease.job_id));
@@ -303,7 +317,7 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
                 LeaseOutcome::NotCommitted(e) => {
-                    eprintln!("lease failed: {}", e);
+                    eprintln!("lease failed: {e}");
                     ExitCode::FAILURE
                 }
                 LeaseOutcome::OutcomeUnknown(ticket) => {
@@ -317,8 +331,9 @@ fn main() -> ExitCode {
         Commands::Stats { path } => {
             match Queue::open(&path, &OpenOptions::default()) {
                 Ok(_queue) => {
-                    // Basic stats: count files in each state
                     let root = &path;
+                    let mut stats_map: std::collections::BTreeMap<String, usize> =
+                        std::collections::BTreeMap::new();
                     for state in [
                         "ready",
                         "leased",
@@ -330,13 +345,21 @@ fn main() -> ExitCode {
                         let state_path = root.join(state);
                         if state_path.exists() {
                             let count = count_files_recursive(&state_path);
-                            println!("{}: {}", state, count);
+                            stats_map.insert(state.to_string(), count);
+                        }
+                    }
+                    // C-59: Support global --json
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&stats_map).unwrap());
+                    } else {
+                        for (state, count) in &stats_map {
+                            println!("{state}: {count}");
                         }
                     }
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -352,12 +375,12 @@ fn main() -> ExitCode {
             }
             // clock_boottime
             match spoolq_fs_linux::clock_boottime_ns() {
-                Ok(ns) => results.push(("clock_boottime", format!("{} ns", ns), true)),
+                Ok(ns) => results.push(("clock_boottime", format!("{ns} ns"), true)),
                 Err(e) => results.push(("clock_boottime", e.to_string(), false)),
             }
             // clock_realtime
             match spoolq_fs_linux::clock_realtime_ns() {
-                Ok(ns) => results.push(("clock_realtime", format!("{} ns", ns), true)),
+                Ok(ns) => results.push(("clock_realtime", format!("{ns} ns"), true)),
                 Err(e) => results.push(("clock_realtime", e.to_string(), false)),
             }
             // getrandom
@@ -386,11 +409,7 @@ fn main() -> ExitCode {
                         } else {
                             "unknown_refused"
                         };
-                        results.push((
-                            "filesystem",
-                            format!("{} (magic {:#x})", fs_name, ft),
-                            true,
-                        ));
+                        results.push(("filesystem", format!("{fs_name} (magic {ft:#x})"), true));
                     }
                     Err(e) => results.push(("filesystem", e.to_string(), false)),
                 }
@@ -445,7 +464,7 @@ fn main() -> ExitCode {
                             }
                         }
                         Err(e) => {
-                            results.push(("publication_mode", format!("open failed: {}", e), false))
+                            results.push(("publication_mode", format!("open failed: {e}"), false))
                         }
                     }
                 }
@@ -470,18 +489,18 @@ fn main() -> ExitCode {
             let lease = match load_handle(&handle_file) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("handle load failed: {}", e);
+                    eprintln!("handle load failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
             let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            match queue.ack(&lease) {
+            match queue.ack_unverified(&lease) {
                 spoolq_core::AckOutcome::Acked => {
                     eprintln!("acked");
                     ExitCode::SUCCESS
@@ -495,7 +514,7 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
                 spoolq_core::AckOutcome::NotCommitted(e) => {
-                    eprintln!("not committed: {}", e);
+                    eprintln!("not committed: {e}");
                     ExitCode::FAILURE
                 }
                 spoolq_core::AckOutcome::OutcomeUnknown(_) => {
@@ -513,21 +532,23 @@ fn main() -> ExitCode {
             let lease = match load_handle(&handle_file) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("handle load failed: {}", e);
+                    eprintln!("handle load failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
             let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
             let outcome = match after_seconds {
                 Some(s) => queue.retry_at(
                     &lease,
-                    spoolq_fs_linux::clock_realtime_ns().unwrap_or(0) + s * 1_000_000_000,
+                    spoolq_fs_linux::clock_realtime_ns()
+                        .unwrap_or(0)
+                        .saturating_add(s.saturating_mul(1_000_000_000)),
                 ),
                 None => queue.retry_now(&lease),
             };
@@ -541,7 +562,7 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
                 spoolq_core::TransitionOutcome::NotCommitted(e) => {
-                    eprintln!("not committed: {}", e);
+                    eprintln!("not committed: {e}");
                     ExitCode::FAILURE
                 }
                 spoolq_core::TransitionOutcome::OutcomeUnknown(_) => {
@@ -559,14 +580,14 @@ fn main() -> ExitCode {
             let lease = match load_handle(&handle_file) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("handle load failed: {}", e);
+                    eprintln!("handle load failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
             let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -582,7 +603,7 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
                 spoolq_core::TransitionOutcome::NotCommitted(e) => {
-                    eprintln!("not committed: {}", e);
+                    eprintln!("not committed: {e}");
                     ExitCode::FAILURE
                 }
                 spoolq_core::TransitionOutcome::OutcomeUnknown(_) => {
@@ -616,7 +637,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -626,7 +647,7 @@ fn main() -> ExitCode {
             let data = match std::fs::read(&file) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("read failed: {}", e);
+                    eprintln!("read failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -647,6 +668,13 @@ fn main() -> ExitCode {
                             );
                             return ExitCode::from(3);
                         }
+                        // C-58: Verify envelope digest
+                        let ext_bytes = &data[128..128 + header.extension_header_length as usize];
+                        if !spoolq_format::verify_envelope_digest(&header, ext_bytes) {
+                            eprintln!("CORRUPT: envelope digest mismatch");
+                            return ExitCode::from(3);
+                        }
+                        eprintln!("envelope_digest: verified");
                         if deep {
                             let payload = &data[128 + header.extension_header_length as usize..];
                             let computed = spoolq_format::payload_digest(payload);
@@ -660,7 +688,7 @@ fn main() -> ExitCode {
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
-                        eprintln!("CORRUPT: {}", e);
+                        eprintln!("CORRUPT: {e}");
                         ExitCode::from(3)
                     }
                 }
@@ -673,7 +701,7 @@ fn main() -> ExitCode {
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
-                        eprintln!("CORRUPT: {}", e);
+                        eprintln!("CORRUPT: {e}");
                         ExitCode::from(3)
                     }
                 }
@@ -687,7 +715,7 @@ fn main() -> ExitCode {
             let data = match std::fs::read(&file) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("read failed: {}", e);
+                    eprintln!("read failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -710,7 +738,7 @@ fn main() -> ExitCode {
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
-                        eprintln!("parse error: {}", e);
+                        eprintln!("parse error: {e}");
                         ExitCode::FAILURE
                     }
                 }
@@ -727,7 +755,7 @@ fn main() -> ExitCode {
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
-                        eprintln!("parse error: {}", e);
+                        eprintln!("parse error: {e}");
                         ExitCode::FAILURE
                     }
                 }
@@ -751,7 +779,7 @@ fn main() -> ExitCode {
                 let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
                     Err(e) => {
-                        eprintln!("open failed: {}", e);
+                        eprintln!("open failed: {e}");
                         return ExitCode::FAILURE;
                     }
                 };
@@ -784,7 +812,7 @@ fn main() -> ExitCode {
             let data = match std::fs::read(&result_file) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("read result file failed: {}", e);
+                    eprintln!("read result file failed: {e}");
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
@@ -792,7 +820,7 @@ fn main() -> ExitCode {
             let ticket_json: serde_json::Value = match serde_json::from_slice(&data) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("parse result file failed: {}", e);
+                    eprintln!("parse result file failed: {e}");
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
@@ -805,12 +833,12 @@ fn main() -> ExitCode {
                 .get("attempted_destination_relative_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            eprintln!("source: {}", source_path);
-            eprintln!("destination: {}", dest_path);
+            eprintln!("source: {source_path}");
+            eprintln!("destination: {dest_path}");
             let queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
-                    eprintln!("open failed: {}", e);
+                    eprintln!("open failed: {e}");
                     return ExitCode::from(EXIT_IO_FAILURE);
                 }
             };
@@ -841,8 +869,7 @@ fn main() -> ExitCode {
             lease_duration_seconds,
         } => {
             eprintln!(
-                "bench: {} producers, {} consumers, {}s, {}B payload",
-                producers, consumers, duration_seconds, payload_size
+                "bench: {producers} producers, {consumers} consumers, {duration_seconds}s, {payload_size}B payload"
             );
 
             let payload = vec![0x42u8; payload_size];
@@ -859,23 +886,23 @@ fn main() -> ExitCode {
 
             let mut handles = Vec::new();
 
-            // Producers
+            // Producers - P-05: reuse one queue handle per worker
             for _ in 0..producers {
                 let p = path.clone();
                 let payload = payload.clone();
                 let enqueued = enqueued.clone();
                 let dl = deadline;
                 handles.push(thread::spawn(move || {
+                    // P-05: Open once per worker, not per operation
+                    let mut queue = Queue::open(
+                        &p,
+                        &OpenOptions {
+                            allow_unsupported_fs: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
                     while std::time::Instant::now() < dl {
-                        let queue = Queue::open(
-                            &p,
-                            &OpenOptions {
-                                allow_unsupported_fs: true,
-                                ..Default::default()
-                            },
-                        )
-                        .unwrap();
-                        let mut queue = queue;
                         if let spoolq_core::EnqueueOutcome::Committed(_) =
                             queue.enqueue(EnqueueInput {
                                 maximum_attempts: 3,
@@ -890,7 +917,7 @@ fn main() -> ExitCode {
                 }));
             }
 
-            // Consumers
+            // Consumers - P-05: reuse one queue handle per worker
             let lease_ns = lease_duration_seconds * 1_000_000_000;
             for _ in 0..consumers {
                 let p = path.clone();
@@ -898,20 +925,20 @@ fn main() -> ExitCode {
                 let acked = acked.clone();
                 let dl = deadline;
                 handles.push(thread::spawn(move || {
+                    // P-05: Open once per worker
+                    let mut queue = Queue::open(
+                        &p,
+                        &OpenOptions {
+                            allow_unsupported_fs: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
                     while std::time::Instant::now() < dl {
-                        let queue = Queue::open(
-                            &p,
-                            &OpenOptions {
-                                allow_unsupported_fs: true,
-                                ..Default::default()
-                            },
-                        )
-                        .unwrap();
-                        let mut queue = queue;
                         match queue.lease(0, lease_ns) {
                             spoolq_core::LeaseOutcome::Leased(l) => {
                                 leased.fetch_add(1, Ordering::Relaxed);
-                                if queue.ack(&l) == spoolq_core::AckOutcome::Acked {
+                                if queue.ack_unverified(&l) == spoolq_core::AckOutcome::Acked {
                                     acked.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
@@ -954,7 +981,7 @@ fn main() -> ExitCode {
                                             .unwrap_or(&file.path())
                                             .display()
                                             .to_string();
-                                        println!("{} {}", name, rp);
+                                        println!("{name} {rp}");
                                     }
                                 }
                             }
@@ -1001,7 +1028,7 @@ fn main() -> ExitCode {
                 {
                     Some(s) => match std::fs::copy(path.join(&s.relative_path), &output) {
                         Ok(n) => {
-                            eprintln!("exported {} bytes", n);
+                            eprintln!("exported {n} bytes");
                             ExitCode::from(EXIT_SUCCESS)
                         }
                         Err(_) => ExitCode::from(EXIT_IO_FAILURE),
@@ -1051,7 +1078,7 @@ fn main() -> ExitCode {
                                             .unwrap_or(&file.path())
                                             .display()
                                             .to_string();
-                                        println!("{} {}", name, rp);
+                                        println!("{name} {rp}");
                                     }
                                 }
                             }
@@ -1064,7 +1091,7 @@ fn main() -> ExitCode {
                 path: _,
                 quarantine_id,
             } => {
-                eprintln!("quarantine_id: {}", quarantine_id);
+                eprintln!("quarantine_id: {quarantine_id}");
                 ExitCode::from(EXIT_SUCCESS)
             }
             AdminCommands::QuarantineExport {
@@ -1072,14 +1099,14 @@ fn main() -> ExitCode {
                 quarantine_id: _,
                 output: _,
             } => {
-                eprintln!("not yet implemented");
-                ExitCode::from(EXIT_ORDINARY)
+                eprintln!("unsupported: this command is not implemented");
+                ExitCode::from(EXIT_UNSUPPORTED)
             }
             AdminCommands::QuarantineRemove {
                 path: _,
                 quarantine_id: _,
             } => {
-                eprintln!("not yet implemented");
+                eprintln!("unsupported: this command is not implemented");
                 ExitCode::from(EXIT_ORDINARY)
             }
             AdminCommands::CompactReceipts { path } => {
@@ -1116,6 +1143,8 @@ fn count_files_recursive(path: &std::path::Path) -> usize {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HandleFile {
     queue_root: String,
+    #[serde(default)]
+    queue_id: Option<String>,
     job_id: String,
     generation: u64,
     attempt: u32,
@@ -1133,11 +1162,13 @@ struct HandleFile {
 
 fn save_handle_to_file(
     queue_root: &std::path::Path,
+    queue_id: &[u8; 16],
     handle_path: &std::path::Path,
     lease: &spoolq_core::LeaseInfo,
 ) -> std::io::Result<()> {
     let handle = HandleFile {
         queue_root: queue_root.display().to_string(),
+        queue_id: Some(spoolq_names::hex_encode(queue_id)),
         job_id: spoolq_names::hex_encode(&lease.job_id),
         generation: lease.generation,
         attempt: lease.attempt,
@@ -1153,16 +1184,29 @@ fn save_handle_to_file(
         payload_verified: lease.payload_verified,
     };
     let json = serde_json::to_string_pretty(&handle)?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
+
+    // C-55: Atomic write: temp file -> fsync -> rename -> fsync parent
+    let tmp_path = handle_path.with_extension("tmp");
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
     }
-    use std::io::Write;
-    let mut file = opts.open(handle_path)?;
-    file.write_all(json.as_bytes())?;
+    std::fs::rename(&tmp_path, handle_path)?;
+    // C-55: Sync parent directory
+    if let Some(parent) = handle_path.parent() {
+        if let Ok(parent_dir) = std::fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -1173,27 +1217,13 @@ fn load_handle(path: &std::path::Path) -> std::io::Result<spoolq_core::LeaseInfo
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad job_id"))?;
     let token = spoolq_names::hex_decode_16(&handle.token)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad token"))?;
-    let envelope_digest = spoolq_names::hex_decode_16(&handle.envelope_digest)
-        .map(|b| {
-            let mut d = [0u8; 32];
-            d.copy_from_slice(&b);
-            d
-        })
-        .or_else(|| {
-            // hex_decode_16 returns [u8;16] but envelope_digest is 32 bytes
-            // Try decoding 32 bytes manually
-            if handle.envelope_digest.len() == 64 {
-                let mut d = [0u8; 32];
-                for (i, chunk) in handle.envelope_digest.as_bytes().chunks(2).enumerate() {
-                    d[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-                }
-                Some(d)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad envelope_digest")
+    // C-57: Use hex_decode_32 directly, reject any other length
+    let envelope_digest =
+        spoolq_names::hex_decode_32(&handle.envelope_digest).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad envelope_digest: expected 64 lowercase hex chars",
+            )
         })?;
     Ok(spoolq_core::LeaseInfo {
         job_id,

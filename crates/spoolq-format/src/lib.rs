@@ -232,10 +232,17 @@ pub enum HeaderError {
     EnvelopeDigestMismatch,
     #[error("envelope digest mismatch in extension")]
     ExtensionDigestMismatch,
+    #[error("extension_header_length does not match actual extension bytes")]
+    ExtensionLengthMismatch,
 }
 
 impl FixedHeader {
-    pub fn encode(&self, _extension: &[u8]) -> [u8; FIXED_HEADER_SIZE] {
+    /// Encode the fixed header. Validates that extension_header_length matches
+    /// the actual extension bytes length (C-52).
+    pub fn encode(&self, extension: &[u8]) -> Result<[u8; FIXED_HEADER_SIZE], HeaderError> {
+        if extension.len() as u32 != self.extension_header_length {
+            return Err(HeaderError::ExtensionLengthMismatch);
+        }
         let mut buf = [0u8; FIXED_HEADER_SIZE];
         buf[0..8].copy_from_slice(JOB_MAGIC);
         buf[8..10].copy_from_slice(&FORMAT_MAJOR.to_be_bytes());
@@ -251,7 +258,7 @@ impl FixedHeader {
         buf[56..64].copy_from_slice(&self.created_at_unix_ns.to_be_bytes());
         buf[64..96].copy_from_slice(&self.payload_digest);
         buf[96..128].copy_from_slice(&self.envelope_digest);
-        buf
+        Ok(buf)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, HeaderError> {
@@ -324,7 +331,9 @@ pub fn payload_digest(payload: &[u8]) -> [u8; 32] {
 }
 
 pub fn envelope_digest(fixed_header: &FixedHeader, extension: &[u8]) -> [u8; 32] {
-    let mut header_with_zero_digest = fixed_header.encode(extension);
+    let mut header_with_zero_digest = fixed_header
+        .encode(extension)
+        .expect("extension length mismatch in envelope_digest");
     // Zero out bytes 96..128 (envelope_digest field)
     header_with_zero_digest[96..128].fill(0);
 
@@ -510,6 +519,96 @@ pub enum WatermarkError {
     WrongSize { expected: usize, actual: usize },
 }
 
+// ---------- Job envelope reader/validator (C-53) ----------
+
+/// Errors from envelope validation.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeError {
+    #[error("header decode error: {0}")]
+    Header(#[from] HeaderError),
+    #[error("envelope digest mismatch")]
+    EnvelopeDigestMismatch,
+    #[error("payload digest mismatch")]
+    PayloadDigestMismatch,
+    #[error("file too short: expected at least {expected}, got {actual}")]
+    TooShort { expected: usize, actual: usize },
+    #[error("trailing bytes after payload")]
+    TrailingBytes,
+    #[error("extension decode error: {0}")]
+    Extension(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+}
+
+/// Result of reading and validating a job envelope from a buffer.
+/// Provides verified access to the header and payload.
+pub struct ValidatedEnvelope<'a> {
+    pub header: FixedHeader,
+    pub extension: &'a [u8],
+    pub payload: &'a [u8],
+}
+
+impl<'a> ValidatedEnvelope<'a> {
+    /// Parse and validate a complete job envelope from a byte buffer.
+    /// Validates: header magic/version/reserved, envelope digest,
+    /// exact total file length, and optionally payload digest.
+    /// Rejects trailing bytes.
+    pub fn from_bytes(data: &'a [u8], verify_payload: bool) -> Result<Self, EnvelopeError> {
+        if data.len() < FIXED_HEADER_SIZE {
+            return Err(EnvelopeError::TooShort {
+                expected: FIXED_HEADER_SIZE,
+                actual: data.len(),
+            });
+        }
+
+        let header = FixedHeader::decode(&data[..FIXED_HEADER_SIZE])?;
+        let ext_len = header.extension_header_length as usize;
+        let payload_len = header.payload_length as usize;
+        let expected_total = FIXED_HEADER_SIZE
+            .checked_add(ext_len)
+            .ok_or(EnvelopeError::Io("size overflow".into()))?
+            .checked_add(payload_len)
+            .ok_or(EnvelopeError::Io("size overflow".into()))?;
+
+        if data.len() != expected_total {
+            if data.len() > expected_total {
+                return Err(EnvelopeError::TrailingBytes);
+            }
+            return Err(EnvelopeError::TooShort {
+                expected: expected_total,
+                actual: data.len(),
+            });
+        }
+
+        let extension = &data[FIXED_HEADER_SIZE..FIXED_HEADER_SIZE + ext_len];
+        let payload = &data[FIXED_HEADER_SIZE + ext_len..];
+
+        // Verify envelope digest
+        if !verify_envelope_digest(&header, extension) {
+            return Err(EnvelopeError::EnvelopeDigestMismatch);
+        }
+
+        // Optionally verify payload digest
+        if verify_payload {
+            let computed = payload_digest(payload);
+            if computed != header.payload_digest {
+                return Err(EnvelopeError::PayloadDigestMismatch);
+            }
+        }
+
+        Ok(ValidatedEnvelope {
+            header,
+            extension,
+            payload,
+        })
+    }
+
+    /// Decode and validate the extension header.
+    pub fn decode_extension(&self) -> Result<cbor::ExtensionHeader, cbor::CborError> {
+        cbor::ExtensionHeader::decode(self.extension)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,7 +678,7 @@ mod tests {
         };
         let extension: &[u8] = &[];
         header.envelope_digest = envelope_digest(&header, extension);
-        let encoded = header.encode(extension);
+        let encoded = header.encode(extension).unwrap();
         let decoded = FixedHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.job_id, header.job_id);
         assert_eq!(decoded.payload_length, 5);
@@ -645,8 +744,7 @@ mod tests {
             let truncated = &encoded[..i];
             assert!(
                 FormatRecord::decode(truncated).is_err(),
-                "FORMAT decode should fail at truncation offset {}",
-                i
+                "FORMAT decode should fail at truncation offset {i}"
             );
         }
     }
@@ -665,13 +763,12 @@ mod tests {
             envelope_digest: [0; 32],
         };
         let ext: &[u8] = &[];
-        let encoded = header.encode(ext);
+        let encoded = header.encode(ext).unwrap();
         for i in 0..FIXED_HEADER_SIZE {
             let truncated = &encoded[..i];
             assert!(
                 FixedHeader::decode(truncated).is_err(),
-                "header decode should fail at truncation offset {}",
-                i
+                "header decode should fail at truncation offset {i}"
             );
         }
     }
@@ -691,8 +788,7 @@ mod tests {
             let truncated = &encoded[..i];
             assert!(
                 CompactReceipt::decode(truncated).is_err(),
-                "receipt decode should fail at truncation offset {}",
-                i
+                "receipt decode should fail at truncation offset {i}"
             );
         }
     }
@@ -724,9 +820,91 @@ mod tests {
             let truncated = &encoded[..i];
             assert!(
                 WatermarkRecord::decode(truncated).is_err(),
-                "watermark decode should fail at truncation offset {}",
-                i
+                "watermark decode should fail at truncation offset {i}"
             );
         }
+    }
+    #[test]
+    fn envelope_reader_validates_complete_file() {
+        let mut header = FixedHeader {
+            extension_header_length: 0,
+            payload_length: 5,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id: [0xAB; 16],
+            maximum_attempts: 3,
+            created_at_unix_ns: 1_700_000_000_000_000_000,
+            payload_digest: payload_digest(b"hello"),
+            envelope_digest: [0; 32],
+        };
+        let ext: &[u8] = &[];
+        header.envelope_digest = envelope_digest(&header, ext);
+        let header_bytes = header.encode(ext).unwrap();
+        let mut data = header_bytes.to_vec();
+        data.extend_from_slice(b"hello");
+        let env = ValidatedEnvelope::from_bytes(&data, true).unwrap();
+        assert_eq!(env.header.job_id, [0xAB; 16]);
+        assert_eq!(env.payload, b"hello");
+    }
+
+    #[test]
+    fn envelope_reader_rejects_trailing_bytes() {
+        let mut header = FixedHeader {
+            extension_header_length: 0,
+            payload_length: 5,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id: [0xAB; 16],
+            maximum_attempts: 3,
+            created_at_unix_ns: 0,
+            payload_digest: payload_digest(b"hello"),
+            envelope_digest: [0; 32],
+        };
+        let ext: &[u8] = &[];
+        header.envelope_digest = envelope_digest(&header, ext);
+        let header_bytes = header.encode(ext).unwrap();
+        let mut data = header_bytes.to_vec();
+        data.extend_from_slice(b"hello");
+        data.push(0xFF); // trailing byte
+        assert!(ValidatedEnvelope::from_bytes(&data, false).is_err());
+    }
+
+    #[test]
+    fn envelope_reader_rejects_bad_payload_digest() {
+        let mut header = FixedHeader {
+            extension_header_length: 0,
+            payload_length: 5,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id: [0xAB; 16],
+            maximum_attempts: 3,
+            created_at_unix_ns: 0,
+            payload_digest: payload_digest(b"hello"),
+            envelope_digest: [0; 32],
+        };
+        let ext: &[u8] = &[];
+        header.envelope_digest = envelope_digest(&header, ext);
+        let header_bytes = header.encode(ext).unwrap();
+        let mut data = header_bytes.to_vec();
+        data.extend_from_slice(b"world"); // wrong payload
+        assert!(ValidatedEnvelope::from_bytes(&data, true).is_err());
+    }
+
+    #[test]
+    fn fixed_header_encode_validates_extension_length() {
+        // C-52: encode must reject mismatched extension_header_length
+        let header = FixedHeader {
+            extension_header_length: 10, // claims 10 but ext is empty
+            payload_length: 0,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id: [0xAB; 16],
+            maximum_attempts: 3,
+            created_at_unix_ns: 0,
+            payload_digest: [0; 32],
+            envelope_digest: [0; 32],
+        };
+        let ext: &[u8] = &[];
+        assert!(header.encode(ext).is_err());
     }
 }

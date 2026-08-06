@@ -20,9 +20,13 @@ pub enum FsckMode {
     Repair,
 }
 
+/// Fsck depth. C-39: Deep is not yet fully implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsckDepth {
+    /// Validate filename grammar, file type, shard placement, and header.
     Structural,
+    /// Also verify envelope and payload digests (not yet implemented).
+    #[allow(dead_code)]
     Deep,
 }
 
@@ -86,15 +90,12 @@ impl Queue {
             Err(_) => return,
         };
 
-        // State directories have either shard dirs (ready) or bucket/shard dirs
         let top_entries = match fs::read_dir_entries_owned(state_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
 
         for entry in &top_entries {
-            // For ready/, entries are shard dirs
-            // For delayed/dead/receipts/, entries are bucket dirs
             let sub_fd = match fs::open_directory(state_fd.as_raw_fd(), entry) {
                 Ok(fd) => fd,
                 Err(_) => continue,
@@ -105,12 +106,19 @@ impl Queue {
                 Err(_) => continue,
             };
 
-            // Check if these are shard dirs (files directly) or another level of dirs
             for sub_entry in &sub_entries {
                 if sub_entry.ends_with(".sqj") || sub_entry.ends_with(".rct") {
-                    // It's a file - verify it
+                    // C-41: Carry full root-relative path
                     report.total_objects += 1;
-                    self.fsck_file(state_fd.as_raw_fd(), entry, sub_entry, opts, report);
+                    let full_path = format!("{state_name}/{entry}/{sub_entry}");
+                    self.fsck_file(
+                        sub_fd.as_raw_fd(),
+                        state_name,
+                        &full_path,
+                        sub_entry,
+                        opts,
+                        report,
+                    );
                 } else {
                     // Another directory level (shard under bucket)
                     let shard_fd = match fs::open_directory(sub_fd.as_raw_fd(), sub_entry) {
@@ -124,7 +132,16 @@ impl Queue {
                     for file in &files {
                         if file.ends_with(".sqj") || file.ends_with(".rct") {
                             report.total_objects += 1;
-                            self.fsck_file(shard_fd.as_raw_fd(), sub_entry, file, opts, report);
+                            // C-41: Full path includes all directory levels
+                            let full_path = format!("{state_name}/{entry}/{sub_entry}/{file}");
+                            self.fsck_file(
+                                shard_fd.as_raw_fd(),
+                                state_name,
+                                &full_path,
+                                file,
+                                opts,
+                                report,
+                            );
                         }
                     }
                 }
@@ -174,7 +191,16 @@ impl Queue {
                     for file in &files {
                         if file.ends_with(".sqj") {
                             report.total_objects += 1;
-                            self.fsck_file(shard_fd.as_raw_fd(), shard_dir, file, opts, report);
+                            let full_path =
+                                format!("leased/{boot_dir}/{bucket_dir}/{shard_dir}/{file}");
+                            self.fsck_file(
+                                shard_fd.as_raw_fd(),
+                                "leased",
+                                &full_path,
+                                file,
+                                opts,
+                                report,
+                            );
                         }
                     }
                 }
@@ -182,40 +208,111 @@ impl Queue {
         }
     }
 
+    /// C-40: Validate using the state-specific parser.
+    /// state_name determines which parser to use.
+    /// full_path carries the root-relative path (C-41).
+    #[allow(clippy::too_many_arguments)]
     fn fsck_file(
         &self,
-        _shard_fd: std::os::unix::io::RawFd,
-        shard_name: &str,
+        shard_fd: std::os::unix::io::RawFd,
+        state_name: &str,
+        full_path: &str,
         filename: &str,
         opts: &FsckOptions,
         report: &mut FsckReport,
     ) {
-        // Try to parse the filename as each active state type
-        let parsed_ok = if filename.ends_with(".sqj") {
-            spoolq_names::parse_ready(filename).is_ok()
-                || spoolq_names::parse_leased(filename).is_ok()
-                || spoolq_names::parse_delayed(filename).is_ok()
-                || spoolq_names::parse_dead(filename).is_ok()
-        } else if filename.ends_with(".rct") {
-            spoolq_names::parse_receipt(filename).is_ok()
-        } else {
-            false
+        // C-40: Use the parser required by the containing state
+        let parsed_ok = match state_name {
+            "ready" => filename.ends_with(".sqj") && spoolq_names::parse_ready(filename).is_ok(),
+            "leased" => filename.ends_with(".sqj") && spoolq_names::parse_leased(filename).is_ok(),
+            "delayed" => {
+                filename.ends_with(".sqj") && spoolq_names::parse_delayed(filename).is_ok()
+            }
+            "dead" => filename.ends_with(".sqj") && spoolq_names::parse_dead(filename).is_ok(),
+            "receipts" => {
+                filename.ends_with(".rct") && spoolq_names::parse_receipt(filename).is_ok()
+            }
+            _ => false,
         };
 
         if parsed_ok {
+            // C-40: Also verify the file is a regular file and check header
+            if let Ok(stat) = fs::fstatat(shard_fd, filename) {
+                if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    report.findings.push(CorruptionFinding {
+                        relative_path: full_path.to_string(),
+                        finding_type: "non_regular_file".into(),
+                        severity: FindingSeverity::Error,
+                        details: "file is not a regular file".into(),
+                    });
+                    return;
+                }
+                // B-10: Check for unexpected hard links
+                if stat.st_nlink != 1 {
+                    report.findings.push(CorruptionFinding {
+                        relative_path: full_path.to_string(),
+                        finding_type: "unexpected_hard_link".into(),
+                        severity: FindingSeverity::Error,
+                        details: format!("link count is {} (expected 1)", stat.st_nlink),
+                    });
+                    return;
+                }
+            }
             report.structurally_verified += 1;
         } else {
+            // B-10: Report corruption with full path
             report.findings.push(CorruptionFinding {
-                relative_path: format!("{}/{}", shard_name, filename),
+                relative_path: full_path.to_string(),
                 finding_type: "filename_parse_failed".into(),
                 severity: FindingSeverity::Error,
-                details: "unparseable filename".into(),
+                details: format!("filename does not match {state_name} state grammar"),
             });
-        }
 
-        if opts.mode == FsckMode::Repair {
-            // TODO: move malformed files to quarantine
+            // B-10: In repair mode, quarantine corrupt objects
+            if opts.mode == FsckMode::Repair {
+                let _ = self.quarantine_object(
+                    shard_fd,
+                    filename,
+                    full_path,
+                    crate::QuarantineReason::FilenameParseFailed,
+                    report,
+                );
+            }
         }
+    }
+
+    /// B-10: Move a corrupt object to quarantine via durable no-overwrite transition.
+    fn quarantine_object(
+        &self,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        full_path: &str,
+        reason: crate::QuarantineReason,
+        report: &mut FsckReport,
+    ) -> Result<(), std::io::Error> {
+        let qid = spoolq_fs_linux::random_128bit()?;
+        let q_name = spoolq_names::quarantine_filename(&qid, reason as u16);
+
+        // Ensure quarantine directory exists
+        let _ = self.ensure_dir("quarantine");
+        let q_dir_fd = crate::queue::open_relative(self.root_fd(), "quarantine")?;
+
+        // Durable no-overwrite move
+        spoolq_fs_linux::durable_move_noreplace(
+            src_dir_fd,
+            filename,
+            q_dir_fd.as_raw_fd(),
+            &q_name,
+        )?;
+
+        report.quarantined.push(qid);
+        report.findings.push(CorruptionFinding {
+            relative_path: full_path.to_string(),
+            finding_type: "quarantined".into(),
+            severity: FindingSeverity::Warning,
+            details: format!("moved to quarantine as {q_name}"),
+        });
+        Ok(())
     }
 }
 

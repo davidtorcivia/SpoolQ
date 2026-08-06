@@ -5,7 +5,19 @@ use sha2::{Digest, Sha256};
 // ---------- Hex helpers ----------
 
 pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex_digit_lower(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn from_hex_pair_lower(chunk: &[u8]) -> Option<u8> {
+    Some((from_hex_digit_lower(chunk[0])? << 4) | from_hex_digit_lower(chunk[1])?)
 }
 
 pub fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
@@ -14,7 +26,7 @@ pub fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
     }
     let mut out = [0u8; 16];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        out[i] = from_hex_pair_lower(chunk)?;
     }
     Some(out)
 }
@@ -38,7 +50,7 @@ pub fn hex_decode_u32(s: &str) -> Option<u32> {
     }
     let mut out = [0u8; 4];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        out[i] = from_hex_pair_lower(chunk)?;
     }
     Some(u32::from_be_bytes(out))
 }
@@ -49,7 +61,7 @@ pub fn hex_decode_u16(s: &str) -> Option<u16> {
     }
     let mut out = [0u8; 2];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        out[i] = from_hex_pair_lower(chunk)?;
     }
     Some(u16::from_be_bytes(out))
 }
@@ -60,7 +72,7 @@ fn hex_decode_bytes(s: &str) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     for chunk in s.as_bytes().chunks(2) {
-        out.push(u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?);
+        out.push(from_hex_pair_lower(chunk)?);
     }
     Some(out)
 }
@@ -70,15 +82,15 @@ fn hex_job_id(id: &[u8; 16]) -> String {
 }
 
 fn hex_u64(v: u64) -> String {
-    format!("{:016x}", v)
+    format!("{v:016x}")
 }
 
 fn hex_u32(v: u32) -> String {
-    format!("{:08x}", v)
+    format!("{v:08x}")
 }
 
 fn hex_u16(v: u16) -> String {
-    format!("{:04x}", v)
+    format!("{v:04x}")
 }
 
 // ---------- States ----------
@@ -142,12 +154,18 @@ pub fn compute_shard(queue_id: &[u8; 16], job_id: &[u8; 16], shard_count: u32) -
 }
 
 pub fn shard_hex(shard: u32) -> String {
-    format!("{:04x}", shard)
+    format!("{shard:04x}")
 }
 
 pub fn shard_from_hex(s: &str) -> Option<u32> {
-    let val = u16::from_str_radix(s, 16).ok()?;
-    Some(val as u32)
+    if s.len() != 4 {
+        return None;
+    }
+    let mut out = [0u8; 2];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = from_hex_pair_lower(chunk)?;
+    }
+    Some(u16::from_be_bytes(out) as u32)
 }
 
 // ---------- Shard scan permutation ----------
@@ -188,7 +206,7 @@ pub fn shard_at(start: u32, stride: u32, i: u32, shard_count: u32) -> u32 {
 // ---------- Bucket names ----------
 
 pub fn bucket_hex(bucket: u64) -> String {
-    format!("{:016x}", bucket)
+    format!("{bucket:016x}")
 }
 
 pub fn bucket_from_hex(s: &str) -> Option<u64> {
@@ -329,7 +347,7 @@ pub fn quarantine_filename(quarantine_id: &[u8; 16], reason: u16) -> String {
 /// Build the canonical context string used for name tag computation.
 /// Format: <state>/<boot-id-or-dash>/<bucket-or-dash>/<shard-hex>/<filename-without-k-and-ext>
 pub fn ready_context(shard_hex: &str, filename_without_tag_ext: &str) -> String {
-    format!("ready/-/-/{}/{}", shard_hex, filename_without_tag_ext)
+    format!("ready/-/-/{shard_hex}/{filename_without_tag_ext}")
 }
 
 pub fn leased_context(
@@ -338,17 +356,11 @@ pub fn leased_context(
     shard_hex: &str,
     filename_without_tag_ext: &str,
 ) -> String {
-    format!(
-        "leased/{}/{}/{}/{}",
-        boot_id, bucket, shard_hex, filename_without_tag_ext
-    )
+    format!("leased/{boot_id}/{bucket}/{shard_hex}/{filename_without_tag_ext}")
 }
 
 pub fn delayed_context(bucket: &str, shard_hex: &str, filename_without_tag_ext: &str) -> String {
-    format!(
-        "delayed/-/{}/{}/{}",
-        bucket, shard_hex, filename_without_tag_ext
-    )
+    format!("delayed/-/{bucket}/{shard_hex}/{filename_without_tag_ext}")
 }
 
 pub fn terminal_context(
@@ -426,87 +438,145 @@ pub enum ParseError {
     BadHex(&'static str),
     #[error("malformed filename")]
     Malformed,
+    #[error("non-ASCII byte in filename")]
+    NonAscii,
 }
 
-fn parse_field<'a>(parts: &[(&'a str, &'a str)], prefix: &str) -> Option<&'a str> {
-    for (p, v) in parts {
-        if *p == prefix {
-            return Some(*v);
-        }
+/// Check that a string is pure ASCII (C-44: filenames are ASCII protocol data).
+/// Rejects any byte > 127 or embedded NUL.
+fn assert_ascii(s: &str) -> Result<(), ParseError> {
+    if s.is_ascii() && !s.contains('\0') {
+        Ok(())
+    } else {
+        Err(ParseError::NonAscii)
     }
-    None
 }
 
-fn split_fields(s: &str) -> Vec<(&str, &str)> {
-    let mut result = Vec::new();
-    for part in s.split('.') {
-        if part.is_empty() {
-            continue;
-        }
-        let prefix = &part[..1];
-        let value = &part[1..];
-        result.push((prefix, value));
+/// Strictly parse a tagged hex value with a single-character prefix.
+/// Returns Err on wrong prefix, wrong length, or non-canonical hex.
+fn parse_tagged_hex_u64(part: &str, prefix: u8) -> Result<u64, ParseError> {
+    let bytes = part.as_bytes();
+    if bytes.len() < 2 || bytes[0] != prefix {
+        return Err(ParseError::Malformed);
     }
-    result
+    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
+    if hex_str.len() != 16 {
+        return Err(ParseError::BadHex("u64"));
+    }
+    hex_decode_u64(hex_str).ok_or(ParseError::BadHex("u64"))
 }
 
-fn parse_common(first: &str, fields: &[(&str, &str)]) -> Result<CommonFields, ParseError> {
-    let job_id = hex_decode_16(first).ok_or(ParseError::BadHex("job_id"))?;
-    let generation = parse_field(fields, "g")
-        .and_then(hex_decode_u64)
-        .ok_or(ParseError::MissingField("g"))?;
-    let attempt = parse_field(fields, "a")
-        .and_then(hex_decode_u32)
-        .ok_or(ParseError::MissingField("a"))?;
-    let maximum_attempts = parse_field(fields, "m")
-        .and_then(hex_decode_u32)
-        .ok_or(ParseError::MissingField("m"))?;
-    Ok(CommonFields {
-        job_id,
-        generation,
-        attempt,
-        maximum_attempts,
-    })
+fn parse_tagged_hex_u32(part: &str, prefix: u8) -> Result<u32, ParseError> {
+    let bytes = part.as_bytes();
+    if bytes.len() < 2 || bytes[0] != prefix {
+        return Err(ParseError::Malformed);
+    }
+    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
+    if hex_str.len() != 8 {
+        return Err(ParseError::BadHex("u32"));
+    }
+    hex_decode_u32(hex_str).ok_or(ParseError::BadHex("u32"))
 }
 
+fn parse_tagged_hex_u16(part: &str, prefix: u8) -> Result<u16, ParseError> {
+    let bytes = part.as_bytes();
+    if bytes.len() < 2 || bytes[0] != prefix {
+        return Err(ParseError::Malformed);
+    }
+    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
+    if hex_str.len() != 4 {
+        return Err(ParseError::BadHex("u16"));
+    }
+    hex_decode_u16(hex_str).ok_or(ParseError::BadHex("u16"))
+}
+
+fn parse_tagged_hex_16(part: &str, prefix: u8) -> Result<[u8; 16], ParseError> {
+    let bytes = part.as_bytes();
+    if bytes.len() < 2 || bytes[0] != prefix {
+        return Err(ParseError::Malformed);
+    }
+    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
+    hex_decode_16(hex_str).ok_or(ParseError::BadHex("16"))
+}
+
+fn parse_tag(part: &str) -> Result<[u8; 8], ParseError> {
+    let bytes = part.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'k' {
+        return Err(ParseError::Malformed);
+    }
+    let hex_str = std::str::from_utf8(&bytes[1..]).map_err(|_| ParseError::NonAscii)?;
+    if hex_str.len() != 16 {
+        return Err(ParseError::BadHex("k"));
+    }
+    let decoded = hex_decode_bytes(hex_str).ok_or(ParseError::BadHex("k"))?;
+    if decoded.len() != 8 {
+        return Err(ParseError::BadHex("k"));
+    }
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&decoded);
+    Ok(tag)
+}
+
+/// Parse common fields from the first four dot-separated parts:
+/// job_id, g{gen}, a{att}, m{max}
+/// Returns (common, remaining_parts).
+fn parse_common_strict<'a>(
+    parts: &'a [&'a str],
+) -> Result<(CommonFields, &'a [&'a str]), ParseError> {
+    if parts.len() < 4 {
+        return Err(ParseError::Malformed);
+    }
+    let job_id = hex_decode_16(parts[0]).ok_or(ParseError::BadHex("job_id"))?;
+    let generation = parse_tagged_hex_u64(parts[1], b'g')?;
+    let attempt = parse_tagged_hex_u32(parts[2], b'a')?;
+    let maximum_attempts = parse_tagged_hex_u32(parts[3], b'm')?;
+    Ok((
+        CommonFields {
+            job_id,
+            generation,
+            attempt,
+            maximum_attempts,
+        },
+        &parts[4..],
+    ))
+}
+
+/// Ready: job_id.g{gen}.a{att}.m{max}.k{tag}.sqj
+/// Exactly 5 dot-separated parts before .sqj.
 pub fn parse_ready(filename: &str) -> Result<ReadyName, ParseError> {
+    assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".sqj")
         .ok_or(ParseError::BadExtension)?;
-    let mut parts = filename.split('.');
-    let first = parts.next().ok_or(ParseError::Malformed)?;
-    let rest: String = parts.collect::<Vec<_>>().join(".");
-    let fields = split_fields(&rest);
-    let common = parse_common(first, &fields)?;
-    let tag_hex = parse_field(&fields, "k").ok_or(ParseError::MissingField("k"))?;
-    let tag_bytes = hex_decode_bytes(tag_hex).ok_or(ParseError::BadHex("k"))?;
-    let mut tag = [0u8; 8];
-    if tag_bytes.len() != 8 {
-        return Err(ParseError::BadHex("k"));
+    let parts: Vec<&str> = filename.split('.').collect();
+    if parts.len() != 5 {
+        return Err(ParseError::Malformed);
     }
-    tag.copy_from_slice(&tag_bytes);
+    let (common, rest) = parse_common_strict(&parts)?;
+    if rest.len() != 1 {
+        return Err(ParseError::Malformed);
+    }
+    let tag = parse_tag(rest[0])?;
     Ok(ReadyName { common, tag })
 }
 
+/// Delayed: job_id.g{gen}.a{att}.m{max}.d{ns}.k{tag}.sqj
+/// Exactly 6 dot-separated parts before .sqj.
 pub fn parse_delayed(filename: &str) -> Result<DelayedName, ParseError> {
+    assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".sqj")
         .ok_or(ParseError::BadExtension)?;
-    let mut parts = filename.split('.');
-    let first = parts.next().ok_or(ParseError::Malformed)?;
-    let rest: String = parts.collect::<Vec<_>>().join(".");
-    let fields = split_fields(&rest);
-    let common = parse_common(first, &fields)?;
-    let not_before_ns = parse_field(&fields, "d")
-        .and_then(hex_decode_u64)
-        .ok_or(ParseError::MissingField("d"))?;
-    let tag_hex = parse_field(&fields, "k").ok_or(ParseError::MissingField("k"))?;
-    let mut tag = [0u8; 8];
-    let tag_bytes = hex_decode_bytes(tag_hex).ok_or(ParseError::BadHex("k"))?;
-    if tag_bytes.len() != 8 {
-        return Err(ParseError::BadHex("k"));
+    let parts: Vec<&str> = filename.split('.').collect();
+    if parts.len() != 6 {
+        return Err(ParseError::Malformed);
     }
-    tag.copy_from_slice(&tag_bytes);
+    let (common, rest) = parse_common_strict(&parts)?;
+    if rest.len() != 2 {
+        return Err(ParseError::Malformed);
+    }
+    let not_before_ns = parse_tagged_hex_u64(rest[0], b'd')?;
+    let tag = parse_tag(rest[1])?;
     Ok(DelayedName {
         common,
         not_before_ns,
@@ -514,25 +584,23 @@ pub fn parse_delayed(filename: &str) -> Result<DelayedName, ParseError> {
     })
 }
 
+/// Dead: job_id.g{gen}.a{att}.m{max}.x{reason}.k{tag}.sqj
+/// Exactly 6 dot-separated parts before .sqj.
 pub fn parse_dead(filename: &str) -> Result<DeadName, ParseError> {
+    assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".sqj")
         .ok_or(ParseError::BadExtension)?;
-    let mut parts = filename.split('.');
-    let first = parts.next().ok_or(ParseError::Malformed)?;
-    let rest: String = parts.collect::<Vec<_>>().join(".");
-    let fields = split_fields(&rest);
-    let common = parse_common(first, &fields)?;
-    let reason = parse_field(&fields, "x")
-        .and_then(hex_decode_u16)
-        .ok_or(ParseError::MissingField("x"))?;
-    let tag_hex = parse_field(&fields, "k").ok_or(ParseError::MissingField("k"))?;
-    let mut tag = [0u8; 8];
-    let tag_bytes = hex_decode_bytes(tag_hex).ok_or(ParseError::BadHex("k"))?;
-    if tag_bytes.len() != 8 {
-        return Err(ParseError::BadHex("k"));
+    let parts: Vec<&str> = filename.split('.').collect();
+    if parts.len() != 6 {
+        return Err(ParseError::Malformed);
     }
-    tag.copy_from_slice(&tag_bytes);
+    let (common, rest) = parse_common_strict(&parts)?;
+    if rest.len() != 2 {
+        return Err(ParseError::Malformed);
+    }
+    let reason = parse_tagged_hex_u16(rest[0], b'x')?;
+    let tag = parse_tag(rest[1])?;
     Ok(DeadName {
         common,
         reason,
@@ -540,51 +608,45 @@ pub fn parse_dead(filename: &str) -> Result<DeadName, ParseError> {
     })
 }
 
+/// Receipt: job_id.g{gen}.a{att}.m{max}.t{token}.k{tag}.rct
+/// Exactly 6 dot-separated parts before .rct.
 pub fn parse_receipt(filename: &str) -> Result<ReceiptName, ParseError> {
+    assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".rct")
         .ok_or(ParseError::BadExtension)?;
-    let mut parts = filename.split('.');
-    let first = parts.next().ok_or(ParseError::Malformed)?;
-    let rest: String = parts.collect::<Vec<_>>().join(".");
-    let fields = split_fields(&rest);
-    let common = parse_common(first, &fields)?;
-    let token_hex = parse_field(&fields, "t").ok_or(ParseError::MissingField("t"))?;
-    let token = hex_decode_16(token_hex).ok_or(ParseError::BadHex("t"))?;
-    let tag_hex = parse_field(&fields, "k").ok_or(ParseError::MissingField("k"))?;
-    let mut tag = [0u8; 8];
-    let tag_bytes = hex_decode_bytes(tag_hex).ok_or(ParseError::BadHex("k"))?;
-    if tag_bytes.len() != 8 {
-        return Err(ParseError::BadHex("k"));
+    let parts: Vec<&str> = filename.split('.').collect();
+    if parts.len() != 6 {
+        return Err(ParseError::Malformed);
     }
-    tag.copy_from_slice(&tag_bytes);
+    let (common, rest) = parse_common_strict(&parts)?;
+    if rest.len() != 2 {
+        return Err(ParseError::Malformed);
+    }
+    let token = parse_tagged_hex_16(rest[0], b't')?;
+    let tag = parse_tag(rest[1])?;
     Ok(ReceiptName { common, token, tag })
 }
 
+/// Leased: job_id.g{gen}.a{att}.m{max}.b{boot_dl}.w{wall_dl}.t{token}.k{tag}.sqj
+/// Exactly 8 dot-separated parts before .sqj.
 pub fn parse_leased(filename: &str) -> Result<LeasedName, ParseError> {
+    assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".sqj")
         .ok_or(ParseError::BadExtension)?;
-    let mut parts = filename.split('.');
-    let first = parts.next().ok_or(ParseError::Malformed)?;
-    let rest: String = parts.collect::<Vec<_>>().join(".");
-    let fields = split_fields(&rest);
-    let common = parse_common(first, &fields)?;
-    let boottime_deadline_ns = parse_field(&fields, "b")
-        .and_then(hex_decode_u64)
-        .ok_or(ParseError::MissingField("b"))?;
-    let wall_deadline_ns = parse_field(&fields, "w")
-        .and_then(hex_decode_u64)
-        .ok_or(ParseError::MissingField("w"))?;
-    let token_hex = parse_field(&fields, "t").ok_or(ParseError::MissingField("t"))?;
-    let token = hex_decode_16(token_hex).ok_or(ParseError::BadHex("t"))?;
-    let tag_hex = parse_field(&fields, "k").ok_or(ParseError::MissingField("k"))?;
-    let mut tag = [0u8; 8];
-    let tag_bytes = hex_decode_bytes(tag_hex).ok_or(ParseError::BadHex("k"))?;
-    if tag_bytes.len() != 8 {
-        return Err(ParseError::BadHex("k"));
+    let parts: Vec<&str> = filename.split('.').collect();
+    if parts.len() != 8 {
+        return Err(ParseError::Malformed);
     }
-    tag.copy_from_slice(&tag_bytes);
+    let (common, rest) = parse_common_strict(&parts)?;
+    if rest.len() != 4 {
+        return Err(ParseError::Malformed);
+    }
+    let boottime_deadline_ns = parse_tagged_hex_u64(rest[0], b'b')?;
+    let wall_deadline_ns = parse_tagged_hex_u64(rest[1], b'w')?;
+    let token = parse_tagged_hex_16(rest[2], b't')?;
+    let tag = parse_tag(rest[3])?;
     Ok(LeasedName {
         common,
         boottime_deadline_ns,
@@ -594,7 +656,10 @@ pub fn parse_leased(filename: &str) -> Result<LeasedName, ParseError> {
     })
 }
 
+/// Temp: {boottime}.{random}.tmp
+/// Exactly 2 dot-separated parts before .tmp.
 pub fn parse_temp(filename: &str) -> Result<TempName, ParseError> {
+    assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".tmp")
         .ok_or(ParseError::BadExtension)?;
@@ -610,23 +675,26 @@ pub fn parse_temp(filename: &str) -> Result<TempName, ParseError> {
     })
 }
 
+/// Quarantine: q{id}.x{reason}.raw
+/// Exactly 2 dot-separated parts before .raw (after the leading 'q' on first).
 pub fn parse_quarantine(filename: &str) -> Result<QuarantineName, ParseError> {
+    assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".raw")
         .ok_or(ParseError::BadExtension)?;
-    // Must start with 'q'
-    if !filename.starts_with('q') {
+    let parts: Vec<&str> = filename.split('.').collect();
+    if parts.len() != 2 {
         return Err(ParseError::Malformed);
     }
-    let rest = &filename[1..];
-    let mut parts = rest.split('.');
-    let id_hex = parts.next().ok_or(ParseError::Malformed)?;
+    // First part: q{32hex}
+    let first_bytes = parts[0].as_bytes();
+    if first_bytes.len() != 33 || first_bytes[0] != b'q' {
+        return Err(ParseError::Malformed);
+    }
+    let id_hex = std::str::from_utf8(&first_bytes[1..]).map_err(|_| ParseError::NonAscii)?;
     let quarantine_id = hex_decode_16(id_hex).ok_or(ParseError::BadHex("id"))?;
-    let reason_part = parts.next().ok_or(ParseError::Malformed)?;
-    if !reason_part.starts_with('x') {
-        return Err(ParseError::Malformed);
-    }
-    let reason = hex_decode_u16(&reason_part[1..]).ok_or(ParseError::BadHex("reason"))?;
+    // Second part: x{4hex}
+    let reason = parse_tagged_hex_u16(parts[1], b'x')?;
     Ok(QuarantineName {
         quarantine_id,
         reason,
@@ -648,14 +716,22 @@ pub fn filename_without_tag_and_ext(filename: &str, ext: &str) -> String {
 }
 
 /// Compute and verify a name tag for a ready filename.
+/// Uses the canonical context builder from parsed fields, consistent with the
+/// queue path. (C-45: runtime tag verification must match helper behavior.)
 pub fn verify_ready_tag(queue_id: &[u8; 16], shard: u32, filename: &str) -> bool {
     let parsed = match parse_ready(filename) {
         Ok(p) => p,
         Err(_) => return false,
     };
     let sh = shard_hex(shard);
-    let without = filename_without_tag_and_ext(filename, ".sqj");
-    let ctx = ready_context(&sh, &without);
+    let base = format!(
+        "{}.g{:016x}.a{:08x}.m{:08x}",
+        hex_encode(&parsed.common.job_id),
+        parsed.common.generation,
+        parsed.common.attempt,
+        parsed.common.maximum_attempts,
+    );
+    let ctx = ready_context(&sh, &base);
     let expected = compute_name_tag(queue_id, &ctx);
     expected == parsed.tag
 }
@@ -666,7 +742,7 @@ pub fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     }
     let mut out = [0u8; 32];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        out[i] = from_hex_pair_lower(chunk)?;
     }
     Some(out)
 }
@@ -806,7 +882,7 @@ mod tests {
         let mut visited = vec![false; count as usize];
         for i in 0..count {
             let s = shard_at(start, stride, i, count);
-            assert!(!visited[s as usize], "shard {} visited twice", s);
+            assert!(!visited[s as usize], "shard {s} visited twice");
             visited[s as usize] = true;
         }
         assert!(visited.iter().all(|&v| v));
@@ -825,6 +901,18 @@ mod tests {
         let s = "12345678-1234-1234-1234-123456789ABC";
         // spec requires lowercase
         assert!(boot_id_bytes(s).is_none());
+    }
+
+    #[test]
+    fn hex_decode_rejects_uppercase() {
+        // ABNF requires lowercase hex only: %x30-39 / %x61-66
+        assert!(hex_decode_16("ABCDEF0123456789ABCDEF0123456789").is_none());
+        assert!(hex_decode_u64("000000000000000F").is_none());
+        assert!(hex_decode_u32("0000000F").is_none());
+        assert!(hex_decode_u16("000F").is_none());
+        // Lowercase still works
+        assert!(hex_decode_16("abcdef0123456789abcdef0123456789").is_some());
+        assert!(hex_decode_u64("000000000000000f").is_some());
     }
 
     #[test]
@@ -865,6 +953,172 @@ mod tests {
     #[test]
     fn parse_rejects_bad_ext() {
         assert!(parse_ready("foo.bar").is_err());
+    }
+
+    // C-43: Canonical parser tests - reject unknown, duplicate, reordered fields
+    #[test]
+    fn ready_rejects_extra_field() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: 0,
+            attempt: 0,
+            maximum_attempts: 3,
+        };
+        let tag = [0xFF; 8];
+        let fname = ready_filename(&common, &tag);
+        // Insert an extra field before .k
+        // Insert extra dot-separated field after .m
+        let bad = fname.replace(".k", ".e00.k");
+        assert!(parse_ready(&bad).is_err(), "should reject extra field");
+    }
+
+    #[test]
+    fn ready_rejects_reordered_fields() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: 1,
+            attempt: 2,
+            maximum_attempts: 3,
+        };
+        let tag = [0xFF; 8];
+        let fname = ready_filename(&common, &tag);
+        // Swap g and a fields
+        let parts: Vec<&str> = fname.split('.').collect();
+        // parts: [jobid, g..., a..., m..., k..., "sqj"]
+        let swapped = format!(
+            "{}.{}.{}.{}.{}.{}",
+            parts[0], parts[2], parts[1], parts[3], parts[4], parts[5]
+        );
+        assert!(parse_ready(&swapped).is_err(), "should reject reordered");
+    }
+
+    #[test]
+    fn ready_rejects_duplicate_field() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: 1,
+            attempt: 2,
+            maximum_attempts: 3,
+        };
+        let tag = [0xFF; 8];
+        let fname = ready_filename(&common, &tag);
+        let parts: Vec<&str> = fname.split('.').collect();
+        // Insert duplicate g field
+        let duped = format!(
+            "{}.{}.{}.{}.{}.{}.{}",
+            parts[0], parts[1], parts[1], parts[2], parts[3], parts[4], parts[5]
+        );
+        assert!(parse_ready(&duped).is_err(), "should reject duplicate");
+    }
+
+    #[test]
+    fn ready_round_trip_canonical() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: 42,
+            attempt: 7,
+            maximum_attempts: 3,
+        };
+        let tag = [0xDE; 8];
+        let fname = ready_filename(&common, &tag);
+        let parsed = parse_ready(&fname).unwrap();
+        assert_eq!(parsed.common, common);
+        assert_eq!(parsed.tag, tag);
+        // Round-trip: format(parse(name)) == name
+        let re_formatted = ready_filename(&parsed.common, &parsed.tag);
+        assert_eq!(fname, re_formatted, "round trip must produce same name");
+    }
+
+    #[test]
+    fn leased_round_trip_canonical() {
+        let common = CommonFields {
+            job_id: [0xCD; 16],
+            generation: 99,
+            attempt: 5,
+            maximum_attempts: 10,
+        };
+        let tag = [0x11; 8];
+        let token = [0x22; 16];
+        let fname = leased_filename(&common, 1_000_000_000, 2_000_000_000, &token, &tag);
+        let parsed = parse_leased(&fname).unwrap();
+        assert_eq!(parsed.common, common);
+        assert_eq!(parsed.tag, tag);
+        assert_eq!(parsed.token, token);
+        assert_eq!(parsed.boottime_deadline_ns, 1_000_000_000);
+        assert_eq!(parsed.wall_deadline_ns, 2_000_000_000);
+        // Round-trip
+        let re_formatted = leased_filename(
+            &parsed.common,
+            parsed.boottime_deadline_ns,
+            parsed.wall_deadline_ns,
+            &parsed.token,
+            &parsed.tag,
+        );
+        assert_eq!(fname, re_formatted);
+    }
+
+    #[test]
+    fn ready_rejects_leased_name() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let tag = [0xFF; 8];
+        let token = [0xEE; 16];
+        let leased_name = leased_filename(&common, 1_000_000_000, 2_000_000_000, &token, &tag);
+        assert!(
+            parse_ready(&leased_name).is_err(),
+            "should reject leased name as ready"
+        );
+    }
+
+    #[test]
+    fn leased_rejects_ready_name() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: 0,
+            attempt: 0,
+            maximum_attempts: 3,
+        };
+        let tag = [0xFF; 8];
+        let ready_name = ready_filename(&common, &tag);
+        assert!(
+            parse_leased(&ready_name).is_err(),
+            "should reject ready name as leased"
+        );
+    }
+
+    // C-44: non-ASCII must not panic
+    #[test]
+    fn non_ascii_filename_does_not_panic() {
+        // Multibyte UTF-8 character at the start of a field
+        let bad = "abababababababababababababababab.g0000000000000000.a00000000.m00000003.kffffffffffffffff.test.sqj";
+        // This has too many fields, so should fail - but must not panic
+        assert!(parse_ready(bad).is_err());
+        // Byte with high bit set
+        let bad2 = "\u{80}bababababababababababababababab.g0000000000000000.a00000000.m00000003.kffffffffffffffff.sqj";
+        let _ = parse_ready(bad2);
+    }
+
+    // C-43: uppercase hex should be rejected by hex decoders
+    #[test]
+    fn parsers_reject_uppercase_hex() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: 0,
+            attempt: 0,
+            maximum_attempts: 3,
+        };
+        let tag = [0xFF; 8];
+        let fname = ready_filename(&common, &tag);
+        // The hex_encode function produces lowercase, so this should work
+        let parsed = parse_ready(&fname).unwrap();
+        assert_eq!(parsed.common, common);
+        // Manually uppercase the job_id hex and verify rejection
+        let bad = fname.to_uppercase().replace(".SQJ", ".sqj");
+        assert!(parse_ready(&bad).is_err(), "uppercase hex must be rejected");
     }
     #[test]
     fn ready_name_length_is_92() {
@@ -985,7 +1239,7 @@ mod tests {
     #[test]
     fn all_names_fit_within_255() {
         let max = 162; // leased is longest
-        assert!(max <= 255, "longest name {} exceeds NAME_MAX 255", max);
+        assert!(max <= 255, "longest name {max} exceeds NAME_MAX 255");
         assert_eq!(255 - max, 93, "remaining budget must be 93");
     }
 }

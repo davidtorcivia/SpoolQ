@@ -14,27 +14,31 @@ pub fn checked_mul_u64(a: u64, b: u64) -> Option<u64> {
 
 // ---------- Bucket arithmetic ----------
 
-/// floor(timestamp_ns / bucket_width_ns)
-pub fn bucket_number(timestamp_ns: u64, bucket_width_ns: u64) -> u64 {
-    timestamp_ns / bucket_width_ns
+/// floor(timestamp_ns / bucket_width_ns).
+/// Returns None if bucket_width_ns is zero (C-50).
+pub fn bucket_number(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
+    if bucket_width_ns == 0 {
+        return None;
+    }
+    Some(timestamp_ns / bucket_width_ns)
 }
 
-/// ceiling(timestamp_ns / bucket_width_ns)
-pub fn ceiling_bucket(timestamp_ns: u64, bucket_width_ns: u64) -> u64 {
+/// ceiling(timestamp_ns / bucket_width_ns).
+/// Returns None if bucket_width_ns is zero (C-50).
+pub fn ceiling_bucket(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
+    if bucket_width_ns == 0 {
+        return None;
+    }
     let q = timestamp_ns / bucket_width_ns;
     let r = timestamp_ns % bucket_width_ns;
-    if r != 0 {
-        q + 1
-    } else {
-        q
-    }
+    Some(if r != 0 { q + 1 } else { q })
 }
 
 /// Rounded-up eligibility bucket for delayed scheduling.
 /// eligibility_bucket = ceiling(requested_ns / bucket_width_ns)
 /// eligibility_ns = eligibility_bucket * bucket_width_ns (checked)
 pub fn eligibility_bucket_and_ns(requested_ns: u64, bucket_width_ns: u64) -> Option<(u64, u64)> {
-    let bucket = ceiling_bucket(requested_ns, bucket_width_ns);
+    let bucket = ceiling_bucket(requested_ns, bucket_width_ns)?;
     let ns = checked_mul_u64(bucket, bucket_width_ns)?;
     Some((bucket, ns))
 }
@@ -52,7 +56,7 @@ pub fn bucket_end_ns(bucket: u64, bucket_width_ns: u64) -> Option<u64> {
 
 // ---------- Lease bucket ----------
 
-pub fn lease_bucket(boottime_deadline_ns: u64, lease_bucket_width_ns: u64) -> u64 {
+pub fn lease_bucket(boottime_deadline_ns: u64, lease_bucket_width_ns: u64) -> Option<u64> {
     bucket_number(boottime_deadline_ns, lease_bucket_width_ns)
 }
 
@@ -176,22 +180,29 @@ pub fn retry_delay_ms(
 }
 
 /// Compute the absolute wall deadline for retry.
-/// effective_wall_floor_ns + delay_ms * 1_000_000 (checked)
-pub fn retry_wall_deadline(effective_wall_floor_ns: u64, delay_ms: u64) -> Option<u64> {
-    let delay_ns = checked_mul_u64(delay_ms, 1_000_000)?;
-    checked_add_u64(effective_wall_floor_ns, delay_ns)
+/// Returns None if the deadline would exceed 2^63 - 1 ns from the Unix epoch.
+pub fn retry_wall_deadline(effective_wall_floor_ns: u64, delay_ns: u64) -> Option<u64> {
+    let deadline = checked_add_u64(effective_wall_floor_ns, delay_ns)?;
+    if deadline > i64::MAX as u64 {
+        return None;
+    }
+    Some(deadline)
 }
 
 // ---------- Wall watermark floor ----------
 
-/// effective_wall_floor_ns = max(clock_realtime_ns, stored_bucket * bucket_width_ns)
+/// effective_wall_floor_ns = max(clock_realtime_ns, stored_bucket * bucket_width_ns).
+/// Returns None if the watermark computation overflows (C-51).
 pub fn effective_wall_floor(
     clock_realtime_ns: u64,
     stored_bucket: u64,
     bucket_width_ns: u64,
-) -> u64 {
-    let watermark_ns = checked_mul_u64(stored_bucket, bucket_width_ns).unwrap_or(u64::MAX);
-    clock_realtime_ns.max(watermark_ns)
+) -> Option<u64> {
+    if bucket_width_ns == 0 {
+        return None;
+    }
+    let watermark_ns = checked_mul_u64(stored_bucket, bucket_width_ns)?;
+    Some(clock_realtime_ns.max(watermark_ns))
 }
 
 #[cfg(test)]
@@ -201,20 +212,20 @@ mod tests {
     #[test]
     fn bucket_arithmetic() {
         let width = 10_000_000_000u64; // 10s
-        assert_eq!(bucket_number(0, width), 0);
-        assert_eq!(bucket_number(1, width), 0);
-        assert_eq!(bucket_number(width, width), 1);
-        assert_eq!(bucket_number(width + 1, width), 1);
-        assert_eq!(bucket_number(2 * width, width), 2);
+        assert_eq!(bucket_number(0, width), Some(0));
+        assert_eq!(bucket_number(1, width), Some(0));
+        assert_eq!(bucket_number(width, width), Some(1));
+        assert_eq!(bucket_number(width + 1, width), Some(1));
+        assert_eq!(bucket_number(2 * width, width), Some(2));
     }
 
     #[test]
     fn ceiling_bucket_test() {
         let width = 10_000_000_000u64;
-        assert_eq!(ceiling_bucket(0, width), 0);
-        assert_eq!(ceiling_bucket(1, width), 1);
-        assert_eq!(ceiling_bucket(width, width), 1);
-        assert_eq!(ceiling_bucket(width + 1, width), 2);
+        assert_eq!(ceiling_bucket(0, width), Some(0));
+        assert_eq!(ceiling_bucket(1, width), Some(1));
+        assert_eq!(ceiling_bucket(width, width), Some(1));
+        assert_eq!(ceiling_bucket(width + 1, width), Some(2));
     }
 
     #[test]
@@ -267,11 +278,7 @@ mod tests {
             let lower = ceiling.div_ceil(2);
             assert!(
                 (lower..=ceiling).contains(&delay),
-                "attempt {}: delay {} not in [{}, {}]",
-                attempt,
-                delay,
-                lower,
-                ceiling
+                "attempt {attempt}: delay {delay} not in [{lower}, {ceiling}]"
             );
         }
     }
@@ -314,9 +321,22 @@ mod tests {
     fn effective_wall_floor_test() {
         let width = 10_000_000_000u64;
         // Clock is ahead of watermark
-        assert_eq!(effective_wall_floor(100, 5, width), 50_000_000_000);
+        assert_eq!(effective_wall_floor(100, 5, width), Some(50_000_000_000));
         // Watermark is ahead of clock
-        assert_eq!(effective_wall_floor(100, 0, width), 100);
+        assert_eq!(effective_wall_floor(100, 0, width), Some(100));
+    }
+
+    #[test]
+    fn bucket_arithmetic_zero_width_is_error() {
+        // C-50: zero bucket width must return None, not panic
+        assert_eq!(bucket_number(100, 0), None);
+        assert_eq!(ceiling_bucket(100, 0), None);
+    }
+
+    #[test]
+    fn effective_wall_floor_zero_width_is_error() {
+        // C-50/C-51: zero width must return None
+        assert_eq!(effective_wall_floor(100, 5, 0), None);
     }
 
     #[test]
