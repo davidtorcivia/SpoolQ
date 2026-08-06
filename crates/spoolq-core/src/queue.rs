@@ -2341,7 +2341,7 @@ impl Queue {
             self.format.shard_count,
         );
         let shard_str = shard_hex(shard);
-        let new_generation = lease.generation.checked_add(1).unwrap_or(u64::MAX);
+        let new_generation = lease.generation.saturating_add(1);
         let receipt_common = CommonFields {
             job_id: lease.job_id,
             generation: new_generation,
