@@ -191,7 +191,7 @@ fn main() -> ExitCode {
             match queue.lease(0, duration_ns) {
                 LeaseOutcome::Leased(lease) => {
                     if let Some(ref hf) = handle_file {
-                        if let Err(e) = save_handle_to_file(hf, &lease) {
+                        if let Err(e) = save_handle_to_file(&path, hf, &lease) {
                             eprintln!("warning: failed to write handle file: {}", e);
                         }
                     }
@@ -484,11 +484,12 @@ struct HandleFile {
 }
 
 fn save_handle_to_file(
-    path: &std::path::Path,
+    queue_root: &std::path::Path,
+    handle_path: &std::path::Path,
     lease: &spoolq_core::LeaseInfo,
 ) -> std::io::Result<()> {
     let handle = HandleFile {
-        queue_root: path.display().to_string(),
+        queue_root: queue_root.display().to_string(),
         job_id: spoolq_names::hex_encode(&lease.job_id),
         generation: lease.generation,
         attempt: lease.attempt,
@@ -512,7 +513,7 @@ fn save_handle_to_file(
         opts.mode(0o600);
     }
     use std::io::Write;
-    let mut file = opts.open(path)?;
+    let mut file = opts.open(handle_path)?;
     file.write_all(json.as_bytes())?;
     Ok(())
 }
