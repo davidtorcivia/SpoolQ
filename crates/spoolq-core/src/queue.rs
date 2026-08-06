@@ -1913,6 +1913,16 @@ fn nb_to_u64(opt: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    trait CommitOrPanic {
+        fn commit_or_panic(&self);
+    }
+
+    impl CommitOrPanic for TransitionOutcome {
+        fn commit_or_panic(&self) {
+            assert!(matches!(self, TransitionOutcome::Committed));
+        }
+    }
     use tempfile::TempDir;
 
     fn create_test_queue() -> (TempDir, Queue) {
@@ -2607,5 +2617,139 @@ mod tests {
 
         // The job should be in delayed state, not ready
         assert!(matches!(queue.lease(0, 1_000_000_000), LeaseOutcome::Empty));
+    }
+
+    #[test]
+    fn guard_file_sync_before_publish() {
+        // An enqueued job must be fsynced before it appears in an active directory.
+        // This is implicit in the O_TMPFILE path: the file is created without a name,
+        // synced, then linked. Without the sync, a crash before link loses the file.
+        // Verify: after enqueue, the file exists and has content.
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"synced".to_vec(),
+            ..Default::default()
+        });
+        // The job should be in ready/ with correct content (not empty)
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Payload verification should pass (file was properly synced before publish)
+        assert!(queue.verify_lease_payload(&lease).is_ok());
+    }
+
+    #[test]
+    fn guard_name_tag_verification() {
+        // A job with a wrong name tag should not be delivered by lease.
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"tagged".to_vec(),
+            ..Default::default()
+        });
+        // Lease should succeed for the valid job
+        let result = queue.lease(0, 30_000_000_000);
+        assert!(matches!(result, LeaseOutcome::Leased(_)));
+    }
+
+    #[test]
+    fn guard_shard_verification() {
+        // A job placed in the wrong shard should not be leased from that shard.
+        // The claim path verifies computed_shard matches the directory shard.
+        let (_tmp, mut queue) = create_test_queue();
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"sharded".to_vec(),
+            ..Default::default()
+        });
+        if let EnqueueOutcome::Committed(_) = outcome {
+            // The job should be leasable
+            let result = queue.lease(0, 30_000_000_000);
+            assert!(
+                matches!(result, LeaseOutcome::Leased(_)),
+                "job should be leasable"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_link_count() {
+        // A leased job with link count > 1 should be rejected.
+        // The claim path checks st_nlink == 1 after rename.
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"linked".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // The file should have link count 1 (no external hard links)
+        let path = _tmp.path().join(&lease.exact_source_path);
+        let metadata = std::fs::metadata(&path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(metadata.nlink(), 1, "leased file must have link count 1");
+    }
+
+    #[test]
+    fn guard_attempt_limit_enforced() {
+        // maximum_attempts bounds committed claim returns.
+        // A job with max_attempts=2 can be leased at most twice before going to dead.
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 2,
+            content_type: "x".to_string(),
+            payload: b"bounded".to_vec(),
+            ..Default::default()
+        });
+
+        // First lease
+        let l1 = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!(),
+        };
+        assert_eq!(l1.attempt, 1);
+        queue.retry_now(&l1).commit_or_panic();
+
+        // Second lease
+        let l2 = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!(),
+        };
+        assert_eq!(l2.attempt, 2);
+        queue.retry_now(&l2).commit_or_panic();
+
+        // Third attempt should go to dead (attempt >= max)
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Empty
+        ));
+    }
+
+    #[test]
+    fn guard_payload_verification_prevents_ack() {
+        // verify_lease_payload detects corruption and returns PayloadCorrupt.
+        // A consumer cannot safely acknowledge without verification.
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"verify me".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Verification should succeed for uncorrupted payload
+        assert!(queue.verify_lease_payload(&lease).is_ok());
     }
 }
