@@ -1061,6 +1061,47 @@ impl Queue {
         self.retry(lease, Some(not_before_ns))
     }
 
+    /// Retry a lease after a duration.
+    pub fn retry_after(&mut self, lease: &LeaseInfo, duration_ns: u64) -> TransitionOutcome {
+        let wall_now = spoolq_fs_linux::clock_realtime_ns().unwrap_or(0);
+        let deadline = match spoolq_math::retry_wall_deadline(wall_now, duration_ns / 1_000_000) {
+            Some(d) => d,
+            None => {
+                return TransitionOutcome::NotCommitted(Error::InvalidInput(
+                    "deadline overflow".into(),
+                ))
+            }
+        };
+        self.retry_at(lease, deadline)
+    }
+
+    /// Retry with a policy (computes delay from attempt and policy).
+    pub fn retry_with_policy(
+        &mut self,
+        lease: &LeaseInfo,
+        policy: &spoolq_math::RetryPolicy,
+    ) -> TransitionOutcome {
+        if let Err(e) = policy.validate() {
+            return TransitionOutcome::NotCommitted(Error::InvalidInput(e.to_string()));
+        }
+
+        let delay_ms = match spoolq_math::retry_delay_ms(
+            &self.format.queue_id,
+            &lease.job_id,
+            lease.attempt,
+            policy,
+        ) {
+            Ok(d) => d,
+            Err(e) => return TransitionOutcome::NotCommitted(Error::InvalidInput(e.to_string())),
+        };
+
+        if delay_ms == 0 {
+            self.retry_now(lease)
+        } else {
+            self.retry_after(lease, delay_ms * 1_000_000)
+        }
+    }
+
     fn retry(&mut self, lease: &LeaseInfo, delayed_ns: Option<u64>) -> TransitionOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return TransitionOutcome::NotCommitted(e);
@@ -1830,5 +1871,27 @@ mod tests {
         };
 
         assert!(queue.verify_lease_payload(&lease).is_ok());
+    }
+    #[test]
+    fn retry_with_policy_works() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 5,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        let policy = spoolq_math::RetryPolicy {
+            base_ms: 1000,
+            cap_ms: 300_000,
+            use_jitter: false,
+            max_delay_ms: None,
+        };
+        let result = queue.retry_with_policy(&lease, &policy);
+        assert!(matches!(result, TransitionOutcome::Committed));
     }
 }
