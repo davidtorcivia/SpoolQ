@@ -911,6 +911,11 @@ impl Queue {
                             Err(_) => continue,
                         };
 
+                        // Verify link count is exactly 1 (rejects external hard links)
+                        if leased_stat.st_nlink != 1 {
+                            continue;
+                        }
+
                         // Read and validate the fixed header
                         let leased_file = match fs::openat(
                             leased_dir_fd.as_raw_fd(),
@@ -2330,7 +2335,7 @@ mod tests {
         let success_count = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
 
-        for _ in 0..8 {
+        for _ in 0..32 {
             let p = path.clone();
             let sc = success_count.clone();
             handles.push(thread::spawn(move || {
