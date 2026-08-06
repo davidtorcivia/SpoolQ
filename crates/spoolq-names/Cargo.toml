@@ -8,3 +8,6 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+sha2.workspace = true
+spoolq-format = { path = "../spoolq-format" }
+thiserror = "1"
