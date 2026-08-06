@@ -866,4 +866,126 @@ mod tests {
     fn parse_rejects_bad_ext() {
         assert!(parse_ready("foo.bar").is_err());
     }
+    #[test]
+    fn ready_name_length_is_92() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: u64::MAX,
+            attempt: u32::MAX,
+            maximum_attempts: u32::MAX,
+        };
+        let tag = [0xFF; 8];
+        let name = ready_filename(&common, &tag);
+        assert_eq!(
+            name.len(),
+            92,
+            "ready name must be exactly 92 bytes, got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn delayed_name_length_is_110() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: u64::MAX,
+            attempt: u32::MAX,
+            maximum_attempts: u32::MAX,
+        };
+        let tag = [0xFF; 8];
+        let name = delayed_filename(&common, u64::MAX, &tag);
+        assert_eq!(
+            name.len(),
+            110,
+            "delayed name must be exactly 110 bytes, got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn dead_name_length_is_98() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: u64::MAX,
+            attempt: u32::MAX,
+            maximum_attempts: u32::MAX,
+        };
+        let tag = [0xFF; 8];
+        let name = dead_filename(&common, 0xFFFF, &tag);
+        assert_eq!(
+            name.len(),
+            98,
+            "dead name must be exactly 98 bytes, got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn receipt_name_length_is_126() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: u64::MAX,
+            attempt: u32::MAX,
+            maximum_attempts: u32::MAX,
+        };
+        let tag = [0xFF; 8];
+        let token = [0xFF; 16];
+        let name = receipt_filename(&common, &token, &tag);
+        assert_eq!(
+            name.len(),
+            126,
+            "receipt name must be exactly 126 bytes, got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn leased_name_length_is_162() {
+        let common = CommonFields {
+            job_id: [0xAB; 16],
+            generation: u64::MAX,
+            attempt: u32::MAX,
+            maximum_attempts: u32::MAX,
+        };
+        let tag = [0xFF; 8];
+        let token = [0xFF; 16];
+        let name = leased_filename(&common, u64::MAX, u64::MAX, &token, &tag);
+        assert_eq!(
+            name.len(),
+            162,
+            "leased name must be exactly 162 bytes, got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn temp_name_length_is_53() {
+        let random = [0xFF; 16];
+        let name = temp_filename(u64::MAX, &random);
+        assert_eq!(
+            name.len(),
+            53,
+            "temp name must be exactly 53 bytes, got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn quarantine_name_length_is_43() {
+        let id = [0xFF; 16];
+        let name = quarantine_filename(&id, 0xFFFF);
+        assert_eq!(
+            name.len(),
+            43,
+            "quarantine name must be exactly 43 bytes, got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn all_names_fit_within_255() {
+        let max = 162; // leased is longest
+        assert!(max <= 255, "longest name {} exceeds NAME_MAX 255", max);
+        assert_eq!(255 - max, 93, "remaining budget must be 93");
+    }
 }

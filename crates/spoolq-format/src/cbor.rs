@@ -554,6 +554,13 @@ enum CborItem {
 
 #[cfg(test)]
 mod tests {
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     use super::*;
 
     #[test]
@@ -731,5 +738,43 @@ mod tests {
         // Empty map
         let raw = vec![0xA0];
         assert!(ExtensionHeader::decode(&raw).is_err());
+    }
+    #[test]
+    fn cbor_vector_minimal() {
+        let ext = ExtensionHeader {
+            content_type: "application/json".to_string(),
+            ..Default::default()
+        };
+        let encoded = ext.encode().unwrap();
+        let expected = hex_to_bytes("a102706170706c69636174696f6e2f6a736f6e");
+        assert_eq!(encoded, expected, "minimal extension mismatch");
+    }
+
+    #[test]
+    fn cbor_vector_with_not_before() {
+        let ext = ExtensionHeader {
+            initial_not_before_unix_ns: Some(0x179a18a8e3e40000),
+            content_type: "x".to_string(),
+            ..Default::default()
+        };
+        let encoded = ext.encode().unwrap();
+        let expected = hex_to_bytes("a2011b179a18a8e3e40000026178");
+        assert_eq!(encoded, expected, "not_before extension mismatch");
+    }
+
+    #[test]
+    fn cbor_vector_with_booleans() {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("active".to_string(), MetadataValue::Bool(true));
+        metadata.insert("done".to_string(), MetadataValue::Bool(false));
+        let ext = ExtensionHeader {
+            content_type: "x".to_string(),
+            metadata,
+            ..Default::default()
+        };
+        let encoded = ext.encode().unwrap();
+        // BTreeMap sorts keys: "active" < "done"
+        let expected = hex_to_bytes("a202617803a266616374697665f564646f6e65f4");
+        assert_eq!(encoded, expected, "boolean metadata mismatch");
     }
 }

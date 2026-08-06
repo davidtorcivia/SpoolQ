@@ -1,0 +1,16 @@
+# SpoolQ/1 Filename Lengths
+
+All lengths verified against NAME_MAX >= 255.
+
+| State      | Bytes | Budget remaining |
+|------------|-------|-----------------|
+| ready      |    92 |             163 |
+| delayed    |   110 |             145 |
+| dead       |    98 |             157 |
+| receipt    |   126 |             129 |
+| leased     |   162 |              93 |
+| temporary  |    53 |             202 |
+| quarantine |    43 |             212 |
+
+Longest active filename: leased at 162 bytes.
+Remaining budget: 255 - 162 = 93 bytes.
