@@ -110,10 +110,19 @@ dependencies = [
 [[package]]
 name = "spoolq-math"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+ "thiserror",
+]
 
 [[package]]
 name = "spoolq-names"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+ "spoolq-format",
+ "thiserror",
+]
 
 [[package]]
 name = "syn"
