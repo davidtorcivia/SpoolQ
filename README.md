@@ -44,6 +44,15 @@ The workspace is split into crates with one-way dependency direction:
 
 `spoolq-cli` command-line interface
 
+## Specification
+
+User-facing spec documents are in [`spec/`](spec/):
+
+- [`contract.md`](spec/contract.md) - assumptions, guarantees, non-goals, terminology
+- [`format.md`](spec/format.md) - binary record layouts, offsets, digest formulas
+- [`filenames.abnf`](spec/filenames.abnf) - normative filename grammar
+- [`reasons.md`](spec/reasons.md) - dead and quarantine reason registries
+
 ## License
 
 Apache-2.0
