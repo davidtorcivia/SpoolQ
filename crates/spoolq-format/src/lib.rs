@@ -1,5 +1,7 @@
 // SpoolQ/1 binary format constants, encoding, and decoding.
 
+pub mod cbor;
+
 use sha2::{Digest, Sha256};
 
 pub const FORMAT_MAGIC: &[u8; 8] = b"SPQFMT1\0";

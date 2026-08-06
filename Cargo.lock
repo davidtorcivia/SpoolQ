@@ -98,6 +98,13 @@ version = "0.1.0"
 [[package]]
 name = "spoolq-core"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+ "spoolq-format",
+ "spoolq-math",
+ "spoolq-names",
+ "thiserror",
+]
 
 [[package]]
 name = "spoolq-format"
