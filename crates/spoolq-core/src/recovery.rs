@@ -35,6 +35,8 @@ pub struct RecoveryStats {
     pub leases_reaped: u32,
     pub leases_to_dead: u32,
     pub buckets_removed: u32,
+    pub receipts_compacted: u32,
+    pub receipts_expired: u32,
     pub budget_exhausted: bool,
     pub errors: Vec<RecoveryError>,
 }
@@ -64,6 +66,12 @@ impl Queue {
         // 3. Clean up old temp files
         if !stats.budget_exhausted {
             self.cleanup_temp_files(boottime_now, budget, &mut stats);
+        }
+        if !stats.budget_exhausted {
+            self.compact_receipts(budget, &mut stats);
+        }
+        if !stats.budget_exhausted {
+            self.delete_expired_receipts(self.options.receipt_retention_ns, budget, &mut stats);
         }
 
         stats
@@ -503,6 +511,268 @@ impl Queue {
     fn ensure_dir_pub(&self, relative: &str) -> io::Result<()> {
         // Reuse the existing ensure_dir logic
         self.ensure_dir(relative)
+    }
+
+    /// Compact full-job receipts into compact receipts.
+    /// Replaces a full-job .rct file with a 128-byte compact receipt at the same pathname.
+    pub fn compact_receipts(&mut self, budget: &WorkBudget, stats: &mut RecoveryStats) {
+        let root_fd = self.root_fd();
+        let receipts_fd = match fs::open_directory(root_fd, "receipts") {
+            Ok(fd) => fd,
+            Err(_) => return,
+        };
+
+        let bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for bucket_name in &bucket_dirs {
+            if stats.operations_attempted >= budget.max_operations {
+                stats.budget_exhausted = true;
+                return;
+            }
+
+            let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
+                Ok(fd) => fd,
+                Err(_) => continue,
+            };
+
+            let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for shard_name in &shard_dirs {
+                let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
+                    Ok(fd) => fd,
+                    Err(_) => continue,
+                };
+
+                let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                for entry in &entries {
+                    if stats.operations_attempted >= budget.max_operations {
+                        stats.budget_exhausted = true;
+                        return;
+                    }
+
+                    if !entry.ends_with(".rct") {
+                        continue;
+                    }
+
+                    stats.operations_attempted += 1;
+
+                    // Try to acquire exclusive lock on the receipt
+                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, 0o0, 0) {
+                        Ok(fd) => fd,
+                        Err(_) => continue,
+                    };
+
+                    if !fs::try_ofd_write_lock(receipt_fd.as_raw_fd()).unwrap_or(false) {
+                        continue; // busy, skip
+                    }
+
+                    // Read the file to check if it's already compact (128 bytes)
+                    let stat = match fs::fstat(receipt_fd.as_raw_fd()) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    let file_size = stat.st_size as usize;
+
+                    // If already 128 bytes with compact magic, skip
+                    if file_size == spoolq_format::COMPACT_RECEIPT_SIZE {
+                        continue;
+                    }
+
+                    // Read the full job to extract compact receipt fields
+                    if file_size < spoolq_format::FIXED_HEADER_SIZE {
+                        continue;
+                    }
+
+                    let mut header_buf = [0u8; 128];
+                    if fs::pread(receipt_fd.as_raw_fd(), &mut header_buf, 0).unwrap_or(0) != 128 {
+                        continue;
+                    }
+
+                    let header = match spoolq_format::FixedHeader::decode(&header_buf) {
+                        Ok(h) => h,
+                        Err(_) => continue,
+                    };
+
+                    // Parse the receipt filename to get generation and token
+                    let parsed = match spoolq_names::parse_receipt(entry) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    // Compute bucket start time
+                    let bucket_num = u64::from_str_radix(bucket_name, 16).unwrap_or(0);
+                    let bucket_start = bucket_num
+                        .checked_mul(self.format.terminal_bucket_width_ns)
+                        .unwrap_or(0);
+
+                    // Build compact receipt
+                    let compact = spoolq_format::CompactReceipt {
+                        job_id: header.job_id,
+                        envelope_digest: header.envelope_digest,
+                        final_attempt: parsed.common.attempt,
+                        lease_token: parsed.token,
+                        receipt_bucket_start_unix_ns: bucket_start,
+                        original_payload_length: header.payload_length,
+                    };
+
+                    let compact_bytes = compact.encode();
+
+                    // Write to a temp file in the same directory
+                    let tmp_name = format!(
+                        ".compact-{}.tmp",
+                        spoolq_fs_linux::random_128bit()
+                            .unwrap_or([0; 16])
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<String>()
+                    );
+
+                    let tmp_fd = match fs::create_exclusive(shard_fd.as_raw_fd(), &tmp_name, 0o600)
+                    {
+                        Ok(fd) => fd,
+                        Err(_) => continue,
+                    };
+
+                    if fs::write_all(tmp_fd.as_raw_fd(), &compact_bytes).is_err() {
+                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+                        continue;
+                    }
+                    if fs::fsync(tmp_fd.as_raw_fd()).is_err() {
+                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+                        continue;
+                    }
+
+                    // Replace the original with the compact version
+                    if fs::durable_move_replace(
+                        shard_fd.as_raw_fd(),
+                        &tmp_name,
+                        shard_fd.as_raw_fd(),
+                        entry,
+                    )
+                    .is_ok()
+                    {
+                        stats.receipts_compacted += 1;
+                    } else {
+                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Delete expired receipts based on retention policy.
+    pub fn delete_expired_receipts(
+        &mut self,
+        retention_ns: u64,
+        budget: &WorkBudget,
+        stats: &mut RecoveryStats,
+    ) {
+        let root_fd = self.root_fd();
+        let wall_floor = self.effective_wall_floor_ns();
+
+        let receipts_fd = match fs::open_directory(root_fd, "receipts") {
+            Ok(fd) => fd,
+            Err(_) => return,
+        };
+
+        let bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for bucket_name in &bucket_dirs {
+            if stats.operations_attempted >= budget.max_operations {
+                stats.budget_exhausted = true;
+                return;
+            }
+
+            let bucket_num = match u64::from_str_radix(bucket_name, 16) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            let bucket_start = match bucket_num.checked_mul(self.format.terminal_bucket_width_ns) {
+                Some(s) => s,
+                None => continue,
+            };
+            let bucket_end = match bucket_start.checked_add(self.format.terminal_bucket_width_ns) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // Check retention: bucket_end + retention <= wall_floor
+            let eligible = match bucket_end.checked_add(retention_ns) {
+                Some(threshold) => threshold <= wall_floor,
+                None => false,
+            };
+
+            if !eligible {
+                continue;
+            }
+
+            let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
+                Ok(fd) => fd,
+                Err(_) => continue,
+            };
+
+            let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for shard_name in &shard_dirs {
+                let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
+                    Ok(fd) => fd,
+                    Err(_) => continue,
+                };
+
+                let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                for entry in &entries {
+                    if stats.operations_attempted >= budget.max_operations {
+                        stats.budget_exhausted = true;
+                        return;
+                    }
+                    stats.operations_attempted += 1;
+
+                    // Lock and delete
+                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, 0o0, 0) {
+                        Ok(fd) => fd,
+                        Err(_) => continue,
+                    };
+
+                    if !fs::try_ofd_write_lock(receipt_fd.as_raw_fd()).unwrap_or(false) {
+                        continue;
+                    }
+
+                    if fs::unlinkat(shard_fd.as_raw_fd(), entry).is_ok() {
+                        stats.receipts_expired += 1;
+                    }
+                }
+
+                // Remove empty shard dir
+                let _ = fs::unlinkat_dir(bucket_fd.as_raw_fd(), shard_name);
+            }
+
+            // Remove empty bucket dir
+            let _ = fs::unlinkat_dir(receipts_fd.as_raw_fd(), bucket_name);
+            let _ = fs::fsync_dir_fd(receipts_fd.as_raw_fd());
+            stats.buckets_removed += 1;
+        }
     }
 }
 
