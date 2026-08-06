@@ -12,15 +12,15 @@ Consumers do not begin processing until `lease()` has returned a committed lease
 
 ## Guarantees
 
-Supports multiple concurrent producers and consumers with at-least-once job execution. No partially written job is returned by `lease()`.
+Supports multiple concurrent producers and consumers with at-least-once job execution. A partially written job is never returned by `lease()`.
 
-A successful strict enqueue remains represented by one recoverable or terminal object after a certified crash. A successful claim returns at most one current lease token for a job.
+A successful strict enqueue remains represented by one recoverable or terminal object after a certified crash, and a successful claim returns at most one current lease token for a job.
 
 A stale or lost token cannot acknowledge, renew, retry, or bury a later lease. An unacknowledged committed lease eventually becomes ready or dead, subject to liveness assumptions.
 
 A successful acknowledgment creates a terminal receipt, and repeating acknowledgment is non-destructive.
 
-Corrupt, malformed, or structurally ambiguous objects are never delivered automatically. Recovery may be interrupted after any filesystem operation and safely rerun.
+Corrupt, malformed, or structurally ambiguous objects are never delivered automatically, and recovery may be interrupted after any filesystem operation and safely rerun without data loss.
 
 No transition overwrites a distinct active job.
 
@@ -32,7 +32,7 @@ SpoolQ/1 does not provide exactly-once external side effects, transactions spann
 
 It does not maintain a queue-wide exact counter or mutable index, does not support transparent online format migration, and does not provide hostile multi-tenant isolation for processes sharing direct filesystem access.
 
-It targets Linux specifically: no generic POSIX portability, no network filesystem support, no overlay filesystem support in strict mode. No transparent deduplication after an indeterminate enqueue. No authoritative event history.
+It targets Linux specifically: no generic POSIX portability, no network filesystem support, and no overlay filesystem support in strict mode. It does not support transparent deduplication after an indeterminate enqueue and does not maintain an authoritative event history.
 
 ## Terms
 
