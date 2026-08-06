@@ -2358,4 +2358,80 @@ mod tests {
             "exactly one consumer should win the race"
         );
     }
+
+    #[test]
+    fn enqueue_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path();
+        Queue::init(path, &CreateOptions::default()).unwrap();
+
+        // Enqueue
+        let ticket = {
+            let mut queue = Queue::open(
+                path,
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            match queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".to_string(),
+                payload: b"survive reopen".to_vec(),
+                ..Default::default()
+            }) {
+                EnqueueOutcome::Committed(t) => t,
+                _ => panic!("enqueue failed"),
+            }
+        };
+
+        // Reopen and verify the job is visible
+        let queue2 = Queue::open(
+            path,
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let snapshots = queue2.inspect(&ticket.job_id);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, "ready");
+    }
+
+    #[test]
+    fn enqueue_zero_payload() {
+        let (_tmp, mut queue) = create_test_queue();
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "empty".to_string(),
+            payload: vec![],
+            ..Default::default()
+        });
+        match outcome {
+            EnqueueOutcome::Committed(ticket) => {
+                // Verify it can be leased
+                let lease = match queue.lease(0, 30_000_000_000) {
+                    LeaseOutcome::Leased(l) => l,
+                    _ => panic!("lease failed"),
+                };
+                assert_eq!(lease.job_id, ticket.job_id);
+            }
+            _ => panic!("zero-payload enqueue should succeed"),
+        }
+    }
+
+    #[test]
+    fn enqueue_large_payload() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = vec![0x42; 1_000_000]; // 1 MB
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "large".to_string(),
+            payload,
+            ..Default::default()
+        });
+        assert!(matches!(outcome, EnqueueOutcome::Committed(_)));
+    }
 }
