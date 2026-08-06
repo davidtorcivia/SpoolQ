@@ -213,6 +213,15 @@ pub fn boot_id_bytes(s: &str) -> Option<[u8; 16]> {
             return None;
         }
     }
+    // Verify lowercase hex at all other positions
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            continue;
+        }
+        if !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b) {
+            return None;
+        }
+    }
     // Collect hex digits
     let hex_str: String = bytes
         .iter()
@@ -800,11 +809,8 @@ mod tests {
     #[test]
     fn boot_id_rejects_uppercase() {
         let s = "12345678-1234-1234-1234-123456789ABC";
-        // to_be_bytes will fail because from_str_radix(16) accepts uppercase
-        // so this tests that it still parses (accepts both)
-        let result = boot_id_bytes(s);
-        // from_str_radix accepts uppercase, so this succeeds
-        assert!(result.is_some());
+        // spec requires lowercase
+        assert!(boot_id_bytes(s).is_none());
     }
 
     #[test]
