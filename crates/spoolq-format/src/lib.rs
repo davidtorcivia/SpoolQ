@@ -629,4 +629,104 @@ mod tests {
         }
         out
     }
+    #[test]
+    fn format_truncation_fails_at_every_offset() {
+        let rec = FormatRecord {
+            queue_id: [0x42; 16],
+            created_at_unix_ns: 1_700_000_000_000_000_000,
+            shard_count: 64,
+            lease_bucket_width_ns: 10_000_000_000,
+            delayed_bucket_width_ns: 10_000_000_000,
+            terminal_bucket_width_ns: 3_600_000_000_000,
+            max_payload_length: MAX_PAYLOAD_LENGTH,
+        };
+        let encoded = rec.encode();
+        for i in 0..FORMAT_SIZE {
+            let truncated = &encoded[..i];
+            assert!(
+                FormatRecord::decode(truncated).is_err(),
+                "FORMAT decode should fail at truncation offset {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn header_truncation_fails_at_every_offset() {
+        let header = FixedHeader {
+            extension_header_length: 0,
+            payload_length: 5,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id: [0xAB; 16],
+            maximum_attempts: 3,
+            created_at_unix_ns: 1_700_000_000_000_000_000,
+            payload_digest: payload_digest(b"hello"),
+            envelope_digest: [0; 32],
+        };
+        let ext: &[u8] = &[];
+        let encoded = header.encode(ext);
+        for i in 0..FIXED_HEADER_SIZE {
+            let truncated = &encoded[..i];
+            assert!(
+                FixedHeader::decode(truncated).is_err(),
+                "header decode should fail at truncation offset {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_truncation_fails_at_every_offset() {
+        let rec = CompactReceipt {
+            job_id: [0xCD; 16],
+            envelope_digest: [0xEE; 32],
+            final_attempt: 2,
+            lease_token: [0x11; 16],
+            receipt_bucket_start_unix_ns: 1_700_000_000_000_000_000,
+            original_payload_length: 1024,
+        };
+        let encoded = rec.encode();
+        for i in 0..COMPACT_RECEIPT_SIZE {
+            let truncated = &encoded[..i];
+            assert!(
+                CompactReceipt::decode(truncated).is_err(),
+                "receipt decode should fail at truncation offset {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn format_extra_byte_fails() {
+        let rec = FormatRecord {
+            queue_id: [0x42; 16],
+            created_at_unix_ns: 0,
+            shard_count: 1,
+            lease_bucket_width_ns: 10_000_000_000,
+            delayed_bucket_width_ns: 10_000_000_000,
+            terminal_bucket_width_ns: 3_600_000_000_000,
+            max_payload_length: MAX_PAYLOAD_LENGTH,
+        };
+        let mut encoded = rec.encode().to_vec();
+        encoded.push(0x00);
+        assert!(FormatRecord::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn watermark_truncation_fails_at_every_offset() {
+        let rec = WatermarkRecord {
+            highest_observed_bucket: 42,
+            sequence: 7,
+        };
+        let encoded = rec.encode();
+        for i in 0..WATERMARK_SIZE {
+            let truncated = &encoded[..i];
+            assert!(
+                WatermarkRecord::decode(truncated).is_err(),
+                "watermark decode should fail at truncation offset {}",
+                i
+            );
+        }
+    }
 }
