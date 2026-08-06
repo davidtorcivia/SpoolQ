@@ -7,6 +7,7 @@ members = [
     "crates/spoolq-fs-linux",
     "crates/spoolq-core",
     "crates/spoolq-cli",
+    "crates/spoolq-testkit",
 ]
 
 [workspace.package]
