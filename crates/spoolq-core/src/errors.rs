@@ -236,6 +236,19 @@ pub enum ResolutionOutcome {
     ResolutionFailed(Error),
 }
 
+/// Diagnostic snapshot of a job's current state.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub job_id: [u8; 16],
+    pub state: String,
+    pub generation: u64,
+    pub attempt: u32,
+    pub maximum_attempts: u32,
+    pub shard: u32,
+    pub relative_path: String,
+    pub size: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
