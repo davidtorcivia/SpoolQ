@@ -10,7 +10,7 @@ Properties: at-least-once execution, crash-safe publication and recovery, no dae
 
 ## Status
 
-Early development. Core format, names, math, filesystem substrate, and lifecycle operations are implemented. Recovery, quarantine, fsck, and formal verification are in progress.
+Core protocol implemented and tested. Format encoding, filename parsing, deterministic CBOR, shard math, and retry jitter are complete. The lifecycle (init, open, enqueue, lease, ack, retry, bury, renew, recover) is functional with concurrent safety tests passing. Quarantine moves, fsck, receipt compaction, and formal verification are in progress.
 
 ## Building
 
@@ -23,35 +23,46 @@ cargo build --release
 ```
 spoolq init /path/to/queue
 echo "payload" | spoolq put /path/to/queue - --content-type text/plain
-spoolq lease /path/to/queue --duration-seconds 30
+spoolq lease /path/to/queue --duration-seconds 30 --handle-file /tmp/handle.json
+spoolq inspect /path/to/queue <job_id>
+spoolq verify /path/to/queue/FORMAT
+spoolq recover /path/to/queue
 spoolq stats /path/to/queue
 spoolq doctor /path/to/queue
 ```
 
-## Architecture
+Handle-based operations (ack, retry, bury) read the JSON handle file saved by lease:
 
-The workspace is split into crates with one-way dependency direction:
-
-`spoolq-format` binary format encoding (FORMAT record, fixed job header, compact receipt, wall watermark, deterministic CBOR extension header)
-
-`spoolq-names` canonical filename parsing and formatting for all states, 64-bit name integrity tags, shard derivation and scan permutation
-
-`spoolq-math` bucket arithmetic, delayed eligibility rounding, retry jitter with rejection sampling, checked arithmetic
-
-`spoolq-fs-linux` Linux syscall wrappers (openat, mkdirat, renameat2, linkat, O_TMPFILE, fsync, OFD locks, clocks, getrandom). All unsafe code confined here.
-
-`spoolq-core` queue state machine: init, open, enqueue, lease, ack, retry, bury, renew
-
-`spoolq-cli` command-line interface
+```
+spoolq ack /path/to/queue --handle-file /tmp/handle.json
+spoolq retry /path/to/queue --handle-file /tmp/handle.json
+spoolq bury /path/to/queue --handle-file /tmp/handle.json --reason 1
+```
 
 ## Specification
 
 User-facing spec documents are in [`spec/`](spec/):
 
-- [`contract.md`](spec/contract.md) - assumptions, guarantees, non-goals, terminology
-- [`format.md`](spec/format.md) - binary record layouts, offsets, digest formulas
-- [`filenames.abnf`](spec/filenames.abnf) - normative filename grammar
-- [`reasons.md`](spec/reasons.md) - dead and quarantine reason registries
+- [`contract.md`](spec/contract.md) covers assumptions, guarantees, non-goals, and terminology
+- [`format.md`](spec/format.md) documents all binary record layouts with offsets and digest formulas
+- [`filenames.abnf`](spec/filenames.abnf) is the normative filename grammar
+- [`reasons.md`](spec/reasons.md) lists dead and quarantine reason registries
+
+## Architecture
+
+The workspace is split into crates with one-way dependency direction:
+
+`spoolq-format` handles binary format encoding (FORMAT record, fixed job header, compact receipt, wall watermark, deterministic CBOR extension header).
+
+`spoolq-names` handles canonical filename parsing and formatting for all states, 64-bit name integrity tags, shard derivation and scan permutation.
+
+`spoolq-math` provides bucket arithmetic, delayed eligibility rounding, retry jitter with rejection sampling, and checked arithmetic.
+
+`spoolq-fs-linux` wraps Linux syscalls (openat, mkdirat, renameat2, linkat, O_TMPFILE, fsync, OFD locks, clocks, getrandom). All unsafe code is confined here.
+
+`spoolq-core` implements the queue state machine: init, open, enqueue, lease, ack, retry, bury, renew, recover, inspect.
+
+`spoolq-cli` provides the command-line interface.
 
 ## License
 
