@@ -1,0 +1,18 @@
+# Internal docs
+SpoolQ_1_Agent_Ready_Final.md
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
