@@ -587,6 +587,90 @@ pub fn is_sync_failure(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EIO) | Some(libc::ESTALE))
 }
 
+/// Probe unnamed-file publication modes. Returns which mode is available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationMode {
+    DirectAtEmptyPath,
+    ProcSelfFd,
+    NamedFallback,
+}
+
+/// Probe publication capability by creating a temp file and trying to link it.
+pub fn probe_publication_mode(dir_fd: RawFd) -> io::Result<PublicationMode> {
+    // Create a temp file via O_TMPFILE
+    let tmp = match open_tmpfile(dir_fd) {
+        Ok(fd) => fd,
+        Err(_) => return Ok(PublicationMode::NamedFallback),
+    };
+
+    // Write a byte so it's not empty
+    write_all(tmp.as_raw_fd(), b"x")?;
+
+    let probe_name = format!(
+        ".pubprobe-{}\0",
+        random_128bit()
+            .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
+            .unwrap_or_default()
+    );
+
+    // Try AT_EMPTY_PATH first
+    let name = probe_name.trim_end_matches('\0');
+    if linkat_empty_path(tmp.as_raw_fd(), dir_fd, name).is_ok() {
+        let _ = unlinkat(dir_fd, name);
+        return Ok(PublicationMode::DirectAtEmptyPath);
+    }
+
+    // Try /proc/self/fd
+    if linkat_proc_self_fd(tmp.as_raw_fd(), dir_fd, name).is_ok() {
+        let _ = unlinkat(dir_fd, name);
+        return Ok(PublicationMode::ProcSelfFd);
+    }
+
+    Ok(PublicationMode::NamedFallback)
+}
+
+/// Probe no-overwrite rename support.
+pub fn probe_rename_noreplace(dir_fd: RawFd) -> io::Result<bool> {
+    let name1 = format!(
+        ".rnprobe1-{}\0",
+        random_128bit()
+            .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
+            .unwrap_or_default()
+    );
+    let name2 = format!(
+        ".rnprobe2-{}\0",
+        random_128bit()
+            .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
+            .unwrap_or_default()
+    );
+    let n1 = name1.trim_end_matches('\0');
+    let n2 = name2.trim_end_matches('\0');
+
+    // Create two files
+    let f1 = create_exclusive(dir_fd, n1, 0o600)?;
+    let f2 = create_exclusive(dir_fd, n2, 0o600)?;
+    drop(f1);
+    drop(f2);
+
+    // Try to rename n1 -> n2 with NOREPLACE (should fail since n2 exists)
+    let result = renameat2_noreplace(dir_fd, n1, dir_fd, n2);
+    let works = result.is_err();
+
+    // Cleanup
+    let _ = unlinkat(dir_fd, n1);
+    let _ = unlinkat(dir_fd, n2);
+
+    Ok(works)
+}
+
+/// Probe directory fsync support.
+pub fn probe_dir_fsync(dir_fd: RawFd) -> io::Result<bool> {
+    match fsync_dir_fd(dir_fd) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
