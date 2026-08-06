@@ -472,6 +472,16 @@ pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<String>> {
     read_dir_entries(dup_fd)
 }
 
+/// Change file mode relative to a directory fd.
+pub fn fchmodat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
+    let c_name = CString::new(name).unwrap();
+    let rc = unsafe { libc::fchmodat(dir_fd, c_name.as_ptr(), mode, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

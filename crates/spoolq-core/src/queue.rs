@@ -194,6 +194,8 @@ impl Queue {
             root_fd.as_raw_fd(),
             "FORMAT",
         )?;
+        // Set FORMAT to read-only (0400)
+        let _ = fs::fchmodat(root_fd.as_raw_fd(), "FORMAT", 0o400);
         fs::fsync_dir_fd(root_fd.as_raw_fd())?;
 
         Ok(format_rec)
@@ -299,6 +301,28 @@ impl Queue {
 
     fn poison(&mut self) {
         self.poisoned = true;
+    }
+    /// Compute the effective wall floor: max(CLOCK_REALTIME, stored watermark bucket * width)
+    pub(crate) fn effective_wall_floor_ns(&self) -> u64 {
+        let clock = spoolq_fs_linux::clock_realtime_ns().unwrap_or(0);
+        // Read the wall watermark
+        match self.read_wall_watermark() {
+            Some(wm) => spoolq_math::effective_wall_floor(
+                clock,
+                wm.highest_observed_bucket,
+                self.format.delayed_bucket_width_ns,
+            ),
+            None => clock,
+        }
+    }
+
+    /// Read the wall watermark record from control/wall-watermark.
+    fn read_wall_watermark(&self) -> Option<spoolq_format::WatermarkRecord> {
+        let data = std::fs::read(self.root_path.join("control/wall-watermark")).ok()?;
+        if data.len() != spoolq_format::WATERMARK_SIZE {
+            return None;
+        }
+        spoolq_format::WatermarkRecord::decode(&data).ok()
     }
 
     /// Enqueue a job with the given payload and metadata.
@@ -412,7 +436,7 @@ impl Queue {
         let shard_str = shard_hex(shard);
 
         // Determine initial state: ready or delayed
-        let now_wall = fs::clock_realtime_ns().unwrap_or(0);
+        let now_wall = self.effective_wall_floor_ns();
         let (initial_state, eligibility_bucket) = match job.initial_not_before {
             Some(nb) if nb > now_wall => {
                 let (eb, _) =
@@ -1063,7 +1087,7 @@ impl Queue {
 
     /// Retry a lease after a duration.
     pub fn retry_after(&mut self, lease: &LeaseInfo, duration_ns: u64) -> TransitionOutcome {
-        let wall_now = spoolq_fs_linux::clock_realtime_ns().unwrap_or(0);
+        let wall_now = self.effective_wall_floor_ns();
         let deadline = match spoolq_math::retry_wall_deadline(wall_now, duration_ns / 1_000_000) {
             Some(d) => d,
             None => {
