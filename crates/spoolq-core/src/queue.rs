@@ -41,10 +41,37 @@ impl Default for CreateOptions {
     }
 }
 
+
+/// Validate all CreateOptions before any filesystem mutation (C-01).
+/// Same validation used in encoding and tests.
+pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
+    if opts.shard_count == 0 || !opts.shard_count.is_power_of_two() || opts.shard_count > 4096 {
+        return Err(Error::InvalidInput("invalid shard count".into()));
+    }
+    if opts.lease_bucket_width_ns == 0 {
+        return Err(Error::InvalidInput("lease bucket width must be non-zero".into()));
+    }
+    if opts.delayed_bucket_width_ns == 0 {
+        return Err(Error::InvalidInput("delayed bucket width must be non-zero".into()));
+    }
+    if opts.terminal_bucket_width_ns == 0 {
+        return Err(Error::InvalidInput("terminal bucket width must be non-zero".into()));
+    }
+    if !(60_000_000_000..=86_400_000_000_000).contains(&opts.terminal_bucket_width_ns) {
+        return Err(Error::InvalidInput("invalid terminal bucket width".into()));
+    }
+    if opts.max_payload_length > MAX_PAYLOAD_LENGTH {
+        return Err(Error::InvalidInput("payload limit exceeds maximum".into()));
+    }
+    Ok(())
+}
+
 /// Operational options for opening a queue.
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
+    /// Deprecated: open-or-create is not implemented (C-04).
     pub create: bool,
+    /// Deprecated: unused when create is false (C-04).
     pub create_options: CreateOptions,
     pub allow_unsupported_fs: bool,
     pub receipt_retention_ns: u64,
@@ -72,45 +99,64 @@ pub struct Queue {
     pub(crate) boot_id: String,
     pub(crate) boot_id_bytes: [u8; 16],
     pub(crate) poisoned: bool,
+    pub(crate) scan_round: u64,
     pub(crate) worker_nonce: [u8; 16],
     pub(crate) options: OpenOptions,
+    pub(crate) maint_lock_fd: Option<OwnedFd>,
 }
 
 impl Queue {
     /// Initialize a new queue at the given path.
     pub fn init(root: &Path, opts: &CreateOptions) -> io::Result<FormatRecord> {
-        // Validate options
-        if opts.shard_count == 0 || !opts.shard_count.is_power_of_two() || opts.shard_count > 4096 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid shard count",
-            ));
-        }
-        if !(60_000_000_000..=86_400_000_000_000).contains(&opts.terminal_bucket_width_ns) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid terminal bucket width",
-            ));
-        }
-        if opts.max_payload_length > MAX_PAYLOAD_LENGTH {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "payload limit exceeds maximum",
-            ));
-        }
+        // C-01: Validate all options before any filesystem mutation
+        validate_create_options(opts).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+        })?;
 
         // Create root directory if needed
         if !root.exists() {
             std::fs::create_dir_all(root)?;
             // Sync the parent directory so the root entry persists
             if let Some(parent) = root.parent() {
-                if let Ok(parent_fd) = fs::open_dir_absolute(parent) {
-                    let _ = fs::fsync_dir_fd(parent_fd.as_raw_fd());
-                }
+                let parent_fd = fs::open_dir_absolute(parent)?;
+                fs::fsync_dir_fd(parent_fd.as_raw_fd())?;
             }
         }
 
         let root_fd = fs::open_dir_absolute(root)?;
+
+        // B-01: Refuse to overwrite an existing queue. Check for FORMAT via fd-relative.
+        let format_exists = fs::fstatat(root_fd.as_raw_fd(), "FORMAT").is_ok();
+        if format_exists {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "queue already initialized; use open() to access an existing queue",
+            ));
+        }
+
+        // B-01: If the root exists but has no FORMAT, it may be a partial init.
+        // Acquire exclusive lock on control/maintenance.lock if control dir exists.
+        let control_exists = fs::fstatat(root_fd.as_raw_fd(), "control").is_ok();
+        if control_exists {
+            if let Ok(control_fd) = fs::open_directory(root_fd.as_raw_fd(), "control") {
+                if let Ok(lock_fd) = fs::openat(
+                    control_fd.as_raw_fd(),
+                    "maintenance.lock",
+                    libc::O_RDWR,
+                    0o600,
+                ) {
+                    let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())?;
+                    if !locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "another initializer or maintenance process holds the lock",
+                        ));
+                    }
+                    // Hold the lock for the duration of init
+                    std::mem::forget(lock_fd);
+                }
+            }
+        }
 
         // Generate queue ID
         let queue_id = fs::random_128bit()?;
@@ -145,7 +191,7 @@ impl Queue {
         // Create static shard directories under ready/
         let ready_fd = fs::open_directory(root_fd.as_raw_fd(), "ready")?;
         for i in 0..opts.shard_count {
-            let shard_name = format!("{:04x}", i);
+            let shard_name = format!("{i:04x}");
             fs::mkdirat_eexist_ok(ready_fd.as_raw_fd(), &shard_name, 0o700)?;
         }
         // Sync ready/ after shard creation
@@ -171,19 +217,21 @@ impl Queue {
 
         // Write initial wall watermark
         let wall_now = fs::clock_realtime_ns()?;
-        let wall_bucket = bucket_number(wall_now, opts.delayed_bucket_width_ns);
+        let wall_bucket = bucket_number(wall_now, opts.delayed_bucket_width_ns).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "zero bucket width in init"))?;
         let wm = WatermarkRecord {
             highest_observed_bucket: wall_bucket,
             sequence: 0,
         };
         let wm_bytes = wm.encode();
         // Write via temp file then rename
-        let wm_tmp = fs::create_exclusive(control_fd.as_raw_fd(), ".wm.tmp", 0o600)?;
+        // C-03: Use unique temp name to avoid collision on partial init rerun
+        let wm_tmp_name = format!(".wm.tmp.{}", spoolq_names::hex_encode(&fs::random_128bit()?));
+        let wm_tmp = fs::create_exclusive(control_fd.as_raw_fd(), &wm_tmp_name, 0o600)?;
         fs::write_all(wm_tmp.as_raw_fd(), &wm_bytes)?;
         fs::fsync(wm_tmp.as_raw_fd())?;
         fs::renameat(
             control_fd.as_raw_fd(),
-            ".wm.tmp",
+            &wm_tmp_name,
             control_fd.as_raw_fd(),
             "wall-watermark",
         )?;
@@ -191,17 +239,19 @@ impl Queue {
 
         // Write FORMAT file
         let format_bytes = format_rec.encode();
-        let fmt_tmp = fs::create_exclusive(root_fd.as_raw_fd(), ".format.tmp", 0o600)?;
+        // C-03: Unique temp name for partial init recovery
+        let fmt_tmp_name = format!(".format.tmp.{}", spoolq_names::hex_encode(&fs::random_128bit()?));
+        let fmt_tmp = fs::create_exclusive(root_fd.as_raw_fd(), &fmt_tmp_name, 0o600)?;
         fs::write_all(fmt_tmp.as_raw_fd(), &format_bytes)?;
         fs::fsync(fmt_tmp.as_raw_fd())?;
         fs::renameat(
             root_fd.as_raw_fd(),
-            ".format.tmp",
+            &fmt_tmp_name,
             root_fd.as_raw_fd(),
             "FORMAT",
         )?;
-        // Set FORMAT to read-only (0400)
-        let _ = fs::fchmodat(root_fd.as_raw_fd(), "FORMAT", 0o400);
+        // C-02: Set FORMAT to read-only before final dir fsync, propagate failure
+        fs::fchmodat(root_fd.as_raw_fd(), "FORMAT", 0o400)?;
         fs::fsync_dir_fd(root_fd.as_raw_fd())?;
 
         // Reopen and verify as a normal client (step 13)
@@ -214,26 +264,50 @@ impl Queue {
 
     /// Open an existing queue.
     pub fn open(root: &Path, opts: &OpenOptions) -> Result<Self, Error> {
-        // Read and validate FORMAT
-        let format_path = root.join("FORMAT");
-        let format_bytes =
-            std::fs::read(&format_path).map_err(|e| Error::IoFailure(e.to_string()))?;
-        let format_rec = FormatRecord::decode(&format_bytes)
-            .map_err(|e| Error::InvalidInput(format!("FORMAT decode: {}", e)))?;
+        // B-11: Open root first using descriptor-relative, no-symlink semantics
+        let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        // B-11: Validate root is a directory
+        let root_stat = fs::fstat(root_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        if root_stat.st_mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+            return Err(Error::QueueCorrupt("root path is not a directory".into()));
+        }
+
+        // B-11: Read FORMAT through descriptor-relative open, not pathname
+        let format_fd = fs::openat(root_fd.as_raw_fd(), "FORMAT", libc::O_RDONLY, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let mut format_bytes = Vec::new();
+        {
+            let mut buf = [0u8; 4096];
+            loop {
+                match fs::read(format_fd.as_raw_fd(), &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => format_bytes.extend_from_slice(&buf[..n]),
+                    Err(e) => return Err(Error::IoFailure(e.to_string())),
+                }
+            }
+        }
+        let format_rec = FormatRecord::decode(&format_bytes).map_err(|e| match e {
+            spoolq_format::FormatError::BadMagic | spoolq_format::FormatError::WrongSize { .. } => {
+                Error::QueueCorrupt(format!("FORMAT decode: {e}"))
+            }
+            spoolq_format::FormatError::UnsupportedVersion(_, _) => Error::UnsupportedFormat,
+            spoolq_format::FormatError::DigestMismatch => {
+                Error::QueueCorrupt("FORMAT digest mismatch".into())
+            }
+            _ => Error::QueueCorrupt(format!("FORMAT decode: {e}")),
+        })?;
 
         // Validate retention bound: ceil(retention / terminal_width) + 2 <= 4096
         let probe_count = ceiling_bucket(
             opts.receipt_retention_ns,
             format_rec.terminal_bucket_width_ns,
-        ) + 2;
+        ).unwrap_or(0).saturating_add(2);
         if probe_count > 4096 {
             return Err(Error::InvalidInput(
                 "receipt retention exceeds duplicate-ack probe bound".into(),
             ));
         }
-
-        // Open root directory
-        let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         // Check filesystem type
         if !opts.allow_unsupported_fs {
@@ -249,6 +323,17 @@ impl Queue {
                 }
                 _ => {
                     return Err(Error::UnsupportedFilesystem);
+                }
+            }
+        }
+
+        // B-11: Verify state directories exist and are on the same device
+        for state_dir in &["control", "ready", "leased", "delayed", "receipts", "dead", "quarantine", "tmp"] {
+            if let Ok(stat) = fs::fstatat(root_fd.as_raw_fd(), state_dir) {
+                if stat.st_dev != root_stat.st_dev {
+                    return Err(Error::QueueCorrupt(
+                        format!("state directory '{}' is on a different device than root", state_dir),
+                    ));
                 }
             }
         }
@@ -269,8 +354,6 @@ impl Queue {
         if !locked {
             return Err(Error::MaintenanceBusy);
         }
-        std::mem::forget(maint_fd);
-
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -278,8 +361,10 @@ impl Queue {
             boot_id,
             boot_id_bytes: boot_id_bin,
             poisoned: false,
+            scan_round: 0,
             worker_nonce,
             options: opts.clone(),
+            maint_lock_fd: Some(maint_fd),
         })
     }
 
@@ -315,25 +400,89 @@ impl Queue {
     }
     /// Compute the effective wall floor: max(CLOCK_REALTIME, stored watermark bucket * width)
     pub(crate) fn effective_wall_floor_ns(&self) -> u64 {
-        let clock = spoolq_fs_linux::clock_realtime_ns().unwrap_or(0);
+        let clock = match spoolq_fs_linux::clock_realtime_ns() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
         // Read the wall watermark
         match self.read_wall_watermark() {
             Some(wm) => spoolq_math::effective_wall_floor(
                 clock,
                 wm.highest_observed_bucket,
                 self.format.delayed_bucket_width_ns,
-            ),
+            ).unwrap_or(clock),
             None => clock,
         }
     }
 
     /// Read the wall watermark record from control/wall-watermark.
     fn read_wall_watermark(&self) -> Option<spoolq_format::WatermarkRecord> {
-        let data = std::fs::read(self.root_path.join("control/wall-watermark")).ok()?;
-        if data.len() != spoolq_format::WATERMARK_SIZE {
+        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control").ok()?;
+        let data = match fs::openat(control_fd.as_raw_fd(), "wall-watermark", libc::O_RDONLY, 0) {
+            Ok(fd) => fd,
+            Err(_) => return None,
+        };
+        let mut buf = [0u8; spoolq_format::WATERMARK_SIZE];
+        if fs::pread_exact(data.as_raw_fd(), &mut buf, 0).is_err() {
             return None;
         }
-        spoolq_format::WatermarkRecord::decode(&data).ok()
+        spoolq_format::WatermarkRecord::decode(&buf).ok()
+    }
+
+    /// B-05: Advance the wall watermark to max(stored, observed).
+    /// Re-reads under lock, computes max, writes atomically with sequence increment.
+    pub fn advance_wall_watermark(&self, observed_ns: u64) -> Result<(), Error> {
+        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        // Acquire exclusive write lock on wall-watermark.lock
+        let lock_fd = fs::openat(control_fd.as_raw_fd(), "wall-watermark.lock", libc::O_RDWR, 0o600)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        if !locked {
+            return Err(Error::MaintenanceBusy);
+        }
+
+        // Re-read current watermark under lock
+        let current = self.read_wall_watermark();
+        let observed_bucket = spoolq_math::bucket_number(
+            observed_ns,
+            self.format.delayed_bucket_width_ns,
+        ).unwrap_or(0);
+
+        let (new_bucket, new_seq) = match current {
+            Some(wm) => {
+                let max_bucket = wm.highest_observed_bucket.max(observed_bucket);
+                let new_seq = wm.sequence.checked_add(1).ok_or_else(|| {
+                    Error::StateExhausted
+                })?;
+                (max_bucket, new_seq)
+            }
+            None => (observed_bucket, 1),
+        };
+
+        let new_wm = spoolq_format::WatermarkRecord {
+            highest_observed_bucket: new_bucket,
+            sequence: new_seq,
+        };
+        let wm_bytes = new_wm.encode();
+
+        // Write via unique temp, then atomic rename, then sync
+        let tmp_name = format!(".wm.adv.{}", spoolq_names::hex_encode(&fs::random_128bit()
+            .map_err(|e| Error::IoFailure(e.to_string()))?));
+        let tmp_fd = fs::create_exclusive(control_fd.as_raw_fd(), &tmp_name, 0o600)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::write_all(tmp_fd.as_raw_fd(), &wm_bytes)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync(tmp_fd.as_raw_fd())
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::renameat(control_fd.as_raw_fd(), &tmp_name, control_fd.as_raw_fd(), "wall-watermark")
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync_dir_fd(control_fd.as_raw_fd())
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Enqueue a job with the given payload and metadata.
@@ -411,10 +560,7 @@ impl Queue {
             }
         };
 
-        // Compute payload digest
-        let pdig = payload_digest(&job.payload);
-
-        // Validate payload size
+        // C-11: Validate payload size BEFORE hashing
         if job.payload.len() as u64 > self.format.max_payload_length.min(MAX_PAYLOAD_LENGTH) {
             let ticket = EnqueueTicket {
                 job_id,
@@ -427,6 +573,9 @@ impl Queue {
                 Error::InvalidInput("payload exceeds limit".into()),
             );
         }
+
+        // Compute payload digest (after size validation - C-11)
+        let pdig = payload_digest(&job.payload);
 
         // Build fixed header
         let mut header = FixedHeader {
@@ -491,8 +640,8 @@ impl Queue {
                 let ctx = ready_context(&shard_str, &base);
                 let tag = compute_name_tag(&self.format.queue_id, &ctx);
                 let fname = ready_filename(&common, &tag);
-                let path = format!("ready/{}/{}", shard_str, fname);
-                (format!("ready/{}", shard_str), fname, path)
+                let path = format!("ready/{shard_str}/{fname}");
+                (format!("ready/{shard_str}"), fname, path)
             }
             InitialState::Delayed => {
                 let bucket_str = bucket_hex(eligibility_bucket);
@@ -507,8 +656,8 @@ impl Queue {
                 let ctx = delayed_context(&bucket_str, &shard_str, &base);
                 let tag = compute_name_tag(&self.format.queue_id, &ctx);
                 let fname = delayed_filename(&common, nb_to_u64(job.initial_not_before), &tag);
-                let path = format!("delayed/{}/{}/{}", bucket_str, shard_str, fname);
-                (format!("delayed/{}/{}", bucket_str, shard_str), fname, path)
+                let path = format!("delayed/{bucket_str}/{shard_str}/{fname}");
+                (format!("delayed/{bucket_str}/{shard_str}"), fname, path)
             }
         };
 
@@ -529,7 +678,11 @@ impl Queue {
         );
 
         match result {
-            Ok(()) => EnqueueOutcome::Committed(ticket),
+            Ok(()) => {
+                // B-05: Advance wall watermark after successful enqueue
+                let _ = self.advance_wall_watermark(created_at);
+                EnqueueOutcome::Committed(ticket)
+            }
             Err(PublishError::NotCommitted(e)) => EnqueueOutcome::NotCommitted(ticket, e),
             Err(PublishError::OutcomeUnknown(e)) => {
                 self.poison();
@@ -559,7 +712,7 @@ impl Queue {
         match fs::open_tmpfile(dest_fd.as_raw_fd()) {
             Ok(tmp_fd) => {
                 // Write header (zeroed placeholder)
-                let header_bytes = header.encode(ext_bytes);
+                let header_bytes = header.encode(ext_bytes).map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
                 fs::write_all(tmp_fd.as_raw_fd(), &header_bytes)
                     .map_err(PublishError::classify_write)?;
                 // Write extension
@@ -572,34 +725,41 @@ impl Queue {
                     fs::write_all(tmp_fd.as_raw_fd(), payload)
                         .map_err(PublishError::classify_write)?;
                 }
-                // Patch header with final values
-                fs::pwrite_all(tmp_fd.as_raw_fd(), &header_bytes, 0)
-                    .map_err(PublishError::classify_write)?;
-                // fsync file
-                fs::fsync(tmp_fd.as_raw_fd()).map_err(PublishError::classify_post_fsync)?;
+                // C-13: No redundant pwrite - header was already written correctly above.
+                // fsync file (before publication: NotCommitted on failure)
+                fs::fsync(tmp_fd.as_raw_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
-                // Publish via linkat
-                // Try AT_EMPTY_PATH first, then proc/self/fd
-                if fs::linkat_empty_path(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name).is_ok()
-                {
-                    // Sync destination directory
+                // Publish via linkat - C-09: capture errors for capability classification
+                let link1 = fs::linkat_empty_path(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
+                if link1.is_ok() {
+                    fs::fsync_dir_fd(dest_fd.as_raw_fd())
+                        .map_err(PublishError::classify_post_fsync)?;
+                    return Ok(());
+                }
+                let link2 = fs::linkat_proc_self_fd(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
+                if link2.is_ok() {
                     fs::fsync_dir_fd(dest_fd.as_raw_fd())
                         .map_err(PublishError::classify_post_fsync)?;
                     return Ok(());
                 }
 
-                if fs::linkat_proc_self_fd(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name)
-                    .is_ok()
-                {
-                    fs::fsync_dir_fd(dest_fd.as_raw_fd())
-                        .map_err(PublishError::classify_post_fsync)?;
-                    return Ok(());
+                // C-09: Fall back to named temp file only for capability errors.
+                // Propagate I/O, resource, and permission errors.
+                let last_err = link2.err();
+                if let Some(ref e) = last_err {
+                    if fs::should_propagate_on_fallback(e) {
+                        return Err(PublishError::NotCommitted(Error::IoFailure(e.to_string())));
+                    }
                 }
-
-                // Fall back to named temp file
                 self.named_fallback(dest_dir_relative, dest_name, header, ext_bytes, payload)
             }
-            Err(_) => self.named_fallback(dest_dir_relative, dest_name, header, ext_bytes, payload),
+            Err(e) => {
+                // C-09: Only fall back on capability errors (ENOENT, ENOSYS, EOPNOTSUPP)
+                if fs::should_propagate_on_fallback(&e) {
+                    return Err(PublishError::NotCommitted(Error::IoFailure(e.to_string())));
+                }
+                self.named_fallback(dest_dir_relative, dest_name, header, ext_bytes, payload)
+            }
         }
     }
 
@@ -624,15 +784,34 @@ impl Queue {
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // Create temp file name
-        let boottime = fs::clock_boottime_ns().unwrap_or(0);
-        let random = fs::random_128bit().unwrap_or([0; 16]);
+        let boottime = fs::clock_boottime_ns().map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let random = fs::random_128bit().map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
         let temp_name = temp_filename(boottime, &random);
 
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_raw_fd(), &temp_name, 0o600)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
+        // C-10: RAII guard to unlink temp file on early return
+        struct TempGuard<'a> {
+            dir_fd: std::os::unix::io::RawFd,
+            name: &'a str,
+            armed: bool,
+        }
+        impl<'a> Drop for TempGuard<'a> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = fs::unlinkat(self.dir_fd, self.name);
+                }
+            }
+        }
+        let mut temp_guard = TempGuard {
+            dir_fd: tmp_dir_fd.as_raw_fd(),
+            name: &temp_name,
+            armed: true,
+        };
+
         // Write header
-        let header_bytes = header.encode(ext_bytes);
+        let header_bytes = header.encode(ext_bytes).map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
         fs::write_all(tmp_file.as_raw_fd(), &header_bytes).map_err(PublishError::classify_write)?;
         if !ext_bytes.is_empty() {
             fs::write_all(tmp_file.as_raw_fd(), ext_bytes).map_err(PublishError::classify_write)?;
@@ -640,11 +819,9 @@ impl Queue {
         if !payload.is_empty() {
             fs::write_all(tmp_file.as_raw_fd(), payload).map_err(PublishError::classify_write)?;
         }
-        // Patch header
-        fs::pwrite_all(tmp_file.as_raw_fd(), &header_bytes, 0)
-            .map_err(PublishError::classify_write)?;
-        // fsync file
-        fs::fsync(tmp_file.as_raw_fd()).map_err(PublishError::classify_post_fsync)?;
+        // C-13: No redundant pwrite - header was written correctly above.
+        // fsync file (before publication: NotCommitted on failure)
+        fs::fsync(tmp_file.as_raw_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
         // Open destination directory for rename
         let dest_fd = open_relative(self.root_fd.as_raw_fd(), dest_dir_relative)
@@ -658,6 +835,7 @@ impl Queue {
             dest_name,
         ) {
             Ok(()) => {
+                temp_guard.armed = false; // C-10: disarm on success
                 // Sync destination first, then source
                 fs::fsync_dir_fd(dest_fd.as_raw_fd()).map_err(PublishError::classify_post_fsync)?;
                 fs::fsync_dir_fd(tmp_dir_fd.as_raw_fd())
@@ -665,12 +843,9 @@ impl Queue {
                 Ok(())
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // Clean up temp file
-                let _ = fs::unlinkat(tmp_dir_fd.as_raw_fd(), &temp_name);
                 Err(PublishError::NotCommitted(Error::IdentityCollision))
             }
             Err(e) => {
-                let _ = fs::unlinkat(tmp_dir_fd.as_raw_fd(), &temp_name);
                 Err(PublishError::classify_write(e))
             }
         }
@@ -683,20 +858,16 @@ impl Queue {
         let mut owned_fds = Vec::new();
 
         for (i, comp) in components.iter().enumerate() {
-            match fs::mkdirat_eexist_ok(current_fd, comp, 0o700)? {
-                true => {}
-                false => {
-                    // EEXIST: verify it's a directory and sync parent
-                }
-            }
-            // Open the child and verify
+            let was_created = fs::mkdirat_eexist_ok(current_fd, comp, 0o700)?;
+            // Open the child
             let child = fs::open_directory(current_fd, comp)?;
-            // Sync parent before using child
-            if i > 0 {
-                fs::fsync_dir_fd(current_fd)?;
-            } else {
-                // First component: sync root
-                fs::fsync_dir_fd(self.root_fd.as_raw_fd())?;
+            // P-01: Only fsync parent when a new child entry was actually created
+            if was_created {
+                if i > 0 {
+                    fs::fsync_dir_fd(current_fd)?;
+                } else {
+                    fs::fsync_dir_fd(self.root_fd.as_raw_fd())?;
+                }
             }
             current_fd = child.as_raw_fd();
             owned_fds.push(child);
@@ -704,6 +875,8 @@ impl Queue {
         Ok(())
     }
     /// Claim a ready job, returning a lease.
+    /// max_wait_ns is accepted for API compatibility but currently performs
+    /// a single immediate scan (C-14: bounded wait/backoff not yet implemented).
     pub fn lease(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return LeaseOutcome::NotCommitted(e);
@@ -718,17 +891,16 @@ impl Queue {
             ));
         }
 
-        let boottime_now = match fs::clock_boottime_ns() {
-            Ok(t) => t,
-            Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
-        };
-        let wall_now = match fs::clock_realtime_ns() {
-            Ok(t) => t,
-            Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
-        };
+        // C-16: Clocks are re-captured inside the scan loop before each claim
+        let _boottime_now = fs::clock_boottime_ns().ok();
+        let _wall_now = fs::clock_realtime_ns().ok();
 
-        // Scan shards for a ready job
-        let scan_round = 0u64;
+        // C-19: Track scan completeness to distinguish Empty from I/O error
+        let mut scan_had_error = false;
+
+        // C-15: Use and advance the per-worker scan round
+        let scan_round = self.scan_round;
+        self.scan_round = self.scan_round.wrapping_add(1);
         let (start, stride) = spoolq_names::shard_scan_params(
             &self.format.queue_id,
             &self.boot_id_bytes,
@@ -742,16 +914,16 @@ impl Queue {
             let shard_str = shard_hex(shard);
 
             // Open the ready shard directory
-            let ready_dir = format!("ready/{}", shard_str);
+            let ready_dir = format!("ready/{shard_str}");
             let shard_fd = match open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
                 Ok(fd) => fd,
-                Err(_) => continue,
+                Err(_) => { scan_had_error = true; continue; }
             };
 
             // List entries
             let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => { scan_had_error = true; continue; }
             };
 
             for entry in &entries {
@@ -801,16 +973,42 @@ impl Queue {
                     continue;
                 }
 
+                // C-16: Re-capture clocks immediately before the claim
+                let boottime_claim = match fs::clock_boottime_ns() {
+                    Ok(t) => t,
+                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+                };
+                let wall_claim = match fs::clock_realtime_ns() {
+                    Ok(t) => t,
+                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+                };
                 // Attempt claim: rename ready -> leased
-                let lease_token = fs::random_128bit().unwrap_or([0; 16]);
-                let boottime_deadline = boottime_now.saturating_add(lease_duration_ns);
-                let wall_deadline = wall_now.saturating_add(lease_duration_ns);
+                let lease_token = match fs::random_128bit() {
+                            Ok(t) => t,
+                            Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+                        };
+                let boottime_deadline = match boottime_claim.checked_add(lease_duration_ns) {
+                    Some(d) => d,
+                    None => continue, // deadline overflow, skip this candidate
+                };
+                let wall_deadline = match wall_claim.checked_add(lease_duration_ns) {
+                    Some(d) => d,
+                    None => continue,
+                };
                 let lease_bucket =
-                    spoolq_math::lease_bucket(boottime_deadline, self.format.lease_bucket_width_ns);
+                    spoolq_math::lease_bucket(boottime_deadline, self.format.lease_bucket_width_ns).unwrap_or(0);
                 let bucket_str = bucket_hex(lease_bucket);
 
-                let new_generation = parsed.common.generation.wrapping_add(1);
-                let new_attempt = parsed.common.attempt.wrapping_add(1);
+                // Checked generation increment: a source at u64::MAX cannot transition.
+                let new_generation = match parsed.common.generation.checked_add(1) {
+                    Some(g) => g,
+                    None => continue,
+                };
+                // Checked attempt increment.
+                let new_attempt = match parsed.common.attempt.checked_add(1) {
+                    Some(a) => a,
+                    None => continue,
+                };
 
                 let leased_common = CommonFields {
                     job_id: parsed.common.job_id,
@@ -875,11 +1073,10 @@ impl Queue {
                                     source_state: "ready".into(),
                                     source_generation: parsed.common.generation,
                                     source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{}/{}", ready_dir, entry),
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
                                     attempted_destination_state: "leased".into(),
                                     attempted_destination_relative_path: format!(
-                                        "{}/{}",
-                                        leased_dir, leased_name
+                                        "{leased_dir}/{leased_name}"
                                     ),
                                     lease_token: Some(lease_token),
                                     envelope_digest: [0; 32],
@@ -892,11 +1089,10 @@ impl Queue {
                                     source_state: "ready".into(),
                                     source_generation: parsed.common.generation,
                                     source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{}/{}", ready_dir, entry),
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
                                     attempted_destination_state: "leased".into(),
                                     attempted_destination_relative_path: format!(
-                                        "{}/{}",
-                                        leased_dir, leased_name
+                                        "{leased_dir}/{leased_name}"
                                     ),
                                     lease_token: Some(lease_token),
                                     envelope_digest: [0; 32],
@@ -904,45 +1100,151 @@ impl Queue {
                             }
                         }
 
+                        // B-03: Post-rename validation failures must NOT continue as Empty.
+                        // The claim is committed; failures here are corruption or indeterminate.
                         // Post-rename: open and verify the leased object
                         let leased_stat = match fs::fstatat(leased_dir_fd.as_raw_fd(), &leased_name)
                         {
                             Ok(s) => s,
-                            Err(_) => continue,
+                            Err(_) => {
+                                // The rename succeeded but we cannot stat the result.
+                                // This is OutcomeUnknown - the job is leased but we cannot verify.
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: [0; 32],
+                                });
+                            }
                         };
 
                         // Verify link count is exactly 1 (rejects external hard links)
                         if leased_stat.st_nlink != 1 {
-                            continue;
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                job_id: parsed.common.job_id,
+                                source_state: "ready".into(),
+                                source_generation: parsed.common.generation,
+                                source_attempt: parsed.common.attempt,
+                                source_relative_path: format!("{ready_dir}/{entry}"),
+                                attempted_destination_state: "leased".into(),
+                                attempted_destination_relative_path: format!(
+                                    "{leased_dir}/{leased_name}"
+                                ),
+                                lease_token: Some(lease_token),
+                                envelope_digest: [0; 32],
+                            });
                         }
 
                         // Read and validate the fixed header
                         let leased_file = match fs::openat(
                             leased_dir_fd.as_raw_fd(),
                             &leased_name,
-                            0o0, // O_RDONLY
+                            libc::O_RDONLY,
                             0,
                         ) {
                             Ok(f) => f,
-                            Err(_) => continue,
+                            Err(_) => {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: [0; 32],
+                                });
+                            }
                         };
 
                         let mut header_buf = [0u8; 128];
-                        if fs::pread(leased_file.as_raw_fd(), &mut header_buf, 0).unwrap_or(0)
-                            != 128
-                        {
-                            continue;
+                        if fs::pread_exact(leased_file.as_raw_fd(), &mut header_buf, 0).is_err() {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                job_id: parsed.common.job_id,
+                                source_state: "ready".into(),
+                                source_generation: parsed.common.generation,
+                                source_attempt: parsed.common.attempt,
+                                source_relative_path: format!("{ready_dir}/{entry}"),
+                                attempted_destination_state: "leased".into(),
+                                attempted_destination_relative_path: format!(
+                                    "{leased_dir}/{leased_name}"
+                                ),
+                                lease_token: Some(lease_token),
+                                envelope_digest: [0; 32],
+                            });
                         }
 
                         let header = match FixedHeader::decode(&header_buf) {
                             Ok(h) => h,
-                            Err(_) => continue,
+                            Err(_) => {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: [0; 32],
+                                });
+                            }
                         };
 
                         // Verify job_id matches
                         if header.job_id != parsed.common.job_id {
-                            continue;
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                job_id: parsed.common.job_id,
+                                source_state: "ready".into(),
+                                source_generation: parsed.common.generation,
+                                source_attempt: parsed.common.attempt,
+                                source_relative_path: format!("{ready_dir}/{entry}"),
+                                attempted_destination_state: "leased".into(),
+                                attempted_destination_relative_path: format!(
+                                    "{leased_dir}/{leased_name}"
+                                ),
+                                lease_token: Some(lease_token),
+                                envelope_digest: [0; 32],
+                            });
                         }
+
+                        // C-21: Read content_type from extension header
+                        let content_type = if header.extension_header_length > 0
+                            && header.extension_header_length <= 65536
+                        {
+                            let mut ext_buf = vec![0u8; header.extension_header_length as usize];
+                            if fs::pread_exact(
+                                leased_file.as_raw_fd(),
+                                &mut ext_buf,
+                                128,
+                            ).is_ok() {
+                                spoolq_format::cbor::ExtensionHeader::decode(&ext_buf)
+                                    .map(|e| e.content_type)
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
 
                         let lease_info = LeaseInfo {
                             job_id: parsed.common.job_id,
@@ -954,12 +1256,12 @@ impl Queue {
                             boot_id: self.boot_id.clone(),
                             expires_boottime_ns: boottime_deadline,
                             expires_wall_ns: wall_deadline,
-                            content_type: String::new(),
+                            content_type,
                             payload_length: header.payload_length,
                             payload_digest: header.payload_digest,
                             expected_dev: leased_stat.st_dev as u64,
                             expected_inode: leased_stat.st_ino as u64,
-                            exact_source_path: format!("{}/{}", leased_dir, leased_name),
+                            exact_source_path: format!("{leased_dir}/{leased_name}"),
                             payload_verified: false,
                         };
 
@@ -970,19 +1272,36 @@ impl Queue {
             }
         }
 
-        LeaseOutcome::Empty
+        // C-19: If the scan had I/O errors, report them rather than returning Empty
+        if scan_had_error {
+            LeaseOutcome::NotCommitted(Error::IoFailure("scan completed with errors".into()))
+        } else {
+            LeaseOutcome::Empty
+        }
     }
 
-    /// Acknowledge a lease: move to terminal receipt.
+    /// Acknowledge a verified lease: move to terminal receipt.
+    /// Requires the lease to have been payload-verified.
     pub fn ack(&mut self, lease: &LeaseInfo) -> AckOutcome {
+        if !lease.payload_verified {
+            return AckOutcome::NotCommitted(Error::InvalidInput(
+                "ack requires a verified lease; use ack_unverified for the unsafe path".into(),
+            ));
+        }
+        self.ack_unverified(lease)
+    }
+
+    /// Acknowledge a lease without payload verification (unsafe).
+    /// Cannot detect payload corruption. Use ack() for the safe path.
+    pub fn ack_unverified(&mut self, lease: &LeaseInfo) -> AckOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return AckOutcome::NotCommitted(e);
         }
 
-        // Compute receipt path
-        let wall_now = fs::clock_realtime_ns().unwrap_or(0);
+        // C-25/B-05: Use effective wall floor for terminal transitions
+        let wall_now = self.effective_wall_floor_ns();
         let terminal_bucket =
-            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns);
+            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(terminal_bucket);
 
         let shard = compute_shard(
@@ -992,9 +1311,13 @@ impl Queue {
         );
         let shard_str = shard_hex(shard);
 
+        let new_generation = match lease.generation.checked_add(1) {
+            Some(g) => g,
+            None => return AckOutcome::NotCommitted(Error::StateExhausted),
+        };
         let receipt_common = CommonFields {
             job_id: lease.job_id,
-            generation: lease.generation.wrapping_add(1),
+            generation: new_generation,
             attempt: lease.attempt,
             maximum_attempts: lease.maximum_attempts,
         };
@@ -1018,7 +1341,7 @@ impl Queue {
         let receipt_name =
             spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
 
-        let receipt_dir = format!("receipts/{}/{}", bucket_str, shard_str);
+        let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
         if let Err(e) = self.ensure_dir(&receipt_dir) {
             return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
         }
@@ -1028,22 +1351,21 @@ impl Queue {
             Err(e) => return AckOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
 
-        // Open source leased directory
-        let src_path_parts: Vec<&str> = lease.exact_source_path.split('/').collect();
-        if src_path_parts.len() < 2 {
-            return AckOutcome::NotCommitted(Error::InvalidInput("bad source path".into()));
-        }
-        let src_name = src_path_parts.last().unwrap();
-        let src_dir = src_path_parts[..src_path_parts.len() - 1].join("/");
-        let src_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &src_dir) {
-            Ok(fd) => fd,
-            Err(_) => return AckOutcome::LeaseLost,
+        // B-04: Validate the current lease source before acknowledging
+        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return AckOutcome::LeaseLost,
+            Err(Error::QueueCorrupt(e)) => {
+                self.poison();
+                return AckOutcome::NotCommitted(Error::QueueCorrupt(e));
+            }
+            Err(e) => return AckOutcome::NotCommitted(e),
         };
 
         // Rename leased -> receipt with NOREPLACE
         match fs::renameat2_noreplace(
             src_dir_fd.as_raw_fd(),
-            src_name,
+            &src_name,
             receipt_dir_fd.as_raw_fd(),
             &receipt_name,
         ) {
@@ -1059,8 +1381,7 @@ impl Queue {
                         source_relative_path: lease.exact_source_path.clone(),
                         attempted_destination_state: "receipts".into(),
                         attempted_destination_relative_path: format!(
-                            "{}/{}",
-                            receipt_dir, receipt_name
+                            "{receipt_dir}/{receipt_name}"
                         ),
                         lease_token: Some(lease.token),
                         envelope_digest: lease.envelope_digest,
@@ -1076,8 +1397,7 @@ impl Queue {
                         source_relative_path: lease.exact_source_path.clone(),
                         attempted_destination_state: "receipts".into(),
                         attempted_destination_relative_path: format!(
-                            "{}/{}",
-                            receipt_dir, receipt_name
+                            "{receipt_dir}/{receipt_name}"
                         ),
                         lease_token: Some(lease.token),
                         envelope_digest: lease.envelope_digest,
@@ -1086,8 +1406,18 @@ impl Queue {
                 AckOutcome::Acked
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => AckOutcome::AlreadyAcked,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => AckOutcome::LeaseLost,
-            Err(_) => AckOutcome::LeaseLost,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                // C-22: On source absence, do a bounded receipt probe.
+                // Construct the finite set of exact retained receipt paths
+                // and check them directly (C-23: bounded, not full scan).
+                if self.check_duplicate_ack_bounded(lease) {
+                    AckOutcome::AlreadyAcked
+                } else {
+                    AckOutcome::LeaseLost
+                }
+            }
+            // C-24/B-12: Preserve I/O, permission, resource, and corruption categories
+            Err(e) => AckOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         }
     }
 
@@ -1104,7 +1434,7 @@ impl Queue {
     /// Retry a lease after a duration.
     pub fn retry_after(&mut self, lease: &LeaseInfo, duration_ns: u64) -> TransitionOutcome {
         let wall_now = self.effective_wall_floor_ns();
-        let deadline = match spoolq_math::retry_wall_deadline(wall_now, duration_ns / 1_000_000) {
+        let deadline = match spoolq_math::retry_wall_deadline(wall_now, duration_ns) {
             Some(d) => d,
             None => {
                 return TransitionOutcome::NotCommitted(Error::InvalidInput(
@@ -1138,7 +1468,24 @@ impl Queue {
         if delay_ms == 0 {
             self.retry_now(lease)
         } else {
-            self.retry_after(lease, delay_ms * 1_000_000)
+            let delay_ns = match spoolq_math::checked_mul_u64(delay_ms, 1_000_000) {
+                Some(d) => d,
+                None => {
+                    return TransitionOutcome::NotCommitted(Error::InvalidInput(
+                        "delay overflow".into(),
+                    ))
+                }
+            };
+            let wall_now = self.effective_wall_floor_ns();
+            let deadline = match spoolq_math::retry_wall_deadline(wall_now, delay_ns) {
+                Some(d) => d,
+                None => {
+                    return TransitionOutcome::NotCommitted(Error::InvalidInput(
+                        "deadline overflow".into(),
+                    ))
+                }
+            };
+            self.retry_at(lease, deadline)
         }
     }
 
@@ -1167,7 +1514,10 @@ impl Queue {
             self.format.shard_count,
         );
         let shard_str = shard_hex(shard);
-        let new_gen = lease.generation.wrapping_add(1);
+        let new_gen = match lease.generation.checked_add(1) {
+            Some(g) => g,
+            None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
+        };
 
         let (dest_dir, dest_name) = match delayed_ns {
             Some(nb) => {
@@ -1200,7 +1550,7 @@ impl Queue {
                 let ctx = spoolq_names::delayed_context(&bucket_str, &shard_str, &base);
                 let tag = compute_name_tag(&self.format.queue_id, &ctx);
                 let fname = spoolq_names::delayed_filename(&common, nb, &tag);
-                let dir = format!("delayed/{}/{}", bucket_str, shard_str);
+                let dir = format!("delayed/{bucket_str}/{shard_str}");
                 (dir, fname)
             }
             None => {
@@ -1220,7 +1570,7 @@ impl Queue {
                 let ctx = ready_context(&shard_str, &base);
                 let tag = compute_name_tag(&self.format.queue_id, &ctx);
                 let fname = ready_filename(&common, &tag);
-                (format!("ready/{}", shard_str), fname)
+                (format!("ready/{shard_str}"), fname)
             }
         };
 
@@ -1242,11 +1592,15 @@ impl Queue {
             self.format.shard_count,
         );
         let shard_str = shard_hex(shard);
-        let new_gen = lease.generation.wrapping_add(1);
+        let new_gen = match lease.generation.checked_add(1) {
+            Some(g) => g,
+            None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
+        };
 
-        let wall_now = fs::clock_realtime_ns().unwrap_or(0);
+        // C-25/B-05: Use effective wall floor for terminal transitions
+        let wall_now = self.effective_wall_floor_ns();
         let terminal_bucket =
-            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns);
+            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(terminal_bucket);
 
         let common = CommonFields {
@@ -1272,7 +1626,7 @@ impl Queue {
         );
         let tag = compute_name_tag(&self.format.queue_id, &ctx);
         let fname = spoolq_names::dead_filename(&common, reason as u16, &tag);
-        let dest_dir = format!("dead/{}/{}", bucket_str, shard_str);
+        let dest_dir = format!("dead/{bucket_str}/{shard_str}");
 
         self.move_leased(lease, &dest_dir, &fname)
     }
@@ -1292,13 +1646,30 @@ impl Queue {
         }
 
         let boottime_now = fs::clock_boottime_ns().unwrap_or(0);
-        let wall_now = fs::clock_realtime_ns().unwrap_or(0);
-        let new_boottime_dl = boottime_now.saturating_add(lease_duration_ns);
-        let new_wall_dl = wall_now.saturating_add(lease_duration_ns);
-        let new_gen = lease.generation.wrapping_add(1);
+        let wall_now = self.effective_wall_floor_ns();
+        let new_boottime_dl = match boottime_now.checked_add(lease_duration_ns) {
+            Some(d) => d,
+            None => {
+                return RenewOutcome::NotCommitted(Error::InvalidInput(
+                    "deadline overflow".into(),
+                ))
+            }
+        };
+        let new_wall_dl = match wall_now.checked_add(lease_duration_ns) {
+            Some(d) => d,
+            None => {
+                return RenewOutcome::NotCommitted(Error::InvalidInput(
+                    "deadline overflow".into(),
+                ))
+            }
+        };
+        let new_gen = match lease.generation.checked_add(1) {
+            Some(g) => g,
+            None => return RenewOutcome::NotCommitted(Error::StateExhausted),
+        };
 
         let lease_bucket =
-            spoolq_math::lease_bucket(new_boottime_dl, self.format.lease_bucket_width_ns);
+            spoolq_math::lease_bucket(new_boottime_dl, self.format.lease_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(lease_bucket);
         let shard = compute_shard(
             &self.format.queue_id,
@@ -1340,13 +1711,135 @@ impl Queue {
                 generation: new_gen,
                 expires_boottime_ns: new_boottime_dl,
                 expires_wall_ns: new_wall_dl,
-                exact_source_path: format!("{}/{}", dest_dir, fname),
+                exact_source_path: format!("{dest_dir}/{fname}"),
                 ..lease.clone()
             }),
             TransitionOutcome::LeaseLost => RenewOutcome::LeaseLost,
             TransitionOutcome::NotCommitted(e) => RenewOutcome::NotCommitted(e),
             TransitionOutcome::OutcomeUnknown(t) => RenewOutcome::OutcomeUnknown(t),
         }
+    }
+
+
+    /// B-04: Open and validate the current leased source object.
+    /// Validates the source path, filename, header, and identity against the handle.
+    /// Returns the opened source directory fd and source filename on success.
+    fn open_and_validate_current_lease(
+        &self,
+        lease: &LeaseInfo,
+    ) -> Result<Option<(OwnedFd, String)>, Error> {
+        let parts: Vec<&str> = lease.exact_source_path.split('/').collect();
+        if parts.len() < 2 {
+            return Err(Error::InvalidInput("bad source path".into()));
+        }
+
+        // B-04: Reject absolute paths, .., empty components
+        for part in &parts {
+            if part.is_empty() || *part == ".." || *part == "." || part.starts_with('/') {
+                return Err(Error::InvalidInput(format!("invalid path component: {}", part)));
+            }
+        }
+
+        let src_name = parts.last().unwrap().to_string();
+        let src_dir = parts[..parts.len() - 1].join("/");
+
+        let src_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &src_dir) {
+            Ok(fd) => fd,
+            Err(_) => return Ok(None), // Source directory gone
+        };
+
+        // Stat the source file with NOFOLLOW
+        let src_stat = match fs::fstatat(src_dir_fd.as_raw_fd(), &src_name) {
+            Ok(s) => s,
+            Err(_) => return Ok(None), // Source file gone
+        };
+
+        // B-04: Verify regular file type
+        if src_stat.st_mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+            return Err(Error::QueueCorrupt("source is not a regular file".into()));
+        }
+
+        // B-04: Verify expected device/inode if set
+        if lease.expected_dev != 0 && lease.expected_dev != src_stat.st_dev as u64 {
+            return Err(Error::QueueCorrupt(format!(
+                "device mismatch: expected {}, got {}",
+                lease.expected_dev, src_stat.st_dev
+            )));
+        }
+        if lease.expected_inode != 0 && lease.expected_inode != src_stat.st_ino as u64 {
+            return Err(Error::QueueCorrupt(format!(
+                "inode mismatch: expected {}, got {}",
+                lease.expected_inode, src_stat.st_ino
+            )));
+        }
+
+        // B-04: Verify link count is exactly 1
+        if src_stat.st_nlink != 1 {
+            return Err(Error::QueueCorrupt("source has unexpected hard links".into()));
+        }
+
+        // B-04: Parse the leased filename canonically
+        let parsed = spoolq_names::parse_leased(&src_name)
+            .map_err(|_| Error::QueueCorrupt("source filename is not a valid leased name".into()))?;
+
+        // B-04: Verify filename fields match the handle
+        if parsed.common.job_id != lease.job_id {
+            return Err(Error::QueueCorrupt("source job_id mismatch".into()));
+        }
+        if parsed.common.generation != lease.generation {
+            return Err(Error::QueueCorrupt("source generation mismatch".into()));
+        }
+        if parsed.common.attempt != lease.attempt {
+            return Err(Error::QueueCorrupt("source attempt mismatch".into()));
+        }
+        if parsed.common.maximum_attempts != lease.maximum_attempts {
+            return Err(Error::QueueCorrupt("source max_attempts mismatch".into()));
+        }
+        if parsed.token != lease.token {
+            return Err(Error::QueueCorrupt("source token mismatch".into()));
+        }
+
+        // B-04: Read and verify the fixed header
+        let file_fd = fs::openat(src_dir_fd.as_raw_fd(), &src_name, libc::O_RDONLY, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let mut header_buf = [0u8; 128];
+        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let header = FixedHeader::decode(&header_buf)
+            .map_err(|e| Error::QueueCorrupt(format!("header decode: {e}")))?;
+
+        if header.job_id != lease.job_id {
+            return Err(Error::QueueCorrupt("header job_id does not match handle".into()));
+        }
+
+        // B-04: Verify envelope digest
+        let ext_len = header.extension_header_length as usize;
+        if ext_len > 0 && ext_len <= 65536 {
+            let mut ext_buf = vec![0u8; ext_len];
+            if fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128).is_ok() {
+                if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+                    return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
+                }
+            }
+        }
+
+        // B-04: Verify queue-derived shard matches
+        let computed_shard = compute_shard(
+            &self.format.queue_id,
+            &lease.job_id,
+            self.format.shard_count,
+        );
+        let shard_from_path = parts.iter()
+            .rev()
+            .find(|p| p.starts_with("000") || p.len() == 4)
+            .and_then(|s| spoolq_names::shard_from_hex(s));
+        if let Some(shard) = shard_from_path {
+            if shard != computed_shard {
+                return Err(Error::QueueCorrupt("source shard does not match queue derivation".into()));
+            }
+        }
+
+        Ok(Some((src_dir_fd, src_name)))
     }
 
     /// Internal: move a leased object to a new state directory.
@@ -1365,30 +1858,31 @@ impl Queue {
             Err(e) => return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
 
-        // Parse source path
-        let src_parts: Vec<&str> = lease.exact_source_path.split('/').collect();
-        let src_name = match src_parts.last() {
-            Some(n) => *n,
-            None => {
-                return TransitionOutcome::NotCommitted(Error::InvalidInput(
-                    "bad source path".into(),
-                ))
+        // B-04: Validate the current lease source before transitioning
+        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return TransitionOutcome::LeaseLost,
+            Err(Error::QueueCorrupt(e)) => {
+                self.poison();
+                return TransitionOutcome::NotCommitted(Error::QueueCorrupt(e));
             }
-        };
-        let src_dir = src_parts[..src_parts.len() - 1].join("/");
-        let src_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &src_dir) {
-            Ok(fd) => fd,
-            Err(_) => return TransitionOutcome::LeaseLost,
+            Err(e) => return TransitionOutcome::NotCommitted(e),
         };
 
         match fs::renameat2_noreplace(
             src_dir_fd.as_raw_fd(),
-            src_name,
+            &src_name,
             dest_dir_fd.as_raw_fd(),
             dest_name,
         ) {
             Ok(()) => {
-                let src_same = src_dir == dest_dir;
+                // Check if source and destination are the same directory
+                let src_stat = fs::fstat(src_dir_fd.as_raw_fd()).ok();
+                let dest_stat = fs::fstat(dest_dir_fd.as_raw_fd()).ok();
+                let src_same = match (src_stat, dest_stat) {
+                    (Some(s), Some(d)) => s.st_dev == d.st_dev && s.st_ino == d.st_ino,
+                    _ => false,
+                };
                 if src_same {
                     if fs::fsync_dir_fd(dest_dir_fd.as_raw_fd()).is_err() {
                         self.poison();
@@ -1443,7 +1937,7 @@ impl Queue {
             source_attempt: lease.attempt,
             source_relative_path: lease.exact_source_path.clone(),
             attempted_destination_state: dest_dir.split('/').next().unwrap_or("").into(),
-            attempted_destination_relative_path: format!("{}/{}", dest_dir, dest_name),
+            attempted_destination_relative_path: format!("{dest_dir}/{dest_name}"),
             lease_token: Some(lease.token),
             envelope_digest: lease.envelope_digest,
         }
@@ -1458,12 +1952,14 @@ impl Queue {
         reason: DeadReason,
     ) -> Result<(), io::Error> {
         let shard_str = ready_dir.rsplit('/').next().unwrap_or("0000");
-        let wall_now = fs::clock_realtime_ns().unwrap_or(0);
+        let wall_now = self.effective_wall_floor_ns();
         let terminal_bucket =
-            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns);
+            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(terminal_bucket);
 
-        let new_gen = common.generation.wrapping_add(1);
+        let new_gen = common.generation.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "generation overflow")
+        })?;
         let dead_common = CommonFields {
             job_id: common.job_id,
             generation: new_gen,
@@ -1487,7 +1983,7 @@ impl Queue {
         );
         let tag = compute_name_tag(&self.format.queue_id, &ctx);
         let dead_name = spoolq_names::dead_filename(&dead_common, reason as u16, &tag);
-        let dead_dir = format!("dead/{}/{}", bucket_str, shard_str);
+        let dead_dir = format!("dead/{bucket_str}/{shard_str}");
 
         let _ = self.ensure_dir(&dead_dir);
         let dead_dir_fd = open_relative(self.root_fd.as_raw_fd(), &dead_dir)?;
@@ -1503,36 +1999,52 @@ impl Queue {
         fs::fsync_dir_fd(ready_dir_fd.as_raw_fd())?;
         Ok(())
     }
-    /// Read and verify the payload of a leased job.
-    /// Returns Ok(()) if the digest matches, Err with PayloadCorrupt otherwise.
-    pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<(), Error> {
-        let parts: Vec<&str> = lease.exact_source_path.split('/').collect();
-        if parts.is_empty() {
-            return Err(Error::InvalidInput("bad source path".into()));
-        }
-        let src_name = parts.last().unwrap();
-        let src_dir = parts[..parts.len() - 1].join("/");
+    /// B-09: Read and verify the payload of a leased job.
+    /// First validates source identity (B-04), then verifies envelope digest,
+    /// then hashes the payload and compares to the header digest.
+    /// Returns a LeaseInfo with payload_verified=true on success.
+    /// Returns Err with PayloadCorrupt if the digest does not match.
+    pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<LeaseInfo, Error> {
+        // B-09: Validate source identity before hashing
+        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
+            Some(pair) => pair,
+            None => return Err(Error::QueueCorrupt("lease source not found".into())),
+        };
 
-        let src_dir_fd = open_relative(self.root_fd.as_raw_fd(), &src_dir)
+        let file_fd = fs::openat(src_dir_fd.as_raw_fd(), &src_name, libc::O_RDONLY, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
 
-        let file_fd = fs::openat(src_dir_fd.as_raw_fd(), src_name, 0o0, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-
-        // Skip header (128 bytes) and extension
-        let header_size = 128usize;
-
-        // Read the fixed header to get extension_header_length
+        // Read the fixed header
         let mut header_buf = [0u8; 128];
-        let n = fs::pread(file_fd.as_raw_fd(), &mut header_buf, 0)
+        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
-        if n != 128 {
-            return Err(Error::QueueCorrupt("could not read header".into()));
-        }
 
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
-        let data_offset = header_size + header.extension_header_length as usize;
+
+        // B-09: Read and verify extension, then envelope digest
+        let ext_len = header.extension_header_length as usize;
+        let data_offset = 128usize + ext_len;
+
+        if ext_len > 0 && ext_len <= 65536 {
+            let mut ext_buf = vec![0u8; ext_len];
+            fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
+                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
+            }
+        }
+
+        // B-09: Verify exact file size (no trailing data)
+        let file_stat = fs::fstat(file_fd.as_raw_fd())
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
+        if file_stat.st_size as u64 != expected_size {
+            return Err(Error::QueueCorrupt(format!(
+                "file size mismatch: expected {}, got {}",
+                expected_size, file_stat.st_size
+            )));
+        }
 
         // Read and hash the payload
         let mut hasher = sha2::Sha256::new();
@@ -1557,7 +2069,10 @@ impl Queue {
             return Err(Error::PayloadCorrupt);
         }
 
-        Ok(())
+        Ok(LeaseInfo {
+            payload_verified: true,
+            ..lease.clone()
+        })
     }
     /// Diagnostic lookup: find all states for a job_id.
     /// Scans active and terminal states for the computed shard.
@@ -1567,7 +2082,7 @@ impl Queue {
         let shard_str = shard_hex(shard);
 
         // Check ready
-        let ready_dir = format!("ready/{}", shard_str);
+        let ready_dir = format!("ready/{shard_str}");
         if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
             if let Ok(entries) = fs::read_dir_entries_owned(dir_fd.as_raw_fd()) {
                 for entry in entries {
@@ -1580,7 +2095,7 @@ impl Queue {
                                 attempt: parsed.common.attempt,
                                 maximum_attempts: parsed.common.maximum_attempts,
                                 shard,
-                                relative_path: format!("{}/{}", ready_dir, entry),
+                                relative_path: format!("{ready_dir}/{entry}"),
                                 size: 0,
                             });
                         }
@@ -1593,12 +2108,12 @@ impl Queue {
         if let Ok(leased_root) = fs::open_directory(self.root_fd.as_raw_fd(), "leased") {
             if let Ok(boot_dirs) = fs::read_dir_entries_owned(leased_root.as_raw_fd()) {
                 for boot_dir in boot_dirs {
-                    let boot_path = format!("leased/{}", boot_dir);
+                    let boot_path = format!("leased/{boot_dir}");
                     if let Ok(boot_fd) = open_relative(self.root_fd.as_raw_fd(), &boot_path) {
                         if let Ok(bucket_dirs) = fs::read_dir_entries_owned(boot_fd.as_raw_fd()) {
                             for bucket_dir in bucket_dirs {
                                 let shard_path =
-                                    format!("{}/{}/{}", boot_path, bucket_dir, shard_str);
+                                    format!("{boot_path}/{bucket_dir}/{shard_str}");
                                 if let Ok(shard_fd) =
                                     open_relative(self.root_fd.as_raw_fd(), &shard_path)
                                 {
@@ -1618,8 +2133,7 @@ impl Queue {
                                                             .maximum_attempts,
                                                         shard,
                                                         relative_path: format!(
-                                                            "{}/{}",
-                                                            shard_path, entry
+                                                            "{shard_path}/{entry}"
                                                         ),
                                                         size: 0,
                                                     });
@@ -1639,7 +2153,7 @@ impl Queue {
         if let Ok(delayed_root) = fs::open_directory(self.root_fd.as_raw_fd(), "delayed") {
             if let Ok(bucket_dirs) = fs::read_dir_entries_owned(delayed_root.as_raw_fd()) {
                 for bucket_dir in bucket_dirs {
-                    let shard_path = format!("delayed/{}/{}", bucket_dir, shard_str);
+                    let shard_path = format!("delayed/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                             for entry in entries {
@@ -1652,7 +2166,7 @@ impl Queue {
                                             attempt: parsed.common.attempt,
                                             maximum_attempts: parsed.common.maximum_attempts,
                                             shard,
-                                            relative_path: format!("{}/{}", shard_path, entry),
+                                            relative_path: format!("{shard_path}/{entry}"),
                                             size: 0,
                                         });
                                     }
@@ -1668,7 +2182,7 @@ impl Queue {
         if let Ok(dead_root) = fs::open_directory(self.root_fd.as_raw_fd(), "dead") {
             if let Ok(bucket_dirs) = fs::read_dir_entries_owned(dead_root.as_raw_fd()) {
                 for bucket_dir in bucket_dirs {
-                    let shard_path = format!("dead/{}/{}", bucket_dir, shard_str);
+                    let shard_path = format!("dead/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                             for entry in entries {
@@ -1681,7 +2195,7 @@ impl Queue {
                                             attempt: parsed.common.attempt,
                                             maximum_attempts: parsed.common.maximum_attempts,
                                             shard,
-                                            relative_path: format!("{}/{}", shard_path, entry),
+                                            relative_path: format!("{shard_path}/{entry}"),
                                             size: 0,
                                         });
                                     }
@@ -1697,7 +2211,7 @@ impl Queue {
         if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
             if let Ok(bucket_dirs) = fs::read_dir_entries_owned(receipts_root.as_raw_fd()) {
                 for bucket_dir in bucket_dirs {
-                    let shard_path = format!("receipts/{}/{}", bucket_dir, shard_str);
+                    let shard_path = format!("receipts/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                             for entry in entries {
@@ -1710,7 +2224,7 @@ impl Queue {
                                             attempt: parsed.common.attempt,
                                             maximum_attempts: parsed.common.maximum_attempts,
                                             shard,
-                                            relative_path: format!("{}/{}", shard_path, entry),
+                                            relative_path: format!("{shard_path}/{entry}"),
                                             size: 0,
                                         });
                                     }
@@ -1739,7 +2253,7 @@ impl Queue {
         if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
             if let Ok(bucket_dirs) = fs::read_dir_entries_owned(receipts_root.as_raw_fd()) {
                 for bucket_dir in bucket_dirs {
-                    let shard_path = format!("receipts/{}/{}", bucket_dir, shard_str);
+                    let shard_path = format!("receipts/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                             for entry in entries {
@@ -1747,7 +2261,7 @@ impl Queue {
                                     if parsed.common.job_id == lease.job_id
                                         && parsed.token == lease.token
                                         && parsed.common.generation
-                                            == lease.generation.wrapping_add(1)
+                                            == lease.generation.saturating_add(1)
                                     {
                                         return AckOutcome::AlreadyAcked;
                                     }
@@ -1761,6 +2275,53 @@ impl Queue {
 
         AckOutcome::LeaseLost
     }
+    /// C-23: Bounded duplicate-ack check.
+    /// Constructs at most the finite set of exact retained receipt paths
+    /// and checks them via fstatat, not by listing receipt contents.
+    fn check_duplicate_ack_bounded(&self, lease: &LeaseInfo) -> bool {
+        let wall_now = self.effective_wall_floor_ns();
+        let retention = self.options.receipt_retention_ns;
+        let width = self.format.terminal_bucket_width_ns;
+        let now_bucket = spoolq_math::bucket_number(wall_now, width).unwrap_or(0);
+        let retention_buckets = spoolq_math::ceiling_bucket(retention, width).unwrap_or(0);
+        let min_bucket = now_bucket.saturating_sub(retention_buckets + 2);
+        let shard = compute_shard(&self.format.queue_id, &lease.job_id, self.format.shard_count);
+        let shard_str = shard_hex(shard);
+        let new_generation = lease.generation.checked_add(1).unwrap_or(u64::MAX);
+        let receipt_common = CommonFields {
+            job_id: lease.job_id,
+            generation: new_generation,
+            attempt: lease.attempt,
+            maximum_attempts: lease.maximum_attempts,
+        };
+        for bucket_num in min_bucket..=now_bucket {
+            let bucket_str = bucket_hex(bucket_num);
+            let receipt_base = format!(
+                "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
+                spoolq_names::hex_encode(&receipt_common.job_id),
+                receipt_common.generation,
+                receipt_common.attempt,
+                receipt_common.maximum_attempts,
+                spoolq_names::hex_encode(&lease.token),
+            );
+            let receipt_ctx = spoolq_names::terminal_context(
+                spoolq_names::State::Receipt,
+                &bucket_str,
+                &shard_str,
+                &receipt_base,
+            );
+            let receipt_tag = compute_name_tag(&self.format.queue_id, &receipt_ctx);
+            let receipt_name = spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
+            let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
+            if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &receipt_dir) {
+                if fs::fstatat(dir_fd.as_raw_fd(), &receipt_name).is_ok() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Resolve an indeterminate operation by probing exact paths.
     pub fn resolve(&self, ticket: &TransitionTicket, stabilize: bool) -> ResolutionOutcome {
         let dest_exists = self.path_exists(&ticket.attempted_destination_relative_path);
@@ -1860,7 +2421,7 @@ pub(crate) fn open_relative(root_fd: RawFd, relative: &str) -> io::Result<OwnedF
         Some(fd) => Ok(fd),
         None => {
             // Re-open root
-            let root_path = format!("/proc/self/fd/{}", root_fd);
+            let root_path = format!("/proc/self/fd/{root_fd}");
             fs::open_dir_absolute(std::path::Path::new(&root_path))
         }
     }
@@ -1897,11 +2458,15 @@ impl PublishError {
         }
     }
 
+    /// Classify a file fsync failure that occurs BEFORE the linearizing
+    /// link/rename. Per spec section 7.8, this is NotCommitted.
+    fn classify_pre_pub_fsync(e: io::Error) -> Self {
+        PublishError::NotCommitted(Error::IoFailure(e.to_string()))
+    }
+
+    /// Classify a directory fsync failure that occurs AFTER the linearizing
+    /// link/rename. Per spec section 7.8, this is OutcomeUnknown.
     fn classify_post_fsync(e: io::Error) -> Self {
-        // After fsync failure, outcome is unknown if the linearization may have occurred.
-        // For file fsync before publication, it's NotCommitted.
-        // For directory fsync after publication, it's OutcomeUnknown.
-        // This is simplified; callers determine context.
         PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
     }
 }
@@ -1962,7 +2527,7 @@ mod tests {
                 assert!(!ticket.expected_relative_path.is_empty());
                 assert!(ticket.expected_relative_path.starts_with("ready/"));
             }
-            _ => panic!("expected committed, got {:?}", outcome),
+            _ => panic!("expected committed, got {outcome:?}"),
         }
     }
 
@@ -1982,7 +2547,7 @@ mod tests {
             EnqueueOutcome::Committed(ticket) => {
                 assert!(ticket.expected_relative_path.starts_with("delayed/"));
             }
-            _ => panic!("expected committed, got {:?}", outcome),
+            _ => panic!("expected committed, got {outcome:?}"),
         }
     }
 
@@ -2026,20 +2591,21 @@ mod tests {
         };
         let ticket = match queue.enqueue(input) {
             EnqueueOutcome::Committed(t) => t,
-            other => panic!("enqueue failed: {:?}", other),
+            other => panic!("enqueue failed: {other:?}"),
         };
 
         // Lease
         let lease = match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(l) => l,
-            other => panic!("lease failed: {:?}", other),
+            other => panic!("lease failed: {other:?}"),
         };
         assert_eq!(lease.job_id, ticket.job_id);
         assert_eq!(lease.attempt, 1);
         assert_eq!(lease.generation, 1);
 
-        // Ack
-        let ack_result = queue.ack(&lease);
+        // Verify and ack
+        let verified = queue.verify_lease_payload(&lease).unwrap();
+        let ack_result = queue.ack(&verified);
         assert!(matches!(ack_result, AckOutcome::Acked));
     }
 
@@ -2063,7 +2629,7 @@ mod tests {
 
         let lease = match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(l) => l,
-            other => panic!("lease failed: {:?}", other),
+            other => panic!("lease failed: {other:?}"),
         };
 
         // Retry now -> back to ready
@@ -2073,7 +2639,7 @@ mod tests {
         // Should be able to lease again
         let lease2 = match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(l) => l,
-            other => panic!("second lease failed: {:?}", other),
+            other => panic!("second lease failed: {other:?}"),
         };
         assert_eq!(lease2.attempt, 2);
     }
@@ -2091,7 +2657,7 @@ mod tests {
 
         let lease = match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(l) => l,
-            other => panic!("lease failed: {:?}", other),
+            other => panic!("lease failed: {other:?}"),
         };
 
         let result = queue.bury(&lease, DeadReason::ConsumerRejected);
@@ -2115,7 +2681,7 @@ mod tests {
 
         let lease = match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(l) => l,
-            other => panic!("lease failed: {:?}", other),
+            other => panic!("lease failed: {other:?}"),
         };
         assert_eq!(lease.maximum_attempts, 1);
         assert_eq!(lease.attempt, 1);
@@ -2142,12 +2708,12 @@ mod tests {
 
         let lease = match queue.lease(0, 10_000_000_000) {
             LeaseOutcome::Leased(l) => l,
-            other => panic!("lease failed: {:?}", other),
+            other => panic!("lease failed: {other:?}"),
         };
 
         let renewed = match queue.renew(&lease, 60_000_000_000) {
             RenewOutcome::Renewed(l) => l,
-            other => panic!("renew failed: {:?}", other),
+            other => panic!("renew failed: {other:?}"),
         };
         assert!(renewed.expires_boottime_ns > lease.expires_boottime_ns);
         assert_eq!(renewed.attempt, lease.attempt);
@@ -2167,14 +2733,15 @@ mod tests {
 
         let lease = match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(l) => l,
-            other => panic!("lease failed: {:?}", other),
+            other => panic!("lease failed: {other:?}"),
         };
 
-        // Ack once
-        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+        // Verify and ack once
+        let verified = queue.verify_lease_payload(&lease).unwrap();
+        assert!(matches!(queue.ack(&verified), AckOutcome::Acked));
 
         // Ack again with the same lease should return LeaseLost (source gone)
-        let result = queue.ack(&lease);
+        let result = queue.ack(&verified);
         assert!(matches!(result, AckOutcome::LeaseLost));
     }
 
@@ -2286,8 +2853,9 @@ mod tests {
             _ => panic!("lease failed"),
         };
 
-        // First ack succeeds
-        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+        // Verify and ack
+        let verified = queue.verify_lease_payload(&lease).unwrap();
+        assert!(matches!(queue.ack(&verified), AckOutcome::Acked));
 
         // Source is gone, so check_duplicate_ack should find the receipt
         let result = queue.check_duplicate_ack(&lease);
@@ -2369,7 +2937,7 @@ mod tests {
                     match queue.lease(0, 30_000_000_000) {
                         LeaseOutcome::Leased(lease) => {
                             lc.fetch_add(1, Ordering::SeqCst);
-                            if queue.ack(&lease) == AckOutcome::Acked {
+                            if queue.ack_unverified(&lease) == AckOutcome::Acked {
                                 ac.fetch_add(1, Ordering::SeqCst);
                             }
                         }
@@ -2751,5 +3319,333 @@ mod tests {
         };
         // Verification should succeed for uncorrupted payload
         assert!(queue.verify_lease_payload(&lease).is_ok());
+    }
+
+    // ===== B-01: Init refuses to overwrite existing queue =====
+    #[test]
+    fn init_refuses_existing_queue() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        // Second init must fail
+        let result = Queue::init(tmp.path(), &CreateOptions::default());
+        assert!(result.is_err(), "init must refuse to overwrite existing queue");
+    }
+
+    // ===== C-01: All options validated before mutation =====
+    #[test]
+    fn init_validates_zero_lease_width() {
+        let tmp = TempDir::new().unwrap();
+        let opts = CreateOptions {
+            lease_bucket_width_ns: 0,
+            ..Default::default()
+        };
+        assert!(Queue::init(tmp.path(), &opts).is_err());
+        // Root should not have been modified
+        assert!(!tmp.path().join("FORMAT").exists());
+    }
+
+    #[test]
+    fn init_validates_zero_delayed_width() {
+        let tmp = TempDir::new().unwrap();
+        let opts = CreateOptions {
+            delayed_bucket_width_ns: 0,
+            ..Default::default()
+        };
+        assert!(Queue::init(tmp.path(), &opts).is_err());
+    }
+
+    // ===== C-11: Payload size checked before hashing =====
+    #[test]
+    fn enqueue_rejects_oversize_payload() {
+        let tmp = TempDir::new().unwrap();
+        let opts = CreateOptions {
+            max_payload_length: 1024,
+            ..Default::default()
+        };
+        Queue::init(tmp.path(), &opts).unwrap();
+        let mut queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let huge = vec![0u8; 2048]; // exceeds max_payload_length of 1024
+        let result = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: huge,
+            ..Default::default()
+        });
+        assert!(matches!(result, EnqueueOutcome::NotCommitted(_, _)));
+    }
+
+    // ===== C-15: Scan round advances =====
+    #[test]
+    fn scan_round_advances() {
+        let (_tmp, mut queue) = create_test_queue();
+        assert_eq!(queue.scan_round, 0);
+        let _ = queue.lease(0, 30_000_000_000);
+        assert_eq!(queue.scan_round, 1);
+        let _ = queue.lease(0, 30_000_000_000);
+        assert_eq!(queue.scan_round, 2);
+    }
+
+    // ===== B-09: ack requires verified lease =====
+    #[test]
+    fn ack_rejects_unverified_lease() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // ack should reject unverified lease
+        let result = queue.ack(&lease);
+        assert!(matches!(result, AckOutcome::NotCommitted(_)));
+    }
+
+    // ===== B-09: ack accepts verified lease =====
+    #[test]
+    fn ack_accepts_verified_lease() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        let verified = queue.verify_lease_payload(&lease).unwrap();
+        assert!(verified.payload_verified);
+        let result = queue.ack(&verified);
+        assert!(matches!(result, AckOutcome::Acked));
+    }
+
+    // ===== B-09: verify_lease_payload detects corruption =====
+    #[test]
+    fn verify_lease_payload_detects_corruption() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"hello world".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Corrupt the actual payload bytes (after header + extension)
+        let src_path = _tmp.path().join(&lease.exact_source_path);
+        let mut data = std::fs::read(&src_path).unwrap();
+        // Header is 128 bytes, extension follows. Find the payload offset.
+        // For content_type "x" the extension is ~4 bytes, so payload starts at ~132.
+        // Corrupt the last byte (guaranteed to be in payload).
+        let last = data.len() - 1;
+        data[last] ^= 0xFF;
+        std::fs::write(&src_path, data).unwrap();
+        let result = queue.verify_lease_payload(&lease);
+        assert!(
+            matches!(result, Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))),
+            "corrupted payload should be detected, got: {:?}", result
+        );
+    }
+
+    // ===== B-05: Wall watermark advances after enqueue =====
+    #[test]
+    fn wall_watermark_advances() {
+        let (_tmp, mut queue) = create_test_queue();
+        let wm_before = queue.read_wall_watermark();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let wm_after = queue.read_wall_watermark();
+        // After enqueue, the watermark should have advanced or stayed the same
+        if let (Some(before), Some(after)) = (wm_before, wm_after) {
+            assert!(after.highest_observed_bucket >= before.highest_observed_bucket);
+            assert!(after.sequence > before.sequence);
+        }
+    }
+
+    // ===== B-04: Lease source validation rejects corrupted handle =====
+    #[test]
+    fn source_validation_rejects_wrong_generation() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let mut lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Corrupt the generation in the handle
+        lease.generation = 999;
+        let result = queue.retry_now(&lease);
+        // Should not get LeaseLost (that's for missing source), should get corruption or not committed
+        assert!(!matches!(result, TransitionOutcome::Committed));
+    }
+
+    // ===== C-19: Scan distinguishes empty from error =====
+    #[test]
+    fn empty_queue_returns_empty_not_error() {
+        let (_tmp, mut queue) = create_test_queue();
+        let result = queue.lease(0, 30_000_000_000);
+        assert!(matches!(result, LeaseOutcome::Empty));
+    }
+
+    // ===== B-12: Unexpected ack errors are not LeaseLost =====
+    #[test]
+    fn ack_preserves_error_categories() {
+        let (_tmp, mut queue) = create_test_queue();
+        // Use a nonexistent source path - should get LeaseLost
+        let fake_lease = LeaseInfo {
+            job_id: [0x42; 16],
+            envelope_digest: [0; 32],
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+            token: [0xFF; 16],
+            boot_id: queue.boot_id.clone(),
+            expires_boottime_ns: u64::MAX,
+            expires_wall_ns: u64::MAX,
+            content_type: String::new(),
+            payload_length: 0,
+            payload_digest: [0; 32],
+            expected_dev: 0,
+            expected_inode: 0,
+            exact_source_path: "leased/fake/0000000000000000/0000/fake.sqj".to_string(),
+            payload_verified: true,
+        };
+        let result = queue.ack(&fake_lease);
+        assert!(matches!(result, AckOutcome::LeaseLost));
+    }
+
+    // ===== B-03: Post-claim validation does not return Empty =====
+    #[test]
+    fn post_claim_returns_lease_on_success() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "application/json".to_string(),
+            payload: b"{\"key\": \"value\"}".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease should succeed"),
+        };
+        // C-21: Content type should be populated
+        assert_eq!(lease.content_type, "application/json");
+        // Verify the source path exists
+        assert!(_tmp.path().join(&lease.exact_source_path).exists());
+    }
+
+    // ===== Init durability: FORMAT is read-only =====
+    #[test]
+    fn format_file_is_readonly() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let meta = std::fs::metadata(tmp.path().join("FORMAT")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            assert_eq!(mode & 0o777, 0o400, "FORMAT should be mode 0400, got {:o}", mode);
+        }
+    }
+
+    // T-03: Real concurrent producers AND consumers
+    #[test]
+    fn concurrent_producers_consumers_overlap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let total = Arc::new(AtomicU64::new(0));
+        let consumed = Arc::new(AtomicU64::new(0));
+        let duration = std::time::Duration::from_secs(2);
+
+        let p_path = path.clone();
+        let p_total = total.clone();
+        let producer = thread::spawn(move || {
+            let mut queue = Queue::open(
+                &p_path,
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < deadline {
+                if let EnqueueOutcome::Committed(_) = queue.enqueue(EnqueueInput {
+                    maximum_attempts: 1,
+                    content_type: "test".to_string(),
+                    payload: b"concurrent".to_vec(),
+                    ..Default::default()
+                }) {
+                    p_total.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let c_path = path.clone();
+        let c_consumed = consumed.clone();
+        let consumer = thread::spawn(move || {
+            let mut queue = Queue::open(
+                &c_path,
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + duration + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                match queue.lease(0, 60_000_000_000) {
+                    LeaseOutcome::Leased(l) => {
+                        let verified = queue.verify_lease_payload(&l).unwrap();
+                        if queue.ack(&verified) == AckOutcome::Acked {
+                            c_consumed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    LeaseOutcome::Empty => {
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        let enq = total.load(Ordering::Relaxed);
+        let con = consumed.load(Ordering::Relaxed);
+        // Consumer should have consumed at least some jobs while producer was active
+        assert!(enq > 0, "should have enqueued some jobs");
+        assert!(con > 0, "should have consumed some jobs concurrently");
+        // With concurrent producer and consumer, we should consume most
+        // but may not consume all (race conditions at start/end)
     }
 }

@@ -224,8 +224,20 @@ impl ExtensionHeader {
         if !self.metadata.is_empty() {
             encode_header(&mut buf, 0, KEY_METADATA as u64);
             encode_header(&mut buf, 5, self.metadata.len() as u64);
-            // BTreeMap iterates in sorted key order - deterministic
-            for (k, v) in &self.metadata {
+            // C-47: Sort metadata keys by their deterministic CBOR encoded bytes,
+            // not by Rust string ordering. Encode each key to a temporary buffer,
+            // sort by those bytes, then emit.
+            let mut encoded_keys: Vec<(Vec<u8>, &str, &MetadataValue)> = self
+                .metadata
+                .iter()
+                .map(|(k, v)| {
+                    let mut key_buf = Vec::new();
+                    encode_text_string(&mut key_buf, k);
+                    (key_buf, k.as_str(), v)
+                })
+                .collect();
+            encoded_keys.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, k, v) in encoded_keys {
                 encode_text_string(&mut buf, k);
                 match v {
                     MetadataValue::Bool(false) => buf.push(0xf4),
@@ -302,49 +314,53 @@ impl<'a> CborParser<'a> {
         match additional {
             0..=23 => Ok(additional as u64),
             24 => {
-                if self.pos + 1 > self.data.len() {
+                self.pos = self.pos.checked_add(1).ok_or(CborError::IntOverflow)?;
+                if self.pos > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let v = u16::from_be_bytes([0, self.data[self.pos]]) as u64;
+                let v = self.data[self.pos - 1] as u64;
                 if v < 24 {
                     return Err(CborError::IntOverflow); // non-canonical
                 }
-                self.pos += 1;
                 Ok(v)
             }
             25 => {
-                if self.pos + 2 > self.data.len() {
+                self.pos = self.pos.checked_add(2).ok_or(CborError::IntOverflow)?;
+                if self.pos > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let v = u16::from_be_bytes(self.data[self.pos..self.pos + 2].try_into().unwrap())
-                    as u64;
+                let v = u16::from_be_bytes(
+                    self.data[self.pos - 2..self.pos].try_into().unwrap(),
+                ) as u64;
                 if v < 256 {
                     return Err(CborError::IntOverflow); // non-canonical
                 }
-                self.pos += 2;
                 Ok(v)
             }
             26 => {
-                if self.pos + 4 > self.data.len() {
+                self.pos = self.pos.checked_add(4).ok_or(CborError::IntOverflow)?;
+                if self.pos > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let v = u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap())
-                    as u64;
+                let v = u32::from_be_bytes(
+                    self.data[self.pos - 4..self.pos].try_into().unwrap(),
+                ) as u64;
                 if v < 65536 {
                     return Err(CborError::IntOverflow); // non-canonical
                 }
-                self.pos += 4;
                 Ok(v)
             }
             27 => {
-                if self.pos + 8 > self.data.len() {
+                self.pos = self.pos.checked_add(8).ok_or(CborError::IntOverflow)?;
+                if self.pos > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let v = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+                let v = u64::from_be_bytes(
+                    self.data[self.pos - 8..self.pos].try_into().unwrap(),
+                );
                 if v < 4_294_967_296 {
                     return Err(CborError::IntOverflow); // non-canonical
                 }
-                self.pos += 8;
                 Ok(v)
             }
             28..=30 => Err(CborError::InvalidMajorType(additional)),
@@ -380,23 +396,25 @@ impl<'a> CborParser<'a> {
             2 => {
                 // byte string
                 let len = self.read_uint(additional)? as usize;
-                if self.pos + len > self.data.len() {
+                let end = self.pos.checked_add(len).ok_or(CborError::IntOverflow)?;
+                if end > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let b = self.data[self.pos..self.pos + len].to_vec();
-                self.pos += len;
+                let b = self.data[self.pos..end].to_vec();
+                self.pos = end;
                 Ok(CborItem::Bytes(b))
             }
             3 => {
                 // text string
                 let len = self.read_uint(additional)? as usize;
-                if self.pos + len > self.data.len() {
+                let end = self.pos.checked_add(len).ok_or(CborError::IntOverflow)?;
+                if end > self.data.len() {
                     return Err(CborError::Truncated);
                 }
-                let s = std::str::from_utf8(&self.data[self.pos..self.pos + len])
+                let s = std::str::from_utf8(&self.data[self.pos..end])
                     .map_err(|_| CborError::InvalidUtf8)?;
                 let s = s.to_string();
-                self.pos += len;
+                self.pos = end;
                 Ok(CborItem::Text(s))
             }
             4 => {
@@ -407,7 +425,18 @@ impl<'a> CborParser<'a> {
                 // map
                 self.depth += 1;
                 let len = self.read_uint(additional)? as usize;
-                let mut items = Vec::with_capacity(len);
+                // Bound the declared length against remaining input:
+                // each entry needs at least 1 byte (key) + 1 byte (val)
+                let remaining = self.data.len() - self.pos;
+                let max_possible = remaining / 2;
+                if len > max_possible {
+                    return Err(CborError::Truncated);
+                }
+                // Also bound against protocol limit
+                if len > MAX_METADATA_ENTRIES * 8 {
+                    return Err(CborError::TooManyEntries);
+                }
+                let mut items = Vec::with_capacity(len.min(256));
                 for _ in 0..len {
                     let key = self.read_item()?;
                     let val = self.read_item()?;
@@ -443,6 +472,7 @@ impl<'a> CborParser<'a> {
 
         let mut ext = ExtensionHeader::default();
         let mut seen_keys = std::collections::HashSet::new();
+        let mut prev_key: Option<u64> = None;
 
         for (key_item, val_item) in map_items {
             let key = match key_item {
@@ -452,6 +482,13 @@ impl<'a> CborParser<'a> {
             if !seen_keys.insert(key) {
                 return Err(CborError::DuplicateKey(key));
             }
+            // C-46: Enforce canonical ascending key order
+            if let Some(pk) = prev_key {
+                if key < pk {
+                    return Err(CborError::DuplicateKey(key));
+                }
+            }
+            prev_key = Some(key);
 
             match key {
                 1 => {
@@ -466,6 +503,7 @@ impl<'a> CborParser<'a> {
                         CborItem::Text(s) => s,
                         _ => return Err(CborError::InvalidMajorType(0)),
                     };
+                    validate_content_type(&ct)?;
                     ext.content_type = ct;
                 }
                 3 => {
@@ -773,8 +811,49 @@ mod tests {
             ..Default::default()
         };
         let encoded = ext.encode().unwrap();
-        // BTreeMap sorts keys: "active" < "done"
-        let expected = hex_to_bytes("a202617803a266616374697665f564646f6e65f4");
-        assert_eq!(encoded, expected, "boolean metadata mismatch");
+        // C-47: deterministic CBOR sorts by encoded key bytes.
+        // "done" (text(4) = 0x64...) sorts before "active" (text(6) = 0x66...)
+        let expected = hex_to_bytes("a202617803a264646f6e65f466616374697665f5");
+        assert_eq!(encoded, expected, "boolean metadata mismatch (C-47 ordering)");
+    }
+
+    #[test]
+    fn cbor_rejects_non_canonical_top_level_key_order() {
+        // C-46: keys must be in ascending order
+        let raw = vec![0xA2, 0x02, 0x61, 0x78, 0x01, 0x18, 0x2A];
+        assert!(ExtensionHeader::decode(&raw).is_err());
+    }
+
+    #[test]
+    fn cbor_metadata_key_order_is_deterministic() {
+        // C-47: keys of different lengths sort by encoded bytes
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("abc".to_string(), MetadataValue::U64(1));
+        metadata.insert("ab".to_string(), MetadataValue::U64(2));
+        metadata.insert("abcd".to_string(), MetadataValue::U64(3));
+        let ext = ExtensionHeader {
+            content_type: "x".to_string(),
+            metadata,
+            ..Default::default()
+        };
+        let encoded = ext.encode().unwrap();
+        let decoded = ExtensionHeader::decode(&encoded).unwrap();
+        assert_eq!(decoded.metadata.get("abc"), Some(&MetadataValue::U64(1)));
+        assert_eq!(decoded.metadata.get("ab"), Some(&MetadataValue::U64(2)));
+        assert_eq!(decoded.metadata.get("abcd"), Some(&MetadataValue::U64(3)));
+    }
+
+    #[test]
+    fn cbor_rejects_huge_map_length() {
+        // C-48: huge declared length should not cause huge allocation
+        let raw = vec![0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x61, 0x78];
+        assert!(ExtensionHeader::decode(&raw).is_err());
+    }
+
+    #[test]
+    fn cbor_rejects_decoded_bad_content_type() {
+        // C-49: decoded content type must pass validation
+        let raw = vec![0xA1, 0x02, 0x41, 0x01];
+        assert!(ExtensionHeader::decode(&raw).is_err());
     }
 }

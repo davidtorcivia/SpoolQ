@@ -203,26 +203,6 @@ impl QuarantineReason {
     }
 }
 
-/// Retry policy for retry_with_policy.
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    pub base_ms: u64,
-    pub cap_ms: u64,
-    pub use_jitter: bool,
-    pub max_delay_ms: Option<u64>,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            base_ms: 1_000,
-            cap_ms: 300_000,
-            use_jitter: true,
-            max_delay_ms: None,
-        }
-    }
-}
-
 /// Resolution outcome from resolve().
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolutionOutcome {
