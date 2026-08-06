@@ -4,6 +4,7 @@ members = [
     "crates/spoolq-format",
     "crates/spoolq-names",
     "crates/spoolq-math",
+    "crates/spoolq-fs-linux",
     "crates/spoolq-core",
     "crates/spoolq-cli",
 ]
