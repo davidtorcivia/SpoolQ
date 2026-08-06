@@ -51,7 +51,7 @@ impl Queue {
     pub fn recover(&mut self, budget: &WorkBudget) -> RecoveryStats {
         let mut stats = RecoveryStats::default();
         let boottime_now = fs::clock_boottime_ns().unwrap_or(0);
-        let wall_now = fs::clock_realtime_ns().unwrap_or(0);
+        let wall_now = self.effective_wall_floor_ns();
 
         // 1. Reap expired leases
         self.reap_expired_leases(boottime_now, wall_now, budget, &mut stats);

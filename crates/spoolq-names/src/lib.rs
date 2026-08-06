@@ -20,12 +20,15 @@ pub fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
 }
 
 pub fn hex_decode_u64(s: &str) -> Option<u64> {
+    if s.len() != 16 {
+        return None;
+    }
     let bytes = hex_decode_bytes(s)?;
-    if bytes.len() > 8 {
+    if bytes.len() != 8 {
         return None;
     }
     let mut buf = [0u8; 8];
-    buf[8 - bytes.len()..].copy_from_slice(&bytes);
+    buf.copy_from_slice(&bytes);
     Some(u64::from_be_bytes(buf))
 }
 
@@ -655,6 +658,17 @@ pub fn verify_ready_tag(queue_id: &[u8; 16], shard: u32, filename: &str) -> bool
     let ctx = ready_context(&sh, &without);
     let expected = compute_name_tag(queue_id, &ctx);
     expected == parsed.tag
+}
+
+pub fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
