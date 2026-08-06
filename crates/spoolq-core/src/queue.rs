@@ -1143,6 +1143,11 @@ impl Queue {
     }
 
     fn retry(&mut self, lease: &LeaseInfo, delayed_ns: Option<u64>) -> TransitionOutcome {
+        // If delayed target is at or before the effective wall floor, it's retry_now.
+        let delayed_ns = match delayed_ns {
+            Some(t) if t <= self.effective_wall_floor_ns() => None,
+            other => other,
+        };
         if let Err(e) = self.check_not_poisoned() {
             return TransitionOutcome::NotCommitted(e);
         }
@@ -2520,5 +2525,87 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(outcome, EnqueueOutcome::Committed(_)));
+    }
+    #[test]
+    fn one_attempt_job_single_lease() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"one shot".to_vec(),
+            ..Default::default()
+        });
+
+        // First lease succeeds
+        let lease = match queue.lease(0, 10_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("first lease should succeed"),
+        };
+        assert_eq!(lease.attempt, 1);
+        assert_eq!(lease.maximum_attempts, 1);
+
+        // Retry should go to dead (attempt >= max)
+        let result = queue.retry_now(&lease);
+        assert!(matches!(result, TransitionOutcome::Committed));
+
+        // No more leases
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Empty
+        ));
+    }
+
+    #[test]
+    fn retry_at_in_past_is_retry_now() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"past".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+
+        // retry_at with a timestamp in the past should behave as retry_now
+        let past_ts = 1;
+        let result = queue.retry_at(&lease, past_ts);
+        assert!(
+            matches!(result, TransitionOutcome::Committed),
+            "retry should commit, got something else"
+        );
+
+        // Job should be in ready (not delayed)
+        let result2 = queue.lease(0, 30_000_000_000);
+        assert!(
+            matches!(result2, LeaseOutcome::Leased(_)),
+            "re-lease should succeed"
+        );
+    }
+
+    #[test]
+    fn delay_preserves_attempt() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 5,
+            content_type: "x".to_string(),
+            payload: b"delay".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        assert_eq!(lease.attempt, 1);
+
+        // Retry with delay
+        let future = spoolq_fs_linux::clock_realtime_ns().unwrap_or(0) + 60_000_000_000;
+        let result = queue.retry_at(&lease, future);
+        assert!(matches!(result, TransitionOutcome::Committed));
+
+        // The job should be in delayed state, not ready
+        assert!(matches!(queue.lease(0, 1_000_000_000), LeaseOutcome::Empty));
     }
 }
