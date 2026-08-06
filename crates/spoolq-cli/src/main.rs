@@ -81,6 +81,16 @@ enum Commands {
         #[arg(long, default_value = "100")]
         budget_ms: u64,
     },
+    /// Inspect a job by ID
+    Inspect { path: PathBuf, job_id: String },
+    /// Verify a job or receipt file
+    Verify {
+        file: PathBuf,
+        #[arg(long)]
+        deep: bool,
+    },
+    /// Dump format info for a file
+    FormatDump { file: PathBuf },
 }
 
 fn parse_duration_seconds(s: u64) -> u64 {
@@ -405,6 +415,151 @@ fn main() -> ExitCode {
                     eprintln!("outcome unknown");
                     ExitCode::from(2)
                 }
+            }
+        }
+
+        Commands::Inspect { path, job_id } => {
+            let job_id_bytes = match spoolq_names::hex_decode_16(&job_id) {
+                Some(b) => b,
+                None => {
+                    eprintln!("invalid job_id: expected 32 lowercase hex chars");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match Queue::open(&path, &OpenOptions::default()) {
+                Ok(queue) => {
+                    let snapshots = queue.inspect(&job_id_bytes);
+                    if snapshots.is_empty() {
+                        eprintln!("not found");
+                        return ExitCode::FAILURE;
+                    }
+                    for s in &snapshots {
+                        println!(
+                            "{} gen={} attempt={}/{} {}",
+                            s.state, s.generation, s.attempt, s.maximum_attempts, s.relative_path
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("open failed: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Commands::Verify { file, deep } => {
+            let data = match std::fs::read(&file) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("read failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if data.len() >= 128 && &data[0..8] == b"SPQJOB1\0" {
+                match spoolq_format::FixedHeader::decode(&data[0..128]) {
+                    Ok(header) => {
+                        eprintln!("job_id: {}", spoolq_names::hex_encode(&header.job_id));
+                        eprintln!("payload_length: {}", header.payload_length);
+                        eprintln!("maximum_attempts: {}", header.maximum_attempts);
+                        let expected_size = 128
+                            + header.extension_header_length as usize
+                            + header.payload_length as usize;
+                        if data.len() != expected_size {
+                            eprintln!(
+                                "CORRUPT: expected {} bytes, got {}",
+                                expected_size,
+                                data.len()
+                            );
+                            return ExitCode::from(3);
+                        }
+                        if deep {
+                            let payload = &data[128 + header.extension_header_length as usize..];
+                            let computed = spoolq_format::payload_digest(payload);
+                            if computed != header.payload_digest {
+                                eprintln!("CORRUPT: payload digest mismatch");
+                                return ExitCode::from(3);
+                            }
+                            eprintln!("payload_digest: verified");
+                        }
+                        eprintln!("valid");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("CORRUPT: {}", e);
+                        ExitCode::from(3)
+                    }
+                }
+            } else if data.len() == 160 && &data[0..8] == b"SPQFMT1\0" {
+                match spoolq_format::FormatRecord::decode(&data) {
+                    Ok(fmt) => {
+                        eprintln!("queue_id: {}", spoolq_names::hex_encode(&fmt.queue_id));
+                        eprintln!("shard_count: {}", fmt.shard_count);
+                        eprintln!("valid");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("CORRUPT: {}", e);
+                        ExitCode::from(3)
+                    }
+                }
+            } else {
+                eprintln!("unknown format");
+                ExitCode::FAILURE
+            }
+        }
+
+        Commands::FormatDump { file } => {
+            let data = match std::fs::read(&file) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("read failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if data.len() >= 128 && &data[0..8] == b"SPQJOB1\0" {
+                match spoolq_format::FixedHeader::decode(&data[0..128]) {
+                    Ok(h) => {
+                        println!("type: job");
+                        println!("job_id: {}", spoolq_names::hex_encode(&h.job_id));
+                        println!("payload_length: {}", h.payload_length);
+                        println!("extension_header_length: {}", h.extension_header_length);
+                        println!("maximum_attempts: {}", h.maximum_attempts);
+                        println!(
+                            "payload_digest: {}",
+                            spoolq_names::hex_encode(&h.payload_digest)
+                        );
+                        println!(
+                            "envelope_digest: {}",
+                            spoolq_names::hex_encode(&h.envelope_digest)
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("parse error: {}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            } else if data.len() == 160 && &data[0..8] == b"SPQFMT1\0" {
+                match spoolq_format::FormatRecord::decode(&data) {
+                    Ok(f) => {
+                        println!("type: format");
+                        println!("queue_id: {}", spoolq_names::hex_encode(&f.queue_id));
+                        println!("shard_count: {}", f.shard_count);
+                        println!("lease_bucket_width_ns: {}", f.lease_bucket_width_ns);
+                        println!("delayed_bucket_width_ns: {}", f.delayed_bucket_width_ns);
+                        println!("terminal_bucket_width_ns: {}", f.terminal_bucket_width_ns);
+                        println!("max_payload_length: {}", f.max_payload_length);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("parse error: {}", e);
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                eprintln!("unrecognized format");
+                ExitCode::FAILURE
             }
         }
 
