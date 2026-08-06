@@ -65,14 +65,14 @@ impl Default for OpenOptions {
 /// Internal queue state.
 #[allow(dead_code)]
 pub struct Queue {
-    root_fd: OwnedFd,
-    root_path: PathBuf,
-    format: FormatRecord,
-    boot_id: String,
-    boot_id_bytes: [u8; 16],
-    poisoned: bool,
-    worker_nonce: [u8; 16],
-    options: OpenOptions,
+    pub(crate) root_fd: OwnedFd,
+    pub(crate) root_path: PathBuf,
+    pub(crate) format: FormatRecord,
+    pub(crate) boot_id: String,
+    pub(crate) boot_id_bytes: [u8; 16],
+    pub(crate) poisoned: bool,
+    pub(crate) worker_nonce: [u8; 16],
+    pub(crate) options: OpenOptions,
 }
 
 impl Queue {
@@ -641,7 +641,7 @@ impl Queue {
     }
 
     /// Create a directory path recursively, syncing parents.
-    fn ensure_dir(&self, relative: &str) -> io::Result<()> {
+    pub(crate) fn ensure_dir(&self, relative: &str) -> io::Result<()> {
         let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
         let mut current_fd = self.root_fd.as_raw_fd();
         let mut owned_fds = Vec::new();
@@ -1419,7 +1419,7 @@ impl Queue {
 }
 
 /// Open a relative path from a directory fd.
-fn open_relative(root_fd: RawFd, relative: &str) -> io::Result<OwnedFd> {
+pub(crate) fn open_relative(root_fd: RawFd, relative: &str) -> io::Result<OwnedFd> {
     let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
     let mut current_fd = root_fd;
     let mut opened = Vec::new();
