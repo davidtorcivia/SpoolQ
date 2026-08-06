@@ -16,3 +16,6 @@ SpoolQ_1_Agent_Ready_Final.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Internal scripts
+merge_pr.sh
