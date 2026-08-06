@@ -2164,4 +2164,163 @@ mod tests {
         let snapshots = queue.inspect(&unknown_id);
         assert!(snapshots.is_empty());
     }
+    #[test]
+    fn concurrent_producers_consumers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        Queue::init(&path, &CreateOptions::default()).unwrap();
+
+        let num_producers = 4;
+        let num_consumers = 4;
+        let jobs_per_producer = 25;
+        let total_jobs = num_producers * jobs_per_producer;
+        let leased_count = Arc::new(AtomicUsize::new(0));
+        let acked_count = Arc::new(AtomicUsize::new(0));
+
+        // Producers
+        let mut producer_handles = Vec::new();
+        for _ in 0..num_producers {
+            let p = path.clone();
+            let handle = thread::spawn(move || {
+                let queue = Queue::open(
+                    &p,
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut queue = queue;
+                for _ in 0..jobs_per_producer {
+                    let payload =
+                        format!("payload-{}", spoolq_fs_linux::random_128bit().unwrap()[0]);
+                    queue.enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "text/plain".to_string(),
+                        payload: payload.into_bytes(),
+                        ..Default::default()
+                    });
+                }
+            });
+            producer_handles.push(handle);
+        }
+        for h in producer_handles {
+            h.join().unwrap();
+        }
+
+        // Consumers
+        let mut consumer_handles = Vec::new();
+        for _ in 0..num_consumers {
+            let p = path.clone();
+            let lc = leased_count.clone();
+            let ac = acked_count.clone();
+            let handle = thread::spawn(move || {
+                let queue = Queue::open(
+                    &p,
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut queue = queue;
+                loop {
+                    match queue.lease(0, 30_000_000_000) {
+                        LeaseOutcome::Leased(lease) => {
+                            lc.fetch_add(1, Ordering::SeqCst);
+                            if queue.ack(&lease) == AckOutcome::Acked {
+                                ac.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        LeaseOutcome::Empty => break,
+                        _ => {}
+                    }
+                }
+            });
+            consumer_handles.push(handle);
+        }
+        for h in consumer_handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            leased_count.load(Ordering::SeqCst),
+            total_jobs,
+            "expected {} leased, got {}",
+            total_jobs,
+            leased_count.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            acked_count.load(Ordering::SeqCst),
+            total_jobs,
+            "expected {} acked, got {}",
+            total_jobs,
+            acked_count.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn concurrent_lease_uniqueness() {
+        // 8 consumers race for 1 job: exactly one should win
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        Queue::init(&path, &CreateOptions::default()).unwrap();
+
+        // Enqueue exactly one job
+        {
+            let mut queue = Queue::open(
+                &path,
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: b"race".to_vec(),
+                ..Default::default()
+            });
+        }
+
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let p = path.clone();
+            let sc = success_count.clone();
+            handles.push(thread::spawn(move || {
+                let queue = Queue::open(
+                    &p,
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut queue = queue;
+                if let LeaseOutcome::Leased(_) = queue.lease(0, 30_000_000_000) {
+                    sc.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            success_count.load(Ordering::SeqCst),
+            1,
+            "exactly one consumer should win the race"
+        );
+    }
 }
