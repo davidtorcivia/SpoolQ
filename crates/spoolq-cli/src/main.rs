@@ -42,11 +42,45 @@ enum Commands {
         path: PathBuf,
         #[arg(long, default_value = "30")]
         duration_seconds: u64,
+        #[arg(long)]
+        handle_file: Option<PathBuf>,
     },
     /// Stats
     Stats { path: PathBuf },
     /// Doctor: check environment
     Doctor { path: PathBuf },
+    /// Acknowledge a lease
+    Ack {
+        path: PathBuf,
+        #[arg(long)]
+        handle_file: PathBuf,
+    },
+    /// Retry a lease
+    Retry {
+        path: PathBuf,
+        #[arg(long)]
+        handle_file: PathBuf,
+        #[arg(long)]
+        after_seconds: Option<u64>,
+    },
+    /// Bury a lease
+    Bury {
+        path: PathBuf,
+        #[arg(long)]
+        handle_file: PathBuf,
+        #[arg(long, default_value = "0")]
+        reason: u16,
+    },
+    /// Run a recovery pass
+    Recover {
+        path: PathBuf,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value = "1000")]
+        budget_ops: u32,
+        #[arg(long, default_value = "100")]
+        budget_ms: u64,
+    },
 }
 
 fn parse_duration_seconds(s: u64) -> u64 {
@@ -142,6 +176,7 @@ fn main() -> ExitCode {
         Commands::Lease {
             path,
             duration_seconds,
+            handle_file,
         } => {
             let queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
@@ -155,11 +190,14 @@ fn main() -> ExitCode {
             let duration_ns = parse_duration_seconds(duration_seconds);
             match queue.lease(0, duration_ns) {
                 LeaseOutcome::Leased(lease) => {
+                    if let Some(ref hf) = handle_file {
+                        if let Err(e) = save_handle_to_file(&path, hf, &lease) {
+                            eprintln!("warning: failed to write handle file: {}", e);
+                        }
+                    }
                     println!("job_id: {}", spoolq_names::hex_encode(&lease.job_id));
                     println!("generation: {}", lease.generation);
                     println!("attempt: {}/{}", lease.attempt, lease.maximum_attempts);
-                    println!("token: {}", spoolq_names::hex_encode(&lease.token));
-                    println!("source: {}", lease.exact_source_path);
                     ExitCode::SUCCESS
                 }
                 LeaseOutcome::Empty => {
@@ -243,6 +281,172 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+
+        Commands::Ack { path, handle_file } => {
+            let lease = match load_handle(&handle_file) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("handle load failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            match queue.ack(&lease) {
+                spoolq_core::AckOutcome::Acked => {
+                    eprintln!("acked");
+                    ExitCode::SUCCESS
+                }
+                spoolq_core::AckOutcome::AlreadyAcked => {
+                    eprintln!("already acked");
+                    ExitCode::FAILURE
+                }
+                spoolq_core::AckOutcome::LeaseLost => {
+                    eprintln!("lease lost");
+                    ExitCode::FAILURE
+                }
+                spoolq_core::AckOutcome::NotCommitted(e) => {
+                    eprintln!("not committed: {}", e);
+                    ExitCode::FAILURE
+                }
+                spoolq_core::AckOutcome::OutcomeUnknown(_) => {
+                    eprintln!("outcome unknown");
+                    ExitCode::from(2)
+                }
+            }
+        }
+
+        Commands::Retry {
+            path,
+            handle_file,
+            after_seconds,
+        } => {
+            let lease = match load_handle(&handle_file) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("handle load failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let outcome = match after_seconds {
+                Some(s) => queue.retry_at(
+                    &lease,
+                    spoolq_fs_linux::clock_realtime_ns().unwrap_or(0) + s * 1_000_000_000,
+                ),
+                None => queue.retry_now(&lease),
+            };
+            match outcome {
+                spoolq_core::TransitionOutcome::Committed => {
+                    eprintln!("retried");
+                    ExitCode::SUCCESS
+                }
+                spoolq_core::TransitionOutcome::LeaseLost => {
+                    eprintln!("lease lost");
+                    ExitCode::FAILURE
+                }
+                spoolq_core::TransitionOutcome::NotCommitted(e) => {
+                    eprintln!("not committed: {}", e);
+                    ExitCode::FAILURE
+                }
+                spoolq_core::TransitionOutcome::OutcomeUnknown(_) => {
+                    eprintln!("outcome unknown");
+                    ExitCode::from(2)
+                }
+            }
+        }
+
+        Commands::Bury {
+            path,
+            handle_file,
+            reason,
+        } => {
+            let lease = match load_handle(&handle_file) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("handle load failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let reason = spoolq_core::DeadReason::from_u16(reason)
+                .unwrap_or(spoolq_core::DeadReason::Unspecified);
+            match queue.bury(&lease, reason) {
+                spoolq_core::TransitionOutcome::Committed => {
+                    eprintln!("buried");
+                    ExitCode::SUCCESS
+                }
+                spoolq_core::TransitionOutcome::LeaseLost => {
+                    eprintln!("lease lost");
+                    ExitCode::FAILURE
+                }
+                spoolq_core::TransitionOutcome::NotCommitted(e) => {
+                    eprintln!("not committed: {}", e);
+                    ExitCode::FAILURE
+                }
+                spoolq_core::TransitionOutcome::OutcomeUnknown(_) => {
+                    eprintln!("outcome unknown");
+                    ExitCode::from(2)
+                }
+            }
+        }
+
+        Commands::Recover {
+            path,
+            watch,
+            budget_ops,
+            budget_ms,
+        } => {
+            let budget = spoolq_core::WorkBudget {
+                max_operations: budget_ops,
+                max_duration_ms: budget_ms,
+            };
+            loop {
+                let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        eprintln!("open failed: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let stats = queue.recover(&budget);
+                eprintln!(
+                    "reaped:{} promoted:{} temp_deleted:{} dead:{} ops:{}{}",
+                    stats.leases_reaped,
+                    stats.delayed_promoted,
+                    stats.temp_files_deleted,
+                    stats.leases_to_dead,
+                    stats.operations_attempted,
+                    if stats.budget_exhausted {
+                        " (budget exhausted)"
+                    } else {
+                        ""
+                    },
+                );
+                if !watch {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -259,4 +463,106 @@ fn count_files_recursive(path: &std::path::Path) -> usize {
         }
     }
     count
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HandleFile {
+    queue_root: String,
+    job_id: String,
+    generation: u64,
+    attempt: u32,
+    maximum_attempts: u32,
+    token: String,
+    boot_id: String,
+    expires_boottime_ns: u64,
+    expires_wall_ns: u64,
+    expected_dev: u64,
+    expected_inode: u64,
+    exact_source_path: String,
+    envelope_digest: String,
+    payload_verified: bool,
+}
+
+fn save_handle_to_file(
+    queue_root: &std::path::Path,
+    handle_path: &std::path::Path,
+    lease: &spoolq_core::LeaseInfo,
+) -> std::io::Result<()> {
+    let handle = HandleFile {
+        queue_root: queue_root.display().to_string(),
+        job_id: spoolq_names::hex_encode(&lease.job_id),
+        generation: lease.generation,
+        attempt: lease.attempt,
+        maximum_attempts: lease.maximum_attempts,
+        token: spoolq_names::hex_encode(&lease.token),
+        boot_id: lease.boot_id.clone(),
+        expires_boottime_ns: lease.expires_boottime_ns,
+        expires_wall_ns: lease.expires_wall_ns,
+        expected_dev: lease.expected_dev,
+        expected_inode: lease.expected_inode,
+        exact_source_path: lease.exact_source_path.clone(),
+        envelope_digest: spoolq_names::hex_encode(&lease.envelope_digest),
+        payload_verified: lease.payload_verified,
+    };
+    let json = serde_json::to_string_pretty(&handle)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    let mut file = opts.open(handle_path)?;
+    file.write_all(json.as_bytes())?;
+    Ok(())
+}
+
+fn load_handle(path: &std::path::Path) -> std::io::Result<spoolq_core::LeaseInfo> {
+    let data = std::fs::read(path)?;
+    let handle: HandleFile = serde_json::from_slice(&data)?;
+    let job_id = spoolq_names::hex_decode_16(&handle.job_id)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad job_id"))?;
+    let token = spoolq_names::hex_decode_16(&handle.token)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad token"))?;
+    let envelope_digest = spoolq_names::hex_decode_16(&handle.envelope_digest)
+        .map(|b| {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&b);
+            d
+        })
+        .or_else(|| {
+            // hex_decode_16 returns [u8;16] but envelope_digest is 32 bytes
+            // Try decoding 32 bytes manually
+            if handle.envelope_digest.len() == 64 {
+                let mut d = [0u8; 32];
+                for (i, chunk) in handle.envelope_digest.as_bytes().chunks(2).enumerate() {
+                    d[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+                }
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad envelope_digest")
+        })?;
+    Ok(spoolq_core::LeaseInfo {
+        job_id,
+        envelope_digest,
+        generation: handle.generation,
+        attempt: handle.attempt,
+        maximum_attempts: handle.maximum_attempts,
+        token,
+        boot_id: handle.boot_id,
+        expires_boottime_ns: handle.expires_boottime_ns,
+        expires_wall_ns: handle.expires_wall_ns,
+        content_type: String::new(),
+        payload_length: 0,
+        payload_digest: [0; 32],
+        expected_dev: handle.expected_dev,
+        expected_inode: handle.expected_inode,
+        exact_source_path: handle.exact_source_path,
+        payload_verified: handle.payload_verified,
+    })
 }
