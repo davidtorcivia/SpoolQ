@@ -1,5 +1,6 @@
 // SpoolQ command-line interface.
 
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -48,7 +49,11 @@ enum Commands {
     /// Stats
     Stats { path: PathBuf },
     /// Doctor: check environment
-    Doctor { path: PathBuf },
+    Doctor {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Acknowledge a lease
     Ack {
         path: PathBuf,
@@ -254,22 +259,32 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Doctor { path } => {
-            eprintln!("spoolq doctor {}", path.display());
-            // Check basic capabilities
+        Commands::Doctor { path, json } => {
+            let mut results: Vec<(&str, String, bool)> = Vec::new();
+
+            // boot_id
             match spoolq_fs_linux::read_boot_id() {
-                Ok(id) => eprintln!("boot_id: {}", id),
-                Err(e) => eprintln!("boot_id: FAILED ({})", e),
+                Ok(id) => results.push(("boot_id", id, true)),
+                Err(e) => results.push(("boot_id", e.to_string(), false)),
             }
+            // clock_boottime
             match spoolq_fs_linux::clock_boottime_ns() {
-                Ok(ns) => eprintln!("clock_boottime: {} ns", ns),
-                Err(e) => eprintln!("clock_boottime: FAILED ({})", e),
+                Ok(ns) => results.push(("clock_boottime", format!("{} ns", ns), true)),
+                Err(e) => results.push(("clock_boottime", e.to_string(), false)),
             }
+            // clock_realtime
+            match spoolq_fs_linux::clock_realtime_ns() {
+                Ok(ns) => results.push(("clock_realtime", format!("{} ns", ns), true)),
+                Err(e) => results.push(("clock_realtime", e.to_string(), false)),
+            }
+            // getrandom
             match spoolq_fs_linux::random_128bit() {
-                Ok(_) => eprintln!("getrandom: OK"),
-                Err(e) => eprintln!("getrandom: FAILED ({})", e),
+                Ok(_) => results.push(("getrandom", "OK".to_string(), true)),
+                Err(e) => results.push(("getrandom", e.to_string(), false)),
             }
+
             if path.exists() {
+                // filesystem type
                 match spoolq_fs_linux::statfs(&path) {
                     Ok(stat) => {
                         let ft = stat.f_type;
@@ -278,15 +293,91 @@ fn main() -> ExitCode {
                         } else if ft == spoolq_fs_linux::XFS_SUPER_MAGIC {
                             "xfs"
                         } else if ft == spoolq_fs_linux::TMPFS_MAGIC {
-                            "tmpfs (not certified)"
+                            "tmpfs_not_certified"
                         } else if ft == spoolq_fs_linux::NFS_SUPER_MAGIC {
-                            "nfs (refused)"
+                            "nfs_refused"
+                        } else if ft == spoolq_fs_linux::FUSE_SUPER_MAGIC {
+                            "fuse_refused"
+                        } else if ft == spoolq_fs_linux::OVERLAYFS_SUPER_MAGIC {
+                            "overlay_refused"
                         } else {
-                            "unknown"
+                            "unknown_refused"
                         };
-                        eprintln!("filesystem: {} (magic {:#x})", fs_name, ft);
+                        results.push((
+                            "filesystem",
+                            format!("{} (magic {:#x})", fs_name, ft),
+                            true,
+                        ));
                     }
-                    Err(e) => eprintln!("statfs: FAILED ({})", e),
+                    Err(e) => results.push(("filesystem", e.to_string(), false)),
+                }
+
+                // Publication mode probe under tmp/
+                let probe_dir = path.join("tmp");
+                if probe_dir.exists() {
+                    match spoolq_fs_linux::open_dir_absolute(&probe_dir) {
+                        Ok(dir_fd) => {
+                            match spoolq_fs_linux::probe_publication_mode(dir_fd.as_raw_fd()) {
+                                Ok(mode) => {
+                                    let mode_str = match mode {
+                                        spoolq_fs_linux::PublicationMode::DirectAtEmptyPath => {
+                                            "direct-at-empty-path"
+                                        }
+                                        spoolq_fs_linux::PublicationMode::ProcSelfFd => {
+                                            "proc-self-fd"
+                                        }
+                                        spoolq_fs_linux::PublicationMode::NamedFallback => {
+                                            "named-fallback"
+                                        }
+                                    };
+                                    results.push(("publication_mode", mode_str.to_string(), true));
+                                }
+                                Err(e) => results.push(("publication_mode", e.to_string(), false)),
+                            }
+                            // rename probe
+                            match spoolq_fs_linux::probe_rename_noreplace(dir_fd.as_raw_fd()) {
+                                Ok(supported) => results.push((
+                                    "rename_noreplace",
+                                    if supported {
+                                        "supported".into()
+                                    } else {
+                                        "unsupported".into()
+                                    },
+                                    supported,
+                                )),
+                                Err(e) => results.push(("rename_noreplace", e.to_string(), false)),
+                            }
+                            // dir fsync probe
+                            match spoolq_fs_linux::probe_dir_fsync(dir_fd.as_raw_fd()) {
+                                Ok(supported) => results.push((
+                                    "dir_fsync",
+                                    if supported {
+                                        "supported".into()
+                                    } else {
+                                        "unsupported".into()
+                                    },
+                                    supported,
+                                )),
+                                Err(e) => results.push(("dir_fsync", e.to_string(), false)),
+                            }
+                        }
+                        Err(e) => {
+                            results.push(("publication_mode", format!("open failed: {}", e), false))
+                        }
+                    }
+                }
+            }
+
+            if json {
+                let map: std::collections::BTreeMap<&str, serde_json::Value> = results
+                    .iter()
+                    .map(|(k, v, ok)| (*k, serde_json::json!({"value": v, "ok": ok})))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&map).unwrap());
+            } else {
+                eprintln!("spoolq doctor {}", path.display());
+                for (k, v, ok) in &results {
+                    eprintln!("  {}: {}{}", k, v, if *ok { "" } else { " [FAIL]" });
                 }
             }
             ExitCode::SUCCESS
