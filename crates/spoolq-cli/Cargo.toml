@@ -1,0 +1,10 @@
+[package]
+name = "spoolq-cli"
+description = "SpoolQ command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]

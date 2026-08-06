@@ -1,0 +1,12 @@
+[package]
+name = "spoolq-format"
+description = "SpoolQ/1 binary format encoding and decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror = "1"
