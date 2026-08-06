@@ -1756,6 +1756,88 @@ impl Queue {
 
         AckOutcome::LeaseLost
     }
+    /// Resolve an indeterminate operation by probing exact paths.
+    pub fn resolve(&self, ticket: &TransitionTicket, stabilize: bool) -> ResolutionOutcome {
+        let dest_exists = self.path_exists(&ticket.attempted_destination_relative_path);
+        let src_exists = self.path_exists(&ticket.source_relative_path);
+
+        match (dest_exists, src_exists) {
+            (true, true) => {
+                if stabilize {
+                    if let Some(fd) = self.open_path(&ticket.attempted_destination_relative_path) {
+                        let _ = fs::fsync(fd.as_raw_fd());
+                    }
+                    if let Some(dir) = self.open_parent(&ticket.attempted_destination_relative_path)
+                    {
+                        let _ = fs::fsync_dir_fd(dir.as_raw_fd());
+                    }
+                }
+                ResolutionOutcome::BothObserved
+            }
+            (true, false) => {
+                if stabilize {
+                    if let Some(dir) = self.open_parent(&ticket.attempted_destination_relative_path)
+                    {
+                        let _ = fs::fsync_dir_fd(dir.as_raw_fd());
+                    }
+                }
+                if stabilize {
+                    ResolutionOutcome::DestinationStabilized
+                } else {
+                    ResolutionOutcome::DestinationObserved
+                }
+            }
+            (false, true) => {
+                if stabilize {
+                    if let Some(dir) = self.open_parent(&ticket.source_relative_path) {
+                        let _ = fs::fsync_dir_fd(dir.as_raw_fd());
+                    }
+                }
+                if stabilize {
+                    ResolutionOutcome::SourceStabilized
+                } else {
+                    ResolutionOutcome::SourceObserved
+                }
+            }
+            (false, false) => ResolutionOutcome::NeitherObserved,
+        }
+    }
+
+    /// Check if a root-relative path exists via fstatat.
+    fn path_exists(&self, relative: &str) -> bool {
+        let parts: Vec<&str> = relative.split('/').collect();
+        if parts.len() < 2 {
+            return false;
+        }
+        let name = parts.last().unwrap();
+        let dir = parts[..parts.len() - 1].join("/");
+        match open_relative(self.root_fd.as_raw_fd(), &dir) {
+            Ok(dir_fd) => fs::fstatat(dir_fd.as_raw_fd(), name).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Open a root-relative file path.
+    fn open_path(&self, relative: &str) -> Option<OwnedFd> {
+        let parts: Vec<&str> = relative.split('/').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let name = parts.last().unwrap();
+        let dir = parts[..parts.len() - 1].join("/");
+        let dir_fd = open_relative(self.root_fd.as_raw_fd(), &dir).ok()?;
+        fs::openat(dir_fd.as_raw_fd(), name, 0o0, 0).ok()
+    }
+
+    /// Open the parent directory of a root-relative path.
+    fn open_parent(&self, relative: &str) -> Option<OwnedFd> {
+        let parts: Vec<&str> = relative.split('/').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let dir = parts[..parts.len() - 1].join("/");
+        open_relative(self.root_fd.as_raw_fd(), &dir).ok()
+    }
 }
 
 /// Open a relative path from a directory fd.
