@@ -136,9 +136,7 @@ impl FormatRecord {
         }
 
         // Check all reserved bytes are zero
-        if buf[82..88].iter().any(|&b| b != 0)
-            || buf[104..128].iter().any(|&b| b != 0)
-        {
+        if buf[82..88].iter().any(|&b| b != 0) || buf[104..128].iter().any(|&b| b != 0) {
             return Err(FormatError::NonzeroReserved);
         }
 
@@ -165,7 +163,7 @@ impl FormatRecord {
         if lease_bucket_width_ns == 0 || delayed_bucket_width_ns == 0 {
             return Err(FormatError::InvalidBucketWidth);
         }
-        if terminal_bucket_width_ns < 60_000_000_000 || terminal_bucket_width_ns > 86_400_000_000_000 {
+        if !(60_000_000_000..=86_400_000_000_000).contains(&terminal_bucket_width_ns) {
             return Err(FormatError::InvalidBucketWidth);
         }
 
@@ -323,17 +321,14 @@ pub fn payload_digest(payload: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-pub fn envelope_digest(
-    fixed_header: &FixedHeader,
-    extension: &[u8],
-) -> [u8; 32] {
+pub fn envelope_digest(fixed_header: &FixedHeader, extension: &[u8]) -> [u8; 32] {
     let mut header_with_zero_digest = fixed_header.encode(extension);
     // Zero out bytes 96..128 (envelope_digest field)
     header_with_zero_digest[96..128].fill(0);
 
     let mut hasher = Sha256::new();
     hasher.update(b"SpoolQ-1-envelope\0");
-    hasher.update(&header_with_zero_digest);
+    hasher.update(header_with_zero_digest);
     hasher.update(extension);
     hasher.finalize().into()
 }
@@ -628,10 +623,7 @@ mod tests {
         let s = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let mut out = [0u8; 32];
         for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            out[i] = u8::from_str_radix(
-                std::str::from_utf8(chunk).unwrap(),
-                16,
-            ).unwrap();
+            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
         }
         out
     }
