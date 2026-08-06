@@ -1,0 +1,227 @@
+{
+  "transitions": [
+    {
+      "operation": "enqueue_immediate",
+      "source": "hidden",
+      "destination": "ready",
+      "generation_change": "zero",
+      "attempt_change": "zero",
+      "token_change": "none",
+      "reason_class": null,
+      "required_syncs": [
+        "file_fsync",
+        "destination_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe destination: observed = committed, absent = not committed"
+    },
+    {
+      "operation": "enqueue_delayed",
+      "source": "hidden",
+      "destination": "delayed",
+      "generation_change": "zero",
+      "attempt_change": "zero",
+      "token_change": "none",
+      "reason_class": null,
+      "required_syncs": [
+        "file_fsync",
+        "destination_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe destination: observed = committed, absent = not committed"
+    },
+    {
+      "operation": "promote",
+      "source": "delayed",
+      "destination": "ready",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": null,
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both: destination observed = committed, source only = not committed"
+    },
+    {
+      "operation": "claim",
+      "source": "ready",
+      "destination": "leased",
+      "generation_change": "increment",
+      "attempt_change": "increment",
+      "token_change": "new",
+      "reason_class": null,
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both directories"
+    },
+    {
+      "operation": "exhausted_ready_cleanup",
+      "source": "ready",
+      "destination": "dead",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": "attempts_exhausted",
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both"
+    },
+    {
+      "operation": "renew",
+      "source": "leased",
+      "destination": "leased",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "same",
+      "reason_class": null,
+      "required_syncs": [
+        "same_or_destination_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe destination: new generation observed = renewed, old gen observed = lease lost"
+    },
+    {
+      "operation": "acknowledge",
+      "source": "leased",
+      "destination": "receipt",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "same",
+      "reason_class": null,
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe receipt buckets by exact name"
+    },
+    {
+      "operation": "retry_now",
+      "source": "leased",
+      "destination": "ready",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": null,
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both"
+    },
+    {
+      "operation": "retry_later",
+      "source": "leased",
+      "destination": "delayed",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": null,
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both"
+    },
+    {
+      "operation": "bury",
+      "source": "leased",
+      "destination": "dead",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": "application_defined",
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both"
+    },
+    {
+      "operation": "reap_expired_to_ready",
+      "source": "leased",
+      "destination": "ready",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": null,
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both",
+      "notes": "attempt < maximum_attempts"
+    },
+    {
+      "operation": "reap_expired_to_dead",
+      "source": "leased",
+      "destination": "dead",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": "attempts_exhausted",
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both",
+      "notes": "attempt >= maximum_attempts"
+    },
+    {
+      "operation": "quarantine",
+      "source": "active",
+      "destination": "quarantine",
+      "generation_change": "increment",
+      "attempt_change": "unchanged",
+      "token_change": "none",
+      "reason_class": "corruption",
+      "required_syncs": [
+        "destination_dir_fsync",
+        "source_dir_fsync"
+      ],
+      "no_overwrite": true,
+      "resolution_behavior": "probe both",
+      "notes": "raw bytes preserved"
+    }
+  ],
+  "exceptions": [
+    {
+      "name": "receipt_compaction",
+      "description": "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname",
+      "uses_replacing_rename": true
+    },
+    {
+      "name": "wall_watermark_advancement",
+      "description": "Monotone wall-watermark record replaced under exclusive OFD lock",
+      "uses_replacing_rename": true
+    }
+  ],
+  "reentry": [
+    {
+      "name": "requeue_dead",
+      "source": "dead",
+      "description": "Verified resubmission: creates new job identity, copies payload and safe metadata, adds old job_id as provenance",
+      "creates_new_identity": true
+    },
+    {
+      "name": "requeue_quarantine",
+      "source": "quarantine",
+      "description": "Verified resubmission after full structural and payload verification: creates new job identity",
+      "creates_new_identity": true
+    }
+  ]
+}

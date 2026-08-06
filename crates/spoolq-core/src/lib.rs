@@ -1,6 +1,7 @@
 pub mod errors;
 pub mod queue;
 pub mod recovery;
+pub mod state_machine;
 
 pub use errors::*;
 pub use queue::*;
