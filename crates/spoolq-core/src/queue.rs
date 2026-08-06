@@ -102,6 +102,12 @@ impl Queue {
         // Create root directory if needed
         if !root.exists() {
             std::fs::create_dir_all(root)?;
+            // Sync the parent directory so the root entry persists
+            if let Some(parent) = root.parent() {
+                if let Ok(parent_fd) = fs::open_dir_absolute(parent) {
+                    let _ = fs::fsync_dir_fd(parent_fd.as_raw_fd());
+                }
+            }
         }
 
         let root_fd = fs::open_dir_absolute(root)?;
@@ -197,6 +203,11 @@ impl Queue {
         // Set FORMAT to read-only (0400)
         let _ = fs::fchmodat(root_fd.as_raw_fd(), "FORMAT", 0o400);
         fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+
+        // Reopen and verify as a normal client (step 13)
+        let verify_format = std::fs::read(root.join("FORMAT"))?;
+        FormatRecord::decode(&verify_format)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         Ok(format_rec)
     }
