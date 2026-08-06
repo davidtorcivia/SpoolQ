@@ -1,0 +1,37 @@
+; SpoolQ/1 canonical filename grammar
+
+hex-digit        = %x30-39 / %x61-66
+job-id           = 32hex-digit
+generation       = 16hex-digit
+attempt          = 8hex-digit
+maximum-attempts = 8hex-digit
+time-ns          = 16hex-digit
+reason           = 4hex-digit
+name-tag         = 16hex-digit
+lease-token      = 32hex-digit
+shard            = 4hex-digit
+bucket           = 16hex-digit
+boot-id          = 8hex-digit "-" 4hex-digit "-" 4hex-digit "-" 4hex-digit "-" 12hex-digit
+
+ready-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts
+             ".k" name-tag ".sqj"
+
+leased-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts
+              ".b" time-ns ".w" time-ns ".t" lease-token
+              ".k" name-tag ".sqj"
+
+delayed-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts
+               ".d" time-ns ".k" name-tag ".sqj"
+
+dead-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts
+            ".x" reason ".k" name-tag ".sqj"
+
+receipt-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts
+               ".t" lease-token ".k" name-tag ".rct"
+
+temp-name = time-ns "." 32hex-digit ".tmp"
+
+quarantine-name = "q" 32hex-digit ".x" reason ".raw"
+
+metadata-key = (lower-alpha / DIGIT) *63(lower-alpha / DIGIT / "." / "_" / "-")
+lower-alpha = %x61-7a
