@@ -4,6 +4,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
+use sha2::Digest;
 use spoolq_format::cbor::ExtensionHeader;
 use spoolq_format::{
     envelope_digest, payload_digest, FixedHeader, FormatRecord, WatermarkRecord,
@@ -1416,6 +1417,62 @@ impl Queue {
         fs::fsync_dir_fd(ready_dir_fd.as_raw_fd())?;
         Ok(())
     }
+    /// Read and verify the payload of a leased job.
+    /// Returns Ok(()) if the digest matches, Err with PayloadCorrupt otherwise.
+    pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<(), Error> {
+        let parts: Vec<&str> = lease.exact_source_path.split('/').collect();
+        if parts.is_empty() {
+            return Err(Error::InvalidInput("bad source path".into()));
+        }
+        let src_name = parts.last().unwrap();
+        let src_dir = parts[..parts.len() - 1].join("/");
+
+        let src_dir_fd = open_relative(self.root_fd.as_raw_fd(), &src_dir)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        let file_fd = fs::openat(src_dir_fd.as_raw_fd(), src_name, 0o0, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        // Skip header (128 bytes) and extension
+        let header_size = 128usize;
+
+        // Read the fixed header to get extension_header_length
+        let mut header_buf = [0u8; 128];
+        let n = fs::pread(file_fd.as_raw_fd(), &mut header_buf, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        if n != 128 {
+            return Err(Error::QueueCorrupt("could not read header".into()));
+        }
+
+        let header =
+            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
+        let data_offset = header_size + header.extension_header_length as usize;
+
+        // Read and hash the payload
+        let mut hasher = sha2::Sha256::new();
+        let mut offset = data_offset as u64;
+        let mut remaining = header.payload_length as usize;
+        let mut buf = vec![0u8; 65536];
+
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len());
+            let n = fs::pread(file_fd.as_raw_fd(), &mut buf[..to_read], offset)
+                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            if n == 0 {
+                return Err(Error::QueueCorrupt("unexpected EOF".into()));
+            }
+            hasher.update(&buf[..n]);
+            offset += n as u64;
+            remaining -= n;
+        }
+
+        let computed: [u8; 32] = hasher.finalize().into();
+        if computed != header.payload_digest {
+            return Err(Error::PayloadCorrupt);
+        }
+
+        Ok(())
+    }
 }
 
 /// Open a relative path from a directory fd.
@@ -1754,5 +1811,24 @@ mod tests {
             queue.lease(0, 8 * 24 * 60 * 60 * 1_000_000_000),
             LeaseOutcome::NotCommitted(_)
         ));
+    }
+    #[test]
+    fn payload_verification() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"verify me please";
+        let input = EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        };
+        queue.enqueue(input);
+
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+
+        assert!(queue.verify_lease_payload(&lease).is_ok());
     }
 }
