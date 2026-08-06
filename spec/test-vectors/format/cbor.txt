@@ -1,0 +1,29 @@
+# SpoolQ/1 CBOR Test Vectors
+
+All byte values are lowercase hex. Canonical encoding only.
+
+## Minimal extension (content_type only)
+
+Input: content_type = "application/json" (16 bytes)
+Output: a102706170706c69636174696f6e2f6a736f6e
+
+## With initial_not_before
+
+Input: content_type = "x", initial_not_before = 0x179a18a8e3e40000
+Output: a2011b179a18a8e3e40000026178
+
+## With metadata booleans
+
+Input: content_type = "x", metadata = {"active": true, "done": false}
+Output: a202617803a266616374697665f564646f6e65f4
+
+Boolean true = 0xf5, false = 0xf4. Integers 0 and 1 are NOT booleans.
+
+## Rejected encodings
+
+null (0xf6): reject
+undefined (0xf7): reject
+float (0xf9/0xfa/0xfb): reject
+non-shortest uint (e.g. 0x18 0x17 for value 23): reject
+indefinite length (0x5f/0x6f etc): reject
+tags (major type 6): reject
