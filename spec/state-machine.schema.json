@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpoolQ/1 State Machine",
+  "type": "object",
+  "required": [
+    "transitions"
+  ],
+  "properties": {
+    "transitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "operation",
+          "source",
+          "destination",
+          "generation_change",
+          "attempt_change",
+          "required_syncs"
+        ],
+        "properties": {
+          "operation": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "hidden",
+              "ready",
+              "leased",
+              "delayed",
+              "dead",
+              "receipt",
+              "quarantine",
+              "active"
+            ]
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "leased",
+              "delayed",
+              "dead",
+              "receipt",
+              "quarantine"
+            ]
+          },
+          "generation_change": {
+            "type": "string",
+            "enum": [
+              "zero",
+              "increment",
+              "increment_or_same"
+            ]
+          },
+          "attempt_change": {
+            "type": "string",
+            "enum": [
+              "zero",
+              "increment",
+              "unchanged"
+            ]
+          },
+          "token_change": {
+            "type": "string",
+            "enum": [
+              "none",
+              "new",
+              "same"
+            ]
+          },
+          "reason_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "required_syncs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "no_overwrite": {
+            "type": "boolean"
+          },
+          "resolution_behavior": {
+            "type": "string"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "exceptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "description"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "uses_replacing_rename": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "reentry": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "source",
+          "description"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "creates_new_identity": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}
