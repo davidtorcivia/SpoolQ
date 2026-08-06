@@ -462,6 +462,16 @@ pub const NFS_SUPER_MAGIC: i64 = 0x6969;
 pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const FUSE_SUPER_MAGIC: i64 = 0x65735546;
 
+/// Read directory entries without consuming the fd (uses dup first).
+pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<String>> {
+    // dup the fd so fdopendir doesn't consume the original
+    let dup_fd = unsafe { libc::dup(dir_fd) };
+    if dup_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    read_dir_entries(dup_fd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
