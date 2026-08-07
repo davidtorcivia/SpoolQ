@@ -514,7 +514,7 @@ impl Queue {
                 self.poison();
                 // Return 0 to avoid panicking callers; the poisoned flag
                 // will reject the next operation.
-                eprintln!("spoolq: poisoned due to wall floor error: {e}");
+                let _ = e; // error captured via poison flag
                 0
             }
         }
@@ -5114,7 +5114,7 @@ mod tests {
                 _ => {
                     // Retry or bury
                     if let LeaseOutcome::Leased(l) = queue.lease(0, 30_000_000_000) {
-                        if rng_state % 2 == 0 {
+                        if rng_state.is_multiple_of(2) {
                             queue.verify_lease_payload(&l).unwrap();
                             let _ = queue.ack(&l);
                             oracle.insert(l.job_id, State::Acked);
