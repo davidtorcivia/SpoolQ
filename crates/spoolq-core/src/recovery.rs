@@ -64,7 +64,18 @@ impl Queue {
                 return s;
             }
         };
-        let wall_now = self.effective_wall_floor_ns();
+        // P1-12: Use checked wall floor. If unavailable, record error and
+        // skip wall-sensitive phases (delayed promotion, receipt retention).
+        let wall_now = self.effective_wall_floor_ns_checked();
+        let wall_ok = wall_now.is_ok();
+        let wall_now = wall_now.unwrap_or(0);
+        if !wall_ok {
+            stats.errors.push(RecoveryError {
+                operation: "wall_floor".into(),
+                relative_path: "/".into(),
+                error: "wall floor unavailable, skipping wall-sensitive recovery phases".into(),
+            });
+        }
         // C-31: Use CLOCK_MONOTONIC for budget enforcement
         let start_mono = match fs::clock_monotonic_ns() {
             Ok(t) => t,
@@ -84,8 +95,8 @@ impl Queue {
         // 1. Reap expired leases
         self.reap_expired_leases(boottime_now, wall_now, budget, &mut stats, deadline_mono);
 
-        // 2. Promote eligible delayed jobs
-        if !stats.budget_exhausted {
+        // 2. Promote eligible delayed jobs (requires trusted wall floor)
+        if !stats.budget_exhausted && wall_ok {
             self.promote_delayed(wall_now, budget, &mut stats, deadline_mono);
         }
 
@@ -96,7 +107,7 @@ impl Queue {
         if !stats.budget_exhausted {
             self.compact_receipts(budget, &mut stats, deadline_mono);
         }
-        if !stats.budget_exhausted {
+        if !stats.budget_exhausted && wall_ok {
             self.delete_expired_receipts(
                 self.options.receipt_retention_ns,
                 budget,

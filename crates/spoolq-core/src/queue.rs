@@ -152,19 +152,35 @@ impl Queue {
             ));
         }
 
-        // R2-B01: Create an exclusive initialization marker BEFORE any other state.
-        // Only one initializer can win this race. Use O_CREAT|O_EXCL on .initializing.
-        let _init_marker = fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600)
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::AlreadyExists {
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "another initializer is in progress or a previous init was interrupted",
-                    )
+        // R2-B01/P1-08: Create an exclusive initialization marker BEFORE any other state.
+        // P1-08: If .initializing already exists but FORMAT is absent, the previous
+        // init was interrupted by a crash. Safe to clean up and retry since no FORMAT
+        // means no queue identity was committed.
+        let _init_marker = match fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // .initializing exists. If FORMAT is absent, this is a stale marker
+                // from a crashed init. Safe to remove and retry.
+                if !format_exists {
+                    let _ = fs::unlinkat(root_fd.as_raw_fd(), ".initializing");
+                    // Retry the exclusive create.
+                    fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600).map_err(
+                        |_| {
+                            io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "could not acquire init lock after cleaning stale marker",
+                            )
+                        },
+                    )?
                 } else {
-                    e
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "queue already initialized; use open() to access an existing queue",
+                    ));
                 }
-            })?;
+            }
+            Err(e) => return Err(e),
+        };
 
         // R2-B01: Use RAII guard to clean up the init marker on any failure.
         struct InitGuard {
