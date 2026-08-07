@@ -1,0 +1,256 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::enqueue -> EnqueueOutcome with Default::default()
+@@ -624,252 +624,17 @@
+         .map_err(|e| Error::IoFailure(e.to_string()))?;
+         fs::fsync_dir_fd(control_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+ 
+         Ok(())
+     }
+ 
+     /// Enqueue a job with the given payload and metadata.
+     pub fn enqueue(&mut self, job: EnqueueInput) -> EnqueueOutcome {
+-        if let Err(e) = self.check_not_poisoned() {
+-            let ticket = EnqueueTicket {
+-                job_id: [0; 16],
+-                envelope_digest: [0; 32],
+-                expected_initial_state: InitialState::Ready,
+-                expected_relative_path: String::new(),
+-            };
+-            return EnqueueOutcome::NotCommitted(ticket, e);
+-        }
+-
+-        // Generate job ID before any filesystem operation
+-        let job_id = match fs::random_128bit() {
+-            Ok(id) => id,
+-            Err(e) => {
+-                let ticket = EnqueueTicket {
+-                    job_id: [0; 16],
+-                    envelope_digest: [0; 32],
+-                    expected_initial_state: InitialState::Ready,
+-                    expected_relative_path: String::new(),
+-                };
+-                return EnqueueOutcome::NotCommitted(ticket, Error::IoFailure(e.to_string()));
+-            }
+-        };
+-
+-        let created_at = match fs::clock_realtime_ns() {
+-            Ok(t) => t,
+-            Err(e) => {
+-                let ticket = EnqueueTicket {
+-                    job_id,
+-                    envelope_digest: [0; 32],
+-                    expected_initial_state: InitialState::Ready,
+-                    expected_relative_path: String::new(),
+-                };
+-                return EnqueueOutcome::NotCommitted(ticket, Error::IoFailure(e.to_string()));
+-            }
+-        };
+-
+-        // Validate maximum_attempts
+-        if job.maximum_attempts == 0 {
+-            let ticket = EnqueueTicket {
+-                job_id,
+-                envelope_digest: [0; 32],
+-                expected_initial_state: InitialState::Ready,
+-                expected_relative_path: String::new(),
+-            };
+-            return EnqueueOutcome::NotCommitted(
+-                ticket,
+-                Error::InvalidInput("maximum_attempts must be >= 1".into()),
+-            );
+-        }
+-
+-        // Encode extension header
+-        let ext = ExtensionHeader {
+-            initial_not_before_unix_ns: job.initial_not_before,
+-            content_type: job.content_type.clone(),
+-            metadata: job.metadata.clone(),
+-            producer_id: job.producer_id.clone(),
+-            trace_context: job.trace_context.clone(),
+-        };
+-
+-        let ext_bytes = match ext.encode() {
+-            Ok(b) => b,
+-            Err(e) => {
+-                let ticket = EnqueueTicket {
+-                    job_id,
+-                    envelope_digest: [0; 32],
+-                    expected_initial_state: InitialState::Ready,
+-                    expected_relative_path: String::new(),
+-                };
+-                return EnqueueOutcome::NotCommitted(ticket, Error::InvalidInput(e.to_string()));
+-            }
+-        };
+-
+-        // C-11: Validate payload size BEFORE hashing
+-        if job.payload.len() as u64 > self.format.max_payload_length.min(MAX_PAYLOAD_LENGTH) {
+-            let ticket = EnqueueTicket {
+-                job_id,
+-                envelope_digest: [0; 32],
+-                expected_initial_state: InitialState::Ready,
+-                expected_relative_path: String::new(),
+-            };
+-            return EnqueueOutcome::NotCommitted(
+-                ticket,
+-                Error::InvalidInput("payload exceeds limit".into()),
+-            );
+-        }
+-
+-        // Compute payload digest (after size validation - C-11)
+-        let pdig = payload_digest(&job.payload);
+-
+-        // Build fixed header
+-        let mut header = FixedHeader {
+-            extension_header_length: ext_bytes.len() as u32,
+-            payload_length: job.payload.len() as u64,
+-            flags: 0,
+-            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+-            job_id,
+-            maximum_attempts: job.maximum_attempts,
+-            created_at_unix_ns: created_at,
+-            payload_digest: pdig,
+-            envelope_digest: [0; 32],
+-        };
+-        let env_dig = match envelope_digest(&header, &ext_bytes) {
+-            Some(d) => d,
+-            None => {
+-                let ticket = EnqueueTicket {
+-                    job_id,
+-                    envelope_digest: [0; 32],
+-                    expected_initial_state: InitialState::Ready,
+-                    expected_relative_path: String::new(),
+-                };
+-                return EnqueueOutcome::NotCommitted(
+-                    ticket,
+-                    Error::InvalidInput("extension length mismatch".into()),
+-                );
+-            }
+-        };
+-        header.envelope_digest = env_dig;
+-
+-        // Compute shard
+-        let shard = compute_shard(&self.format.queue_id, &job_id, self.format.shard_count);
+-        let shard_str = shard_hex(shard);
+-
+-        // Determine initial state: ready or delayed
+-        let now_wall = match self.wall_floor_for_mutation() {
+-            Ok(v) => v,
+-            Err(e) => {
+-                return EnqueueOutcome::NotCommitted(
+-                    EnqueueTicket {
+-                        job_id: [0; 16],
+-                        envelope_digest: [0; 32],
+-                        expected_initial_state: crate::errors::InitialState::Ready,
+-                        expected_relative_path: String::new(),
+-                    },
+-                    e,
+-                )
+-            }
+-        };
+-        let (initial_state, eligibility_bucket) = match job.initial_not_before {
+-            Some(nb) if nb > now_wall => {
+-                let (eb, _) =
+-                    match eligibility_bucket_and_ns(nb, self.format.delayed_bucket_width_ns) {
+-                        Some(v) => v,
+-                        None => {
+-                            let ticket = EnqueueTicket {
+-                                job_id,
+-                                envelope_digest: header.envelope_digest,
+-                                expected_initial_state: InitialState::Ready,
+-                                expected_relative_path: String::new(),
+-                            };
+-                            return EnqueueOutcome::NotCommitted(
+-                                ticket,
+-                                Error::InvalidInput("eligibility overflow".into()),
+-                            );
+-                        }
+-                    };
+-                (InitialState::Delayed, eb)
+-            }
+-            _ => (InitialState::Ready, 0),
+-        };
+-
+-        // Build the canonical filename and path
+-        let common = CommonFields {
+-            job_id,
+-            generation: 0,
+-            attempt: 0,
+-            maximum_attempts: job.maximum_attempts,
+-        };
+-
+-        let (dest_dir_relative, filename, expected_path) = match initial_state {
+-            InitialState::Ready => {
+-                let base = format!(
+-                    "{}.g{:016x}.a{:08x}.m{:08x}",
+-                    spoolq_names::hex_encode(&job_id),
+-                    0u64,
+-                    0u32,
+-                    job.maximum_attempts
+-                );
+-                let ctx = ready_context(&shard_str, &base);
+-                let tag = compute_name_tag(&self.format.queue_id, &ctx);
+-                let fname = ready_filename(&common, &tag);
+-                let path = format!("ready/{shard_str}/{fname}");
+-                (format!("ready/{shard_str}"), fname, path)
+-            }
+-            InitialState::Delayed => {
+-                let bucket_str = bucket_hex(eligibility_bucket);
+-                let base = format!(
+-                    "{}.g{:016x}.a{:08x}.m{:08x}.d{:016x}",
+-                    spoolq_names::hex_encode(&job_id),
+-                    0u64,
+-                    0u32,
+-                    job.maximum_attempts,
+-                    nb_to_u64(job.initial_not_before)
+-                );
+-                let ctx = delayed_context(&bucket_str, &shard_str, &base);
+-                let tag = compute_name_tag(&self.format.queue_id, &ctx);
+-                let fname = delayed_filename(&common, nb_to_u64(job.initial_not_before), &tag);
+-                let path = format!("delayed/{bucket_str}/{shard_str}/{fname}");
+-                (format!("delayed/{bucket_str}/{shard_str}"), fname, path)
+-            }
+-        };
+-
+-        let ticket = EnqueueTicket {
+-            job_id,
+-            envelope_digest: header.envelope_digest,
+-            expected_initial_state: initial_state,
+-            expected_relative_path: expected_path.clone(),
+-        };
+-
+-        // Create the job file using O_TMPFILE in the destination directory
+-        let result = self.write_and_publish(
+-            &dest_dir_relative,
+-            &filename,
+-            &header,
+-            &ext_bytes,
+-            &job.payload,
+-        );
+-
+-        match result {
+-            Ok(()) => {
+-                // R2-B05: Advance wall watermark. Failure is not fatal to the
+-                // committed enqueue but is logged via the poison flag for
+-                // diagnostics. The watermark is advisory monotonicity, not
+-                // a correctness barrier for the enqueue itself.
+-                if self.advance_wall_watermark(created_at).is_err() {
+-                    // Watermark advancement failed; the enqueue is still committed.
+-                    // Future clock-rollback protection is degraded for this bucket.
+-                }
+-                EnqueueOutcome::Committed(ticket)
+-            }
+-            Err(PublishError::NotCommitted(e)) => EnqueueOutcome::NotCommitted(ticket, e),
+-            Err(PublishError::OutcomeUnknown(e)) => {
+-                self.poison();
+-                EnqueueOutcome::OutcomeUnknown(ticket, e)
+-            }
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Write the job envelope to a temp file and publish via rename.
+     fn write_and_publish(
+         &mut self,
+         dest_dir_relative: &str,
+         dest_name: &str,
+         header: &FixedHeader,

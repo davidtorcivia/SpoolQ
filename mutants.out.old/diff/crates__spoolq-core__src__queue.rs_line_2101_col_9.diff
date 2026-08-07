@@ -1,0 +1,108 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::renew -> RenewOutcome with Default::default()
+@@ -2093,104 +2093,17 @@
+         let fname = spoolq_names::dead_filename(&common, reason as u16, &tag);
+         let dest_dir = format!("dead/{bucket_str}/{shard_str}");
+ 
+         self.move_leased(lease, &dest_dir, &fname)
+     }
+ 
+     /// Renew a lease with a new deadline.
+     pub fn renew(&mut self, lease: &LeaseInfo, lease_duration_ns: u64) -> RenewOutcome {
+-        if let Err(e) = self.check_not_poisoned() {
+-            return RenewOutcome::NotCommitted(e);
+-        }
+-
+-        let min_dur = 1_000_000_000u64;
+-        let max_dur = 7 * 24 * 60 * 60 * 1_000_000_000u64;
+-        if lease_duration_ns < min_dur || lease_duration_ns > max_dur {
+-            return RenewOutcome::NotCommitted(Error::InvalidInput(
+-                "lease duration must be 1s to 7d".into(),
+-            ));
+-        }
+-
+-        let boottime_now = match fs::clock_boottime_ns() {
+-            Ok(t) => t,
+-            Err(e) => return RenewOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+-        };
+-        let wall_now = match self.wall_floor_for_mutation() {
+-            Ok(v) => v,
+-            Err(e) => return RenewOutcome::NotCommitted(e),
+-        };
+-        let new_boottime_dl = match boottime_now.checked_add(lease_duration_ns) {
+-            Some(d) => d,
+-            None => {
+-                return RenewOutcome::NotCommitted(Error::InvalidInput("deadline overflow".into()))
+-            }
+-        };
+-        let new_wall_dl = match wall_now.checked_add(lease_duration_ns) {
+-            Some(d) => d,
+-            None => {
+-                return RenewOutcome::NotCommitted(Error::InvalidInput("deadline overflow".into()))
+-            }
+-        };
+-        let new_gen = match lease.generation.checked_add(1) {
+-            Some(g) => g,
+-            None => return RenewOutcome::NotCommitted(Error::StateExhausted),
+-        };
+-
+-        let lease_bucket =
+-            spoolq_math::lease_bucket(new_boottime_dl, self.format.lease_bucket_width_ns)
+-                .unwrap_or(0);
+-        let bucket_str = bucket_hex(lease_bucket);
+-        let shard = compute_shard(
+-            &self.format.queue_id,
+-            &lease.job_id,
+-            self.format.shard_count,
+-        );
+-        let shard_str = shard_hex(shard);
+-
+-        let common = CommonFields {
+-            job_id: lease.job_id,
+-            generation: new_gen,
+-            attempt: lease.attempt,
+-            maximum_attempts: lease.maximum_attempts,
+-        };
+-
+-        let base = format!(
+-            "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
+-            spoolq_names::hex_encode(&lease.job_id),
+-            new_gen,
+-            lease.attempt,
+-            lease.maximum_attempts,
+-            new_boottime_dl,
+-            new_wall_dl,
+-            spoolq_names::hex_encode(&lease.token),
+-        );
+-        let ctx = spoolq_names::leased_context(&self.boot_id, &bucket_str, &shard_str, &base);
+-        let tag = compute_name_tag(&self.format.queue_id, &ctx);
+-        let fname = spoolq_names::leased_filename(
+-            &common,
+-            new_boottime_dl,
+-            new_wall_dl,
+-            &lease.token,
+-            &tag,
+-        );
+-        let dest_dir = format!("leased/{}/{}/{}", self.boot_id, bucket_str, shard_str);
+-
+-        match self.move_leased_renew(lease, &dest_dir, &fname) {
+-            TransitionOutcome::Committed => RenewOutcome::Renewed(LeaseInfo {
+-                generation: new_gen,
+-                expires_boottime_ns: new_boottime_dl,
+-                expires_wall_ns: new_wall_dl,
+-                exact_source_path: format!("{dest_dir}/{fname}"),
+-                ..lease.clone()
+-            }),
+-            TransitionOutcome::LeaseLost => RenewOutcome::LeaseLost,
+-            TransitionOutcome::NotCommitted(e) => RenewOutcome::NotCommitted(e),
+-            TransitionOutcome::OutcomeUnknown(t) => RenewOutcome::OutcomeUnknown(t),
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// B-04: Open and validate the current leased source object.
+     /// Validates the source path, filename, header, and identity against the handle.
+     /// Returns the opened source directory fd and source filename on success.
+     fn open_and_validate_current_lease(
+         &self,
+         lease: &LeaseInfo,

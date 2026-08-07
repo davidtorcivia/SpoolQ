@@ -1,0 +1,131 @@
+
+*** crates/spoolq-core/src/queue.rs:1892:9: replace Queue::retry_after -> TransitionOutcome with Default::default()
+
+*** mutation diff:
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::retry_after -> TransitionOutcome with Default::default()
+@@ -1884,29 +1884,17 @@
+ 
+     /// Retry a lease at a future time (move to delayed).
+     pub fn retry_at(&mut self, lease: &LeaseInfo, not_before_ns: u64) -> TransitionOutcome {
+         self.retry(lease, Some(not_before_ns))
+     }
+ 
+     /// Retry a lease after a duration.
+     pub fn retry_after(&mut self, lease: &LeaseInfo, duration_ns: u64) -> TransitionOutcome {
+-        let wall_now = match self.wall_floor_for_mutation() {
+-            Ok(v) => v,
+-            Err(e) => return TransitionOutcome::NotCommitted(e),
+-        };
+-        let deadline = match spoolq_math::retry_wall_deadline(wall_now, duration_ns) {
+-            Some(d) => d,
+-            None => {
+-                return TransitionOutcome::NotCommitted(Error::InvalidInput(
+-                    "deadline overflow".into(),
+-                ))
+-            }
+-        };
+-        self.retry_at(lease, deadline)
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Retry with a policy (computes delay from attempt and policy).
+     pub fn retry_with_policy(
+         &mut self,
+         lease: &LeaseInfo,
+         policy: &spoolq_math::RetryPolicy,
+     ) -> TransitionOutcome {
+
+
+*** /home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=spoolq-core@0.1.0
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh version_check v0.9.5
+       Fresh cfg-if v1.0.4
+       Fresh typenum v1.20.1
+       Fresh autocfg v1.5.1
+       Fresh cpufeatures v0.2.17
+       Fresh quote v1.0.47
+       Fresh either v1.17.0
+       Fresh clap_lex v1.1.0
+       Fresh itoa v1.0.18
+       Fresh plotters-backend v0.3.7
+       Fresh anstyle v1.0.14
+       Fresh syn v2.0.119
+       Fresh libc v0.2.189
+       Fresh crossbeam-utils v0.8.22
+       Fresh serde_core v1.0.229
+       Fresh syn v3.0.3
+       Fresh regex-syntax v0.8.11
+       Fresh memchr v2.8.3
+       Fresh ciborium-io v0.2.2
+       Fresh itertools v0.10.5
+       Fresh clap_builder v4.6.6
+       Fresh plotters-svg v0.3.7
+       Fresh bitflags v2.13.1
+       Fresh same-file v1.0.6
+       Fresh cast v0.3.0
+       Fresh generic-array v0.14.7
+       Fresh zerocopy-derive v0.8.56
+       Fresh thiserror-impl v1.0.69
+       Fresh serde_derive v1.0.229
+       Fresh crossbeam-epoch v0.9.20
+       Fresh zmij v1.0.23
+       Fresh regex-automata v0.4.18
+       Fresh num-traits v0.2.19
+       Fresh once_cell v1.21.4
+       Fresh linux-raw-sys v0.12.1
+       Fresh getrandom v0.4.3
+       Fresh is-terminal v0.4.17
+       Fresh clap v4.6.6
+       Fresh spoolq-fs-linux v0.1.0 (/tmp/cargo-mutants-spoolq-tt77hP.tmp/crates/spoolq-fs-linux)
+       Fresh criterion-plot v0.5.0
+       Fresh walkdir v2.5.0
+       Fresh anes v0.1.6
+       Fresh fastrand v2.5.0
+       Fresh oorandom v11.1.5
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh zerocopy v0.8.56
+       Fresh thiserror v1.0.69
+       Fresh crossbeam-deque v0.8.7
+       Fresh serde v1.0.229
+       Fresh serde_json v1.0.151
+       Fresh rustix v1.1.4
+       Fresh plotters v0.3.7
+       Fresh regex v1.13.1
+       Fresh digest v0.10.7
+       Fresh half v2.7.1
+       Fresh rayon-core v1.13.0
+       Fresh tinytemplate v1.2.1
+       Fresh tempfile v3.27.0
+       Fresh sha2 v0.10.9
+       Fresh ciborium-ll v0.2.2
+       Fresh rayon v1.12.0
+       Fresh spoolq-format v0.1.0 (/tmp/cargo-mutants-spoolq-tt77hP.tmp/crates/spoolq-format)
+       Fresh ciborium v0.2.2
+       Fresh spoolq-math v0.1.0 (/tmp/cargo-mutants-spoolq-tt77hP.tmp/crates/spoolq-math)
+       Fresh spoolq-names v0.1.0 (/tmp/cargo-mutants-spoolq-tt77hP.tmp/crates/spoolq-names)
+       Fresh criterion v0.5.1
+       Dirty spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-tt77hP.tmp/crates/spoolq-core): stale, unknown reason
+   Compiling spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-tt77hP.tmp/crates/spoolq-core)
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=03247d8421bced53 -C extra-filename=-3df264829b7166b2 --out-dir /tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps --extern criterion=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libcriterion-5e7c93a05943ba7c.rlib --extern libc=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/liblibc-cb8fd924c8df72bf.rlib --extern sha2=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libsha2-eb5e74d628211b89.rlib --extern spoolq_format=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_format-5ff958cb57533a93.rlib --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_fs_linux-d94b1782d2179a22.rlib --extern spoolq_math=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_math-f5bb1f10d08ec56c.rlib --extern spoolq_names=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_names-fcdca88f9689e449.rlib --extern tempfile=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libtempfile-f80ce2590971964f.rlib --extern thiserror=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libthiserror-4c83c32296ce572b.rlib --cap-lints=warn`
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=e4f6ed4dd60641bc -C extra-filename=-32a261b615590b88 --out-dir /tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps --extern libc=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/liblibc-cb8fd924c8df72bf.rmeta --extern sha2=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libsha2-eb5e74d628211b89.rmeta --extern spoolq_format=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_format-5ff958cb57533a93.rmeta --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_fs_linux-d94b1782d2179a22.rmeta --extern spoolq_math=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_math-f5bb1f10d08ec56c.rmeta --extern spoolq_names=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_names-fcdca88f9689e449.rmeta --extern thiserror=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libthiserror-4c83c32296ce572b.rmeta --cap-lints=warn`
+error[E0277]: the trait bound `errors::TransitionOutcome: Default` is not satisfied
+    --> crates/spoolq-core/src/queue.rs:1892:9
+     |
+1892 |         Default::default() /* ~ changed by cargo-mutants ~ */
+     |         ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `errors::TransitionOutcome`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `spoolq-core` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=e4f6ed4dd60641bc -C extra-filename=-32a261b615590b88 --out-dir /tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps --extern libc=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/liblibc-cb8fd924c8df72bf.rmeta --extern sha2=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libsha2-eb5e74d628211b89.rmeta --extern spoolq_format=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_format-5ff958cb57533a93.rmeta --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_fs_linux-d94b1782d2179a22.rmeta --extern spoolq_math=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_math-f5bb1f10d08ec56c.rmeta --extern spoolq_names=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_names-fcdca88f9689e449.rmeta --extern thiserror=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libthiserror-4c83c32296ce572b.rmeta --cap-lints=warn` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `spoolq-core` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=03247d8421bced53 -C extra-filename=-3df264829b7166b2 --out-dir /tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps --extern criterion=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libcriterion-5e7c93a05943ba7c.rlib --extern libc=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/liblibc-cb8fd924c8df72bf.rlib --extern sha2=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libsha2-eb5e74d628211b89.rlib --extern spoolq_format=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_format-5ff958cb57533a93.rlib --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_fs_linux-d94b1782d2179a22.rlib --extern spoolq_math=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_math-f5bb1f10d08ec56c.rlib --extern spoolq_names=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libspoolq_names-fcdca88f9689e449.rlib --extern tempfile=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libtempfile-f80ce2590971964f.rlib --extern thiserror=/tmp/cargo-mutants-spoolq-tt77hP.tmp/target/debug/deps/libthiserror-4c83c32296ce572b.rlib --cap-lints=warn` (exit status: 1)
+
+*** result: Failure(101)

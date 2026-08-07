@@ -1,0 +1,2 @@
+crates/spoolq-core/src/queue.rs:511:9: replace Queue::wall_floor_for_mutation -> Result<u64, Error> with Ok(0)
+crates/spoolq-core/src/queue.rs:511:9: replace Queue::wall_floor_for_mutation -> Result<u64, Error> with Ok(1)

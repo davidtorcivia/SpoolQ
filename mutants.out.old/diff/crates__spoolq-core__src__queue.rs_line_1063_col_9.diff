@@ -1,0 +1,602 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::lease -> LeaseOutcome with Default::default()
+@@ -1055,598 +1055,17 @@
+             owned_fds.push(child);
+         }
+         Ok(())
+     }
+     /// Claim a ready job, returning a lease.
+     /// max_wait_ns is accepted for API compatibility but currently performs
+     /// a single immediate scan (C-14: bounded wait/backoff not yet implemented).
+     pub fn lease(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
+-        if let Err(e) = self.check_not_poisoned() {
+-            return LeaseOutcome::NotCommitted(e);
+-        }
+-
+-        // Validate lease duration: 1s to 7d
+-        let min_dur = 1_000_000_000u64;
+-        let max_dur = 7 * 24 * 60 * 60 * 1_000_000_000u64;
+-        if lease_duration_ns < min_dur || lease_duration_ns > max_dur {
+-            return LeaseOutcome::NotCommitted(Error::InvalidInput(
+-                "lease duration must be 1s to 7d".into(),
+-            ));
+-        }
+-
+-        // C-16: Clocks are re-captured inside the scan loop before each claim
+-        let _boottime_now = fs::clock_boottime_ns().ok();
+-        let _wall_now = fs::clock_realtime_ns().ok();
+-
+-        // C-19: Track scan completeness to distinguish Empty from I/O error
+-        let mut scan_had_error = false;
+-
+-        // C-15: Use and advance the per-worker scan round
+-        let scan_round = self.scan_round;
+-        self.scan_round = self.scan_round.wrapping_add(1);
+-        let (start, stride) = spoolq_names::shard_scan_params(
+-            &self.format.queue_id,
+-            &self.boot_id_bytes,
+-            &self.worker_nonce,
+-            scan_round,
+-            self.format.shard_count,
+-        );
+-
+-        for i in 0..self.format.shard_count {
+-            let shard = spoolq_names::shard_at(start, stride, i, self.format.shard_count);
+-            let shard_str = shard_hex(shard);
+-
+-            // Open the ready shard directory
+-            let ready_dir = format!("ready/{shard_str}");
+-            let shard_fd = match open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
+-                Ok(fd) => fd,
+-                Err(_) => {
+-                    scan_had_error = true;
+-                    continue;
+-                }
+-            };
+-
+-            // List entries
+-            let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+-                Ok(e) => e,
+-                Err(_) => {
+-                    scan_had_error = true;
+-                    continue;
+-                }
+-            };
+-
+-            for entry in &entries {
+-                if !entry.ends_with(".sqj") {
+-                    continue;
+-                }
+-
+-                // Parse and verify the ready filename
+-                let parsed = match spoolq_names::parse_ready(entry) {
+-                    Ok(p) => p,
+-                    Err(_) => continue,
+-                };
+-
+-                // Verify name tag
+-                let base = format!(
+-                    "{}.g{:016x}.a{:08x}.m{:08x}",
+-                    spoolq_names::hex_encode(&parsed.common.job_id),
+-                    parsed.common.generation,
+-                    parsed.common.attempt,
+-                    parsed.common.maximum_attempts,
+-                );
+-                let ctx = ready_context(&shard_str, &base);
+-                let expected_tag = compute_name_tag(&self.format.queue_id, &ctx);
+-                if expected_tag != parsed.tag {
+-                    continue;
+-                }
+-
+-                // Verify shard matches job_id
+-                let computed_shard = compute_shard(
+-                    &self.format.queue_id,
+-                    &parsed.common.job_id,
+-                    self.format.shard_count,
+-                );
+-                if computed_shard != shard {
+-                    continue;
+-                }
+-
+-                // Check attempt limit
+-                if parsed.common.attempt >= parsed.common.maximum_attempts {
+-                    // Move to dead
+-                    match self.move_to_dead(
+-                        &ready_dir,
+-                        entry,
+-                        &parsed.common,
+-                        DeadReason::AttemptsExhausted,
+-                    ) {
+-                        Ok(()) => continue,
+-                        Err(_) => {
+-                            // P1-07: Don't ignore cleanup failure.
+-                            scan_had_error = true;
+-                            self.poison();
+-                            continue;
+-                        }
+-                    }
+-                }
+-
+-                // C-16: Re-capture clocks immediately before the claim
+-                let boottime_claim = match fs::clock_boottime_ns() {
+-                    Ok(t) => t,
+-                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+-                };
+-                let wall_claim = match fs::clock_realtime_ns() {
+-                    Ok(t) => t,
+-                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+-                };
+-                // Attempt claim: rename ready -> leased
+-                let lease_token = match fs::random_128bit() {
+-                    Ok(t) => t,
+-                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+-                };
+-                let boottime_deadline = match boottime_claim.checked_add(lease_duration_ns) {
+-                    Some(d) => d,
+-                    None => continue, // deadline overflow, skip this candidate
+-                };
+-                let wall_deadline = match wall_claim.checked_add(lease_duration_ns) {
+-                    Some(d) => d,
+-                    None => continue,
+-                };
+-                let lease_bucket =
+-                    spoolq_math::lease_bucket(boottime_deadline, self.format.lease_bucket_width_ns)
+-                        .unwrap_or(0);
+-                let bucket_str = bucket_hex(lease_bucket);
+-
+-                // Checked generation increment: a source at u64::MAX cannot transition.
+-                let new_generation = match parsed.common.generation.checked_add(1) {
+-                    Some(g) => g,
+-                    None => continue,
+-                };
+-                // Checked attempt increment.
+-                let new_attempt = match parsed.common.attempt.checked_add(1) {
+-                    Some(a) => a,
+-                    None => continue,
+-                };
+-
+-                let leased_common = CommonFields {
+-                    job_id: parsed.common.job_id,
+-                    generation: new_generation,
+-                    attempt: new_attempt,
+-                    maximum_attempts: parsed.common.maximum_attempts,
+-                };
+-
+-                // Build leased filename
+-                let leased_base = format!(
+-                    "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
+-                    spoolq_names::hex_encode(&leased_common.job_id),
+-                    leased_common.generation,
+-                    leased_common.attempt,
+-                    leased_common.maximum_attempts,
+-                    boottime_deadline,
+-                    wall_deadline,
+-                    spoolq_names::hex_encode(&lease_token),
+-                );
+-                let leased_ctx = spoolq_names::leased_context(
+-                    &self.boot_id,
+-                    &bucket_str,
+-                    &shard_str,
+-                    &leased_base,
+-                );
+-                let leased_tag = compute_name_tag(&self.format.queue_id, &leased_ctx);
+-                let leased_name = spoolq_names::leased_filename(
+-                    &leased_common,
+-                    boottime_deadline,
+-                    wall_deadline,
+-                    &lease_token,
+-                    &leased_tag,
+-                );
+-
+-                // Ensure lease directory exists
+-                let leased_dir = format!("leased/{}/{}/{}", self.boot_id, bucket_str, shard_str);
+-                if let Err(e) = self.ensure_dir(&leased_dir) {
+-                    // R4-B04: Propagate real errors, don't mask as scan miss
+-                    scan_had_error = true;
+-                    let _ = e;
+-                    continue;
+-                }
+-
+-                let leased_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &leased_dir) {
+-                    Ok(fd) => fd,
+-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+-                    Err(_) => {
+-                        scan_had_error = true;
+-                        continue;
+-                    }
+-                };
+-
+-                // Rename ready -> leased with NOREPLACE
+-                match fs::renameat2_noreplace(
+-                    shard_fd.as_raw_fd(),
+-                    entry,
+-                    leased_dir_fd.as_raw_fd(),
+-                    &leased_name,
+-                ) {
+-                    Ok(()) => {
+-                        // Sync both directories
+-                        let same_dir = false; // different directories
+-                        if !same_dir {
+-                            if fs::fsync_dir_fd(leased_dir_fd.as_raw_fd()).is_err() {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: [0; 32],
+-                                });
+-                            }
+-                            if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_err() {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: [0; 32],
+-                                });
+-                            }
+-                        }
+-
+-                        // B-03: Post-rename validation failures must NOT continue as Empty.
+-                        // The claim is committed; failures here are corruption or indeterminate.
+-                        // Post-rename: open and verify the leased object
+-                        let leased_stat = match fs::fstatat(leased_dir_fd.as_raw_fd(), &leased_name)
+-                        {
+-                            Ok(s) => s,
+-                            Err(_) => {
+-                                // The rename succeeded but we cannot stat the result.
+-                                // This is OutcomeUnknown - the job is leased but we cannot verify.
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: [0; 32],
+-                                });
+-                            }
+-                        };
+-
+-                        // Verify link count is exactly 1 (rejects external hard links)
+-                        if leased_stat.st_nlink != 1 {
+-                            self.poison();
+-                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                job_id: parsed.common.job_id,
+-                                source_state: "ready".into(),
+-                                source_generation: parsed.common.generation,
+-                                source_attempt: parsed.common.attempt,
+-                                source_relative_path: format!("{ready_dir}/{entry}"),
+-                                attempted_destination_state: "leased".into(),
+-                                attempted_destination_relative_path: format!(
+-                                    "{leased_dir}/{leased_name}"
+-                                ),
+-                                lease_token: Some(lease_token),
+-                                envelope_digest: [0; 32],
+-                            });
+-                        }
+-
+-                        // Read and validate the fixed header
+-                        // R4-B06: Open with O_NOFOLLOW to reject symlinks
+-                        let leased_file = match fs::openat(
+-                            leased_dir_fd.as_raw_fd(),
+-                            &leased_name,
+-                            libc::O_RDONLY | libc::O_NOFOLLOW,
+-                            0,
+-                        ) {
+-                            Ok(f) => f,
+-                            Err(_) => {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: [0; 32],
+-                                });
+-                            }
+-                        };
+-
+-                        let mut header_buf = [0u8; 128];
+-                        if fs::pread_exact(leased_file.as_raw_fd(), &mut header_buf, 0).is_err() {
+-                            self.poison();
+-                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                job_id: parsed.common.job_id,
+-                                source_state: "ready".into(),
+-                                source_generation: parsed.common.generation,
+-                                source_attempt: parsed.common.attempt,
+-                                source_relative_path: format!("{ready_dir}/{entry}"),
+-                                attempted_destination_state: "leased".into(),
+-                                attempted_destination_relative_path: format!(
+-                                    "{leased_dir}/{leased_name}"
+-                                ),
+-                                lease_token: Some(lease_token),
+-                                envelope_digest: [0; 32],
+-                            });
+-                        }
+-
+-                        let header = match FixedHeader::decode(&header_buf) {
+-                            Ok(h) => h,
+-                            Err(_) => {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: [0; 32],
+-                                });
+-                            }
+-                        };
+-
+-                        // Verify job_id matches
+-                        if header.job_id != parsed.common.job_id {
+-                            self.poison();
+-                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                job_id: parsed.common.job_id,
+-                                source_state: "ready".into(),
+-                                source_generation: parsed.common.generation,
+-                                source_attempt: parsed.common.attempt,
+-                                source_relative_path: format!("{ready_dir}/{entry}"),
+-                                attempted_destination_state: "leased".into(),
+-                                attempted_destination_relative_path: format!(
+-                                    "{leased_dir}/{leased_name}"
+-                                ),
+-                                lease_token: Some(lease_token),
+-                                envelope_digest: [0; 32],
+-                            });
+-                        }
+-
+-                        // R4-B05: Full structural validation of the claimed object before return.
+-                        // Verify envelope digest, exact size, and payload limit.
+-                        {
+-                            let ext_len_h = header.extension_header_length as usize;
+-                            if ext_len_h > 65536 {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: header.envelope_digest,
+-                                });
+-                            }
+-                            let mut ext_buf_claim = vec![0u8; ext_len_h];
+-                            if ext_len_h > 0
+-                                && fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf_claim, 128)
+-                                    .is_err()
+-                            {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: header.envelope_digest,
+-                                });
+-                            }
+-                            if !spoolq_format::verify_envelope_digest(&header, &ext_buf_claim) {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: header.envelope_digest,
+-                                });
+-                            }
+-                            // Verify exact file size
+-                            let expected_claim_size =
+-                                (128 + ext_len_h + header.payload_length as usize) as u64;
+-                            if leased_stat.st_size as u64 != expected_claim_size {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: header.envelope_digest,
+-                                });
+-                            }
+-                            // Verify payload limit
+-                            if header.payload_length > self.format.max_payload_length {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: header.envelope_digest,
+-                                });
+-                            }
+-                            // Verify header max_attempts matches filename
+-                            if header.maximum_attempts != parsed.common.maximum_attempts {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: header.envelope_digest,
+-                                });
+-                            }
+-                        }
+-
+-                        // B2: Extension read/decode failure after claim is a post-linearization
+-                        // corruption. Do not return an ordinary lease with empty content_type.
+-                        let content_type = if header.extension_header_length > 0 {
+-                            if header.extension_header_length > 65536 {
+-                                self.poison();
+-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                    job_id: parsed.common.job_id,
+-                                    source_state: "ready".into(),
+-                                    source_generation: parsed.common.generation,
+-                                    source_attempt: parsed.common.attempt,
+-                                    source_relative_path: format!("{ready_dir}/{entry}"),
+-                                    attempted_destination_state: "leased".into(),
+-                                    attempted_destination_relative_path: format!(
+-                                        "{leased_dir}/{leased_name}"
+-                                    ),
+-                                    lease_token: Some(lease_token),
+-                                    envelope_digest: header.envelope_digest,
+-                                });
+-                            }
+-                            let mut ext_buf = vec![0u8; header.extension_header_length as usize];
+-                            match fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf, 128) {
+-                                Ok(()) => {
+-                                    match spoolq_format::cbor::ExtensionHeader::decode(&ext_buf) {
+-                                        Ok(e) => e.content_type,
+-                                        Err(_) => {
+-                                            self.poison();
+-                                            return LeaseOutcome::OutcomeUnknown(
+-                                                TransitionTicket {
+-                                                    job_id: parsed.common.job_id,
+-                                                    source_state: "ready".into(),
+-                                                    source_generation: parsed.common.generation,
+-                                                    source_attempt: parsed.common.attempt,
+-                                                    source_relative_path: format!(
+-                                                        "{ready_dir}/{entry}"
+-                                                    ),
+-                                                    attempted_destination_state: "leased".into(),
+-                                                    attempted_destination_relative_path: format!(
+-                                                        "{leased_dir}/{leased_name}"
+-                                                    ),
+-                                                    lease_token: Some(lease_token),
+-                                                    envelope_digest: header.envelope_digest,
+-                                                },
+-                                            );
+-                                        }
+-                                    }
+-                                }
+-                                Err(_) => {
+-                                    self.poison();
+-                                    return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+-                                        job_id: parsed.common.job_id,
+-                                        source_state: "ready".into(),
+-                                        source_generation: parsed.common.generation,
+-                                        source_attempt: parsed.common.attempt,
+-                                        source_relative_path: format!("{ready_dir}/{entry}"),
+-                                        attempted_destination_state: "leased".into(),
+-                                        attempted_destination_relative_path: format!(
+-                                            "{leased_dir}/{leased_name}"
+-                                        ),
+-                                        lease_token: Some(lease_token),
+-                                        envelope_digest: header.envelope_digest,
+-                                    });
+-                                }
+-                            }
+-                        } else {
+-                            String::new()
+-                        };
+-
+-                        let lease_info = LeaseInfo {
+-                            job_id: parsed.common.job_id,
+-                            envelope_digest: header.envelope_digest,
+-                            generation: new_generation,
+-                            attempt: new_attempt,
+-                            maximum_attempts: parsed.common.maximum_attempts,
+-                            token: lease_token,
+-                            boot_id: self.boot_id.clone(),
+-                            expires_boottime_ns: boottime_deadline,
+-                            expires_wall_ns: wall_deadline,
+-                            content_type,
+-                            payload_length: header.payload_length,
+-                            payload_digest: header.payload_digest,
+-                            expected_dev: leased_stat.st_dev as u64,
+-                            expected_inode: leased_stat.st_ino as u64,
+-                            exact_source_path: format!("{leased_dir}/{leased_name}"),
+-                        };
+-
+-                        return LeaseOutcome::Leased(lease_info);
+-                    }
+-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+-                    Err(_) => {
+-                        scan_had_error = true;
+-                        continue;
+-                    }
+-                }
+-            }
+-        }
+-
+-        // C-19: If the scan had I/O errors, report them rather than returning Empty
+-        if scan_had_error {
+-            LeaseOutcome::NotCommitted(Error::IoFailure("scan completed with errors".into()))
+-        } else {
+-            LeaseOutcome::Empty
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Acknowledge a lease: move to terminal receipt.
+     /// R4-H22/H23: Re-hashes the payload at ack time to close the TOCTOU
+     /// window between lease() and ack(). Use ack_unverified() to skip.
+     pub fn ack(&mut self, lease: &LeaseInfo) -> AckOutcome {
+         self.ack_impl(lease, true)
+     }

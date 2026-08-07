@@ -1,0 +1,33 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::retry_after -> TransitionOutcome with Default::default()
+@@ -1884,29 +1884,17 @@
+ 
+     /// Retry a lease at a future time (move to delayed).
+     pub fn retry_at(&mut self, lease: &LeaseInfo, not_before_ns: u64) -> TransitionOutcome {
+         self.retry(lease, Some(not_before_ns))
+     }
+ 
+     /// Retry a lease after a duration.
+     pub fn retry_after(&mut self, lease: &LeaseInfo, duration_ns: u64) -> TransitionOutcome {
+-        let wall_now = match self.wall_floor_for_mutation() {
+-            Ok(v) => v,
+-            Err(e) => return TransitionOutcome::NotCommitted(e),
+-        };
+-        let deadline = match spoolq_math::retry_wall_deadline(wall_now, duration_ns) {
+-            Some(d) => d,
+-            None => {
+-                return TransitionOutcome::NotCommitted(Error::InvalidInput(
+-                    "deadline overflow".into(),
+-                ))
+-            }
+-        };
+-        self.retry_at(lease, deadline)
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Retry with a policy (computes delay from attempt and policy).
+     pub fn retry_with_policy(
+         &mut self,
+         lease: &LeaseInfo,
+         policy: &spoolq_math::RetryPolicy,
+     ) -> TransitionOutcome {

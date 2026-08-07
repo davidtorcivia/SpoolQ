@@ -1252,6 +1252,25 @@ mod tests {
     }
 
     #[test]
+    fn fsync_dir_fd_honors_fault_injection() {
+        // Whole-function Ok(()) mutants skip fault_check and would pass a bare
+        // success test. Arming a fault requires the real function body.
+        fault::reset();
+        let dir = tempfile_dir("fsyncdir-fault");
+        let fd = open_dir_absolute(&dir).unwrap();
+        fault::inject("fsync_dir_fd", 1);
+        let err = fsync_dir_fd(fd.as_raw_fd()).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        fault::reset();
+        fault::inject("fsync_dir", 1);
+        mkdirat(fd.as_raw_fd(), "nested", 0o700).unwrap();
+        let err = fsync_dir(fd.as_raw_fd(), "nested").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        fault::reset();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn clocks_return_plausible_values() {
         // Kill Ok(1) whole-function mutants: real clocks are far above 1.
         let boot = clock_boottime_ns().unwrap();

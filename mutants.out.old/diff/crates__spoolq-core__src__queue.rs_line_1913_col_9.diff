@@ -1,0 +1,59 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::retry_with_policy -> TransitionOutcome with Default::default()
+@@ -1905,55 +1905,17 @@
+     }
+ 
+     /// Retry with a policy (computes delay from attempt and policy).
+     pub fn retry_with_policy(
+         &mut self,
+         lease: &LeaseInfo,
+         policy: &spoolq_math::RetryPolicy,
+     ) -> TransitionOutcome {
+-        if let Err(e) = policy.validate() {
+-            return TransitionOutcome::NotCommitted(Error::InvalidInput(e.to_string()));
+-        }
+-
+-        let delay_ms = match spoolq_math::retry_delay_ms(
+-            &self.format.queue_id,
+-            &lease.job_id,
+-            lease.attempt,
+-            policy,
+-        ) {
+-            Ok(d) => d,
+-            Err(e) => return TransitionOutcome::NotCommitted(Error::InvalidInput(e.to_string())),
+-        };
+-
+-        if delay_ms == 0 {
+-            self.retry_now(lease)
+-        } else {
+-            let delay_ns = match spoolq_math::checked_mul_u64(delay_ms, 1_000_000) {
+-                Some(d) => d,
+-                None => {
+-                    return TransitionOutcome::NotCommitted(Error::InvalidInput(
+-                        "delay overflow".into(),
+-                    ))
+-                }
+-            };
+-            let wall_now = match self.wall_floor_for_mutation() {
+-                Ok(v) => v,
+-                Err(e) => return TransitionOutcome::NotCommitted(e),
+-            };
+-            let deadline = match spoolq_math::retry_wall_deadline(wall_now, delay_ns) {
+-                Some(d) => d,
+-                None => {
+-                    return TransitionOutcome::NotCommitted(Error::InvalidInput(
+-                        "deadline overflow".into(),
+-                    ))
+-                }
+-            };
+-            self.retry_at(lease, deadline)
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn retry(&mut self, lease: &LeaseInfo, delayed_ns: Option<u64>) -> TransitionOutcome {
+         // If delayed target is at or before the effective wall floor, it's retry_now.
+         let delayed_ns = match delayed_ns {
+             Some(t) if t <= self.effective_wall_floor_ns() => None,
+             other => other,
+         };

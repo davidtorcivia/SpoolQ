@@ -2,13 +2,13 @@
   "outcomes": [
     {
       "scenario": "Baseline",
-      "summary": "Failure",
+      "summary": "Success",
       "log_path": "log/baseline.log",
       "diff_path": null,
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 8.116300142,
+          "duration": 8.068148066,
           "process_status": "Success",
           "argv": [
             "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
@@ -20,28 +20,471 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051350853,
+          "duration": 3.255633256,
+          "process_status": "Success",
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::wall_floor_for_mutation",
+            "return_type": "-> Result<u64, Error>",
+            "span": {
+              "start": {
+                "line": 507,
+                "column": 5
+              },
+              "end": {
+                "line": 518,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 511,
+              "column": 9
+            },
+            "end": {
+              "line": 517,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(0)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_511_col_9.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_511_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.752124442,
+          "process_status": "Success",
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 3.205199953,
           "process_status": {
-            "Failure": 1
+            "Failure": 101
           },
           "argv": [
             "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--verbose",
-            "--package=spoolq-core@0.1.0",
-            "--test-threads=4"
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::wall_floor_for_mutation",
+            "return_type": "-> Result<u64, Error>",
+            "span": {
+              "start": {
+                "line": 507,
+                "column": 5
+              },
+              "end": {
+                "line": 518,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 511,
+              "column": 9
+            },
+            "end": {
+              "line": 517,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(1)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_511_col_9_001.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_511_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.551813717,
+          "process_status": "Success",
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 3.155394827,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::enqueue",
+            "return_type": "-> EnqueueOutcome",
+            "span": {
+              "start": {
+                "line": 630,
+                "column": 5
+              },
+              "end": {
+                "line": 868,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 632,
+              "column": 9
+            },
+            "end": {
+              "line": 867,
+              "column": 10
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_632_col_9.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_632_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.351478078,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::lease",
+            "return_type": "-> LeaseOutcome",
+            "span": {
+              "start": {
+                "line": 1059,
+                "column": 5
+              },
+              "end": {
+                "line": 1645,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1063,
+              "column": 9
+            },
+            "end": {
+              "line": 1644,
+              "column": 10
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_1063_col_9.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_1063_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.351453803,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::retry_after",
+            "return_type": "-> TransitionOutcome",
+            "span": {
+              "start": {
+                "line": 1890,
+                "column": 5
+              },
+              "end": {
+                "line": 1905,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1892,
+              "column": 9
+            },
+            "end": {
+              "line": 1904,
+              "column": 39
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_1892_col_9.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_1892_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.351605984,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::retry_with_policy",
+            "return_type": "-> TransitionOutcome",
+            "span": {
+              "start": {
+                "line": 1907,
+                "column": 5
+              },
+              "end": {
+                "line": 1952,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1913,
+              "column": 9
+            },
+            "end": {
+              "line": 1951,
+              "column": 10
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_1913_col_9.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_1913_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.351668577,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::bury_internal",
+            "return_type": "-> TransitionOutcome",
+            "span": {
+              "start": {
+                "line": 2050,
+                "column": 5
+              },
+              "end": {
+                "line": 2097,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 2051,
+              "column": 9
+            },
+            "end": {
+              "line": 2096,
+              "column": 51
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_2051_col_9.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_2051_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.351400717,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "spoolq-core",
+          "file": "crates/spoolq-core/src/queue.rs",
+          "function": {
+            "function_name": "Queue::renew",
+            "return_type": "-> RenewOutcome",
+            "span": {
+              "start": {
+                "line": 2099,
+                "column": 5
+              },
+              "end": {
+                "line": 2189,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 2101,
+              "column": 9
+            },
+            "end": {
+              "line": 2188,
+              "column": 10
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__spoolq-core__src__queue.rs_line_2101_col_9.log",
+      "diff_path": "diff/crates__spoolq-core__src__queue.rs_line_2101_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.401551638,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
           ]
         }
       ]
     }
   ],
-  "total_mutants": 0,
+  "total_mutants": 8,
   "missed": 0,
-  "caught": 0,
+  "caught": 2,
   "timeout": 0,
-  "unviable": 0,
+  "unviable": 6,
   "success": 0,
-  "start_time": "2026-08-07T21:00:24.009252986Z",
-  "end_time": "2026-08-07T21:00:32.180983723Z",
+  "start_time": "2026-08-07T21:54:30.970829783Z",
+  "end_time": "2026-08-07T21:54:52.203978742Z",
   "cargo_mutants_version": "26.0.0"
 }
