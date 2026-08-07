@@ -1,10 +1,28 @@
-/* SpoolQ/1 C ABI test program */
+/* SpoolQ/1 C ABI test program - hermetic with unique temp dir */
 #include "spoolq.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* Remove a directory tree recursively. */
+static void rmrf(const char *path) {
+    /* Best-effort cleanup for hermetic repeatability. */
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+    /* This is a test program, so system() is acceptable here. */
+    int rc = system(cmd);
+    (void)rc;
+}
 
 int main(void) {
-    const char *path = "/tmp/spoolq_capi_test";
+    /* P1-24: Use a unique temp directory and clean it up. */
+    char tmpl[] = "/tmp/spoolq_capi_XXXXXX";
+    char *d = mkdtemp(tmpl);
+    if (!d) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/queue", d);
     SpoolqQueue *q = spoolq_init(path, 64);
     if (!q) { fprintf(stderr, "init failed\n"); return 1; }
 
@@ -36,5 +54,7 @@ int main(void) {
     spoolq_lease_free(lease);
     spoolq_close(q);
     printf("C ABI test passed\n");
+    /* P1-24: Cleanup temp directory for repeatability. */
+    rmrf(d);
     return 0;
 }
