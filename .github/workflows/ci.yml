@@ -58,27 +58,37 @@ jobs:
       - name: Fuzz smoke (bucket arithmetic)
         run: timeout 90 cargo +nightly fuzz run fuzz_bucket_arithmetic -- -max_len=64 -runs=5000
 
-  # Mutation testing - parallelized per crate via matrix
+  # Mutation testing - parallelized by crate and file group
   mutants:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        crate:
-          - spoolq-format
-          - spoolq-names
-          - spoolq-math
-          - spoolq-fs-linux
-          - spoolq-core
+        include:
+          - crate: spoolq-format
+          - crate: spoolq-names
+          - crate: spoolq-math
+          - crate: spoolq-fs-linux
+          - crate: spoolq-core
+            files: "*queue*"
+          - crate: spoolq-core
+            files: "*recovery*"
+          - crate: spoolq-core
+            files: "*quarantine* *errors* *state_machine*"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-mutants
         run: cargo install cargo-mutants
-      - name: Run mutants for ${{ matrix.crate }}
-        run: cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 || true
+      - name: Run mutants for ${{ matrix.crate }}${{ matrix.files && ' (files)' || '' }}
+        run: |
+          if [ -z "${{ matrix.files }}" ]; then
+            cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 || true
+          else
+            cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20               $(for f in ${{ matrix.files }}; do echo "-f $f"; done) || true
+          fi
 
   # Deep fuzz - extended runs (continue-on-error)
   deep-fuzz:
