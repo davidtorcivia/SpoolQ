@@ -486,7 +486,7 @@ impl Queue {
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
             if let Some(ref cursor) = self.recovery_cursor.promote_delayed_bucket {
-                if bucket_name.as_str() <= cursor.as_str() {
+                if bucket_name.as_str() < cursor.as_str() {
                     continue;
                 }
             }
@@ -758,7 +758,7 @@ impl Queue {
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
             if let Some(ref cursor) = self.recovery_cursor.compact_receipts_bucket {
-                if bucket_name.as_str() <= cursor.as_str() {
+                if bucket_name.as_str() < cursor.as_str() {
                     continue;
                 }
             }
@@ -1013,7 +1013,7 @@ impl Queue {
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
             if let Some(ref cursor) = self.recovery_cursor.delete_receipts_bucket {
-                if bucket_name.as_str() <= cursor.as_str() {
+                if bucket_name.as_str() < cursor.as_str() {
                     continue;
                 }
             }
@@ -1075,8 +1075,9 @@ impl Queue {
                         continue;
                     }
 
-                    if stats.operations_attempted >= budget.max_operations {
+                    if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
+                        self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
                         return;
                     }
                     stats.operations_attempted += 1;

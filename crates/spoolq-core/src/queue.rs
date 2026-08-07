@@ -101,7 +101,6 @@ impl Default for OpenOptions {
 /// fully processed bucket per phase so the next pass resumes from there.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RecoveryCursor {
-    pub reap_lease_bucket: Option<String>,
     pub promote_delayed_bucket: Option<String>,
     pub compact_receipts_bucket: Option<String>,
     pub delete_receipts_bucket: Option<String>,
@@ -1698,12 +1697,35 @@ impl Queue {
         };
 
         // R4-H22/H23: Re-hash the payload at ack time to close the TOCTOU window.
-        if verify_payload {
-            if let Err(e) = self.verify_payload_at_path(src_dir_fd.as_raw_fd(), &src_name) {
+        // Hold the verified fd open across the rename so we can verify
+        // post-rename that the destination inode matches the verified source.
+        let verified_inode: Option<u64> = if verify_payload {
+            let file_fd = match fs::openat(
+                src_dir_fd.as_raw_fd(),
+                &src_name,
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                0,
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.poison();
+                    return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
+                }
+            };
+            if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
                 self.poison();
                 return AckOutcome::NotCommitted(e);
             }
-        }
+            match fs::fstat(file_fd.as_raw_fd()) {
+                Ok(st) => Some(st.st_ino),
+                Err(e) => {
+                    self.poison();
+                    return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
+                }
+            }
+        } else {
+            None
+        };
 
         // Rename leased -> receipt with NOREPLACE
         match fs::renameat2_noreplace(
@@ -1713,6 +1735,29 @@ impl Queue {
             &receipt_name,
         ) {
             Ok(()) => {
+                // R4-H22/H23: Verify the renamed file has the same inode
+                // as the one we verified above.
+                if let Some(expected_inode) = verified_inode {
+                    match fs::fstatat(receipt_dir_fd.as_raw_fd(), &receipt_name) {
+                        Ok(dest_stat) if dest_stat.st_ino == expected_inode => {}
+                        _ => {
+                            self.poison();
+                            return AckOutcome::OutcomeUnknown(TransitionTicket {
+                                job_id: lease.job_id,
+                                source_state: "leased".into(),
+                                source_generation: lease.generation,
+                                source_attempt: lease.attempt,
+                                source_relative_path: lease.exact_source_path.clone(),
+                                attempted_destination_state: "receipts".into(),
+                                attempted_destination_relative_path: format!(
+                                    "{receipt_dir}/{receipt_name}"
+                                ),
+                                lease_token: Some(lease.token),
+                                envelope_digest: lease.envelope_digest,
+                            });
+                        }
+                    }
+                }
                 // Sync both directories
                 if fs::fsync_dir_fd(receipt_dir_fd.as_raw_fd()).is_err() {
                     self.poison();
@@ -2209,13 +2254,14 @@ impl Queue {
         if ext_len > 65536 {
             return Err(Error::QueueCorrupt("extension header too large".into()));
         }
+        // R4-H05: Always verify envelope digest (even when extension is empty).
+        let mut ext_buf = vec![0u8; ext_len];
         if ext_len > 0 {
-            let mut ext_buf = vec![0u8; ext_len];
             fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
                 .map_err(|e| Error::IoFailure(e.to_string()))?;
-            if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-            }
+        }
+        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+            return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
         }
 
         // R2-B02: Verify exact file size (no trailing data)
@@ -2401,9 +2447,6 @@ impl Queue {
     }
 
     /// R4-H22/H23: Verify the payload digest of a file at the given path.
-    /// Reads the header, verifies the envelope digest, then hashes the payload
-    /// and compares to the header digest. Closes the TOCTOU window by
-    /// re-reading the file at the time of use.
     fn verify_payload_at_path(
         &self,
         dir_fd: std::os::unix::io::RawFd,
@@ -2411,10 +2454,16 @@ impl Queue {
     ) -> Result<(), Error> {
         let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
+        self.verify_payload_on_fd(file_fd.as_raw_fd())
+    }
 
+    /// R4-H22/H23: Verify the payload digest on an already-open file descriptor.
+    /// Reads the header, verifies the envelope digest, then hashes the payload
+    /// and compares to the header digest. The caller must hold the fd open
+    /// across any subsequent operation to prevent TOCTOU swap.
+    fn verify_payload_on_fd(&self, fd: std::os::unix::io::RawFd) -> Result<(), Error> {
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::pread_exact(fd, &mut header_buf, 0).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
@@ -2425,17 +2474,16 @@ impl Queue {
         if ext_len > 65536 {
             return Err(Error::QueueCorrupt("extension header too large".into()));
         }
+        // R4-H05: Always read extension (even empty) and verify envelope digest.
+        let mut ext_buf = vec![0u8; ext_len];
         if ext_len > 0 {
-            let mut ext_buf = vec![0u8; ext_len];
-            fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
-                .map_err(|e| Error::IoFailure(e.to_string()))?;
-            if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-            }
+            fs::pread_exact(fd, &mut ext_buf, 128).map_err(|e| Error::IoFailure(e.to_string()))?;
+        }
+        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+            return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
         }
 
-        let file_stat =
-            fs::fstat(file_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let file_stat = fs::fstat(fd).map_err(|e| Error::IoFailure(e.to_string()))?;
         let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
         if file_stat.st_size as u64 != expected_size {
             return Err(Error::QueueCorrupt(format!(
@@ -2451,7 +2499,7 @@ impl Queue {
 
         while remaining > 0 {
             let to_read = remaining.min(buf.len());
-            let n = fs::pread(file_fd.as_raw_fd(), &mut buf[..to_read], offset)
+            let n = fs::pread(fd, &mut buf[..to_read], offset)
                 .map_err(|e| Error::IoFailure(e.to_string()))?;
             if n == 0 {
                 return Err(Error::QueueCorrupt("unexpected EOF".into()));
@@ -3213,9 +3261,10 @@ impl Queue {
                 if p.common.job_id != ticket.job_id {
                     return ResolveObj::Conflict;
                 }
-                if parts.len() == 5 {
-                    let bucket = parts[2];
-                    let shard_hex = parts[3];
+                // delayed/<bucket>/<shard>/<file> = 4 parts
+                if parts.len() == 4 {
+                    let bucket = parts[1];
+                    let shard_hex = parts[2];
                     let base = format!(
                         "{}.g{:016x}.a{:08x}.m{:08x}.r{:016x}",
                         spoolq_names::hex_encode(&p.common.job_id),
@@ -3251,9 +3300,10 @@ impl Queue {
                 if p.common.job_id != ticket.job_id {
                     return ResolveObj::Conflict;
                 }
-                if parts.len() == 5 {
-                    let bucket = parts[2];
-                    let shard_hex = parts[3];
+                // dead/<bucket>/<shard>/<file> = 4 parts
+                if parts.len() == 4 {
+                    let bucket = parts[1];
+                    let shard_hex = parts[2];
                     let base = format!(
                         "{}.g{:016x}.a{:08x}.m{:08x}",
                         spoolq_names::hex_encode(&p.common.job_id),
@@ -3298,9 +3348,10 @@ impl Queue {
                         return ResolveObj::Conflict;
                     }
                 }
-                if parts.len() == 5 {
-                    let bucket = parts[2];
-                    let shard_hex = parts[3];
+                // receipts/<bucket>/<shard>/<file> = 4 parts
+                if parts.len() == 4 {
+                    let bucket = parts[1];
+                    let shard_hex = parts[2];
                     let base = format!(
                         "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
                         spoolq_names::hex_encode(&p.common.job_id),

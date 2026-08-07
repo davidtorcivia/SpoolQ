@@ -714,16 +714,16 @@ impl Queue {
 
         let expected_tag = match state_name {
             "ready" => {
-                // ready/<shard>/<filename>
+                // ready/<shard>/<filename> = 3 parts
                 if path_parts.len() != 3 {
-                    return true; // cannot verify, skip
+                    return true;
                 }
                 let shard_hex = path_parts[1];
                 let ctx = spoolq_names::ready_context(shard_hex, &base_no_token);
                 spoolq_names::compute_name_tag(queue_id, &ctx)
             }
             "leased" => {
-                // leased/<boot>/<bucket>/<shard>/<filename>
+                // leased/<boot>/<bucket>/<shard>/<filename> = 5 parts
                 if path_parts.len() != 5 {
                     return true;
                 }
@@ -739,20 +739,20 @@ impl Queue {
                 spoolq_names::compute_name_tag(queue_id, &ctx)
             }
             "delayed" => {
-                // delayed/-/<bucket>/<shard>/<filename>
+                // delayed/<bucket>/<shard>/<filename> = 4 parts
                 // Delayed filenames include retry_after_ns in the tag context.
-                // The parse result does not expose retry_after_ns separately,
-                // so tag verification for delayed is handled by shard placement
-                // checks instead. Skip tag verification here.
+                // We cannot reconstruct the full context here without the
+                // retry_after_ns field, so skip tag verification for delayed.
+                // Shard placement is still verified by fsck_extract_shard_hex.
                 return true;
             }
             "dead" => {
-                // dead/-/<bucket>/<shard>/<filename>
-                if path_parts.len() != 5 {
+                // dead/<bucket>/<shard>/<filename> = 4 parts
+                if path_parts.len() != 4 {
                     return true;
                 }
-                let bucket = path_parts[2];
-                let shard_hex = path_parts[3];
+                let bucket = path_parts[1];
+                let shard_hex = path_parts[2];
                 let ctx = spoolq_names::terminal_context(
                     spoolq_names::State::Dead,
                     bucket,
@@ -762,12 +762,12 @@ impl Queue {
                 spoolq_names::compute_name_tag(queue_id, &ctx)
             }
             "receipts" => {
-                // receipts/-/<bucket>/<shard>/<filename>
-                if path_parts.len() != 5 {
+                // receipts/<bucket>/<shard>/<filename> = 4 parts
+                if path_parts.len() != 4 {
                     return true;
                 }
-                let bucket = path_parts[2];
-                let shard_hex = path_parts[3];
+                let bucket = path_parts[1];
+                let shard_hex = path_parts[2];
                 let token_hex = match token {
                     Some(t) => spoolq_names::hex_encode(&t),
                     None => return true,
@@ -795,9 +795,8 @@ impl Queue {
     ) -> Option<&'a str> {
         match state_name {
             "ready" if path_parts.len() == 3 => Some(path_parts[1]),
-            "leased" | "delayed" | "dead" | "receipts" if path_parts.len() == 5 => {
-                Some(path_parts[3])
-            }
+            "leased" if path_parts.len() == 5 => Some(path_parts[3]),
+            "delayed" | "dead" | "receipts" if path_parts.len() == 4 => Some(path_parts[2]),
             _ => None,
         }
     }
