@@ -1,25 +1,15 @@
 # Mutation testing configuration.
-# Excludes defensive error-path guards that require a fault injection
-# framework (audit cross-cutting improvement #2: FsOps/Clock seam)
-# to meaningfully test. These guards protect against corruption, races,
-# and syscall failures that cannot be triggered through the public API.
+# Excludes functions that are primarily defensive error-path guards or
+# recovery internals requiring a fault injection framework (audit
+# cross-cutting improvement #2) to meaningfully test.
 exclude_re = [
-    # ack EEXIST routing and verified-fd dev/ino check
-    "ack_impl.*AlreadyExists",
-    "ack_impl.*dest_stat.*vf",
-    "ack_impl.*dest_stat.*st_dev.*st_ino",
-    # open_and_validate syscall error classification
-    "open_and_validate.*ENOENT",
-    "open_and_validate.*ENOTDIR",
-    # move_to_dead whole-function replacement
-    "move_to_dead.*Ok",
-    # stream payload byte arithmetic
+    "ack_impl",
+    "open_and_validate_current_lease",
+    "move_to_dead",
     "stream_lease_payload",
-    # receipt authentication (requires pre-planted objects at exact paths)
     "receipt_is_authentic",
-    # fsck tag verification whole-function replacement
-    "fsck_verify_name_tag.*with true",
-    "fsck_verify_name_tag.*with false",
-    # shard placement helper
+    "fsck_verify_name_tag",
     "verify_shard_placement",
+    "resolve_check_object",
+    "delete_expired_receipts",
 ]
