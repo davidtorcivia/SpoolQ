@@ -556,6 +556,47 @@ fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
     Ok(entries)
 }
 
+/// R4-PERF: Iterate directory entries with a callback, avoiding full
+/// materialization. The callback returns true to continue, false to stop.
+/// Returns the number of entries processed.
+pub fn read_dir_for_each<F: FnMut(&str) -> bool>(dir_fd: RawFd, mut f: F) -> io::Result<usize> {
+    let dup_fd = unsafe { libc::dup(dir_fd) };
+    if dup_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dir = unsafe { libc::fdopendir(dup_fd) };
+    if dir.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut count = 0usize;
+    loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != 0 {
+                unsafe { libc::closedir(dir) };
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            break;
+        }
+        let name_bytes = unsafe {
+            let name_ptr = (*entry).d_name.as_ptr();
+            let len = libc::strlen(name_ptr);
+            std::slice::from_raw_parts(name_ptr as *const u8, len)
+        };
+        let name = String::from_utf8_lossy(name_bytes);
+        if name != "." && name != ".." {
+            count += 1;
+            if !f(&name) {
+                break;
+            }
+        }
+    }
+    unsafe { libc::closedir(dir) };
+    Ok(count)
+}
+
 /// Read directory entries. Consumes the fd (fdopendir takes ownership).
 /// Prefer read_dir_entries_owned which dups the fd first.
 pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<String>> {

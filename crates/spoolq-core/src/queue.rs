@@ -2468,6 +2468,66 @@ impl Queue {
 
         Ok(())
     }
+    /// R4-PERF: Read a chunk of a leased job's payload at the given offset.
+    /// Returns the number of bytes read (0 at EOF).
+    /// Validates source identity before reading (B-04).
+    pub fn read_lease_payload_chunk(
+        &self,
+        lease: &LeaseInfo,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, Error> {
+        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
+            Some(pair) => pair,
+            None => return Err(Error::QueueCorrupt("lease source not found".into())),
+        };
+        let file_fd = fs::openat(
+            src_dir_fd.as_raw_fd(),
+            &src_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        )
+        .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let mut header_buf = [0u8; 128];
+        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let header =
+            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
+        let ext_len = header.extension_header_length as usize;
+        let payload_start = (128 + ext_len) as u64;
+        let payload_len = header.payload_length;
+        if offset >= payload_len {
+            return Ok(0);
+        }
+        let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
+        let abs_offset = payload_start + offset;
+        let n = fs::pread(file_fd.as_raw_fd(), &mut buf[..to_read], abs_offset)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// R4-PERF: Stream a leased job's payload through a callback.
+    /// Reads in chunks of chunk_size, calling f for each chunk.
+    /// Validates source identity before reading (B-04).
+    pub fn stream_lease_payload<F: FnMut(&[u8]) -> Result<(), Error>>(
+        &self,
+        lease: &LeaseInfo,
+        chunk_size: usize,
+        mut f: F,
+    ) -> Result<(), Error> {
+        let mut buf = vec![0u8; chunk_size.clamp(4096, 1 << 20)];
+        let mut offset = 0u64;
+        loop {
+            let n = self.read_lease_payload_chunk(lease, &mut buf, offset)?;
+            if n == 0 {
+                break;
+            }
+            f(&buf[..n])?;
+            offset += n as u64;
+        }
+        Ok(())
+    }
+
     /// Diagnostic lookup: find all states for a job_id.
     /// Scans active and terminal states for the computed shard.
     pub fn inspect(&self, job_id: &[u8; 16]) -> Vec<Snapshot> {
@@ -4357,6 +4417,56 @@ mod tests {
             ),
             "corrupted payload should be detected, got: {result:?}"
         );
+    }
+
+    // ===== R4-PERF: streaming payload read =====
+    #[test]
+    fn stream_lease_payload_reads_all_data() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"streaming payload data for testing chunked reads";
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        let mut collected = Vec::new();
+        queue
+            .stream_lease_payload(&lease, 8, |chunk| {
+                collected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(&collected[..], &payload[..]);
+    }
+
+    #[test]
+    fn read_lease_payload_chunk_respects_offset() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"0123456789abcdef";
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        let mut buf = [0u8; 4];
+        let n = queue.read_lease_payload_chunk(&lease, &mut buf, 4).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"4567");
+        // Read at EOF
+        let n = queue
+            .read_lease_payload_chunk(&lease, &mut buf, 16)
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     // ===== B-05: Wall watermark advances after enqueue =====
