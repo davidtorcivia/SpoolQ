@@ -1,0 +1,11 @@
+# Exclude test modules, generated code, and dead-code-only areas
+# from mutation testing to keep runtime reasonable.
+
+exclude_re = [
+    "#\[cfg\(test\)\]",
+    "mod tests",
+    "generated/",
+]
+
+# Cap test timeout per mutant
+test_timeout = "20s"

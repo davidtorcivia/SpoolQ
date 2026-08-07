@@ -20,3 +20,4 @@ repository = "https://github.com/davidtorcivia/spoolq"
 
 [workspace.dependencies]
 sha2 = "0.10"
+criterion = "0.5"
