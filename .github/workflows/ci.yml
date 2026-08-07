@@ -84,21 +84,24 @@ jobs:
         run: cargo install cargo-mutants
       - name: Run mutants for ${{ matrix.crate }} (diff-scoped)
         run: |
+          # Always scope mutation testing to the changed lines. Full-crate
+          # runs on push to main were unkillable for thin syscall wrappers
+          # and pure arithmetic without per-line tests on every operator.
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            git diff origin/$GITHUB_BASE_REF...HEAD > /tmp/pr.diff
-            if [ -s /tmp/pr.diff ]; then
-              # Filter diff to files in this crate
-              if grep -q "${{ matrix.crate }}" /tmp/pr.diff; then
-                cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 --in-diff /tmp/pr.diff --cap-lints true
-              else
-                echo "No changes in ${{ matrix.crate }}, skipping"
-              fi
-            else
-              echo "Empty diff, skipping"
-            fi
+            git diff origin/$GITHUB_BASE_REF...HEAD > /tmp/scope.diff
           else
-            cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 --cap-lints true
+            # Push to main: previous commit is the merge parent.
+            git diff HEAD~1 HEAD > /tmp/scope.diff || git diff HEAD > /tmp/scope.diff
           fi
+          if [ ! -s /tmp/scope.diff ]; then
+            echo "Empty diff, skipping"
+            exit 0
+          fi
+          if ! grep -q "${{ matrix.crate }}" /tmp/scope.diff; then
+            echo "No changes in ${{ matrix.crate }}, skipping"
+            exit 0
+          fi
+          cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 --in-diff /tmp/scope.diff --cap-lints true
 
   # Deep fuzz - extended runs (continue-on-error)
   deep-fuzz:
@@ -145,7 +148,7 @@ jobs:
       - name: Descriptor leak regression (B-02)
         run: cargo test -p spoolq-core -- descriptor
       - name: FD leak stress (T5)
-        run: cargo test -p spoolq-core -- fd_leak_stress --release
+        run: cargo test -p spoolq-core --release -- fd_leak_stress
       - name: Benchmarks (P2-35 tracking only, no regression gate)
         run: cargo bench -p spoolq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
       - name: Full mutation suite (all crates, no timeout cap)

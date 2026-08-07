@@ -7,6 +7,7 @@ pub mod state_machine;
 pub use errors::*;
 pub use quarantine::{
     CorruptionFinding, FindingSeverity, FsckDepth, FsckMode, FsckOptions, FsckReport,
+    QuarantineEntry,
 };
 pub use queue::*;
 pub use recovery::{RecoveryStats, WorkBudget};

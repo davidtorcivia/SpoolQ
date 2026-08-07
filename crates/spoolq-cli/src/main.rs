@@ -1224,50 +1224,108 @@ fn main() -> ExitCode {
                 }
             }
             AdminCommands::QuarantineList { path } => {
-                let qroot = path.join("quarantine");
-                if let Ok(entries) = std::fs::read_dir(&qroot) {
-                    for bucket in entries.flatten() {
-                        if let Ok(shards) = std::fs::read_dir(bucket.path()) {
-                            for shard in shards.flatten() {
-                                if let Ok(files) = std::fs::read_dir(shard.path()) {
-                                    for file in files.flatten() {
-                                        let name = file.file_name().to_string_lossy().to_string();
-                                        let rp = file
-                                            .path()
-                                            .strip_prefix(&path)
-                                            .unwrap_or(&file.path())
-                                            .display()
-                                            .to_string();
-                                        println!("{name} {rp}");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                let queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                for entry in queue.list_quarantine() {
+                    println!(
+                        "{} reason=0x{:04x} {}",
+                        spoolq_names::hex_encode(&entry.quarantine_id),
+                        entry.reason,
+                        entry.relative_path
+                    );
                 }
                 ExitCode::from(EXIT_SUCCESS)
             }
             AdminCommands::QuarantineInspect {
-                path: _,
+                path,
                 quarantine_id,
             } => {
-                eprintln!("quarantine_id: {quarantine_id}");
-                ExitCode::from(EXIT_SUCCESS)
+                let qid = match spoolq_names::hex_decode_16(&quarantine_id) {
+                    Some(b) => b,
+                    None => {
+                        eprintln!("invalid quarantine_id");
+                        return ExitCode::from(EXIT_ORDINARY);
+                    }
+                };
+                let queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                match queue.find_quarantine(&qid) {
+                    Some(entry) => {
+                        let abs = path.join(&entry.relative_path);
+                        let meta = std::fs::metadata(&abs).ok();
+                        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                        println!(
+                            "quarantine_id={} reason=0x{:04x} path={} size={size}",
+                            spoolq_names::hex_encode(&entry.quarantine_id),
+                            entry.reason,
+                            entry.relative_path
+                        );
+                        ExitCode::from(EXIT_SUCCESS)
+                    }
+                    None => {
+                        eprintln!("not found");
+                        ExitCode::from(EXIT_ORDINARY)
+                    }
+                }
             }
             AdminCommands::QuarantineExport {
-                path: _,
-                quarantine_id: _,
-                output: _,
+                path,
+                quarantine_id,
+                output,
             } => {
-                eprintln!("unsupported: this command is not implemented");
-                ExitCode::from(EXIT_UNSUPPORTED)
+                let qid = match spoolq_names::hex_decode_16(&quarantine_id) {
+                    Some(b) => b,
+                    None => {
+                        eprintln!("invalid quarantine_id");
+                        return ExitCode::from(EXIT_ORDINARY);
+                    }
+                };
+                let queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                match queue.export_quarantine(&qid, &output) {
+                    Ok(n) => {
+                        eprintln!("exported {n} bytes");
+                        ExitCode::from(EXIT_SUCCESS)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        eprintln!("not found");
+                        ExitCode::from(EXIT_ORDINARY)
+                    }
+                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                }
             }
             AdminCommands::QuarantineRemove {
-                path: _,
-                quarantine_id: _,
+                path,
+                quarantine_id,
             } => {
-                eprintln!("unsupported: this command is not implemented");
-                ExitCode::from(EXIT_ORDINARY)
+                let qid = match spoolq_names::hex_decode_16(&quarantine_id) {
+                    Some(b) => b,
+                    None => {
+                        eprintln!("invalid quarantine_id");
+                        return ExitCode::from(EXIT_ORDINARY);
+                    }
+                };
+                let queue = match Queue::open(&path, &OpenOptions::default()) {
+                    Ok(q) => q,
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                match queue.remove_quarantine(&qid) {
+                    Ok(true) => {
+                        eprintln!("removed");
+                        ExitCode::from(EXIT_SUCCESS)
+                    }
+                    Ok(false) => {
+                        eprintln!("not found");
+                        ExitCode::from(EXIT_ORDINARY)
+                    }
+                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                }
             }
             AdminCommands::CompactReceipts { path } => {
                 let mut queue = match Queue::open(&path, &OpenOptions::default()) {

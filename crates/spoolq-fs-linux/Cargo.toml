@@ -9,3 +9,9 @@ repository.workspace = true
 
 [dependencies]
 libc = "0.2"
+
+[features]
+default = []
+# Historical alias. Fault injection is always compiled; arming is a no-op
+# until tests call fault::inject.
+fault-injection = []

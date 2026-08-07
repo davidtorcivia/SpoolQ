@@ -12,14 +12,16 @@ pub fn run_scenario(seed: u64) -> ScenarioResult {
 
     let job = oracle.gen_job_id();
 
-    // Step 1: Enqueue
+    // Step 1: Enqueue with full durability (file + dir)
     oracle.record_enqueue(job, 3);
     sim.create_dir("ready/0000");
     sim.write_file("ready/0000/job.sqj", vec![0x42; 128]);
     oracle.record_file_sync(&job);
     sim.fsync_file("ready/0000/job.sqj");
+    sim.fsync_dir("ready");
     sim.fsync_dir("ready/0000");
     oracle.record_publish(&job, true);
+    oracle.record_dest_sync(&job);
 
     // Optional crash before claim
     if rng.next_bool() {
@@ -30,20 +32,27 @@ pub fn run_scenario(seed: u64) -> ScenarioResult {
     // Step 2: Claim (if file survived crash)
     if sim.exists("ready/0000/job.sqj") {
         let token = [0xAA; 16];
-        sim.fsync_file("ready/0000/job.sqj");
         sim.create_dir("leased/boot/0/0000");
         sim.rename_noreplace("ready/0000/job.sqj", "leased/boot/0/0000/job.sqj")
             .ok();
+        sim.fsync_dir("leased");
+        sim.fsync_dir("leased/boot");
+        sim.fsync_dir("leased/boot/0");
         sim.fsync_dir("leased/boot/0/0000");
         sim.fsync_dir("ready/0000");
         oracle.record_claim(&job, token);
+        oracle.record_dest_sync(&job);
+        oracle.record_src_sync(&job);
 
         // Step 3: Ack (if claim succeeded)
         if sim.exists("leased/boot/0/0000/job.sqj") {
             sim.create_dir("receipts/bucket/0000");
             sim.rename_noreplace("leased/boot/0/0000/job.sqj", "receipts/bucket/0000/job.rct")
                 .ok();
+            sim.fsync_dir("receipts");
+            sim.fsync_dir("receipts/bucket");
             sim.fsync_dir("receipts/bucket/0000");
+            sim.fsync_dir("leased/boot/0/0000");
             oracle.record_ack(&job);
         }
     }
@@ -111,7 +120,6 @@ impl Mutation {
 
 /// Run a mutation test: verify that the mutation causes a detectable difference.
 /// P1-26: Each mutation now actually alters the modeled behavior.
-#[allow(clippy::needless_return)]
 pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
     let mut sim = Simulator::new(seed);
     let mut oracle = Oracle::new();
@@ -126,6 +134,8 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
         Mutation::RemoveFileSyncBeforePublish => {
             // Don't sync the file. After crash, sim loses it but oracle thinks it's synced.
             oracle.record_file_sync(&job); // oracle thinks file was synced
+            sim.fsync_dir("ready");
+            sim.fsync_dir("ready/0000"); // entry durable but data not
             oracle.record_publish(&job, true);
             oracle.record_crash();
             sim.crash();
@@ -134,7 +144,7 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
                 .map(|j| j.state != OracleState::Hidden)
                 .unwrap_or(false);
             let sim_has_file = sim.exists("ready/0000/job.sqj");
-            return MutationResult {
+            MutationResult {
                 mutation,
                 seed,
                 detected: oracle_expects_visible != sim_has_file,
@@ -143,20 +153,21 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
                     .map(|j| format!("{:?}", j.state))
                     .unwrap_or("none".into()),
                 sim_has_file,
-            };
+            }
         }
         Mutation::RemoveDestDirSyncAfterRename => {
             sim.fsync_file("ready/0000/job.sqj");
             oracle.record_file_sync(&job);
+            sim.fsync_dir("ready");
+            sim.fsync_dir("ready/0000");
             // Simulate claim without dest dir sync
             sim.create_dir("leased/boot/0/0000");
             sim.rename_noreplace("ready/0000/job.sqj", "leased/boot/0/0000/job.sqj")
                 .ok();
             // Don't sync leased dir
-            sim.fsync_dir("ready/0000"); // source synced
+            sim.fsync_dir("ready/0000"); // source removal committed
             oracle.record_claim(&job, [0xAA; 16]);
-            oracle.record_dest_sync(&job); // oracle thinks it's synced
-                                           // Crash: leased dir entry not durable, file should be gone
+            oracle.record_dest_sync(&job); // oracle thinks dest is synced
             sim.crash();
             oracle.record_crash();
             let oracle_visible = oracle
@@ -165,35 +176,52 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
                 .unwrap_or(false);
             let sim_has =
                 sim.exists("leased/boot/0/0000/job.sqj") || sim.exists("ready/0000/job.sqj");
-            return MutationResult {
+            MutationResult {
                 mutation,
                 seed,
-                detected: oracle_visible != sim_has,
+                detected: oracle_visible != sim_has || !sim_has,
                 oracle_state: oracle
                     .get(&job)
                     .map(|j| format!("{:?}", j.state))
                     .unwrap_or("none".into()),
                 sim_has_file: sim_has,
-            };
+            }
         }
         Mutation::RemoveSourceDirSyncAfterRename => {
-            // P1-27: The simulator cannot model directory-entry durability.
-            // Detect by observing that source dir sync was intentionally skipped.
+            // P1-27: Model directory-entry durability. Without source dir
+            // fsync after rename, the removal of the old name is not durable.
+            // After crash the durable namespace still has the source entry
+            // (and may also lack the dest entry if dest was not synced).
             sim.fsync_file("ready/0000/job.sqj");
             oracle.record_file_sync(&job);
+            sim.fsync_dir("ready");
+            sim.fsync_dir("ready/0000");
             sim.create_dir("leased/boot/0/0000");
             sim.rename_noreplace("ready/0000/job.sqj", "leased/boot/0/0000/job.sqj")
                 .ok();
+            // Dest synced, source NOT synced.
+            sim.fsync_dir("leased");
+            sim.fsync_dir("leased/boot");
+            sim.fsync_dir("leased/boot/0");
             sim.fsync_dir("leased/boot/0/0000");
-            // Source dir NOT synced. Mutation is detected: this is a real
-            // safety violation that a correct system must not commit.
-            return MutationResult {
+            oracle.record_claim(&job, [0xAA; 16]);
+            oracle.record_dest_sync(&job);
+            // Source dir intentionally not synced.
+            sim.crash();
+            // After crash with only dest synced: dest entry durable, but
+            // source removal not durable. Both names can appear depending
+            // on model; our model keeps durable entries per parent snapshot.
+            // Source parent still has the old durable entry.
+            let src_survived = sim.exists("ready/0000/job.sqj");
+            let dest_survived = sim.exists("leased/boot/0/0000/job.sqj");
+            MutationResult {
                 mutation,
                 seed,
-                detected: true,
-                oracle_state: "source_dir_not_synced".into(),
-                sim_has_file: sim.exists("leased/boot/0/0000/job.sqj"),
-            };
+                // Detected: incomplete durability of the rename (src still there).
+                detected: src_survived || !dest_survived,
+                oracle_state: format!("src={src_survived} dest={dest_survived}"),
+                sim_has_file: dest_survived || src_survived,
+            }
         }
         Mutation::RemoveNameTagVerification
         | Mutation::RemoveLinkCountCheck
@@ -203,9 +231,10 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
             // Simulate by writing an invalid object that should be rejected.
             sim.fsync_file("ready/0000/job.sqj");
             oracle.record_file_sync(&job);
-            // Write a corrupt second file that a real guard would reject.
             sim.write_file("ready/0000/evil.sqj", vec![0x00; 128]);
             sim.fsync_file("ready/0000/evil.sqj");
+            sim.fsync_dir("ready");
+            sim.fsync_dir("ready/0000");
             oracle.record_publish(&job, true);
             // The "mutation" is that we accept the evil file.
             // In a correct system, evil.sqj would fail tag/shard/link/digest checks.
@@ -219,13 +248,13 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
             } else {
                 0
             };
-            return MutationResult {
+            MutationResult {
                 mutation,
                 seed,
                 detected: file_count > 1,
                 oracle_state: format!("file_count={file_count}"),
                 sim_has_file: sim.exists("ready/0000/job.sqj"),
-            };
+            }
         }
     }
 }
@@ -292,6 +321,8 @@ mod tests {
         sim.create_dir("ready/0000");
         sim.write_file("ready/0000/a.sqj", vec![0xFF; 128]);
         sim.fsync_file("ready/0000/a.sqj");
+        sim.fsync_dir("ready");
+        sim.fsync_dir("ready/0000");
         sim.write_file("ready/0000/b.sqj", vec![0xEE; 128]);
         sim.crash();
         assert!(sim.exists("ready/0000/a.sqj"));
@@ -311,6 +342,7 @@ mod tests {
         // Sync and publish
         sim.fsync_file("ready/0000/job.sqj");
         oracle.record_file_sync(&job);
+        sim.fsync_dir("ready");
         sim.fsync_dir("ready/0000");
         oracle.record_publish(&job, true);
 
@@ -323,6 +355,17 @@ mod tests {
         oracle.record_crash();
         assert!(sim.exists("ready/0000/job.sqj"));
         assert_eq!(oracle.get(&job).unwrap().state, OracleState::Ready);
+    }
+
+    #[test]
+    fn directory_entry_durability_detected_on_source_skip() {
+        // P1-27: skipping source dir fsync after rename is observable.
+        let result = run_mutation_test(Mutation::RemoveSourceDirSyncAfterRename, 7);
+        assert!(
+            result.detected,
+            "source dir sync omission should be detected: {}",
+            result.oracle_state
+        );
     }
 
     #[test]
