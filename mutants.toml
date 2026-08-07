@@ -1,11 +1,2 @@
-# Exclude test modules, generated code, and dead-code-only areas
-# from mutation testing to keep runtime reasonable.
-
-exclude_re = [
-    "#\[cfg\(test\)\]",
-    "mod tests",
-    "generated/",
-]
-
-# Cap test timeout per mutant
-test_timeout = "20s"
+# Placeholder - actual config is in .cargo/mutants.toml
+# See that file for exclude_re patterns.
