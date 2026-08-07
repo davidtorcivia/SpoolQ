@@ -65,6 +65,8 @@ enum Commands {
         duration_seconds: u64,
         #[arg(long)]
         handle_file: Option<PathBuf>,
+        #[arg(long)]
+        ticket_out: Option<PathBuf>,
     },
     /// Stats
     Stats { path: PathBuf },
@@ -287,6 +289,7 @@ fn main() -> ExitCode {
             path,
             duration_seconds,
             handle_file,
+            ticket_out,
         } => {
             let queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
@@ -329,6 +332,13 @@ fn main() -> ExitCode {
                 LeaseOutcome::OutcomeUnknown(ticket) => {
                     eprintln!("outcome unknown");
                     eprintln!("job_id: {}", spoolq_names::hex_encode(&ticket.job_id));
+                    // P1-19: Persist ticket for later resolution.
+                    if let Some(ref tf) = ticket_out {
+                        match write_ticket_file(tf, &ticket) {
+                            Ok(()) => eprintln!("ticket written to: {}", tf.display()),
+                            Err(e) => eprintln!("warning: failed to write ticket: {e}"),
+                        }
+                    }
                     ExitCode::from(2)
                 }
             }
@@ -499,14 +509,14 @@ fn main() -> ExitCode {
         }
 
         Commands::Ack { path, handle_file } => {
-            let lease = match load_handle(&handle_file) {
-                Ok(l) => l,
+            let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
                 Err(e) => {
-                    eprintln!("handle load failed: {e}");
-                    return ExitCode::FAILURE;
+                    eprintln!("open failed: {e}");
+                    return ExitCode::from(EXIT_IO_FAILURE);
                 }
             };
-            let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+            let lease = match load_handle(&handle_file, &queue.format().queue_id) {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
@@ -545,17 +555,17 @@ fn main() -> ExitCode {
             handle_file,
             after_seconds,
         } => {
-            let lease = match load_handle(&handle_file) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("handle load failed: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
             let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let lease = match load_handle(&handle_file, &queue.format().queue_id) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("handle load failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -593,17 +603,17 @@ fn main() -> ExitCode {
             handle_file,
             reason,
         } => {
-            let lease = match load_handle(&handle_file) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("handle load failed: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
             let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let lease = match load_handle(&handle_file, &queue.format().queue_id) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("handle load failed: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -839,7 +849,8 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
-            // R2-H21: Parse typed ticket and call core resolver
+            // P1-20: Strict ticket parsing. All identity fields must be
+            // present and valid. No silent defaults for security-critical fields.
             let ticket_json: serde_json::Value = match serde_json::from_slice(&data) {
                 Ok(v) => v,
                 Err(e) => {
@@ -847,35 +858,95 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
-            let job_id_hex = ticket_json
-                .get("job_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let job_id = match spoolq_names::hex_decode_16(job_id_hex) {
-                Some(id) => id,
-                None => {
-                    eprintln!("invalid job_id in ticket");
+            let get_str = |key: &str| -> Result<&str, &str> {
+                ticket_json
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing")
+            };
+            let get_u64_field = |key: &str| -> Result<u64, &str> {
+                ticket_json
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .ok_or("missing")
+            };
+
+            let job_id_hex = match get_str("job_id") {
+                Ok(v) => v.to_string(),
+                Err(_) => {
+                    eprintln!("missing field: job_id");
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
-            let source_path = ticket_json
-                .get("source_relative_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let dest_path = ticket_json
-                .get("attempted_destination_relative_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let queue = match Queue::open(&path, &OpenOptions::default()) {
-                Ok(q) => q,
-                Err(e) => {
-                    eprintln!("open failed: {e}");
-                    return ExitCode::from(EXIT_IO_FAILURE);
+            let job_id = match spoolq_names::hex_decode_16(&job_id_hex) {
+                Some(id) => id,
+                None => {
+                    eprintln!("invalid job_id hex");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let source_path = match get_str("source_relative_path") {
+                Ok(v) => v.to_string(),
+                Err(_) => {
+                    eprintln!("missing field: source_relative_path");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let dest_path = match get_str("attempted_destination_relative_path") {
+                Ok(v) => v.to_string(),
+                Err(_) => {
+                    eprintln!("missing field: attempted_destination_relative_path");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let source_state = match get_str("source_state") {
+                Ok(v) => v.to_string(),
+                Err(_) => {
+                    eprintln!("missing field: source_state");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let dest_state = match get_str("attempted_destination_state") {
+                Ok(v) => v.to_string(),
+                Err(_) => {
+                    eprintln!("missing field: attempted_destination_state");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let source_generation = match get_u64_field("source_generation") {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("missing field: source_generation");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let source_attempt_raw = match get_u64_field("source_attempt") {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("missing field: source_attempt");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            if source_attempt_raw > u32::MAX as u64 {
+                eprintln!("source_attempt exceeds u32 range");
+                return ExitCode::from(EXIT_ORDINARY);
+            }
+            let envelope_digest_hex = match get_str("envelope_digest") {
+                Ok(v) => v.to_string(),
+                Err(_) => {
+                    eprintln!("missing field: envelope_digest");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
+            let envelope_digest = match spoolq_names::hex_decode_32(&envelope_digest_hex) {
+                Some(d) => d,
+                None => {
+                    eprintln!("invalid envelope_digest hex");
+                    return ExitCode::from(EXIT_ORDINARY);
                 }
             };
 
-            // R4-H20: Preserve ticket identity from JSON
+            // lease_token is optional but must be valid if present
             let lease_token = ticket_json
                 .get("lease_token")
                 .and_then(|v| v.as_str())
@@ -886,34 +957,34 @@ fn main() -> ExitCode {
                         None
                     }
                 });
-            let env_digest_hex = ticket_json
-                .get("envelope_digest")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let envelope_digest = spoolq_names::hex_decode_32(env_digest_hex).unwrap_or([0; 32]);
+            // If lease_token field exists but is malformed, reject
+            if ticket_json.get("lease_token").is_some()
+                && ticket_json
+                    .get("lease_token")
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                && lease_token.is_none()
+            {
+                eprintln!("invalid lease_token hex in ticket");
+                return ExitCode::from(EXIT_ORDINARY);
+            }
+
+            let queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {e}");
+                    return ExitCode::from(EXIT_IO_FAILURE);
+                }
+            };
 
             let ticket = spoolq_core::TransitionTicket {
                 job_id,
-                source_state: ticket_json
-                    .get("source_state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                source_generation: ticket_json
-                    .get("source_generation")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                source_attempt: ticket_json
-                    .get("source_attempt")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-                source_relative_path: source_path.to_string(),
-                attempted_destination_state: ticket_json
-                    .get("attempted_destination_state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                attempted_destination_relative_path: dest_path.to_string(),
+                source_state,
+                source_generation,
+                source_attempt: source_attempt_raw as u32,
+                source_relative_path: source_path.clone(),
+                attempted_destination_state: dest_state,
+                attempted_destination_relative_path: dest_path.clone(),
                 lease_token,
                 envelope_digest,
             };
@@ -1248,6 +1319,34 @@ struct HandleFile {
     envelope_digest: String,
 }
 
+fn write_ticket_file(
+    path: &std::path::Path,
+    ticket: &spoolq_core::TransitionTicket,
+) -> std::io::Result<()> {
+    let json = format!(
+        r#"{{"job_id":"{}","source_state":"{}","source_generation":{},"source_attempt":{},"source_relative_path":"{}","attempted_destination_state":"{}","attempted_destination_relative_path":"{}","lease_token":{},"envelope_digest":"{}"}}"#,
+        spoolq_names::hex_encode(&ticket.job_id),
+        ticket.source_state,
+        ticket.source_generation,
+        ticket.source_attempt,
+        ticket.source_relative_path,
+        ticket.attempted_destination_state,
+        ticket.attempted_destination_relative_path,
+        match ticket.lease_token {
+            Some(t) => format!(r#""{}""#, spoolq_names::hex_encode(&t)),
+            None => "null".to_string(),
+        },
+        spoolq_names::hex_encode(&ticket.envelope_digest),
+    );
+    let rand_bytes = spoolq_fs_linux::random_128bit()
+        .map(|b| spoolq_names::hex_encode(&b))
+        .unwrap_or_else(|_| format!("{}", std::process::id()));
+    let tmp_path = path.with_extension(format!("tmp.{rand_bytes}"));
+    std::fs::write(&tmp_path, &json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 fn save_handle_to_file(
     queue_root: &std::path::Path,
     queue_id: &[u8; 16],
@@ -1300,14 +1399,16 @@ fn save_handle_to_file(
     Ok(())
 }
 
-fn load_handle(path: &std::path::Path) -> std::io::Result<spoolq_core::LeaseInfo> {
+fn load_handle(
+    path: &std::path::Path,
+    queue_id: &[u8; 16],
+) -> std::io::Result<spoolq_core::LeaseInfo> {
     let data = std::fs::read(path)?;
     let handle: HandleFile = serde_json::from_slice(&data)?;
     let job_id = spoolq_names::hex_decode_16(&handle.job_id)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad job_id"))?;
     let token = spoolq_names::hex_decode_16(&handle.token)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad token"))?;
-    // C-57: Use hex_decode_32 directly, reject any other length
     let envelope_digest =
         spoolq_names::hex_decode_32(&handle.envelope_digest).ok_or_else(|| {
             std::io::Error::new(
@@ -1315,6 +1416,19 @@ fn load_handle(path: &std::path::Path) -> std::io::Result<spoolq_core::LeaseInfo
                 "bad envelope_digest: expected 64 lowercase hex chars",
             )
         })?;
+
+    // P1-21: Verify queue binding.
+    if let Some(ref hqid) = handle.queue_id {
+        if let Some(handle_qid) = spoolq_names::hex_decode_16(hqid) {
+            if handle_qid != *queue_id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "handle file queue_id does not match target queue",
+                ));
+            }
+        }
+    }
+
     Ok(spoolq_core::LeaseInfo {
         job_id,
         envelope_digest,
