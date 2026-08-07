@@ -62,7 +62,7 @@ jobs:
         continue-on-error: true
         run: |
           cargo install cargo-mutants
-          cargo mutants --workspace -j 2 --in-place || true
+          cargo mutants --workspace -j 2 || true
       - name: Deep fuzz (50000 runs per target)
         continue-on-error: true
         run: |
