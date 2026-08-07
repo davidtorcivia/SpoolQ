@@ -510,36 +510,61 @@ impl<'a> CborParser<'a> {
                     if meta_map.len() > MAX_METADATA_ENTRIES {
                         return Err(CborError::TooManyEntries);
                     }
-                    for (mk_item, mv_item) in meta_map {
+                    let mut seen_meta_keys = std::collections::HashSet::new();
+                    let mut meta_items: Vec<(&str, &CborItem)> = Vec::new();
+                    for (mk_item, mv_item) in &meta_map {
                         let mk = match mk_item {
-                            CborItem::Text(s) => s,
+                            CborItem::Text(s) => s.as_str(),
                             _ => return Err(CborError::InvalidKey("non-string".into())),
                         };
-                        validate_metadata_key(&mk)?;
+                        validate_metadata_key(mk)?;
+                        // R2-M03: Reject duplicate metadata keys
+                        if !seen_meta_keys.insert(mk.to_string()) {
+                            return Err(CborError::InvalidKey(format!(
+                                "duplicate metadata key: {mk}"
+                            )));
+                        }
+                        meta_items.push((mk, mv_item));
+                    }
+                    // R2-M04: Verify metadata keys arrive in deterministic encoded-byte order
+                    let mut prev_key_bytes: Option<Vec<u8>> = None;
+                    for (mk, _) in &meta_items {
+                        let mut key_buf = Vec::new();
+                        encode_text_string(&mut key_buf, mk);
+                        if let Some(ref pk) = prev_key_bytes {
+                            if key_buf.as_slice() <= pk.as_slice() {
+                                return Err(CborError::InvalidKey(format!(
+                                    "metadata keys not in canonical order: {mk}"
+                                )));
+                            }
+                        }
+                        prev_key_bytes = Some(key_buf);
+                    }
+                    for (mk, mv_item) in meta_items {
                         let mv = match mv_item {
-                            CborItem::Bool(b) => MetadataValue::Bool(b),
-                            CborItem::UInt(v) => MetadataValue::U64(v),
+                            CborItem::Bool(b) => MetadataValue::Bool(*b),
+                            CborItem::UInt(v) => MetadataValue::U64(*v),
                             CborItem::NInt(v) => {
-                                if v > i64::MAX as u64 {
+                                if *v > i64::MAX as u64 {
                                     return Err(CborError::IntOverflow);
                                 }
-                                MetadataValue::I64(-1i64 - v as i64)
+                                MetadataValue::I64(-1i64 - *v as i64)
                             }
                             CborItem::Text(s) => {
                                 if s.len() > MAX_TEXT_VALUE {
                                     return Err(CborError::TextTooLong);
                                 }
-                                MetadataValue::Text(s)
+                                MetadataValue::Text(s.clone())
                             }
                             CborItem::Bytes(b) => {
                                 if b.len() > MAX_BYTES_VALUE {
                                     return Err(CborError::BytesTooLong);
                                 }
-                                MetadataValue::Bytes(b)
+                                MetadataValue::Bytes(b.clone())
                             }
                             CborItem::Map(_) => return Err(CborError::InvalidMajorType(5)),
                         };
-                        ext.metadata.insert(mk, mv);
+                        ext.metadata.insert(mk.to_string(), mv);
                     }
                 }
                 4 => {

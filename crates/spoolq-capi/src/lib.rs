@@ -1,33 +1,83 @@
 // SpoolQ/1 C ABI.
+// R2-B07: Queue handle is wrapped in a Mutex for thread safety.
+// R2-B07: All FFI functions catch panics to prevent process termination.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::unnecessary_cast)]
-// Exposes the core queue operations through a stable C interface.
-// Opaque handles wrap Rust types. All strings are null-terminated UTF-8.
 
 use std::cell::Cell;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_uint};
+use std::ptr;
+use std::sync::Mutex;
+
+use spoolq_core::{
+    CreateOptions, EnqueueInput, EnqueueOutcome, Error, LeaseInfo, LeaseOutcome, OpenOptions,
+    Queue, TransitionOutcome, WorkBudget,
+};
 
 thread_local! {
     static LAST_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
-/// Set the last error message (thread-local).
-#[allow(dead_code)]
 fn set_last_error(msg: &'static str) {
     LAST_ERROR.with(|cell| cell.set(Some(msg)));
 }
 
-/// Get the last error message as a C string pointer.
+/// R2-H17: Centralized error-to-code mapping.
+fn error_to_code(e: &Error) -> c_int {
+    match e {
+        Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
+        Error::PayloadCorrupt => SPOOLQ_CORRUPTION,
+        Error::UnsupportedFilesystem | Error::UnsupportedFormat => SPOOLQ_UNSUPPORTED,
+        Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
+        Error::ResourceExhausted | Error::StateExhausted => SPOOLQ_RESOURCE_EXHAUSTED,
+        Error::IoFailure(_) => SPOOLQ_IO_FAILURE,
+        Error::InvalidClock => SPOOLQ_IO_FAILURE,
+        Error::MaintenanceBusy => SPOOLQ_NOT_COMMITTED,
+        Error::QueuePoisoned(_) => SPOOLQ_CORRUPTION,
+        Error::NotCommitted(_) => SPOOLQ_NOT_COMMITTED,
+        Error::IdentityCollision => SPOOLQ_NOT_COMMITTED,
+        Error::InvalidInput(_) => SPOOLQ_NOT_COMMITTED,
+    }
+}
+
+/// Result codes matching the spec exit codes.
+pub const SPOOLQ_OK: c_int = 0;
+pub const SPOOLQ_NOT_COMMITTED: c_int = 1;
+pub const SPOOLQ_INDETERMINATE: c_int = 2;
+pub const SPOOLQ_CORRUPTION: c_int = 3;
+pub const SPOOLQ_RESOURCE_EXHAUSTED: c_int = 4;
+pub const SPOOLQ_PERMISSION_DENIED: c_int = 5;
+pub const SPOOLQ_IO_FAILURE: c_int = 6;
+pub const SPOOLQ_UNSUPPORTED: c_int = 64;
+
+/// Opaque queue handle. R2-B07: Wrapped in Mutex for thread safety.
+#[repr(C)]
+pub struct SpoolqQueue {
+    inner: Mutex<Queue>,
+}
+
+/// Opaque lease handle.
+#[repr(C)]
+pub struct SpoolqLease {
+    inner: LeaseInfo,
+}
+
+/// Job ID (128 bits = 16 bytes).
+#[repr(C)]
+pub struct SpoolqJobId {
+    pub bytes: [u8; 16],
+}
+
+/// Get the last error message as a C string pointer. Caller must free with spoolq_free_string.
 #[no_mangle]
 pub extern "C" fn spoolq_last_error() -> *const c_char {
-    LAST_ERROR.with(|cell| {
-        match cell.get() {
-            Some(msg) => {
-                // Leak a CString so it persists
-                let cs = CString::new(msg).unwrap_or_else(|_| CString::new("error").unwrap());
-                cs.into_raw()
-            }
-            None => std::ptr::null(),
+    LAST_ERROR.with(|cell| match cell.get() {
+        Some(msg) => {
+            let cs = CString::new(msg).unwrap_or_else(|_| CString::new("error").unwrap());
+            cs.into_raw()
         }
+        None => ptr::null(),
     })
 }
 
@@ -45,119 +95,81 @@ pub extern "C" fn spoolq_abi_version() -> c_uint {
     1
 }
 
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_uint};
-use std::ptr;
-
-use spoolq_core::{
-    CreateOptions, EnqueueInput, EnqueueOutcome, LeaseInfo, LeaseOutcome, OpenOptions, Queue,
-    TransitionOutcome, WorkBudget,
-};
-
-/// Opaque queue handle.
-#[repr(C)]
-pub struct SpoolqQueue {
-    inner: Queue,
-}
-
-/// Opaque lease handle.
-#[repr(C)]
-pub struct SpoolqLease {
-    inner: LeaseInfo,
-}
-
-/// Result codes matching the spec exit codes.
-#[allow(dead_code)]
-pub const SPOOLQ_OK: c_int = 0;
-#[allow(dead_code)]
-pub const SPOOLQ_NOT_COMMITTED: c_int = 1;
-#[allow(dead_code)]
-pub const SPOOLQ_INDETERMINATE: c_int = 2;
-#[allow(dead_code)]
-pub const SPOOLQ_CORRUPTION: c_int = 3;
-#[allow(dead_code)]
-pub const SPOOLQ_RESOURCE_EXHAUSTED: c_int = 4;
-#[allow(dead_code)]
-pub const SPOOLQ_PERMISSION_DENIED: c_int = 5;
-#[allow(dead_code)]
-pub const SPOOLQ_IO_FAILURE: c_int = 6;
-#[allow(dead_code)]
-pub const SPOOLQ_UNSUPPORTED: c_int = 64;
-
-/// Job ID (128 bits = 16 bytes).
-#[repr(C)]
-pub struct SpoolqJobId {
-    pub bytes: [u8; 16],
-}
-
-/// Initialize a new queue.
-/// Returns null on failure, or a queue handle on success.
+/// Initialize a new queue. Returns null on failure.
 #[no_mangle]
 pub extern "C" fn spoolq_init(path: *const c_char, shard_count: c_uint) -> *mut SpoolqQueue {
-    // B-08: Null check
     if path.is_null() {
+        set_last_error("null path");
         return ptr::null_mut();
     }
-    let path = match unsafe { CStr::from_ptr(path) }.to_str() {
-        Ok(s) => std::path::PathBuf::from(s),
-        Err(_) => return ptr::null_mut(),
-    };
-    let opts = CreateOptions {
-        shard_count,
-        ..Default::default()
-    };
-    match Queue::init(&path, &opts) {
-        Ok(_) => {
-            match Queue::open(
-                &path,
-                &OpenOptions {
-                    allow_unsupported_fs: true,
-                    ..Default::default()
-                },
-            ) {
-                Ok(q) => Box::into_raw(Box::new(SpoolqQueue { inner: q })),
-                Err(_) => ptr::null_mut(),
-            }
+    let result = std::panic::catch_unwind(|| {
+        let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return Err(Error::InvalidInput("invalid UTF-8 path".into())),
+        };
+        let opts = CreateOptions {
+            shard_count,
+            ..Default::default()
+        };
+        match Queue::init(std::path::Path::new(path_str), &opts) {
+            Ok(_) => {}
+            Err(e) => return Err(Error::IoFailure(e.to_string())),
         }
-        Err(_) => ptr::null_mut(),
+        Queue::open(std::path::Path::new(path_str), &OpenOptions::default())
+    });
+    match result {
+        Ok(Ok(q)) => Box::into_raw(Box::new(SpoolqQueue {
+            inner: Mutex::new(q),
+        })),
+        Ok(Err(e)) => {
+            set_last_error(leak_error(e));
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error("panic in spoolq_init");
+            ptr::null_mut()
+        }
     }
 }
 
-/// Open an existing queue.
+/// Open an existing queue. Returns null on failure.
 #[no_mangle]
 pub extern "C" fn spoolq_open(path: *const c_char) -> *mut SpoolqQueue {
-    // B-08: Null check
     if path.is_null() {
+        set_last_error("null path");
         return ptr::null_mut();
     }
-    let path = match unsafe { CStr::from_ptr(path) }.to_str() {
-        Ok(s) => std::path::PathBuf::from(s),
-        Err(_) => return ptr::null_mut(),
-    };
-    match Queue::open(
-        &path,
-        &OpenOptions {
-            allow_unsupported_fs: true,
-            ..Default::default()
-        },
-    ) {
-        Ok(q) => Box::into_raw(Box::new(SpoolqQueue { inner: q })),
-        Err(_) => ptr::null_mut(),
+    let result = std::panic::catch_unwind(|| {
+        let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return Err(Error::InvalidInput("invalid UTF-8 path".into())),
+        };
+        Queue::open(std::path::Path::new(path_str), &OpenOptions::default())
+    });
+    match result {
+        Ok(Ok(q)) => Box::into_raw(Box::new(SpoolqQueue {
+            inner: Mutex::new(q),
+        })),
+        Ok(Err(e)) => {
+            set_last_error(leak_error(e));
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error("panic in spoolq_open");
+            ptr::null_mut()
+        }
     }
 }
 
 /// Close a queue handle.
 #[no_mangle]
 pub extern "C" fn spoolq_close(queue: *mut SpoolqQueue) {
-    // B-08: Null check
     if !queue.is_null() {
         unsafe { drop(Box::from_raw(queue)) };
     }
 }
 
 /// Enqueue a job.
-/// Returns SPOOLQ_OK on success, error code on failure.
-/// Fills job_id_out with the generated job ID.
 #[no_mangle]
 pub extern "C" fn spoolq_enqueue(
     queue: *mut SpoolqQueue,
@@ -167,146 +179,199 @@ pub extern "C" fn spoolq_enqueue(
     max_attempts: c_uint,
     job_id_out: *mut SpoolqJobId,
 ) -> c_int {
-    // B-08: Null check queue pointer
     if queue.is_null() {
+        set_last_error("null queue");
         return SPOOLQ_NOT_COMMITTED;
     }
-    let queue = unsafe { &mut *queue };
-
-    // B-08: Null payload with nonzero length is an error
-    let payload = if payload.is_null() {
-        if payload_len != 0 {
-            return SPOOLQ_NOT_COMMITTED;
-        }
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(payload, payload_len) }.to_vec()
-    };
-
-    // B-08: Handle null content_type
-    let content_type = if content_type.is_null() {
-        "application/octet-stream".to_string()
-    } else {
-        unsafe { CStr::from_ptr(content_type) }
-            .to_str()
-            .unwrap_or("application/octet-stream")
-            .to_string()
-    };
-
-    let outcome = queue.inner.enqueue(EnqueueInput {
-        maximum_attempts: max_attempts,
-        content_type,
-        payload,
-        ..Default::default()
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let mut guard = queue.inner.lock().unwrap();
+        let payload = if payload.is_null() {
+            if payload_len != 0 {
+                return Err(("null payload with nonzero length", SPOOLQ_NOT_COMMITTED));
+            }
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(payload, payload_len) }.to_vec()
+        };
+        let content_type = if content_type.is_null() {
+            "application/octet-stream".to_string()
+        } else {
+            unsafe { CStr::from_ptr(content_type) }
+                .to_str()
+                .unwrap_or("application/octet-stream")
+                .to_string()
+        };
+        let outcome = guard.enqueue(EnqueueInput {
+            maximum_attempts: max_attempts,
+            content_type,
+            payload,
+            ..Default::default()
+        });
+        Ok::<_, (&str, c_int)>(outcome)
     });
-
-    match outcome {
-        EnqueueOutcome::Committed(ticket) => {
+    match result {
+        Ok(Ok(EnqueueOutcome::Committed(ticket))) => {
             if !job_id_out.is_null() {
                 unsafe { (*job_id_out).bytes = ticket.job_id };
             }
             SPOOLQ_OK
         }
-        EnqueueOutcome::NotCommitted(_, e) => match e {
-            spoolq_core::Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
-            spoolq_core::Error::UnsupportedFilesystem | spoolq_core::Error::UnsupportedFormat => {
-                SPOOLQ_UNSUPPORTED
-            }
-            spoolq_core::Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
-            spoolq_core::Error::ResourceExhausted | spoolq_core::Error::StateExhausted => {
-                SPOOLQ_RESOURCE_EXHAUSTED
-            }
-            _ => SPOOLQ_NOT_COMMITTED,
-        },
-        EnqueueOutcome::OutcomeUnknown(ticket, _) => {
+        Ok(Ok(EnqueueOutcome::NotCommitted(_, e))) => {
+            let code = error_to_code(&e);
+            set_last_error(leak_error(e));
+            code
+        }
+        Ok(Ok(EnqueueOutcome::OutcomeUnknown(ticket, e))) => {
             if !job_id_out.is_null() {
                 unsafe { (*job_id_out).bytes = ticket.job_id };
             }
+            set_last_error(leak_error(e));
             SPOOLQ_INDETERMINATE
+        }
+        Ok(Err((msg, code))) => {
+            set_last_error(msg);
+            code
+        }
+        Err(_) => {
+            set_last_error("panic in spoolq_enqueue");
+            SPOOLQ_IO_FAILURE
         }
     }
 }
 
 /// Lease a job.
-/// Returns SPOOLQ_OK on success with lease_out filled.
-/// Returns SPOOLQ_NOT_COMMITTED if no jobs available (lease_out is null).
 #[no_mangle]
 pub extern "C" fn spoolq_lease(
     queue: *mut SpoolqQueue,
     lease_duration_ns: u64,
     lease_out: *mut *mut SpoolqLease,
 ) -> c_int {
-    // B-08: Null check queue and lease_out
     if queue.is_null() || lease_out.is_null() {
+        set_last_error("null queue or lease_out");
         return SPOOLQ_NOT_COMMITTED;
     }
-    let queue = unsafe { &mut *queue };
-    match queue.inner.lease(0, lease_duration_ns) {
-        LeaseOutcome::Leased(lease) => {
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let mut guard = queue.inner.lock().unwrap();
+        guard.lease(0, lease_duration_ns)
+    });
+    match result {
+        Ok(LeaseOutcome::Leased(lease)) => {
             unsafe { *lease_out = Box::into_raw(Box::new(SpoolqLease { inner: lease })) };
             SPOOLQ_OK
         }
-        LeaseOutcome::Empty => {
+        Ok(LeaseOutcome::Empty) => {
             unsafe { *lease_out = ptr::null_mut() };
             SPOOLQ_NOT_COMMITTED
         }
-        LeaseOutcome::NotCommitted(e) => match e {
-            spoolq_core::Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
-            spoolq_core::Error::UnsupportedFilesystem | spoolq_core::Error::UnsupportedFormat => {
-                SPOOLQ_UNSUPPORTED
-            }
-            spoolq_core::Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
-            spoolq_core::Error::ResourceExhausted | spoolq_core::Error::StateExhausted => {
-                SPOOLQ_RESOURCE_EXHAUSTED
-            }
-            _ => SPOOLQ_NOT_COMMITTED,
-        },
-        LeaseOutcome::OutcomeUnknown(_) => SPOOLQ_INDETERMINATE,
+        Ok(LeaseOutcome::NotCommitted(e)) => {
+            let code = error_to_code(&e);
+            set_last_error(leak_error(e));
+            code
+        }
+        Ok(LeaseOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
+        Err(_) => {
+            set_last_error("panic in spoolq_lease");
+            SPOOLQ_IO_FAILURE
+        }
     }
 }
 
-/// Acknowledge a lease.
+/// R2-B04: Verify a leased job's payload. Returns SPOOLQ_OK if verified.
+/// After this call, spoolq_ack() will accept the lease.
 #[no_mangle]
-pub extern "C" fn spoolq_ack(queue: *mut SpoolqQueue, lease: *mut SpoolqLease) -> c_int {
-    // B-08: Null checks
+pub extern "C" fn spoolq_lease_verify(queue: *mut SpoolqQueue, lease: *mut SpoolqLease) -> c_int {
     if queue.is_null() || lease.is_null() {
+        set_last_error("null queue or lease");
         return SPOOLQ_NOT_COMMITTED;
     }
-    let queue = unsafe { &mut *queue };
-    let lease = unsafe { &*lease };
-    match queue.inner.ack(&lease.inner) {
-        spoolq_core::AckOutcome::Acked => SPOOLQ_OK,
-        spoolq_core::AckOutcome::AlreadyAcked => SPOOLQ_OK,
-        spoolq_core::AckOutcome::LeaseLost => SPOOLQ_NOT_COMMITTED,
-        spoolq_core::AckOutcome::NotCommitted(e) => match e {
-            spoolq_core::Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
-            spoolq_core::Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
-            spoolq_core::Error::ResourceExhausted => SPOOLQ_RESOURCE_EXHAUSTED,
-            _ => SPOOLQ_NOT_COMMITTED,
-        },
-        spoolq_core::AckOutcome::OutcomeUnknown(_) => SPOOLQ_INDETERMINATE,
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let guard = queue.inner.lock().unwrap();
+        let lease_ref = unsafe { &mut *lease };
+        guard.verify_lease_payload(&lease_ref.inner)
+    });
+    match result {
+        Ok(Ok(verified)) => {
+            let lease_ref = unsafe { &mut *lease };
+            lease_ref.inner = verified;
+            SPOOLQ_OK
+        }
+        Ok(Err(e)) => {
+            let code = error_to_code(&e);
+            set_last_error(leak_error(e));
+            code
+        }
+        Err(_) => {
+            set_last_error("panic in spoolq_lease_verify");
+            SPOOLQ_IO_FAILURE
+        }
+    }
+}
+
+/// Acknowledge a verified lease. R2-B04: Use strict ack().
+#[no_mangle]
+pub extern "C" fn spoolq_ack(queue: *mut SpoolqQueue, lease: *mut SpoolqLease) -> c_int {
+    if queue.is_null() || lease.is_null() {
+        set_last_error("null queue or lease");
+        return SPOOLQ_NOT_COMMITTED;
+    }
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let mut guard = queue.inner.lock().unwrap();
+        let lease_ref = unsafe { &*lease };
+        guard.ack(&lease_ref.inner)
+    });
+    match result {
+        Ok(spoolq_core::AckOutcome::Acked) => SPOOLQ_OK,
+        Ok(spoolq_core::AckOutcome::AlreadyAcked) => SPOOLQ_OK,
+        Ok(spoolq_core::AckOutcome::LeaseLost) => {
+            set_last_error("lease lost");
+            SPOOLQ_NOT_COMMITTED
+        }
+        Ok(spoolq_core::AckOutcome::NotCommitted(e)) => {
+            let code = error_to_code(&e);
+            set_last_error(leak_error(e));
+            code
+        }
+        Ok(spoolq_core::AckOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
+        Err(_) => {
+            set_last_error("panic in spoolq_ack");
+            SPOOLQ_IO_FAILURE
+        }
     }
 }
 
 /// Retry a lease immediately.
 #[no_mangle]
 pub extern "C" fn spoolq_retry(queue: *mut SpoolqQueue, lease: *mut SpoolqLease) -> c_int {
-    // B-08: Null checks
     if queue.is_null() || lease.is_null() {
+        set_last_error("null queue or lease");
         return SPOOLQ_NOT_COMMITTED;
     }
-    let queue = unsafe { &mut *queue };
-    let lease = unsafe { &*lease };
-    match queue.inner.retry_now(&lease.inner) {
-        TransitionOutcome::Committed => SPOOLQ_OK,
-        TransitionOutcome::LeaseLost => SPOOLQ_NOT_COMMITTED,
-        TransitionOutcome::NotCommitted(e) => match e {
-            spoolq_core::Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
-            spoolq_core::Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
-            spoolq_core::Error::ResourceExhausted => SPOOLQ_RESOURCE_EXHAUSTED,
-            _ => SPOOLQ_NOT_COMMITTED,
-        },
-        TransitionOutcome::OutcomeUnknown(_) => SPOOLQ_INDETERMINATE,
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let mut guard = queue.inner.lock().unwrap();
+        let lease_ref = unsafe { &*lease };
+        guard.retry_now(&lease_ref.inner)
+    });
+    match result {
+        Ok(TransitionOutcome::Committed) => SPOOLQ_OK,
+        Ok(TransitionOutcome::LeaseLost) => {
+            set_last_error("lease lost");
+            SPOOLQ_NOT_COMMITTED
+        }
+        Ok(TransitionOutcome::NotCommitted(e)) => {
+            let code = error_to_code(&e);
+            set_last_error(leak_error(e));
+            code
+        }
+        Ok(TransitionOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
+        Err(_) => {
+            set_last_error("panic in spoolq_retry");
+            SPOOLQ_IO_FAILURE
+        }
     }
 }
 
@@ -317,37 +382,56 @@ pub extern "C" fn spoolq_bury(
     lease: *mut SpoolqLease,
     reason: c_uint,
 ) -> c_int {
-    // B-08: Null checks
     if queue.is_null() || lease.is_null() {
+        set_last_error("null queue or lease");
         return SPOOLQ_NOT_COMMITTED;
     }
-    let queue = unsafe { &mut *queue };
-    let lease = unsafe { &*lease };
-    let reason = spoolq_core::DeadReason::from_u16(reason as u16)
-        .unwrap_or(spoolq_core::DeadReason::Unspecified);
-    match queue.inner.bury(&lease.inner, reason) {
-        TransitionOutcome::Committed => SPOOLQ_OK,
-        TransitionOutcome::LeaseLost => SPOOLQ_NOT_COMMITTED,
-        TransitionOutcome::NotCommitted(e) => match e {
-            spoolq_core::Error::QueueCorrupt(_) => SPOOLQ_CORRUPTION,
-            spoolq_core::Error::PermissionDenied => SPOOLQ_PERMISSION_DENIED,
-            spoolq_core::Error::ResourceExhausted => SPOOLQ_RESOURCE_EXHAUSTED,
-            _ => SPOOLQ_NOT_COMMITTED,
-        },
-        TransitionOutcome::OutcomeUnknown(_) => SPOOLQ_INDETERMINATE,
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let mut guard = queue.inner.lock().unwrap();
+        let lease_ref = unsafe { &*lease };
+        let reason = spoolq_core::DeadReason::from_u16(reason as u16)
+            .unwrap_or(spoolq_core::DeadReason::Unspecified);
+        guard.bury(&lease_ref.inner, reason)
+    });
+    match result {
+        Ok(TransitionOutcome::Committed) => SPOOLQ_OK,
+        Ok(TransitionOutcome::LeaseLost) => {
+            set_last_error("lease lost");
+            SPOOLQ_NOT_COMMITTED
+        }
+        Ok(TransitionOutcome::NotCommitted(e)) => {
+            let code = error_to_code(&e);
+            set_last_error(leak_error(e));
+            code
+        }
+        Ok(TransitionOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
+        Err(_) => {
+            set_last_error("panic in spoolq_bury");
+            SPOOLQ_IO_FAILURE
+        }
     }
 }
 
 /// Run a recovery pass.
 #[no_mangle]
 pub extern "C" fn spoolq_recover(queue: *mut SpoolqQueue) -> c_int {
-    // B-08: Null check
     if queue.is_null() {
+        set_last_error("null queue");
         return SPOOLQ_NOT_COMMITTED;
     }
-    let queue = unsafe { &mut *queue };
-    queue.inner.recover(&WorkBudget::default());
-    SPOOLQ_OK
+    let result = std::panic::catch_unwind(|| {
+        let queue = unsafe { &*queue };
+        let mut guard = queue.inner.lock().unwrap();
+        guard.recover(&WorkBudget::default());
+    });
+    match result {
+        Ok(()) => SPOOLQ_OK,
+        Err(_) => {
+            set_last_error("panic in spoolq_recover");
+            SPOOLQ_IO_FAILURE
+        }
+    }
 }
 
 /// Free a lease handle.
@@ -384,4 +468,12 @@ pub extern "C" fn spoolq_lease_attempt(lease: *const SpoolqLease) -> c_uint {
         return 0;
     }
     unsafe { (*lease).inner.attempt as c_uint }
+}
+
+/// Leak an Error into a 'static str for the thread-local last-error store.
+fn leak_error(e: Error) -> &'static str {
+    // The Error Display impl produces an owned String; we leak it to get 'static.
+    // This is acceptable for a last-error mechanism where the string is consumed once.
+    let s = format!("{e}");
+    Box::leak(s.into_boxed_str())
 }

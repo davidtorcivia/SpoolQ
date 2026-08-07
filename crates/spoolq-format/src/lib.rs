@@ -330,10 +330,9 @@ pub fn payload_digest(payload: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-pub fn envelope_digest(fixed_header: &FixedHeader, extension: &[u8]) -> [u8; 32] {
-    let mut header_with_zero_digest = fixed_header
-        .encode(extension)
-        .expect("extension length mismatch in envelope_digest");
+/// R2-M01: Fallible envelope digest. Returns None on extension length mismatch.
+pub fn envelope_digest(fixed_header: &FixedHeader, extension: &[u8]) -> Option<[u8; 32]> {
+    let mut header_with_zero_digest = fixed_header.encode(extension).ok()?;
     // Zero out bytes 96..128 (envelope_digest field)
     header_with_zero_digest[96..128].fill(0);
 
@@ -341,13 +340,16 @@ pub fn envelope_digest(fixed_header: &FixedHeader, extension: &[u8]) -> [u8; 32]
     hasher.update(b"SpoolQ-1-envelope\0");
     hasher.update(header_with_zero_digest);
     hasher.update(extension);
-    hasher.finalize().into()
+    let result: [u8; 32] = hasher.finalize().into();
+    Some(result)
 }
 
 /// Verify envelope digest given the fixed header and extension bytes.
 pub fn verify_envelope_digest(header: &FixedHeader, extension: &[u8]) -> bool {
-    let computed = envelope_digest(header, extension);
-    computed == header.envelope_digest
+    match envelope_digest(header, extension) {
+        Some(computed) => computed == header.envelope_digest,
+        None => false,
+    }
 }
 
 // ---------- Compact receipt ----------
@@ -677,7 +679,7 @@ mod tests {
             envelope_digest: [0; 32], // placeholder
         };
         let extension: &[u8] = &[];
-        header.envelope_digest = envelope_digest(&header, extension);
+        header.envelope_digest = envelope_digest(&header, extension).unwrap();
         let encoded = header.encode(extension).unwrap();
         let decoded = FixedHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.job_id, header.job_id);
@@ -838,7 +840,7 @@ mod tests {
             envelope_digest: [0; 32],
         };
         let ext: &[u8] = &[];
-        header.envelope_digest = envelope_digest(&header, ext);
+        header.envelope_digest = envelope_digest(&header, ext).unwrap();
         let header_bytes = header.encode(ext).unwrap();
         let mut data = header_bytes.to_vec();
         data.extend_from_slice(b"hello");
@@ -861,7 +863,7 @@ mod tests {
             envelope_digest: [0; 32],
         };
         let ext: &[u8] = &[];
-        header.envelope_digest = envelope_digest(&header, ext);
+        header.envelope_digest = envelope_digest(&header, ext).unwrap();
         let header_bytes = header.encode(ext).unwrap();
         let mut data = header_bytes.to_vec();
         data.extend_from_slice(b"hello");
@@ -883,7 +885,7 @@ mod tests {
             envelope_digest: [0; 32],
         };
         let ext: &[u8] = &[];
-        header.envelope_digest = envelope_digest(&header, ext);
+        header.envelope_digest = envelope_digest(&header, ext).unwrap();
         let header_bytes = header.encode(ext).unwrap();
         let mut data = header_bytes.to_vec();
         data.extend_from_slice(b"world"); // wrong payload
