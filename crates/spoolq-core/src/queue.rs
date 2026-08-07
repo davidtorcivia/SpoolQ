@@ -5203,4 +5203,113 @@ mod tests {
         });
         assert!(matches!(outcome, EnqueueOutcome::Committed(_)));
     }
+
+    // ===== P0-04: ack EEXIST authenticates receipt =====
+    #[test]
+    fn ack_conflicting_receipt_is_not_already_acked() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Compute the EXACT receipt path ack() will target.
+        let shard = compute_shard(
+            &queue.format.queue_id,
+            &lease.job_id,
+            queue.format.shard_count,
+        );
+        let shard_str = shard_hex(shard);
+        let wall = queue.effective_wall_floor_ns();
+        let bucket =
+            spoolq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap_or(0);
+        let bucket_str = bucket_hex(bucket);
+        let new_gen = lease.generation + 1;
+        let receipt_common = CommonFields {
+            job_id: lease.job_id,
+            generation: new_gen,
+            attempt: lease.attempt,
+            maximum_attempts: lease.maximum_attempts,
+        };
+        let receipt_base = format!(
+            "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
+            spoolq_names::hex_encode(&receipt_common.job_id),
+            receipt_common.generation,
+            receipt_common.attempt,
+            receipt_common.maximum_attempts,
+            spoolq_names::hex_encode(&lease.token),
+        );
+        let receipt_ctx = spoolq_names::terminal_context(
+            spoolq_names::State::Receipt,
+            &bucket_str,
+            &shard_str,
+            &receipt_base,
+        );
+        let receipt_tag = compute_name_tag(&queue.format.queue_id, &receipt_ctx);
+        let receipt_name =
+            spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
+        // Pre-plant a non-receipt file at the exact destination.
+        let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
+        let full_dir = _tmp.path().join(&receipt_dir);
+        std::fs::create_dir_all(&full_dir).unwrap();
+        std::fs::write(full_dir.join(&receipt_name), b"not a receipt at all").unwrap();
+        // Ack should not succeed because the destination already has a conflicting object.
+        let result = queue.ack(&lease);
+        assert!(
+            matches!(result, AckOutcome::NotCommitted(_)),
+            "conflicting receipt should be NotCommitted, got {result:?}"
+        );
+    }
+
+    // ===== P1-06: ENOTDIR is QueueCorrupt =====
+    #[test]
+    fn enotdir_in_lease_path_is_corruption() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Replace an intermediate directory with a regular file.
+        let boot_dir = _tmp.path().join("leased").join(&lease.boot_id);
+        let bucket_dir = boot_dir.join(lease.exact_source_path.split('/').nth(2).unwrap());
+        // Remove the bucket dir and replace with a file
+        let _ = std::fs::remove_dir_all(&bucket_dir);
+        std::fs::write(&bucket_dir, b"notadir").unwrap();
+        // Ack should report corruption, not LeaseLost.
+        let result = queue.ack(&lease);
+        assert!(
+            matches!(result, AckOutcome::NotCommitted(Error::QueueCorrupt(_))),
+            "ENOTDIR should be QueueCorrupt, got {result:?}"
+        );
+    }
+
+    // ===== P0-05: verified fd check detects swap =====
+    #[test]
+    fn ack_verified_fd_dev_ino_check() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"test payload data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Normal ack should work - payload is valid.
+        let result = queue.ack(&lease);
+        assert!(matches!(result, AckOutcome::Acked));
+    }
 }

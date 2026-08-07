@@ -1344,4 +1344,129 @@ mod tests {
         assert!(max <= 255, "longest name {max} exceeds NAME_MAX 255");
         assert_eq!(255 - max, 93, "remaining budget must be 93");
     }
+
+    // ===== Canonical authenticate_tag tests (P1-25 mutation coverage) =====
+
+    fn make_common() -> CommonFields {
+        CommonFields {
+            job_id: test_job_id(),
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+        }
+    }
+
+    #[test]
+    fn ready_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let shard = "01ab";
+        let ctx = ready_context(shard, &common.base_name());
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = ReadyName {
+            common: common.clone(),
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], shard));
+        assert!(!name.authenticate_tag(&qid, "0000"));
+    }
+
+    #[test]
+    fn leased_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let boot = "00000000-0000-0000-0000-000000000000";
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let token = [0xCD; 16];
+        let name = LeasedName {
+            common: common.clone(),
+            boottime_deadline_ns: 30000000000,
+            wall_deadline_ns: 1234567890,
+            token,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(boot, bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = LeasedName {
+            common: common.clone(),
+            boottime_deadline_ns: 30000000000,
+            wall_deadline_ns: 1234567890,
+            token,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, boot, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], boot, bucket, shard));
+        assert!(!name.authenticate_tag(&qid, "wrong", bucket, shard));
+    }
+
+    #[test]
+    fn delayed_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let nb: u64 = 9999999999;
+        let name = DelayedName {
+            common: common.clone(),
+            not_before_ns: nb,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = DelayedName {
+            common: common.clone(),
+            not_before_ns: nb,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
+        assert!(!name.authenticate_tag(&qid, "0000000000000000", shard));
+    }
+
+    #[test]
+    fn dead_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let name = DeadName {
+            common: common.clone(),
+            reason: 0x0004,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = DeadName {
+            common: common.clone(),
+            reason: 0x0004,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
+    }
+
+    #[test]
+    fn receipt_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let token = [0xEE; 16];
+        let name = ReceiptName {
+            common: common.clone(),
+            token,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = ReceiptName {
+            common: common.clone(),
+            token,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
+    }
 }
