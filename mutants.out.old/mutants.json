@@ -1,6 +1,4026 @@
 [
   {
     "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "LeaseInfo::remaining_ns",
+      "return_type": "-> u64",
+      "span": {
+        "start": {
+          "line": 139,
+          "column": 5
+        },
+        "end": {
+          "line": 142,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 141,
+        "column": 9
+      },
+      "end": {
+        "line": 141,
+        "column": 69
+      }
+    },
+    "replacement": "0",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "LeaseInfo::remaining_ns",
+      "return_type": "-> u64",
+      "span": {
+        "start": {
+          "line": 139,
+          "column": 5
+        },
+        "end": {
+          "line": 142,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 141,
+        "column": 9
+      },
+      "end": {
+        "line": 141,
+        "column": 69
+      }
+    },
+    "replacement": "1",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "DeadReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 157,
+          "column": 5
+        },
+        "end": {
+          "line": 166,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 158,
+        "column": 9
+      },
+      "end": {
+        "line": 165,
+        "column": 10
+      }
+    },
+    "replacement": "None",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "DeadReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 157,
+          "column": 5
+        },
+        "end": {
+          "line": 166,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 158,
+        "column": 9
+      },
+      "end": {
+        "line": 165,
+        "column": 10
+      }
+    },
+    "replacement": "Some(Default::default())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "DeadReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 157,
+          "column": 5
+        },
+        "end": {
+          "line": 166,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 159,
+        "column": 13
+      },
+      "end": {
+        "line": 159,
+        "column": 47
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "DeadReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 157,
+          "column": 5
+        },
+        "end": {
+          "line": 166,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 160,
+        "column": 13
+      },
+      "end": {
+        "line": 160,
+        "column": 52
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "DeadReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 157,
+          "column": 5
+        },
+        "end": {
+          "line": 166,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 161,
+        "column": 13
+      },
+      "end": {
+        "line": 161,
+        "column": 58
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "DeadReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 157,
+          "column": 5
+        },
+        "end": {
+          "line": 166,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 162,
+        "column": 13
+      },
+      "end": {
+        "line": 162,
+        "column": 54
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "DeadReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 157,
+          "column": 5
+        },
+        "end": {
+          "line": 166,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 163,
+        "column": 13
+      },
+      "end": {
+        "line": 163,
+        "column": 53
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 188,
+        "column": 9
+      },
+      "end": {
+        "line": 201,
+        "column": 10
+      }
+    },
+    "replacement": "None",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 188,
+        "column": 9
+      },
+      "end": {
+        "line": 201,
+        "column": 10
+      }
+    },
+    "replacement": "Some(Default::default())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 189,
+        "column": 13
+      },
+      "end": {
+        "line": 189,
+        "column": 51
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 190,
+        "column": 13
+      },
+      "end": {
+        "line": 190,
+        "column": 50
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 191,
+        "column": 13
+      },
+      "end": {
+        "line": 191,
+        "column": 55
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 192,
+        "column": 13
+      },
+      "end": {
+        "line": 192,
+        "column": 53
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 193,
+        "column": 13
+      },
+      "end": {
+        "line": 193,
+        "column": 58
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 194,
+        "column": 13
+      },
+      "end": {
+        "line": 194,
+        "column": 62
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 195,
+        "column": 13
+      },
+      "end": {
+        "line": 195,
+        "column": 58
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 196,
+        "column": 13
+      },
+      "end": {
+        "line": 196,
+        "column": 50
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 197,
+        "column": 13
+      },
+      "end": {
+        "line": 197,
+        "column": 54
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 198,
+        "column": 13
+      },
+      "end": {
+        "line": 198,
+        "column": 53
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/errors.rs",
+    "function": {
+      "function_name": "QuarantineReason::from_u16",
+      "return_type": "-> Option<Self>",
+      "span": {
+        "start": {
+          "line": 187,
+          "column": 5
+        },
+        "end": {
+          "line": 202,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 199,
+        "column": 13
+      },
+      "end": {
+        "line": 199,
+        "column": 61
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck",
+      "return_type": "-> FsckReport",
+      "span": {
+        "start": {
+          "line": 70,
+          "column": 5
+        },
+        "end": {
+          "line": 86,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 72,
+        "column": 9
+      },
+      "end": {
+        "line": 85,
+        "column": 15
+      }
+    },
+    "replacement": "Default::default()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_state_dir",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 88,
+          "column": 5
+        },
+        "end": {
+          "line": 152,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 89,
+        "column": 9
+      },
+      "end": {
+        "line": 151,
+        "column": 10
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_state_dir",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 88,
+          "column": 5
+        },
+        "end": {
+          "line": 152,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 112,
+        "column": 48
+      },
+      "end": {
+        "line": 112,
+        "column": 50
+      }
+    },
+    "replacement": "&&",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_state_dir",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 88,
+          "column": 5
+        },
+        "end": {
+          "line": 152,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 114,
+        "column": 42
+      },
+      "end": {
+        "line": 114,
+        "column": 44
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_state_dir",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 88,
+          "column": 5
+        },
+        "end": {
+          "line": 152,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 114,
+        "column": 42
+      },
+      "end": {
+        "line": 114,
+        "column": 44
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_state_dir",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 88,
+          "column": 5
+        },
+        "end": {
+          "line": 152,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 135,
+        "column": 51
+      },
+      "end": {
+        "line": 135,
+        "column": 53
+      }
+    },
+    "replacement": "&&",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_state_dir",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 88,
+          "column": 5
+        },
+        "end": {
+          "line": 152,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 136,
+        "column": 50
+      },
+      "end": {
+        "line": 136,
+        "column": 52
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_state_dir",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 88,
+          "column": 5
+        },
+        "end": {
+          "line": 152,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 136,
+        "column": 50
+      },
+      "end": {
+        "line": 136,
+        "column": 52
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_leased_dirs",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 5
+        },
+        "end": {
+          "line": 211,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 155,
+        "column": 9
+      },
+      "end": {
+        "line": 210,
+        "column": 10
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_leased_dirs",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 5
+        },
+        "end": {
+          "line": 211,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 195,
+        "column": 50
+      },
+      "end": {
+        "line": 195,
+        "column": 52
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_leased_dirs",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 5
+        },
+        "end": {
+          "line": 211,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 195,
+        "column": 50
+      },
+      "end": {
+        "line": 195,
+        "column": 52
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 228,
+        "column": 9
+      },
+      "end": {
+        "line": 695,
+        "column": 10
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 233,
+        "column": 13
+      },
+      "end": {
+        "line": 236,
+        "column": 15
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 237,
+        "column": 13
+      },
+      "end": {
+        "line": 240,
+        "column": 15
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 241,
+        "column": 13
+      },
+      "end": {
+        "line": 244,
+        "column": 15
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 245,
+        "column": 13
+      },
+      "end": {
+        "line": 248,
+        "column": 15
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 249,
+        "column": 13
+      },
+      "end": {
+        "line": 252,
+        "column": 15
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 265,
+        "column": 30
+      },
+      "end": {
+        "line": 265,
+        "column": 32
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 293,
+        "column": 40
+      },
+      "end": {
+        "line": 293,
+        "column": 42
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 293,
+        "column": 25
+      },
+      "end": {
+        "line": 293,
+        "column": 26
+      }
+    },
+    "replacement": "|",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 293,
+        "column": 25
+      },
+      "end": {
+        "line": 293,
+        "column": 26
+      }
+    },
+    "replacement": "^",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 300,
+        "column": 26
+      },
+      "end": {
+        "line": 300,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 313,
+        "column": 26
+      },
+      "end": {
+        "line": 313,
+        "column": 28
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 320,
+        "column": 26
+      },
+      "end": {
+        "line": 320,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 355,
+        "column": 26
+      },
+      "end": {
+        "line": 355,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 369,
+        "column": 13
+      },
+      "end": {
+        "line": 369,
+        "column": 15
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 368,
+        "column": 56
+      },
+      "end": {
+        "line": 368,
+        "column": 58
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 369,
+        "column": 34
+      },
+      "end": {
+        "line": 369,
+        "column": 36
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 374,
+        "column": 34
+      },
+      "end": {
+        "line": 374,
+        "column": 36
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 381,
+        "column": 38
+      },
+      "end": {
+        "line": 381,
+        "column": 40
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 392,
+        "column": 50
+      },
+      "end": {
+        "line": 392,
+        "column": 52
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 392,
+        "column": 50
+      },
+      "end": {
+        "line": 392,
+        "column": 52
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 402,
+        "column": 34
+      },
+      "end": {
+        "line": 402,
+        "column": 36
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 426,
+        "column": 30
+      },
+      "end": {
+        "line": 426,
+        "column": 32
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 440,
+        "column": 26
+      },
+      "end": {
+        "line": 440,
+        "column": 28
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 447,
+        "column": 26
+      },
+      "end": {
+        "line": 447,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 460,
+        "column": 36
+      },
+      "end": {
+        "line": 460,
+        "column": 38
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 467,
+        "column": 26
+      },
+      "end": {
+        "line": 467,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 481,
+        "column": 20
+      },
+      "end": {
+        "line": 481,
+        "column": 21
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 481,
+        "column": 20
+      },
+      "end": {
+        "line": 481,
+        "column": 21
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 481,
+        "column": 20
+      },
+      "end": {
+        "line": 481,
+        "column": 21
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 488,
+        "column": 26
+      },
+      "end": {
+        "line": 488,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 500,
+        "column": 24
+      },
+      "end": {
+        "line": 500,
+        "column": 26
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 500,
+        "column": 20
+      },
+      "end": {
+        "line": 500,
+        "column": 21
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 500,
+        "column": 20
+      },
+      "end": {
+        "line": 500,
+        "column": 21
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 500,
+        "column": 20
+      },
+      "end": {
+        "line": 500,
+        "column": 21
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 507,
+        "column": 26
+      },
+      "end": {
+        "line": 507,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 518,
+        "column": 12
+      },
+      "end": {
+        "line": 518,
+        "column": 13
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 525,
+        "column": 26
+      },
+      "end": {
+        "line": 525,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 538,
+        "column": 44
+      },
+      "end": {
+        "line": 538,
+        "column": 45
+      }
+    },
+    "replacement": "-",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 538,
+        "column": 44
+      },
+      "end": {
+        "line": 538,
+        "column": 45
+      }
+    },
+    "replacement": "*",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 538,
+        "column": 34
+      },
+      "end": {
+        "line": 538,
+        "column": 35
+      }
+    },
+    "replacement": "-",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 538,
+        "column": 34
+      },
+      "end": {
+        "line": 538,
+        "column": 35
+      }
+    },
+    "replacement": "*",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 539,
+        "column": 32
+      },
+      "end": {
+        "line": 539,
+        "column": 34
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 549,
+        "column": 26
+      },
+      "end": {
+        "line": 549,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 562,
+        "column": 34
+      },
+      "end": {
+        "line": 562,
+        "column": 35
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 562,
+        "column": 34
+      },
+      "end": {
+        "line": 562,
+        "column": 35
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 562,
+        "column": 34
+      },
+      "end": {
+        "line": 562,
+        "column": 35
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 572,
+        "column": 26
+      },
+      "end": {
+        "line": 572,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 594,
+        "column": 12
+      },
+      "end": {
+        "line": 594,
+        "column": 13
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 601,
+        "column": 26
+      },
+      "end": {
+        "line": 601,
+        "column": 28
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 619,
+        "column": 31
+      },
+      "end": {
+        "line": 619,
+        "column": 33
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 628,
+        "column": 34
+      },
+      "end": {
+        "line": 628,
+        "column": 36
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 642,
+        "column": 38
+      },
+      "end": {
+        "line": 642,
+        "column": 40
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 642,
+        "column": 38
+      },
+      "end": {
+        "line": 642,
+        "column": 40
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 645,
+        "column": 42
+      },
+      "end": {
+        "line": 645,
+        "column": 44
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 645,
+        "column": 23
+      },
+      "end": {
+        "line": 645,
+        "column": 25
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 645,
+        "column": 56
+      },
+      "end": {
+        "line": 645,
+        "column": 58
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 646,
+        "column": 39
+      },
+      "end": {
+        "line": 646,
+        "column": 40
+      }
+    },
+    "replacement": "-",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 646,
+        "column": 39
+      },
+      "end": {
+        "line": 646,
+        "column": 40
+      }
+    },
+    "replacement": "*",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 652,
+        "column": 29
+      },
+      "end": {
+        "line": 652,
+        "column": 30
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 652,
+        "column": 29
+      },
+      "end": {
+        "line": 652,
+        "column": 30
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 652,
+        "column": 29
+      },
+      "end": {
+        "line": 652,
+        "column": 30
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 655,
+        "column": 30
+      },
+      "end": {
+        "line": 655,
+        "column": 35
+      }
+    },
+    "replacement": "true",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 655,
+        "column": 30
+      },
+      "end": {
+        "line": 655,
+        "column": 35
+      }
+    },
+    "replacement": "false",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 655,
+        "column": 32
+      },
+      "end": {
+        "line": 655,
+        "column": 33
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 655,
+        "column": 32
+      },
+      "end": {
+        "line": 655,
+        "column": 33
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 655,
+        "column": 32
+      },
+      "end": {
+        "line": 655,
+        "column": 33
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 657,
+        "column": 32
+      },
+      "end": {
+        "line": 657,
+        "column": 34
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 657,
+        "column": 32
+      },
+      "end": {
+        "line": 657,
+        "column": 34
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 658,
+        "column": 35
+      },
+      "end": {
+        "line": 658,
+        "column": 37
+      }
+    },
+    "replacement": "+=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 658,
+        "column": 35
+      },
+      "end": {
+        "line": 658,
+        "column": 37
+      }
+    },
+    "replacement": "/=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 666,
+        "column": 16
+      },
+      "end": {
+        "line": 666,
+        "column": 17
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 676,
+        "column": 25
+      },
+      "end": {
+        "line": 676,
+        "column": 27
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 683,
+        "column": 30
+      },
+      "end": {
+        "line": 683,
+        "column": 32
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 694,
+        "column": 43
+      },
+      "end": {
+        "line": 694,
+        "column": 45
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_file",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 213,
+          "column": 5
+        },
+        "end": {
+          "line": 696,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 694,
+        "column": 43
+      },
+      "end": {
+        "line": 694,
+        "column": 45
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 712,
+        "column": 9
+      },
+      "end": {
+        "line": 783,
+        "column": 10
+      }
+    },
+    "replacement": "true",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 712,
+        "column": 9
+      },
+      "end": {
+        "line": 783,
+        "column": 10
+      }
+    },
+    "replacement": "false",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 713,
+        "column": 13
+      },
+      "end": {
+        "line": 723,
+        "column": 14
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 724,
+        "column": 13
+      },
+      "end": {
+        "line": 745,
+        "column": 14
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 746,
+        "column": 13
+      },
+      "end": {
+        "line": 757,
+        "column": 14
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 758,
+        "column": 13
+      },
+      "end": {
+        "line": 769,
+        "column": 14
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 770,
+        "column": 13
+      },
+      "end": {
+        "line": 781,
+        "column": 14
+      }
+    },
+    "replacement": "",
+    "genre": "MatchArm"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 714,
+        "column": 37
+      },
+      "end": {
+        "line": 714,
+        "column": 39
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 725,
+        "column": 37
+      },
+      "end": {
+        "line": 725,
+        "column": 39
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 747,
+        "column": 37
+      },
+      "end": {
+        "line": 747,
+        "column": 39
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 759,
+        "column": 37
+      },
+      "end": {
+        "line": 759,
+        "column": 39
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_verify_name_tag",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 698,
+          "column": 5
+        },
+        "end": {
+          "line": 784,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 771,
+        "column": 37
+      },
+      "end": {
+        "line": 771,
+        "column": 39
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 791,
+        "column": 9
+      },
+      "end": {
+        "line": 796,
+        "column": 10
+      }
+    },
+    "replacement": "None",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 791,
+        "column": 9
+      },
+      "end": {
+        "line": 796,
+        "column": 10
+      }
+    },
+    "replacement": "Some(\"\")",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 791,
+        "column": 9
+      },
+      "end": {
+        "line": 796,
+        "column": 10
+      }
+    },
+    "replacement": "Some(\"xyzzy\")",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 792,
+        "column": 24
+      },
+      "end": {
+        "line": 792,
+        "column": 45
+      }
+    },
+    "replacement": "true",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 792,
+        "column": 24
+      },
+      "end": {
+        "line": 792,
+        "column": 45
+      }
+    },
+    "replacement": "false",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 793,
+        "column": 25
+      },
+      "end": {
+        "line": 793,
+        "column": 46
+      }
+    },
+    "replacement": "true",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 793,
+        "column": 25
+      },
+      "end": {
+        "line": 793,
+        "column": 46
+      }
+    },
+    "replacement": "false",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 794,
+        "column": 48
+      },
+      "end": {
+        "line": 794,
+        "column": 69
+      }
+    },
+    "replacement": "true",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 794,
+        "column": 48
+      },
+      "end": {
+        "line": 794,
+        "column": 69
+      }
+    },
+    "replacement": "false",
+    "genre": "MatchArmGuard"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 792,
+        "column": 41
+      },
+      "end": {
+        "line": 792,
+        "column": 43
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 793,
+        "column": 42
+      },
+      "end": {
+        "line": 793,
+        "column": 44
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::fsck_extract_shard_hex",
+      "return_type": "-> Option<&'a str>",
+      "span": {
+        "start": {
+          "line": 786,
+          "column": 5
+        },
+        "end": {
+          "line": 797,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 794,
+        "column": 65
+      },
+      "end": {
+        "line": 794,
+        "column": 67
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/quarantine.rs",
+    "function": {
+      "function_name": "Queue::quarantine_object",
+      "return_type": "-> Result<(), std::io::Error>",
+      "span": {
+        "start": {
+          "line": 799,
+          "column": 5
+        },
+        "end": {
+          "line": 831,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 808,
+        "column": 9
+      },
+      "end": {
+        "line": 830,
+        "column": 15
+      }
+    },
+    "replacement": "Ok(())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
     "file": "crates/spoolq-core/src/queue.rs",
     "function": {
       "function_name": "validate_create_options",
@@ -7503,36 +11523,6 @@
     "package": "spoolq-core",
     "file": "crates/spoolq-core/src/queue.rs",
     "function": {
-      "function_name": "Queue::move_to_dead",
-      "return_type": "-> Result<(), io::Error>",
-      "span": {
-        "start": {
-          "line": 2464,
-          "column": 5
-        },
-        "end": {
-          "line": 2520,
-          "column": 6
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 2472,
-        "column": 9
-      },
-      "end": {
-        "line": 2519,
-        "column": 15
-      }
-    },
-    "replacement": "Ok(())",
-    "genre": "FnValue"
-  },
-  {
-    "package": "spoolq-core",
-    "file": "crates/spoolq-core/src/queue.rs",
-    "function": {
       "function_name": "Queue::verify_lease_payload",
       "return_type": "-> Result<(), Error>",
       "span": {
@@ -13828,5 +17818,3455 @@
     },
     "replacement": "1",
     "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::recover",
+      "return_type": "-> RecoveryStats",
+      "span": {
+        "start": {
+          "line": 52,
+          "column": 5
+        },
+        "end": {
+          "line": 109,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 54,
+        "column": 9
+      },
+      "end": {
+        "line": 108,
+        "column": 14
+      }
+    },
+    "replacement": "Default::default()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::recover",
+      "return_type": "-> RecoveryStats",
+      "span": {
+        "start": {
+          "line": 52,
+          "column": 5
+        },
+        "end": {
+          "line": 109,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 88,
+        "column": 12
+      },
+      "end": {
+        "line": 88,
+        "column": 13
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::recover",
+      "return_type": "-> RecoveryStats",
+      "span": {
+        "start": {
+          "line": 52,
+          "column": 5
+        },
+        "end": {
+          "line": 109,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 93,
+        "column": 12
+      },
+      "end": {
+        "line": 93,
+        "column": 13
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::recover",
+      "return_type": "-> RecoveryStats",
+      "span": {
+        "start": {
+          "line": 52,
+          "column": 5
+        },
+        "end": {
+          "line": 109,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 96,
+        "column": 12
+      },
+      "end": {
+        "line": 96,
+        "column": 13
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::recover",
+      "return_type": "-> RecoveryStats",
+      "span": {
+        "start": {
+          "line": 52,
+          "column": 5
+        },
+        "end": {
+          "line": 109,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 99,
+        "column": 12
+      },
+      "end": {
+        "line": 99,
+        "column": 13
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::quarantine_recovery_object",
+      "return_type": "-> Result<(), Error>",
+      "span": {
+        "start": {
+          "line": 111,
+          "column": 5
+        },
+        "end": {
+          "line": 128,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 119,
+        "column": 9
+      },
+      "end": {
+        "line": 127,
+        "column": 15
+      }
+    },
+    "replacement": "Ok(())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::budget_time_exceeded",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 130,
+          "column": 5
+        },
+        "end": {
+          "line": 136,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 132,
+        "column": 9
+      },
+      "end": {
+        "line": 135,
+        "column": 10
+      }
+    },
+    "replacement": "true",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::budget_time_exceeded",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 130,
+          "column": 5
+        },
+        "end": {
+          "line": 136,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 132,
+        "column": 9
+      },
+      "end": {
+        "line": 135,
+        "column": 10
+      }
+    },
+    "replacement": "false",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::budget_time_exceeded",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 130,
+          "column": 5
+        },
+        "end": {
+          "line": 136,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 133,
+        "column": 28
+      },
+      "end": {
+        "line": 133,
+        "column": 30
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::budget_exhausted",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 138,
+          "column": 5
+        },
+        "end": {
+          "line": 144,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 140,
+        "column": 9
+      },
+      "end": {
+        "line": 143,
+        "column": 50
+      }
+    },
+    "replacement": "true",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::budget_exhausted",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 138,
+          "column": 5
+        },
+        "end": {
+          "line": 144,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 140,
+        "column": 9
+      },
+      "end": {
+        "line": 143,
+        "column": 50
+      }
+    },
+    "replacement": "false",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::budget_exhausted",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 138,
+          "column": 5
+        },
+        "end": {
+          "line": 144,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 140,
+        "column": 39
+      },
+      "end": {
+        "line": 140,
+        "column": 41
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::record_error",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 146,
+          "column": 5
+        },
+        "end": {
+          "line": 154,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 149,
+        "column": 9
+      },
+      "end": {
+        "line": 153,
+        "column": 12
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 164,
+        "column": 9
+      },
+      "end": {
+        "line": 361,
+        "column": 10
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 189,
+        "column": 49
+      },
+      "end": {
+        "line": 189,
+        "column": 51
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 215,
+        "column": 39
+      },
+      "end": {
+        "line": 215,
+        "column": 40
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 215,
+        "column": 39
+      },
+      "end": {
+        "line": 215,
+        "column": 40
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 215,
+        "column": 39
+      },
+      "end": {
+        "line": 215,
+        "column": 40
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 243,
+        "column": 55
+      },
+      "end": {
+        "line": 243,
+        "column": 57
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 248,
+        "column": 28
+      },
+      "end": {
+        "line": 248,
+        "column": 29
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 252,
+        "column": 52
+      },
+      "end": {
+        "line": 252,
+        "column": 54
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 252,
+        "column": 52
+      },
+      "end": {
+        "line": 252,
+        "column": 54
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 271,
+        "column": 44
+      },
+      "end": {
+        "line": 271,
+        "column": 46
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 271,
+        "column": 75
+      },
+      "end": {
+        "line": 271,
+        "column": 76
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 271,
+        "column": 75
+      },
+      "end": {
+        "line": 271,
+        "column": 76
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 271,
+        "column": 75
+      },
+      "end": {
+        "line": 271,
+        "column": 76
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 312,
+        "column": 42
+      },
+      "end": {
+        "line": 312,
+        "column": 44
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 327,
+        "column": 50
+      },
+      "end": {
+        "line": 327,
+        "column": 52
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 341,
+        "column": 54
+      },
+      "end": {
+        "line": 341,
+        "column": 56
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 341,
+        "column": 54
+      },
+      "end": {
+        "line": 341,
+        "column": 56
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 355,
+        "column": 53
+      },
+      "end": {
+        "line": 355,
+        "column": 55
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_expired_leases",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 156,
+          "column": 5
+        },
+        "end": {
+          "line": 362,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 355,
+        "column": 53
+      },
+      "end": {
+        "line": 355,
+        "column": 55
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_to_ready",
+      "return_type": "-> io::Result<()>",
+      "span": {
+        "start": {
+          "line": 364,
+          "column": 5
+        },
+        "end": {
+          "line": 409,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 372,
+        "column": 9
+      },
+      "end": {
+        "line": 408,
+        "column": 15
+      }
+    },
+    "replacement": "Ok(())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::reap_to_dead",
+      "return_type": "-> io::Result<()>",
+      "span": {
+        "start": {
+          "line": 411,
+          "column": 5
+        },
+        "end": {
+          "line": 465,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 422,
+        "column": 9
+      },
+      "end": {
+        "line": 464,
+        "column": 15
+      }
+    },
+    "replacement": "Ok(())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 474,
+        "column": 9
+      },
+      "end": {
+        "line": 653,
+        "column": 60
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 489,
+        "column": 41
+      },
+      "end": {
+        "line": 489,
+        "column": 42
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 489,
+        "column": 41
+      },
+      "end": {
+        "line": 489,
+        "column": 42
+      }
+    },
+    "replacement": ">",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 489,
+        "column": 41
+      },
+      "end": {
+        "line": 489,
+        "column": 42
+      }
+    },
+    "replacement": "<=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 511,
+        "column": 27
+      },
+      "end": {
+        "line": 511,
+        "column": 28
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 511,
+        "column": 27
+      },
+      "end": {
+        "line": 511,
+        "column": 28
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 511,
+        "column": 27
+      },
+      "end": {
+        "line": 511,
+        "column": 28
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 542,
+        "column": 24
+      },
+      "end": {
+        "line": 542,
+        "column": 25
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 546,
+        "column": 48
+      },
+      "end": {
+        "line": 546,
+        "column": 50
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 546,
+        "column": 48
+      },
+      "end": {
+        "line": 546,
+        "column": 50
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 633,
+        "column": 36
+      },
+      "end": {
+        "line": 633,
+        "column": 38
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 634,
+        "column": 52
+      },
+      "end": {
+        "line": 634,
+        "column": 54
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::promote_delayed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 467,
+          "column": 5
+        },
+        "end": {
+          "line": 654,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 634,
+        "column": 52
+      },
+      "end": {
+        "line": 634,
+        "column": 54
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 663,
+        "column": 9
+      },
+      "end": {
+        "line": 729,
+        "column": 10
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 680,
+        "column": 49
+      },
+      "end": {
+        "line": 680,
+        "column": 51
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 709,
+        "column": 24
+      },
+      "end": {
+        "line": 709,
+        "column": 25
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 713,
+        "column": 48
+      },
+      "end": {
+        "line": 713,
+        "column": 50
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 713,
+        "column": 48
+      },
+      "end": {
+        "line": 713,
+        "column": 50
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 715,
+        "column": 44
+      },
+      "end": {
+        "line": 715,
+        "column": 45
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 719,
+        "column": 29
+      },
+      "end": {
+        "line": 719,
+        "column": 30
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 719,
+        "column": 29
+      },
+      "end": {
+        "line": 719,
+        "column": 30
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 719,
+        "column": 29
+      },
+      "end": {
+        "line": 719,
+        "column": 30
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 724,
+        "column": 38
+      },
+      "end": {
+        "line": 724,
+        "column": 40
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 725,
+        "column": 50
+      },
+      "end": {
+        "line": 725,
+        "column": 52
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::cleanup_temp_files",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 656,
+          "column": 5
+        },
+        "end": {
+          "line": 730,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 725,
+        "column": 50
+      },
+      "end": {
+        "line": 725,
+        "column": 52
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::ensure_dir_pub",
+      "return_type": "-> io::Result<()>",
+      "span": {
+        "start": {
+          "line": 733,
+          "column": 5
+        },
+        "end": {
+          "line": 736,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 735,
+        "column": 9
+      },
+      "end": {
+        "line": 735,
+        "column": 34
+      }
+    },
+    "replacement": "Ok(())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 746,
+        "column": 9
+      },
+      "end": {
+        "line": 988,
+        "column": 61
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 761,
+        "column": 41
+      },
+      "end": {
+        "line": 761,
+        "column": 42
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 761,
+        "column": 41
+      },
+      "end": {
+        "line": 761,
+        "column": 42
+      }
+    },
+    "replacement": ">",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 761,
+        "column": 41
+      },
+      "end": {
+        "line": 761,
+        "column": 42
+      }
+    },
+    "replacement": "<=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 799,
+        "column": 24
+      },
+      "end": {
+        "line": 799,
+        "column": 25
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 803,
+        "column": 48
+      },
+      "end": {
+        "line": 803,
+        "column": 50
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 803,
+        "column": 48
+      },
+      "end": {
+        "line": 803,
+        "column": 50
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 812,
+        "column": 24
+      },
+      "end": {
+        "line": 812,
+        "column": 25
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 825,
+        "column": 34
+      },
+      "end": {
+        "line": 825,
+        "column": 36
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 828,
+        "column": 29
+      },
+      "end": {
+        "line": 828,
+        "column": 31
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 837,
+        "column": 34
+      },
+      "end": {
+        "line": 837,
+        "column": 35
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 837,
+        "column": 34
+      },
+      "end": {
+        "line": 837,
+        "column": 35
+      }
+    },
+    "replacement": ">",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 837,
+        "column": 34
+      },
+      "end": {
+        "line": 837,
+        "column": 35
+      }
+    },
+    "replacement": "<=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 842,
+        "column": 91
+      },
+      "end": {
+        "line": 842,
+        "column": 93
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 858,
+        "column": 38
+      },
+      "end": {
+        "line": 858,
+        "column": 40
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 861,
+        "column": 48
+      },
+      "end": {
+        "line": 861,
+        "column": 50
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 867,
+        "column": 32
+      },
+      "end": {
+        "line": 867,
+        "column": 33
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 867,
+        "column": 32
+      },
+      "end": {
+        "line": 867,
+        "column": 33
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 867,
+        "column": 32
+      },
+      "end": {
+        "line": 867,
+        "column": 33
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 872,
+        "column": 25
+      },
+      "end": {
+        "line": 872,
+        "column": 27
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 871,
+        "column": 32
+      },
+      "end": {
+        "line": 871,
+        "column": 33
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 871,
+        "column": 32
+      },
+      "end": {
+        "line": 871,
+        "column": 33
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 871,
+        "column": 32
+      },
+      "end": {
+        "line": 871,
+        "column": 33
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 876,
+        "column": 24
+      },
+      "end": {
+        "line": 876,
+        "column": 25
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 881,
+        "column": 56
+      },
+      "end": {
+        "line": 881,
+        "column": 57
+      }
+    },
+    "replacement": "-",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 881,
+        "column": 56
+      },
+      "end": {
+        "line": 881,
+        "column": 57
+      }
+    },
+    "replacement": "*",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 881,
+        "column": 46
+      },
+      "end": {
+        "line": 881,
+        "column": 47
+      }
+    },
+    "replacement": "-",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 881,
+        "column": 46
+      },
+      "end": {
+        "line": 881,
+        "column": 47
+      }
+    },
+    "replacement": "*",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 882,
+        "column": 41
+      },
+      "end": {
+        "line": 882,
+        "column": 43
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 904,
+        "column": 37
+      },
+      "end": {
+        "line": 904,
+        "column": 39
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 918,
+        "column": 35
+      },
+      "end": {
+        "line": 918,
+        "column": 37
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 976,
+        "column": 50
+      },
+      "end": {
+        "line": 976,
+        "column": 52
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::compact_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 738,
+          "column": 5
+        },
+        "end": {
+          "line": 989,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 976,
+        "column": 50
+      },
+      "end": {
+        "line": 976,
+        "column": 52
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 999,
+        "column": 9
+      },
+      "end": {
+        "line": 1161,
+        "column": 60
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1016,
+        "column": 41
+      },
+      "end": {
+        "line": 1016,
+        "column": 42
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1016,
+        "column": 41
+      },
+      "end": {
+        "line": 1016,
+        "column": 42
+      }
+    },
+    "replacement": ">",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1016,
+        "column": 41
+      },
+      "end": {
+        "line": 1016,
+        "column": 42
+      }
+    },
+    "replacement": "<=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1043,
+        "column": 46
+      },
+      "end": {
+        "line": 1043,
+        "column": 48
+      }
+    },
+    "replacement": ">",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1047,
+        "column": 16
+      },
+      "end": {
+        "line": 1047,
+        "column": 17
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1074,
+        "column": 24
+      },
+      "end": {
+        "line": 1074,
+        "column": 25
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1083,
+        "column": 48
+      },
+      "end": {
+        "line": 1083,
+        "column": 50
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1083,
+        "column": 48
+      },
+      "end": {
+        "line": 1083,
+        "column": 50
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1103,
+        "column": 24
+      },
+      "end": {
+        "line": 1103,
+        "column": 25
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1112,
+        "column": 57
+      },
+      "end": {
+        "line": 1112,
+        "column": 59
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1112,
+        "column": 42
+      },
+      "end": {
+        "line": 1112,
+        "column": 43
+      }
+    },
+    "replacement": "|",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1112,
+        "column": 42
+      },
+      "end": {
+        "line": 1112,
+        "column": 43
+      }
+    },
+    "replacement": "^",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1125,
+        "column": 52
+      },
+      "end": {
+        "line": 1125,
+        "column": 54
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1125,
+        "column": 52
+      },
+      "end": {
+        "line": 1125,
+        "column": 54
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1145,
+        "column": 43
+      },
+      "end": {
+        "line": 1145,
+        "column": 45
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/recovery.rs",
+    "function": {
+      "function_name": "Queue::delete_expired_receipts",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 991,
+          "column": 5
+        },
+        "end": {
+          "line": 1162,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1145,
+        "column": 43
+      },
+      "end": {
+        "line": 1145,
+        "column": 45
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/state_machine.rs",
+    "function": {
+      "function_name": "is_legal_transition",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 1
+        },
+        "end": {
+          "line": 159,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 156,
+        "column": 5
+      },
+      "end": {
+        "line": 158,
+        "column": 69
+      }
+    },
+    "replacement": "true",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/state_machine.rs",
+    "function": {
+      "function_name": "is_legal_transition",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 1
+        },
+        "end": {
+          "line": 159,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 156,
+        "column": 5
+      },
+      "end": {
+        "line": 158,
+        "column": 69
+      }
+    },
+    "replacement": "false",
+    "genre": "FnValue"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/state_machine.rs",
+    "function": {
+      "function_name": "is_legal_transition",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 1
+        },
+        "end": {
+          "line": 159,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 158,
+        "column": 37
+      },
+      "end": {
+        "line": 158,
+        "column": 39
+      }
+    },
+    "replacement": "||",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/state_machine.rs",
+    "function": {
+      "function_name": "is_legal_transition",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 1
+        },
+        "end": {
+          "line": 159,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 158,
+        "column": 27
+      },
+      "end": {
+        "line": 158,
+        "column": 29
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "spoolq-core",
+    "file": "crates/spoolq-core/src/state_machine.rs",
+    "function": {
+      "function_name": "is_legal_transition",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 154,
+          "column": 1
+        },
+        "end": {
+          "line": 159,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 158,
+        "column": 54
+      },
+      "end": {
+        "line": 158,
+        "column": 56
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
   }
 ]

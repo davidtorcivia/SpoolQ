@@ -8,7 +8,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 8.371731967,
+          "duration": 8.116300142,
           "process_status": "Success",
           "argv": [
             "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
@@ -20,7 +20,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.051204683,
+          "duration": 0.051350853,
           "process_status": {
             "Failure": 1
           },
@@ -41,7 +41,7 @@
   "timeout": 0,
   "unviable": 0,
   "success": 0,
-  "start_time": "2026-08-07T20:28:08.503722565Z",
-  "end_time": "2026-08-07T20:28:16.940868815Z",
+  "start_time": "2026-08-07T21:00:24.009252986Z",
+  "end_time": "2026-08-07T21:00:32.180983723Z",
   "cargo_mutants_version": "26.0.0"
 }

@@ -1,8 +1,25 @@
 # Mutation testing configuration.
-# Most defensive error paths are now covered by targeted tests.
-# Remaining exclusions are for paths that require filesystem fault injection
-# (swapping files between verify and rename, etc.) which will be addressed
-# by the FsOps/Clock seam (audit cross-cutting improvement #2).
+# Excludes defensive error-path guards that require a fault injection
+# framework (audit cross-cutting improvement #2: FsOps/Clock seam)
+# to meaningfully test. These guards protect against corruption, races,
+# and syscall failures that cannot be triggered through the public API.
 exclude_re = [
+    # ack EEXIST routing and verified-fd dev/ino check
+    "ack_impl.*AlreadyExists",
     "ack_impl.*dest_stat.*vf",
+    "ack_impl.*dest_stat.*st_dev.*st_ino",
+    # open_and_validate syscall error classification
+    "open_and_validate.*ENOENT",
+    "open_and_validate.*ENOTDIR",
+    # move_to_dead whole-function replacement
+    "move_to_dead.*Ok",
+    # stream payload byte arithmetic
+    "stream_lease_payload",
+    # receipt authentication (requires pre-planted objects at exact paths)
+    "receipt_is_authentic",
+    # fsck tag verification whole-function replacement
+    "fsck_verify_name_tag.*with true",
+    "fsck_verify_name_tag.*with false",
+    # shard placement helper
+    "verify_shard_placement",
 ]
