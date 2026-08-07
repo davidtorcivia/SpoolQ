@@ -1,6 +1,0 @@
-crates/spoolq-core/src/queue.rs:632:9: replace Queue::enqueue -> EnqueueOutcome with Default::default()
-crates/spoolq-core/src/queue.rs:1063:9: replace Queue::lease -> LeaseOutcome with Default::default()
-crates/spoolq-core/src/queue.rs:1892:9: replace Queue::retry_after -> TransitionOutcome with Default::default()
-crates/spoolq-core/src/queue.rs:1913:9: replace Queue::retry_with_policy -> TransitionOutcome with Default::default()
-crates/spoolq-core/src/queue.rs:2051:9: replace Queue::bury_internal -> TransitionOutcome with Default::default()
-crates/spoolq-core/src/queue.rs:2101:9: replace Queue::renew -> RenewOutcome with Default::default()
