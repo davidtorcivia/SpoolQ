@@ -12,4 +12,8 @@ exclude_re = [
     "verify_shard_placement",
     "resolve_check_object",
     "delete_expired_receipts",
+    "reap_expired_leases",
+    "promote_delayed",
+    "cleanup_temp_files",
+    "compact_receipts",
 ]

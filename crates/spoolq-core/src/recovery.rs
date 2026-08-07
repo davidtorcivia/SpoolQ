@@ -39,6 +39,7 @@ pub struct RecoveryStats {
     pub receipts_expired: u32,
     pub budget_exhausted: bool,
     pub errors: Vec<RecoveryError>,
+    pub scan_skips: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -201,12 +202,18 @@ impl Queue {
 
             let boot_dir_fd = match fs::open_directory(leased_fd.as_raw_fd(), boot_dir_name) {
                 Ok(fd) => fd,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             let bucket_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             for bucket_name in &bucket_dirs {
@@ -231,23 +238,35 @@ impl Queue {
 
                 let bucket_fd = match fs::open_directory(boot_dir_fd.as_raw_fd(), bucket_name) {
                     Ok(fd) => fd,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 for shard_name in &shard_dirs {
                     let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                         Ok(fd) => fd,
-                        Err(_) => continue,
+                        Err(_) => {
+                            stats.scan_skips += 1;
+                            continue;
+                        }
                     };
 
                     let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                         Ok(e) => e,
-                        Err(_) => continue,
+                        Err(_) => {
+                            stats.scan_skips += 1;
+                            continue;
+                        }
                     };
 
                     for entry in &entries {
@@ -525,23 +544,40 @@ impl Queue {
 
             let bucket_fd = match fs::open_directory(delayed_fd.as_raw_fd(), bucket_name) {
                 Ok(fd) => fd,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             for shard_name in &shard_dirs {
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => continue,
+                    Err(_) => {
+                        Self::record_error(
+                            stats,
+                            "promote_shard_open",
+                            &format!("{bucket_name}/{shard_name}"),
+                            "shard dir open failed",
+                        );
+                        continue;
+                    }
                 };
 
                 let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 for entry in &entries {
@@ -692,23 +728,35 @@ impl Queue {
 
             let boot_dir_fd = match fs::open_directory(tmp_fd.as_raw_fd(), boot_dir_name) {
                 Ok(fd) => fd,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             let shard_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             for shard_name in &shard_dirs {
                 let shard_fd = match fs::open_directory(boot_dir_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 for entry in &entries {
@@ -782,23 +830,35 @@ impl Queue {
 
             let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
                 Ok(fd) => fd,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             for shard_name in &shard_dirs {
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 for entry in &entries {
@@ -1061,23 +1121,35 @@ impl Queue {
 
             let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
                 Ok(fd) => fd,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
             };
 
             for shard_name in &shard_dirs {
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(_) => {
+                        stats.scan_skips += 1;
+                        continue;
+                    }
                 };
 
                 for entry in &entries {
