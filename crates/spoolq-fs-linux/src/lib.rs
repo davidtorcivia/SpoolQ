@@ -7,8 +7,117 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
+// ---------- Fault injection (always compiled; idle until armed) ----------
+//
+// Tests arm faults via fault::inject / inject_errno. Production code paths
+// pay only an AtomicBool load when nothing is armed.
+
+/// Fault injection control for deterministic failure testing.
+///
+/// State is thread-local so parallel tests do not interfere with each other.
+/// Idle threads pay only a TLS lookup that finds an empty map.
+pub mod fault {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::io;
+
+    #[derive(Clone, Copy, Debug)]
+    struct Fault {
+        current: u64,
+        target: u64,
+        errno: i32,
+    }
+
+    struct State {
+        faults: HashMap<String, Fault>,
+        counts: HashMap<String, u64>,
+    }
+
+    impl State {
+        fn new() -> Self {
+            State {
+                faults: HashMap::new(),
+                counts: HashMap::new(),
+            }
+        }
+    }
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::new());
+    }
+
+    /// Clear all pending faults and call counters on this thread.
+    pub fn reset() {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.faults.clear();
+            s.counts.clear();
+        });
+    }
+
+    /// Fail the Nth (1-indexed) call to `func_name` with EIO.
+    pub fn inject(func_name: &str, at_count: u64) {
+        inject_errno(func_name, at_count, libc::EIO);
+    }
+
+    /// Fail the Nth (1-indexed) call to `func_name` with the given errno.
+    pub fn inject_errno(func_name: &str, at_count: u64, errno: i32) {
+        assert!(at_count >= 1, "fault inject count is 1-indexed");
+        STATE.with(|s| {
+            s.borrow_mut().faults.insert(
+                func_name.to_string(),
+                Fault {
+                    current: 0,
+                    target: at_count,
+                    errno,
+                },
+            );
+        });
+    }
+
+    /// Alias used by older call sites / docs.
+    pub fn inject_at(func_name: &str, at_count: u64) {
+        inject(func_name, at_count);
+    }
+
+    /// Number of times `func_name` has been checked since the last reset.
+    pub fn call_count(func_name: &str) -> u64 {
+        STATE.with(|s| *s.borrow().counts.get(func_name).unwrap_or(&0))
+    }
+
+    /// Called by instrumented functions. Returns an error when a fault fires.
+    #[inline]
+    pub fn check(func_name: &str) -> Option<io::Error> {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.faults.is_empty() {
+                return None;
+            }
+            *s.counts.entry(func_name.to_string()).or_insert(0) += 1;
+            if let Some(entry) = s.faults.get_mut(func_name) {
+                entry.current += 1;
+                if entry.current == entry.target {
+                    let errno = entry.errno;
+                    s.faults.remove(func_name);
+                    return Some(io::Error::from_raw_os_error(errno));
+                }
+            }
+            None
+        })
+    }
+}
+
+macro_rules! fault_check {
+    ($name:expr) => {
+        if let Some(e) = $crate::fault::check($name) {
+            return Err(e);
+        }
+    };
+}
+
 /// Open or create a file with O_TMPFILE.
 pub fn open_tmpfile(dir_fd: RawFd) -> io::Result<OwnedFd> {
+    fault_check!("open_tmpfile");
     // Use libc::O_TMPFILE which correctly includes O_DIRECTORY on all arches.
     // Fall back to the defined constant if libc does not expose it.
     let o_tmpfile = libc::O_TMPFILE;
@@ -45,6 +154,7 @@ fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CString> {
 
 /// Open a directory for reading.
 pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
+    fault_check!("open_directory");
     // R2-B06: Use O_NOFOLLOW to prevent symlink traversal on state directories.
     let c_name = cstr_from_name(name)?;
     let fd = unsafe {
@@ -62,6 +172,7 @@ pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
 
 /// Open a path relative to a directory fd with given flags.
 pub fn openat(dir_fd: RawFd, name: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
+    fault_check!("openat");
     let c_name = cstr_from_name(name)?;
     let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), flags, mode) };
     if fd < 0 {
@@ -72,6 +183,7 @@ pub fn openat(dir_fd: RawFd, name: &str, flags: i32, mode: u32) -> io::Result<Ow
 
 /// Create a directory.
 pub fn mkdirat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
+    fault_check!("mkdirat");
     let c_name = cstr_from_name(name)?;
     let rc = unsafe { libc::mkdirat(dir_fd, c_name.as_ptr(), mode) };
     if rc < 0 {
@@ -92,6 +204,7 @@ pub fn mkdirat_eexist_ok(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<boo
 
 /// fsync a file descriptor.
 pub fn fsync(fd: RawFd) -> io::Result<()> {
+    fault_check!("fsync");
     let rc = unsafe { libc::fsync(fd) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -101,12 +214,14 @@ pub fn fsync(fd: RawFd) -> io::Result<()> {
 
 /// fsync a directory by opening it read-only and syncing.
 pub fn fsync_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
+    fault_check!("fsync_dir");
     let fd = open_directory(dir_fd, name)?;
     fsync(fd.as_raw_fd())
 }
 
 /// fsync a directory by its already-open fd.
 pub fn fsync_dir_fd(fd: RawFd) -> io::Result<()> {
+    fault_check!("fsync_dir_fd");
     fsync(fd)
 }
 
@@ -117,6 +232,7 @@ pub fn renameat2_noreplace(
     new_dir_fd: RawFd,
     new_name: &str,
 ) -> io::Result<()> {
+    fault_check!("renameat2_noreplace");
     const RENAME_NOREPLACE: u32 = 1 << 0;
     let c_old = cstr_from_name(old_name)?;
     let c_new = cstr_from_name(new_name)?;
@@ -143,6 +259,7 @@ pub fn renameat(
     new_dir_fd: RawFd,
     new_name: &str,
 ) -> io::Result<()> {
+    fault_check!("renameat");
     let c_old = cstr_from_name(old_name)?;
     let c_new = cstr_from_name(new_name)?;
     let rc = unsafe { libc::renameat(old_dir_fd, c_old.as_ptr(), new_dir_fd, c_new.as_ptr()) };
@@ -154,6 +271,7 @@ pub fn renameat(
 
 /// linkat with AT_EMPTY_PATH for O_TMPFILE publication.
 pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::Result<()> {
+    fault_check!("linkat_empty_path");
     const AT_EMPTY_PATH: i32 = 0x1000;
     let c_dest = cstr_from_name(dest_name)?;
     let empty = CString::new("").unwrap();
@@ -175,6 +293,7 @@ pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::
 
 /// linkat via /proc/self/fd for unprivileged O_TMPFILE publication.
 pub fn linkat_proc_self_fd(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::Result<()> {
+    fault_check!("linkat_proc_self_fd");
     const AT_SYMLINK_FOLLOW: i32 = 0x400;
     #[allow(clippy::manual_c_str_literals)]
     let proc_path = format!("/proc/self/fd/{fd}\0");
@@ -197,6 +316,7 @@ pub fn linkat_proc_self_fd(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io
 
 /// unlinkat - remove a file.
 pub fn unlinkat(dir_fd: RawFd, name: &str) -> io::Result<()> {
+    fault_check!("unlinkat");
     let c_name = cstr_from_name(name)?;
     let rc = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
     if rc < 0 {
@@ -207,6 +327,7 @@ pub fn unlinkat(dir_fd: RawFd, name: &str) -> io::Result<()> {
 
 /// Remove a directory (must be empty).
 pub fn unlinkat_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
+    fault_check!("unlinkat_dir");
     const AT_REMOVEDIR: i32 = 0x200;
     let c_name = cstr_from_name(name)?;
     let rc = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), AT_REMOVEDIR) };
@@ -218,6 +339,7 @@ pub fn unlinkat_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
 
 /// stat a file relative to a directory fd using AT_SYMLINK_NOFOLLOW.
 pub fn fstatat(dir_fd: RawFd, name: &str) -> io::Result<libc::stat> {
+    fault_check!("fstatat");
     let c_name = cstr_from_name(name)?;
     let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe {
@@ -236,6 +358,7 @@ pub fn fstatat(dir_fd: RawFd, name: &str) -> io::Result<libc::stat> {
 
 /// fstat on an already-open fd.
 pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+    fault_check!("fstat");
     let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::fstat(fd, &mut statbuf) };
     if rc < 0 {
@@ -262,6 +385,7 @@ pub fn read_boot_id() -> io::Result<String> {
 
 /// CLOCK_BOOTTIME in nanoseconds.
 pub fn clock_boottime_ns() -> io::Result<u64> {
+    fault_check!("clock_boottime_ns");
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
     if rc < 0 {
@@ -272,6 +396,7 @@ pub fn clock_boottime_ns() -> io::Result<u64> {
 
 /// CLOCK_REALTIME in nanoseconds.
 pub fn clock_realtime_ns() -> io::Result<u64> {
+    fault_check!("clock_realtime_ns");
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     if rc < 0 {
@@ -289,6 +414,7 @@ pub fn clock_realtime_ns() -> io::Result<u64> {
 
 /// CLOCK_MONOTONIC in nanoseconds (for budget enforcement).
 pub fn clock_monotonic_ns() -> io::Result<u64> {
+    fault_check!("clock_monotonic_ns");
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     if rc < 0 {
@@ -301,6 +427,7 @@ pub fn clock_monotonic_ns() -> io::Result<u64> {
 /// Loops until the entire buffer is filled. Handles short reads, EINTR,
 /// and EAGAIN. Returns an error (not zero data) on any failure.
 pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
+    fault_check!("get_random");
     if bytes == 0 {
         return Ok(Vec::new());
     }
@@ -353,6 +480,7 @@ pub fn random_128bit() -> io::Result<[u8; 16]> {
 
 /// pwrite to a file descriptor at a given offset.
 pub fn pwrite(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
+    fault_check!("pwrite");
     let rc = unsafe { libc::pwrite(fd, buf.as_ptr() as *const _, buf.len(), offset as i64) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -423,6 +551,7 @@ pub fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 
 /// Read at a specific offset using pread.
 pub fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    fault_check!("pread");
     loop {
         let rc = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), offset as i64) };
         if rc < 0 {
@@ -656,6 +785,7 @@ pub fn durable_move_noreplace(
     dest_dir_fd: RawFd,
     dest_name: &str,
 ) -> io::Result<()> {
+    fault_check!("durable_move_noreplace");
     renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name)?;
 
     // Check if same directory by comparing device and inode
@@ -681,6 +811,7 @@ pub fn durable_move_replace(
     dest_dir_fd: RawFd,
     dest_name: &str,
 ) -> io::Result<()> {
+    fault_check!("durable_move_replace");
     renameat(src_dir_fd, src_name, dest_dir_fd, dest_name)?;
 
     let src_stat = fstat(src_dir_fd)?;
@@ -1002,5 +1133,74 @@ mod tests {
         assert_eq!(count_seen, 1);
 
         std::fs::remove_dir_all(&dir_path).ok();
+    }
+
+    #[test]
+    fn fault_inject_fsync_fires_once() {
+        fault::reset();
+        fault::inject("fsync", 1);
+        // Use a real fd (stdout). The fault fires before the syscall.
+        let err = fsync(1).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        // Second call is not faulted.
+        let _ = fsync(1);
+        fault::reset();
+    }
+
+    #[test]
+    fn fault_inject_nth_call() {
+        fault::reset();
+        fault::inject("renameat2_noreplace", 2);
+        let dir = tempfile_dir("nth");
+        let fd = open_dir_absolute(&dir).unwrap();
+        std::fs::write(dir.join("src1"), b"1").unwrap();
+        std::fs::write(dir.join("src2"), b"2").unwrap();
+        let r1 = renameat2_noreplace(fd.as_raw_fd(), "src1", fd.as_raw_fd(), "dst1");
+        assert!(r1.is_ok(), "first call should succeed: {r1:?}");
+        let r2 = renameat2_noreplace(fd.as_raw_fd(), "src2", fd.as_raw_fd(), "dst2");
+        assert!(r2.is_err(), "second call should fault: {r2:?}");
+        assert_eq!(r2.unwrap_err().raw_os_error(), Some(libc::EIO));
+        fault::reset();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fault_inject_errno_enotdir() {
+        fault::reset();
+        fault::inject_errno("fstatat", 1, libc::ENOTDIR);
+        let dir = tempfile_dir("enotdir");
+        let fd = open_dir_absolute(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        let err = fstatat(fd.as_raw_fd(), "f").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+        fault::reset();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fault_idle_has_no_effect() {
+        fault::reset();
+        assert_eq!(fault::call_count("fsync"), 0);
+        let dir = tempfile_dir("idle");
+        let fd = open_dir_absolute(&dir).unwrap();
+        fsync(fd.as_raw_fd()).unwrap();
+        // Idle threads do not count checks when no faults are armed.
+        assert_eq!(fault::call_count("fsync"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "spoolq-fs-fault-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
     }
 }

@@ -1,12 +1,10 @@
 # Mutation testing configuration.
-# Excludes functions that are primarily defensive error-path guards or
-# recovery internals requiring a fault injection framework (audit
-# cross-cutting improvement #2) to meaningfully test.
+# Exclude recovery/scan internals whose counters and skip paths are not
+# asserted by unit tests, and whole-function replacements of multi-path
+# guards that are covered by fault-injection tests as integration paths
+# rather than by cargo-mutants line mutants.
 exclude_re = [
-    "ack_impl",
-    "open_and_validate_current_lease",
     "move_to_dead",
-    "stream_lease_payload",
     "receipt_is_authentic",
     "fsck_verify_name_tag",
     "verify_shard_placement",
@@ -16,4 +14,11 @@ exclude_re = [
     "promote_delayed",
     "cleanup_temp_files",
     "compact_receipts",
+    # Thin TLS fault-check branches and idle paths.
+    "fault::check",
+    "fault::reset",
+    "fault::inject",
+    "fault::inject_errno",
+    "fault::inject_at",
+    "fault::call_count",
 ]

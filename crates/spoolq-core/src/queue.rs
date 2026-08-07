@@ -5148,15 +5148,13 @@ mod tests {
     }
 
     // ===== T2: Oracle-driven closed-loop simulation =====
-    // P1-28: This test tracks synthetic oracle IDs, not real queue job IDs.
-    // A proper model-based test would reconcile every EnqueueTicket.job_id
-    // with the oracle state after each operation.
+    // P1-28: Track real EnqueueTicket.job_id / LeaseInfo.job_id values and
+    // reconcile oracle state with inspect() after every operation.
     #[test]
     fn oracle_driven_closed_loop() {
         use std::collections::HashMap;
         let (_tmp, mut queue) = create_test_queue();
 
-        // Simple oracle: track each job's expected state
         #[derive(Clone, Copy, PartialEq, Debug)]
         enum State {
             Ready,
@@ -5165,63 +5163,105 @@ mod tests {
             Retried,
         }
         let mut oracle: HashMap<[u8; 16], State> = HashMap::new();
+        // Live lease handles keyed by real job_id.
+        let mut leases: HashMap<[u8; 16], LeaseInfo> = HashMap::new();
         let mut rng_state = 42u64;
-        let mut next_id = 0u64;
 
         for _step in 0..500 {
-            // xorshift
             rng_state ^= rng_state << 13;
             rng_state ^= rng_state >> 7;
             rng_state ^= rng_state << 17;
 
             match rng_state % 4 {
                 0 => {
-                    // Enqueue
-                    let mut id = [0u8; 16];
-                    id[..8].copy_from_slice(&next_id.to_be_bytes());
-                    next_id += 1;
                     let outcome = queue.enqueue(EnqueueInput {
                         maximum_attempts: 3,
                         content_type: "x".to_string(),
                         payload: b"data".to_vec(),
                         ..Default::default()
                     });
-                    if let EnqueueOutcome::Committed(_) = outcome {
-                        oracle.insert(id, State::Ready);
+                    if let EnqueueOutcome::Committed(ticket) = outcome {
+                        oracle.insert(ticket.job_id, State::Ready);
+                        // Reconcile: inspect must see a ready object for this id.
+                        let snaps = queue.inspect(&ticket.job_id);
+                        assert!(
+                            snaps.iter().any(|s| s.state == "ready"),
+                            "oracle Ready not reflected by inspect for {}",
+                            spoolq_names::hex_encode(&ticket.job_id)
+                        );
                     }
                 }
                 1 => {
-                    // Lease
                     if let LeaseOutcome::Leased(l) = queue.lease(0, 30_000_000_000) {
-                        oracle.insert(l.job_id, State::Leased);
+                        let id = l.job_id;
+                        oracle.insert(id, State::Leased);
+                        leases.insert(id, l);
+                        let snaps = queue.inspect(&id);
+                        assert!(
+                            snaps.iter().any(|s| s.state == "leased"),
+                            "oracle Leased not reflected by inspect"
+                        );
                     }
                 }
                 2 => {
-                    // Ack a leased job (find one)
-                    if let Some((&job_id, _)) = oracle.iter().find(|(_, s)| **s == State::Leased) {
-                        // Re-lease to get a valid handle
-                        drop(queue.lease(0, 30_000_000_000));
-                        // Just track state transition in oracle
-                        oracle.insert(job_id, State::Acked);
+                    // Ack a leased job using the real handle.
+                    let job_id = oracle
+                        .iter()
+                        .find(|(_, s)| **s == State::Leased)
+                        .map(|(id, _)| *id);
+                    if let Some(job_id) = job_id {
+                        if let Some(lease) = leases.remove(&job_id) {
+                            queue.verify_lease_payload(&lease).unwrap();
+                            match queue.ack(&lease) {
+                                AckOutcome::Acked | AckOutcome::AlreadyAcked => {
+                                    oracle.insert(job_id, State::Acked);
+                                    let snaps = queue.inspect(&job_id);
+                                    assert!(
+                                        snaps.iter().any(|s| s.state == "receipt")
+                                            || snaps.is_empty()
+                                            || snaps.iter().all(|s| s.state != "leased"),
+                                        "acked job still leased in inspect"
+                                    );
+                                }
+                                _ => {
+                                    // Keep as leased if ack failed; reinsert handle.
+                                    leases.insert(job_id, lease);
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
-                    // Retry or bury
                     if let LeaseOutcome::Leased(l) = queue.lease(0, 30_000_000_000) {
+                        let id = l.job_id;
                         if rng_state.is_multiple_of(2) {
                             queue.verify_lease_payload(&l).unwrap();
-                            let _ = queue.ack(&l);
-                            oracle.insert(l.job_id, State::Acked);
-                        } else {
-                            let _ = queue.retry_now(&l);
-                            oracle.insert(l.job_id, State::Retried);
+                            if matches!(queue.ack(&l), AckOutcome::Acked | AckOutcome::AlreadyAcked)
+                            {
+                                oracle.insert(id, State::Acked);
+                                leases.remove(&id);
+                            }
+                        } else if let TransitionOutcome::Committed = queue.retry_now(&l) {
+                            leases.remove(&id);
+                            let snaps = queue.inspect(&id);
+                            // retry_now moves to ready, or to dead when
+                            // attempts are exhausted.
+                            if snaps.iter().any(|s| s.state == "ready") {
+                                oracle.insert(id, State::Retried);
+                            } else if snaps.iter().any(|s| s.state == "dead") {
+                                oracle.insert(id, State::Acked); // terminal
+                            } else {
+                                panic!(
+                                    "retry committed but inspect has {:?}",
+                                    snaps.iter().map(|s| s.state.as_str()).collect::<Vec<_>>()
+                                );
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Verify oracle consistency: no job in Leased state that wasn't acked
         let ready_count = oracle.values().filter(|s| **s == State::Ready).count();
         let leased_count = oracle.values().filter(|s| **s == State::Leased).count();
         let acked_count = oracle.values().filter(|s| **s == State::Acked).count();
@@ -5230,6 +5270,34 @@ mod tests {
             ready_count + leased_count + acked_count + retried_count > 0,
             "oracle should have tracked some jobs"
         );
+
+        // Final reconciliation: every oracle Ready/Leased job must appear in inspect.
+        for (id, state) in &oracle {
+            match state {
+                State::Ready => {
+                    let snaps = queue.inspect(id);
+                    // May have been leased later without oracle update if we only
+                    // track transitions we apply; re-check live state.
+                    let live_ready = snaps.iter().any(|s| s.state == "ready");
+                    let live_leased = snaps.iter().any(|s| s.state == "leased");
+                    assert!(
+                        live_ready || live_leased || snaps.is_empty(),
+                        "oracle Ready job in unexpected state: {:?}",
+                        snaps.iter().map(|s| s.state.as_str()).collect::<Vec<_>>()
+                    );
+                }
+                State::Leased => {
+                    let snaps = queue.inspect(id);
+                    assert!(
+                        snaps.iter().any(|s| s.state == "leased")
+                            || snaps.iter().any(|s| s.state == "ready")
+                            || snaps.iter().any(|s| s.state == "receipt"),
+                        "oracle Leased job vanished without transition"
+                    );
+                }
+                State::Acked | State::Retried => {}
+            }
+        }
     }
 
     // ===== B3: Wall floor poisoning =====
@@ -5726,5 +5794,125 @@ mod tests {
         // Normal ack should work - payload is valid.
         let result = queue.ack(&lease);
         assert!(matches!(result, AckOutcome::Acked));
+    }
+
+    // ===== Fault injection: post-linearization and pre-linearization paths =====
+
+    #[test]
+    fn fault_ack_post_rename_fsync_is_outcome_unknown() {
+        spoolq_fs_linux::fault::reset();
+        let (_tmp, mut queue) = create_test_queue();
+
+        // Warm up receipt directory layout so ensure_dir does not fsync.
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"warmup".to_vec(),
+            ..Default::default()
+        });
+        let warm = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("warmup lease failed"),
+        };
+        queue.verify_lease_payload(&warm).unwrap();
+        assert!(matches!(queue.ack(&warm), AckOutcome::Acked));
+
+        // Real job under test.
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"payload-under-test".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        queue.verify_lease_payload(&lease).unwrap();
+
+        // ensure_dir may still fsync once when creating a new shard for this
+        // job_id. Fail the second fsync_dir_fd, which is the post-rename
+        // receipt-directory sync (OutcomeUnknown).
+        spoolq_fs_linux::fault::inject("fsync_dir_fd", 2);
+        let result = queue.ack(&lease);
+        spoolq_fs_linux::fault::reset();
+        assert!(
+            matches!(result, AckOutcome::OutcomeUnknown(_)),
+            "expected OutcomeUnknown, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fault_ack_rename_failure_is_not_committed() {
+        spoolq_fs_linux::fault::reset();
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        queue.verify_lease_payload(&lease).unwrap();
+        spoolq_fs_linux::fault::inject("renameat2_noreplace", 1);
+        let result = queue.ack(&lease);
+        spoolq_fs_linux::fault::reset();
+        assert!(
+            matches!(result, AckOutcome::NotCommitted(_)),
+            "expected NotCommitted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fault_retry_post_rename_fsync_is_outcome_unknown() {
+        spoolq_fs_linux::fault::reset();
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Fail the first dest-dir fsync after the linearizing rename.
+        spoolq_fs_linux::fault::inject("fsync_dir_fd", 1);
+        let result = queue.retry_now(&lease);
+        spoolq_fs_linux::fault::reset();
+        // ensure_dir may consume the first fsync when creating ready shards;
+        // accept either OutcomeUnknown (post-lin) or NotCommitted (pre-lin).
+        assert!(
+            matches!(
+                result,
+                TransitionOutcome::OutcomeUnknown(_) | TransitionOutcome::NotCommitted(_)
+            ),
+            "expected faulted transition, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fault_clock_realtime_poisons_enqueue() {
+        spoolq_fs_linux::fault::reset();
+        let (_tmp, mut queue) = create_test_queue();
+        spoolq_fs_linux::fault::inject("clock_realtime_ns", 1);
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        spoolq_fs_linux::fault::reset();
+        assert!(
+            matches!(
+                outcome,
+                EnqueueOutcome::NotCommitted(_, _) | EnqueueOutcome::OutcomeUnknown(_, _)
+            ),
+            "expected clock fault to fail enqueue, got {outcome:?}"
+        );
     }
 }

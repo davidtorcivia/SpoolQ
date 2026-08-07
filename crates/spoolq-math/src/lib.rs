@@ -356,5 +356,81 @@ mod tests {
         // exp > 64 saturates
         assert_eq!(saturating_double(1, 65), u64::MAX);
         assert_eq!(saturating_double(u64::MAX, 2), u64::MAX);
+        assert_eq!(saturating_double(0, 5), 0);
+        assert_eq!(saturating_double(1000, 0), 1000);
+    }
+
+    #[test]
+    fn checked_arithmetic_edges() {
+        assert_eq!(checked_add_u64(1, 2), Some(3));
+        assert_eq!(checked_add_u64(u64::MAX, 1), None);
+        assert_eq!(checked_mul_u64(2, 3), Some(6));
+        assert_eq!(checked_mul_u64(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn lease_bucket_and_bucket_ends() {
+        let width = 10u64;
+        assert_eq!(lease_bucket(0, width), Some(0));
+        assert_eq!(lease_bucket(10, width), Some(1));
+        assert_eq!(lease_bucket(25, width), Some(2));
+        assert_eq!(lease_bucket(1, 0), None);
+        assert_eq!(bucket_start_ns(3, width), Some(30));
+        assert_eq!(bucket_end_ns(3, width), Some(40));
+        // Zero width multiplies to zero without overflow.
+        assert_eq!(bucket_start_ns(1, 0), Some(0));
+        assert_eq!(bucket_end_ns(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn retry_wall_deadline_bounds() {
+        assert_eq!(retry_wall_deadline(100, 50), Some(150));
+        assert_eq!(retry_wall_deadline(u64::MAX, 1), None);
+        // Must stay within i64::MAX ns from epoch.
+        let over = (i64::MAX as u64).saturating_add(1);
+        assert_eq!(retry_wall_deadline(over, 0), None);
+        assert_eq!(
+            retry_wall_deadline(i64::MAX as u64, 0),
+            Some(i64::MAX as u64)
+        );
+    }
+
+    #[test]
+    fn retry_delay_jitter_bounds_table() {
+        let policy = RetryPolicy {
+            base_ms: 1000,
+            cap_ms: 8_000,
+            use_jitter: true,
+            max_delay_ms: Some(4_000),
+        };
+        assert_eq!(policy.effective_cap_ms(), 4_000);
+        policy.validate().unwrap();
+        let qid = [9u8; 16];
+        let jid = [8u8; 16];
+        for attempt in 1..=8 {
+            let d = retry_delay_ms(&qid, &jid, attempt, &policy).unwrap();
+            let ceiling = policy
+                .effective_cap_ms()
+                .min(saturating_double(policy.base_ms, attempt));
+            let lower = ceiling.div_ceil(2);
+            assert!(
+                (lower..=ceiling).contains(&d),
+                "attempt {attempt}: {d} not in [{lower},{ceiling}]"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_max_delay_tightens_cap() {
+        let policy = RetryPolicy {
+            base_ms: 1000,
+            cap_ms: 300_000,
+            use_jitter: false,
+            max_delay_ms: Some(1500),
+        };
+        let qid = [1u8; 16];
+        let jid = [2u8; 16];
+        // attempt 2 would be 2000 without max_delay, but cap is 1500.
+        assert_eq!(retry_delay_ms(&qid, &jid, 2, &policy).unwrap(), 1500);
     }
 }

@@ -829,6 +829,97 @@ impl Queue {
         });
         Ok(())
     }
+
+    /// List all quarantined objects under the queue root.
+    ///
+    /// Quarantine objects live as `quarantine/q{id}.x{reason}.raw` (flat).
+    /// Nested layouts are also scanned for compatibility with older trees.
+    pub fn list_quarantine(&self) -> Vec<QuarantineEntry> {
+        let mut out = Vec::new();
+        let root = &self.root_path;
+        let qroot = root.join("quarantine");
+        if !qroot.is_dir() {
+            return out;
+        }
+        collect_quarantine_entries(&qroot, root, &mut out);
+        out
+    }
+
+    /// Find a quarantined object by quarantine id.
+    pub fn find_quarantine(&self, quarantine_id: &[u8; 16]) -> Option<QuarantineEntry> {
+        self.list_quarantine()
+            .into_iter()
+            .find(|e| e.quarantine_id == *quarantine_id)
+    }
+
+    /// Remove a quarantined object by id. Returns true if a file was removed.
+    pub fn remove_quarantine(&self, quarantine_id: &[u8; 16]) -> Result<bool, std::io::Error> {
+        match self.find_quarantine(quarantine_id) {
+            Some(entry) => {
+                std::fs::remove_file(self.root_path.join(&entry.relative_path))?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Copy a quarantined object's raw bytes to `output`. Returns bytes written.
+    pub fn export_quarantine(
+        &self,
+        quarantine_id: &[u8; 16],
+        output: &std::path::Path,
+    ) -> Result<u64, std::io::Error> {
+        match self.find_quarantine(quarantine_id) {
+            Some(entry) => {
+                let n = std::fs::copy(self.root_path.join(&entry.relative_path), output)?;
+                Ok(n)
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "quarantine object not found",
+            )),
+        }
+    }
+}
+
+/// A quarantined object discovered under the queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantineEntry {
+    pub quarantine_id: [u8; 16],
+    pub reason: u16,
+    pub filename: String,
+    pub relative_path: String,
+}
+
+fn collect_quarantine_entries(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    out: &mut Vec<QuarantineEntry>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_quarantine_entries(&path, root, out);
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Ok(parsed) = spoolq_names::parse_quarantine(&name) {
+            let relative = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+            out.push(QuarantineEntry {
+                quarantine_id: parsed.quarantine_id,
+                reason: parsed.reason,
+                filename: name,
+                relative_path: relative,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -852,6 +943,45 @@ mod tests {
         let report = queue.fsck(&FsckOptions::default());
         assert_eq!(report.findings.len(), 0);
         assert_eq!(report.total_objects, 0);
+    }
+
+    #[test]
+    fn quarantine_list_export_remove() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let qid = [0x11u8; 16];
+        let reason = 0x0001u16;
+        let name = spoolq_names::quarantine_filename(&qid, reason);
+        let qdir = tmp.path().join("quarantine");
+        std::fs::create_dir_all(&qdir).unwrap();
+        let payload = b"quarantined-bytes";
+        std::fs::write(qdir.join(&name), payload).unwrap();
+
+        let listed = queue.list_quarantine();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].quarantine_id, qid);
+        assert_eq!(listed[0].reason, reason);
+
+        let found = queue.find_quarantine(&qid).unwrap();
+        assert_eq!(found.filename, name);
+
+        let out = tmp.path().join("export.raw");
+        let n = queue.export_quarantine(&qid, &out).unwrap();
+        assert_eq!(n, payload.len() as u64);
+        assert_eq!(std::fs::read(&out).unwrap(), payload);
+
+        assert!(queue.remove_quarantine(&qid).unwrap());
+        assert!(queue.list_quarantine().is_empty());
+        assert!(!queue.remove_quarantine(&qid).unwrap());
     }
 
     #[test]
