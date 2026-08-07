@@ -20,3 +20,4 @@ Thumbs.db
 # Internal scripts
 merge_pr.sh
 mutants.out/
+mutants.out.old/
