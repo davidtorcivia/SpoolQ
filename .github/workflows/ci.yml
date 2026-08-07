@@ -112,7 +112,7 @@ jobs:
             echo "Warning: No TLA+ model found"
           fi
 
-  # Nightly lane: release-mode extended tests
+  # Nightly lane: release-mode extended tests and benchmarks
   nightly:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -123,3 +123,7 @@ jobs:
         run: cargo test --all --release
       - name: Descriptor leak regression (B-02)
         run: cargo test -p spoolq-core -- descriptor
+      - name: FD leak stress (T5)
+        run: cargo test -p spoolq-core -- fd_leak_stress --release
+      - name: Benchmarks (P3)
+        run: cargo bench -p spoolq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
