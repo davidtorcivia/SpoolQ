@@ -477,14 +477,23 @@ impl Queue {
             Err(_) => return,
         };
 
-        let bucket_dirs = match fs::read_dir_entries_owned(delayed_fd.as_raw_fd()) {
+        let mut bucket_dirs = match fs::read_dir_entries_owned(delayed_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
+        bucket_dirs.sort();
 
         for bucket_name in &bucket_dirs {
+            // R4-RES: Skip buckets already processed in a prior pass.
+            if let Some(ref cursor) = self.recovery_cursor.promote_delayed_bucket {
+                if bucket_name.as_str() < cursor.as_str() {
+                    continue;
+                }
+            }
+
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
+                self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
                 return;
             }
 
@@ -635,7 +644,13 @@ impl Queue {
                     }
                 }
             }
+
+            // R4-RES: Bucket fully processed, advance cursor.
+            self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
         }
+
+        // R4-RES: All buckets processed, reset cursor for next full pass.
+        self.recovery_cursor.promote_delayed_bucket = None;
     }
 
     fn cleanup_temp_files(
@@ -734,14 +749,23 @@ impl Queue {
             Err(_) => return,
         };
 
-        let bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
+        bucket_dirs.sort();
 
         for bucket_name in &bucket_dirs {
+            // R4-RES: Skip buckets already processed in a prior pass.
+            if let Some(ref cursor) = self.recovery_cursor.compact_receipts_bucket {
+                if bucket_name.as_str() < cursor.as_str() {
+                    continue;
+                }
+            }
+
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
+                self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
                 return;
             }
 
@@ -830,11 +854,68 @@ impl Queue {
                         Err(_) => continue,
                     };
 
-                    // R4-H11: Authenticate consistency before compaction
+                    // R4-H11: Full consistency proof before compaction.
                     if header.job_id != parsed.common.job_id {
                         continue;
                     }
                     if header.maximum_attempts != parsed.common.maximum_attempts {
+                        continue;
+                    }
+
+                    // R4-H11: Verify envelope digest.
+                    let ext_len = header.extension_header_length as usize;
+                    if ext_len > 65536 {
+                        continue;
+                    }
+                    let mut ext_buf = vec![0u8; ext_len];
+                    if ext_len > 0
+                        && fs::pread_exact(receipt_fd.as_raw_fd(), &mut ext_buf, 128).is_err()
+                    {
+                        continue;
+                    }
+                    if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+                        continue;
+                    }
+
+                    // R4-H11: Verify file size matches expected.
+                    let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
+                    if file_size as u64 != expected_size {
+                        continue;
+                    }
+
+                    // R4-H11: Verify name tag for the receipt context.
+                    let job_hex = spoolq_names::hex_encode(&parsed.common.job_id);
+                    let token_hex = spoolq_names::hex_encode(&parsed.token);
+                    let base = format!(
+                        "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
+                        job_hex,
+                        parsed.common.generation,
+                        parsed.common.attempt,
+                        parsed.common.maximum_attempts,
+                        token_hex,
+                    );
+                    let tag_ctx = spoolq_names::terminal_context(
+                        spoolq_names::State::Receipt,
+                        bucket_name,
+                        shard_name,
+                        &base,
+                    );
+                    let expected_tag = compute_name_tag(&self.format.queue_id, &tag_ctx);
+                    if expected_tag != parsed.tag {
+                        continue;
+                    }
+
+                    // R4-H11: Verify shard placement.
+                    let computed_shard = spoolq_names::compute_shard(
+                        &self.format.queue_id,
+                        &parsed.common.job_id,
+                        self.format.shard_count,
+                    );
+                    let path_shard = match spoolq_names::shard_from_hex(shard_name) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if path_shard != computed_shard {
                         continue;
                     }
 
@@ -898,7 +979,13 @@ impl Queue {
                     }
                 }
             }
+
+            // R4-RES: Bucket fully processed, advance cursor.
+            self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
         }
+
+        // R4-RES: All buckets processed, reset cursor for next full pass.
+        self.recovery_cursor.compact_receipts_bucket = None;
     }
 
     /// Delete expired receipts based on retention policy.
@@ -917,14 +1004,23 @@ impl Queue {
             Err(_) => return,
         };
 
-        let bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
+        bucket_dirs.sort();
 
         for bucket_name in &bucket_dirs {
+            // R4-RES: Skip buckets already processed in a prior pass.
+            if let Some(ref cursor) = self.recovery_cursor.delete_receipts_bucket {
+                if bucket_name.as_str() < cursor.as_str() {
+                    continue;
+                }
+            }
+
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
+                self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
                 return;
             }
 
@@ -974,11 +1070,28 @@ impl Queue {
                 };
 
                 for entry in &entries {
-                    if stats.operations_attempted >= budget.max_operations {
+                    // R4-H08: Only process receipt files.
+                    if !entry.ends_with(".rct") {
+                        continue;
+                    }
+
+                    if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
+                        self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
                         return;
                     }
                     stats.operations_attempted += 1;
+
+                    // R4-H08: Validate the receipt filename before operating.
+                    if spoolq_names::parse_receipt(entry).is_err() {
+                        Self::record_error(
+                            stats,
+                            "receipt_delete_parse",
+                            &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                            "receipt filename does not parse",
+                        );
+                        continue;
+                    }
 
                     // C-35: Open with write-capable mode for lock
                     let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, libc::O_RDWR, 0)
@@ -988,6 +1101,21 @@ impl Queue {
                     };
 
                     if !fs::try_ofd_write_lock(receipt_fd.as_raw_fd()).unwrap_or(false) {
+                        continue;
+                    }
+
+                    // R4-H08: Validate the receipt is a regular file.
+                    let file_stat = match fs::fstat(receipt_fd.as_raw_fd()) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if file_stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                        Self::record_error(
+                            stats,
+                            "receipt_delete_nonregular",
+                            &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                            "receipt is not a regular file",
+                        );
                         continue;
                     }
 
@@ -1024,7 +1152,13 @@ impl Queue {
                     );
                 }
             }
+
+            // R4-RES: Bucket fully processed, advance cursor.
+            self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
         }
+
+        // R4-RES: All buckets processed, reset cursor for next full pass.
+        self.recovery_cursor.delete_receipts_bucket = None;
     }
 }
 

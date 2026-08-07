@@ -323,10 +323,7 @@ pub extern "C" fn spoolq_lease_verify(queue: *mut SpoolqQueue, lease: *mut Spool
         };
         let lease_ref = unsafe { &mut *lease };
         match guard.verify_lease_payload(&lease_ref.inner) {
-            Ok(verified) => {
-                lease_ref.inner = verified;
-                SPOOLQ_OK
-            }
+            Ok(()) => SPOOLQ_OK,
             Err(e) => {
                 let code = error_to_code(&e);
                 set_last_error(&leak_error(e));

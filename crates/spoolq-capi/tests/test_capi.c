@@ -25,6 +25,10 @@ int main(void) {
     unsigned int attempt = spoolq_lease_attempt(lease);
     printf("leased: gen=%llu attempt=%u\n", (unsigned long long)gen, attempt);
 
+    rc = spoolq_lease_verify(q, lease);
+    if (rc != SPOOLQ_OK) { fprintf(stderr, "verify failed: %d\n", rc); return 1; }
+    printf("payload verified\n");
+
     rc = spoolq_ack(q, lease);
     if (rc != SPOOLQ_OK) { fprintf(stderr, "ack failed: %d\n", rc); return 1; }
     printf("acked\n");

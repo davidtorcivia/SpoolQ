@@ -14,14 +14,20 @@ Properties: at-least-once execution, crash-safe publication and recovery, no dae
 duplicate execution, silent attempt consumption, or an unrecoverable queue
 would be materially harmful.
 
-Core protocol implemented with static-code audit remediations applied.
+Core protocol implemented with five passes of static-code audit remediations.
 Format encoding, filename parsing, deterministic CBOR, shard math, and retry
 jitter are complete with canonical parser validation. The lifecycle (init,
-open, enqueue, lease, ack, retry, bury, renew, recover) includes source
-identity validation, wall watermark advancement, bounded duplicate-ack
-probing, error classification, and post-linearization outcome handling.
-Formal verification, fault injection, and real filesystem crash testing
-remain future work.
+open, enqueue, lease, ack, retry, bury, renew, recover) includes full source
+identity validation (device, inode, generation, token, header, envelope
+digest, name tag, shard placement), payload re-verification at ack time,
+wall watermark advancement, bounded duplicate-ack probing, error
+classification, and post-linearization outcome handling. Deep fsck verifies
+headers, envelope digests, name tags, and payload digests. Recovery uses
+per-phase bucket cursors for resumability. Streaming payload read APIs avoid
+full materialization.
+
+Formal verification (TLA+/TLC), syscall fault injection, and real filesystem
+crash testing remain future work.
 
 ## Building
 

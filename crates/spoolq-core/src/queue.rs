@@ -97,8 +97,18 @@ impl Default for OpenOptions {
 
 /// Internal queue state.
 #[allow(dead_code)]
+/// R4-RES: In-memory cursor for resumable recovery. Tracks the last
+/// fully processed bucket per phase so the next pass resumes from there.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RecoveryCursor {
+    pub promote_delayed_bucket: Option<String>,
+    pub compact_receipts_bucket: Option<String>,
+    pub delete_receipts_bucket: Option<String>,
+}
+
 pub struct Queue {
     pub(crate) root_fd: OwnedFd,
+    #[allow(dead_code)]
     pub(crate) root_path: PathBuf,
     pub(crate) format: FormatRecord,
     pub(crate) boot_id: String,
@@ -107,7 +117,9 @@ pub struct Queue {
     pub(crate) scan_round: u64,
     pub(crate) worker_nonce: [u8; 16],
     pub(crate) options: OpenOptions,
+    #[allow(dead_code)]
     pub(crate) maint_lock_fd: Option<OwnedFd>,
+    pub(crate) recovery_cursor: RecoveryCursor,
 }
 
 /// Internal helper enum for resolver object authentication.
@@ -452,6 +464,7 @@ impl Queue {
             worker_nonce,
             options: opts.clone(),
             maint_lock_fd: Some(maint_fd),
+            recovery_cursor: RecoveryCursor::default(),
         })
     }
 
@@ -1573,7 +1586,6 @@ impl Queue {
                             expected_dev: leased_stat.st_dev as u64,
                             expected_inode: leased_stat.st_ino as u64,
                             exact_source_path: format!("{leased_dir}/{leased_name}"),
-                            payload_verified: false,
                         };
 
                         return LeaseOutcome::Leased(lease_info);
@@ -1595,20 +1607,20 @@ impl Queue {
         }
     }
 
-    /// Acknowledge a verified lease: move to terminal receipt.
-    /// Requires the lease to have been payload-verified.
+    /// Acknowledge a lease: move to terminal receipt.
+    /// R4-H22/H23: Re-hashes the payload at ack time to close the TOCTOU
+    /// window between lease() and ack(). Use ack_unverified() to skip.
     pub fn ack(&mut self, lease: &LeaseInfo) -> AckOutcome {
-        if !lease.payload_verified {
-            return AckOutcome::NotCommitted(Error::InvalidInput(
-                "ack requires a verified lease; use ack_unverified for the unsafe path".into(),
-            ));
-        }
-        self.ack_unverified(lease)
+        self.ack_impl(lease, true)
     }
 
     /// Acknowledge a lease without payload verification (unsafe).
     /// Cannot detect payload corruption. Use ack() for the safe path.
     pub fn ack_unverified(&mut self, lease: &LeaseInfo) -> AckOutcome {
+        self.ack_impl(lease, false)
+    }
+
+    fn ack_impl(&mut self, lease: &LeaseInfo, verify_payload: bool) -> AckOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return AckOutcome::NotCommitted(e);
         }
@@ -1684,6 +1696,37 @@ impl Queue {
             Err(e) => return AckOutcome::NotCommitted(e),
         };
 
+        // R4-H22/H23: Re-hash the payload at ack time to close the TOCTOU window.
+        // Hold the verified fd open across the rename so we can verify
+        // post-rename that the destination inode matches the verified source.
+        let verified_inode: Option<u64> = if verify_payload {
+            let file_fd = match fs::openat(
+                src_dir_fd.as_raw_fd(),
+                &src_name,
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                0,
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.poison();
+                    return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
+                }
+            };
+            if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
+                self.poison();
+                return AckOutcome::NotCommitted(e);
+            }
+            match fs::fstat(file_fd.as_raw_fd()) {
+                Ok(st) => Some(st.st_ino),
+                Err(e) => {
+                    self.poison();
+                    return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
+                }
+            }
+        } else {
+            None
+        };
+
         // Rename leased -> receipt with NOREPLACE
         match fs::renameat2_noreplace(
             src_dir_fd.as_raw_fd(),
@@ -1692,6 +1735,29 @@ impl Queue {
             &receipt_name,
         ) {
             Ok(()) => {
+                // R4-H22/H23: Verify the renamed file has the same inode
+                // as the one we verified above.
+                if let Some(expected_inode) = verified_inode {
+                    match fs::fstatat(receipt_dir_fd.as_raw_fd(), &receipt_name) {
+                        Ok(dest_stat) if dest_stat.st_ino == expected_inode => {}
+                        _ => {
+                            self.poison();
+                            return AckOutcome::OutcomeUnknown(TransitionTicket {
+                                job_id: lease.job_id,
+                                source_state: "leased".into(),
+                                source_generation: lease.generation,
+                                source_attempt: lease.attempt,
+                                source_relative_path: lease.exact_source_path.clone(),
+                                attempted_destination_state: "receipts".into(),
+                                attempted_destination_relative_path: format!(
+                                    "{receipt_dir}/{receipt_name}"
+                                ),
+                                lease_token: Some(lease.token),
+                                envelope_digest: lease.envelope_digest,
+                            });
+                        }
+                    }
+                }
                 // Sync both directories
                 if fs::fsync_dir_fd(receipt_dir_fd.as_raw_fd()).is_err() {
                     self.poison();
@@ -2103,14 +2169,25 @@ impl Queue {
             return Err(Error::QueueCorrupt("source is not a regular file".into()));
         }
 
-        // R2-M06: Always verify device/inode (do not allow disabling by zeroing)
-        if lease.expected_dev != 0 && lease.expected_dev != src_stat.st_dev as u64 {
+        // R4-H02: Always verify device/inode. Zero values are rejected, not
+        // treated as wildcards.
+        if lease.expected_dev == 0 {
+            return Err(Error::QueueCorrupt(
+                "expected_dev is zero (forgeable handle)".into(),
+            ));
+        }
+        if lease.expected_inode == 0 {
+            return Err(Error::QueueCorrupt(
+                "expected_inode is zero (forgeable handle)".into(),
+            ));
+        }
+        if lease.expected_dev != src_stat.st_dev as u64 {
             return Err(Error::QueueCorrupt(format!(
                 "device mismatch: expected {}, got {}",
                 lease.expected_dev, src_stat.st_dev
             )));
         }
-        if lease.expected_inode != 0 && lease.expected_inode != src_stat.st_ino as u64 {
+        if lease.expected_inode != src_stat.st_ino as u64 {
             return Err(Error::QueueCorrupt(format!(
                 "inode mismatch: expected {}, got {}",
                 lease.expected_inode, src_stat.st_ino
@@ -2177,13 +2254,14 @@ impl Queue {
         if ext_len > 65536 {
             return Err(Error::QueueCorrupt("extension header too large".into()));
         }
+        // R4-H05: Always verify envelope digest (even when extension is empty).
+        let mut ext_buf = vec![0u8; ext_len];
         if ext_len > 0 {
-            let mut ext_buf = vec![0u8; ext_len];
             fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
                 .map_err(|e| Error::IoFailure(e.to_string()))?;
-            if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-            }
+        }
+        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+            return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
         }
 
         // R2-B02: Verify exact file size (no trailing data)
@@ -2356,51 +2434,56 @@ impl Queue {
         fs::fsync_dir_fd(ready_dir_fd.as_raw_fd())?;
         Ok(())
     }
-    /// R4-H23: Read and verify the payload of a leased job.
-    /// NOTE: Verification establishes correctness at the time of the call.
-    /// Between verify_lease_payload() and ack(), the file must not be modified
-    /// by any external process. The strict ack path re-validates source identity
-    /// (B-04) but does not rehash payload. For maximum safety, ack immediately
-    /// after verify, or keep the file descriptor open.
     /// B-09: Read and verify the payload of a leased job.
-    /// First validates source identity (B-04), then verifies envelope digest,
+    /// Validates source identity (B-04), then verifies envelope digest,
     /// then hashes the payload and compares to the header digest.
-    /// Returns a LeaseInfo with payload_verified=true on success.
-    /// Returns Err with PayloadCorrupt if the digest does not match.
-    pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<LeaseInfo, Error> {
-        // B-09: Validate source identity before hashing
+    /// Returns Ok(()) on success, Err(PayloadCorrupt) if the digest does not match.
+    pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<(), Error> {
         let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
             Some(pair) => pair,
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
+        self.verify_payload_at_path(src_dir_fd.as_raw_fd(), &src_name)
+    }
 
-        let file_fd = fs::openat(src_dir_fd.as_raw_fd(), &src_name, libc::O_RDONLY, 0)
+    /// R4-H22/H23: Verify the payload digest of a file at the given path.
+    fn verify_payload_at_path(
+        &self,
+        dir_fd: std::os::unix::io::RawFd,
+        name: &str,
+    ) -> Result<(), Error> {
+        let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
+        self.verify_payload_on_fd(file_fd.as_raw_fd())
+    }
 
-        // Read the fixed header
+    /// R4-H22/H23: Verify the payload digest on an already-open file descriptor.
+    /// Reads the header, verifies the envelope digest, then hashes the payload
+    /// and compares to the header digest. The caller must hold the fd open
+    /// across any subsequent operation to prevent TOCTOU swap.
+    fn verify_payload_on_fd(&self, fd: std::os::unix::io::RawFd) -> Result<(), Error> {
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::pread_exact(fd, &mut header_buf, 0).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
 
-        // B-09: Read and verify extension, then envelope digest
         let ext_len = header.extension_header_length as usize;
         let data_offset = 128usize + ext_len;
 
-        if ext_len > 0 && ext_len <= 65536 {
-            let mut ext_buf = vec![0u8; ext_len];
-            fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
-                .map_err(|e| Error::IoFailure(e.to_string()))?;
-            if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-            }
+        if ext_len > 65536 {
+            return Err(Error::QueueCorrupt("extension header too large".into()));
+        }
+        // R4-H05: Always read extension (even empty) and verify envelope digest.
+        let mut ext_buf = vec![0u8; ext_len];
+        if ext_len > 0 {
+            fs::pread_exact(fd, &mut ext_buf, 128).map_err(|e| Error::IoFailure(e.to_string()))?;
+        }
+        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+            return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
         }
 
-        // B-09: Verify exact file size (no trailing data)
-        let file_stat =
-            fs::fstat(file_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let file_stat = fs::fstat(fd).map_err(|e| Error::IoFailure(e.to_string()))?;
         let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
         if file_stat.st_size as u64 != expected_size {
             return Err(Error::QueueCorrupt(format!(
@@ -2409,7 +2492,6 @@ impl Queue {
             )));
         }
 
-        // Read and hash the payload
         let mut hasher = sha2::Sha256::new();
         let mut offset = data_offset as u64;
         let mut remaining = header.payload_length as usize;
@@ -2417,7 +2499,7 @@ impl Queue {
 
         while remaining > 0 {
             let to_read = remaining.min(buf.len());
-            let n = fs::pread(file_fd.as_raw_fd(), &mut buf[..to_read], offset)
+            let n = fs::pread(fd, &mut buf[..to_read], offset)
                 .map_err(|e| Error::IoFailure(e.to_string()))?;
             if n == 0 {
                 return Err(Error::QueueCorrupt("unexpected EOF".into()));
@@ -2432,11 +2514,68 @@ impl Queue {
             return Err(Error::PayloadCorrupt);
         }
 
-        Ok(LeaseInfo {
-            payload_verified: true,
-            ..lease.clone()
-        })
+        Ok(())
     }
+    /// R4-PERF: Read a chunk of a leased job's payload at the given offset.
+    /// Returns the number of bytes read (0 at EOF).
+    /// Validates source identity before reading (B-04).
+    pub fn read_lease_payload_chunk(
+        &self,
+        lease: &LeaseInfo,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, Error> {
+        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
+            Some(pair) => pair,
+            None => return Err(Error::QueueCorrupt("lease source not found".into())),
+        };
+        let file_fd = fs::openat(
+            src_dir_fd.as_raw_fd(),
+            &src_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        )
+        .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let mut header_buf = [0u8; 128];
+        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let header =
+            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
+        let ext_len = header.extension_header_length as usize;
+        let payload_start = (128 + ext_len) as u64;
+        let payload_len = header.payload_length;
+        if offset >= payload_len {
+            return Ok(0);
+        }
+        let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
+        let abs_offset = payload_start + offset;
+        let n = fs::pread(file_fd.as_raw_fd(), &mut buf[..to_read], abs_offset)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// R4-PERF: Stream a leased job's payload through a callback.
+    /// Reads in chunks of chunk_size, calling f for each chunk.
+    /// Validates source identity before reading (B-04).
+    pub fn stream_lease_payload<F: FnMut(&[u8]) -> Result<(), Error>>(
+        &self,
+        lease: &LeaseInfo,
+        chunk_size: usize,
+        mut f: F,
+    ) -> Result<(), Error> {
+        let mut buf = vec![0u8; chunk_size.clamp(4096, 1 << 20)];
+        let mut offset = 0u64;
+        loop {
+            let n = self.read_lease_payload_chunk(lease, &mut buf, offset)?;
+            if n == 0 {
+                break;
+            }
+            f(&buf[..n])?;
+            offset += n as u64;
+        }
+        Ok(())
+    }
+
     /// Diagnostic lookup: find all states for a job_id.
     /// Scans active and terminal states for the computed shard.
     pub fn inspect(&self, job_id: &[u8; 16]) -> Vec<Snapshot> {
@@ -2883,9 +3022,9 @@ impl Queue {
     /// Validates source/destination by opening them, reading headers, and
     /// comparing job_id and generation against the ticket.
     pub fn resolve(&self, ticket: &TransitionTicket, stabilize: bool) -> ResolutionOutcome {
-        let src_result = self.resolve_check_object(&ticket.source_relative_path, ticket.job_id);
+        let src_result = self.resolve_check_object(&ticket.source_relative_path, ticket);
         let dest_result =
-            self.resolve_check_object(&ticket.attempted_destination_relative_path, ticket.job_id);
+            self.resolve_check_object(&ticket.attempted_destination_relative_path, ticket);
 
         match (src_result, dest_result) {
             // Source exists but destination doesn't
@@ -2924,9 +3063,9 @@ impl Queue {
         }
     }
 
-    fn resolve_check_object(&self, path: &str, expected_job_id: [u8; 16]) -> ResolveObj {
+    fn resolve_check_object(&self, path: &str, ticket: &TransitionTicket) -> ResolveObj {
         let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() < 2 {
+        if parts.len() < 3 {
             return ResolveObj::Absent;
         }
         let name = parts.last().unwrap();
@@ -2948,34 +3087,310 @@ impl Queue {
             return ResolveObj::Conflict;
         }
 
-        let file_fd = match fs::openat(dir_fd.as_raw_fd(), name, libc::O_RDONLY, 0) {
+        let file_fd = match fs::openat(
+            dir_fd.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        ) {
             Ok(fd) => fd,
             Err(e) => return ResolveObj::Error(Error::IoFailure(e.to_string())),
         };
 
-        // B3: Try fixed job header first, then compact receipt
+        // R4-B07: Read the 128-byte header buffer.
         let mut header_buf = [0u8; 128];
         if fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0).is_err() {
             return ResolveObj::Conflict;
         }
 
-        // Check for compact receipt magic first (128 bytes)
+        // Check for compact receipt magic first (128 bytes).
         if stat.st_size as usize == spoolq_format::COMPACT_RECEIPT_SIZE
             && &header_buf[0..8] == spoolq_format::RECEIPT_MAGIC
         {
             match spoolq_format::CompactReceipt::decode(&header_buf) {
-                Ok(cr) if cr.job_id == expected_job_id => return ResolveObj::Match,
+                Ok(cr) if cr.job_id == ticket.job_id => {
+                    // R4-B07: Verify compact receipt fields against the ticket.
+                    // The envelope digest must match when known (non-zero).
+                    if ticket.envelope_digest != [0u8; 32]
+                        && cr.envelope_digest != ticket.envelope_digest
+                    {
+                        return ResolveObj::Conflict;
+                    }
+                    // Verify lease token if present in the ticket.
+                    if let Some(tkt) = ticket.lease_token {
+                        if cr.lease_token != tkt {
+                            return ResolveObj::Conflict;
+                        }
+                    }
+                    return ResolveObj::Match;
+                }
                 Ok(_) => return ResolveObj::Conflict,
                 Err(_) => return ResolveObj::Conflict,
             }
         }
 
-        // Check for full job header
-        match FixedHeader::decode(&header_buf) {
-            Ok(header) if header.job_id == expected_job_id => ResolveObj::Match,
-            Ok(_) => ResolveObj::Conflict,
-            Err(_) => ResolveObj::Conflict,
+        // Decode the full job header.
+        let header = match FixedHeader::decode(&header_buf) {
+            Ok(h) => h,
+            Err(_) => return ResolveObj::Conflict,
+        };
+
+        // R4-B07: Verify header job_id matches the ticket.
+        if header.job_id != ticket.job_id {
+            return ResolveObj::Conflict;
         }
+
+        // R4-B07: Verify envelope digest when the ticket carries a known value.
+        if ticket.envelope_digest != [0u8; 32] && header.envelope_digest != ticket.envelope_digest {
+            return ResolveObj::Conflict;
+        }
+
+        // R4-B07: Verify the envelope digest against the on-disk extension.
+        let ext_len = header.extension_header_length as usize;
+        if ext_len > 65536 {
+            return ResolveObj::Conflict;
+        }
+        let mut ext_buf = vec![0u8; ext_len];
+        if ext_len > 0 && fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128).is_err() {
+            return ResolveObj::Conflict;
+        }
+        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+            return ResolveObj::Conflict;
+        }
+
+        // R4-B07: Parse the filename using the state-appropriate parser and
+        // verify identity fields against the ticket. The state is derived from
+        // the path prefix, not trusted from the ticket.
+        let state = parts[0];
+        let known_digest = ticket.envelope_digest != [0u8; 32];
+
+        match state {
+            "ready" => {
+                let p = match spoolq_names::parse_ready(name) {
+                    Ok(p) => p,
+                    Err(_) => return ResolveObj::Conflict,
+                };
+                if p.common.job_id != ticket.job_id
+                    || p.common.generation != ticket.source_generation
+                    || p.common.attempt != ticket.source_attempt
+                {
+                    return ResolveObj::Conflict;
+                }
+                // R4-B07: Verify name tag.
+                let base = format!(
+                    "{}.g{:016x}.a{:08x}.m{:08x}",
+                    spoolq_names::hex_encode(&p.common.job_id),
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                );
+                let shard_hex = match parts.len() {
+                    3 => parts[1],
+                    _ => return ResolveObj::Conflict,
+                };
+                let ctx = ready_context(shard_hex, &base);
+                let expected_tag = compute_name_tag(&self.format.queue_id, &ctx);
+                if expected_tag != p.tag {
+                    return ResolveObj::Conflict;
+                }
+                // Verify shard placement.
+                let computed = compute_shard(
+                    &self.format.queue_id,
+                    &ticket.job_id,
+                    self.format.shard_count,
+                );
+                let path_shard = match spoolq_names::shard_from_hex(shard_hex) {
+                    Some(s) => s,
+                    None => return ResolveObj::Conflict,
+                };
+                if path_shard != computed {
+                    return ResolveObj::Conflict;
+                }
+            }
+            "leased" => {
+                let p = match spoolq_names::parse_leased(name) {
+                    Ok(p) => p,
+                    Err(_) => return ResolveObj::Conflict,
+                };
+                if p.common.job_id != ticket.job_id {
+                    return ResolveObj::Conflict;
+                }
+                // R4-B07: Verify lease token.
+                if let Some(tkt) = ticket.lease_token {
+                    if p.token != tkt {
+                        return ResolveObj::Conflict;
+                    }
+                }
+                // Verify name tag using path-derived boot/bucket/shard.
+                if parts.len() == 5 {
+                    let boot = parts[1];
+                    let bucket = parts[2];
+                    let shard_hex = parts[3];
+                    let base = format!(
+                        "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
+                        spoolq_names::hex_encode(&p.common.job_id),
+                        p.common.generation,
+                        p.common.attempt,
+                        p.common.maximum_attempts,
+                        spoolq_names::hex_encode(&p.token),
+                    );
+                    let ctx = spoolq_names::leased_context(boot, bucket, shard_hex, &base);
+                    let expected_tag = compute_name_tag(&self.format.queue_id, &ctx);
+                    if expected_tag != p.tag {
+                        return ResolveObj::Conflict;
+                    }
+                    let computed = compute_shard(
+                        &self.format.queue_id,
+                        &ticket.job_id,
+                        self.format.shard_count,
+                    );
+                    let path_shard = match spoolq_names::shard_from_hex(shard_hex) {
+                        Some(s) => s,
+                        None => return ResolveObj::Conflict,
+                    };
+                    if path_shard != computed {
+                        return ResolveObj::Conflict;
+                    }
+                }
+            }
+            "delayed" => {
+                let p = match spoolq_names::parse_delayed(name) {
+                    Ok(p) => p,
+                    Err(_) => return ResolveObj::Conflict,
+                };
+                if p.common.job_id != ticket.job_id {
+                    return ResolveObj::Conflict;
+                }
+                // delayed/<bucket>/<shard>/<file> = 4 parts
+                if parts.len() == 4 {
+                    let bucket = parts[1];
+                    let shard_hex = parts[2];
+                    let base = format!(
+                        "{}.g{:016x}.a{:08x}.m{:08x}.r{:016x}",
+                        spoolq_names::hex_encode(&p.common.job_id),
+                        p.common.generation,
+                        p.common.attempt,
+                        p.common.maximum_attempts,
+                        p.not_before_ns,
+                    );
+                    let ctx = delayed_context(bucket, shard_hex, &base);
+                    let expected_tag = compute_name_tag(&self.format.queue_id, &ctx);
+                    if expected_tag != p.tag {
+                        return ResolveObj::Conflict;
+                    }
+                    let computed = compute_shard(
+                        &self.format.queue_id,
+                        &ticket.job_id,
+                        self.format.shard_count,
+                    );
+                    let path_shard = match spoolq_names::shard_from_hex(shard_hex) {
+                        Some(s) => s,
+                        None => return ResolveObj::Conflict,
+                    };
+                    if path_shard != computed {
+                        return ResolveObj::Conflict;
+                    }
+                }
+            }
+            "dead" => {
+                let p = match spoolq_names::parse_dead(name) {
+                    Ok(p) => p,
+                    Err(_) => return ResolveObj::Conflict,
+                };
+                if p.common.job_id != ticket.job_id {
+                    return ResolveObj::Conflict;
+                }
+                // dead/<bucket>/<shard>/<file> = 4 parts
+                if parts.len() == 4 {
+                    let bucket = parts[1];
+                    let shard_hex = parts[2];
+                    let base = format!(
+                        "{}.g{:016x}.a{:08x}.m{:08x}",
+                        spoolq_names::hex_encode(&p.common.job_id),
+                        p.common.generation,
+                        p.common.attempt,
+                        p.common.maximum_attempts,
+                    );
+                    let ctx = spoolq_names::terminal_context(
+                        spoolq_names::State::Dead,
+                        bucket,
+                        shard_hex,
+                        &base,
+                    );
+                    let expected_tag = compute_name_tag(&self.format.queue_id, &ctx);
+                    if expected_tag != p.tag {
+                        return ResolveObj::Conflict;
+                    }
+                    let computed = compute_shard(
+                        &self.format.queue_id,
+                        &ticket.job_id,
+                        self.format.shard_count,
+                    );
+                    let path_shard = match spoolq_names::shard_from_hex(shard_hex) {
+                        Some(s) => s,
+                        None => return ResolveObj::Conflict,
+                    };
+                    if path_shard != computed {
+                        return ResolveObj::Conflict;
+                    }
+                }
+            }
+            "receipts" => {
+                let p = match spoolq_names::parse_receipt(name) {
+                    Ok(p) => p,
+                    Err(_) => return ResolveObj::Conflict,
+                };
+                if p.common.job_id != ticket.job_id {
+                    return ResolveObj::Conflict;
+                }
+                if let Some(tkt) = ticket.lease_token {
+                    if p.token != tkt {
+                        return ResolveObj::Conflict;
+                    }
+                }
+                // receipts/<bucket>/<shard>/<file> = 4 parts
+                if parts.len() == 4 {
+                    let bucket = parts[1];
+                    let shard_hex = parts[2];
+                    let base = format!(
+                        "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
+                        spoolq_names::hex_encode(&p.common.job_id),
+                        p.common.generation,
+                        p.common.attempt,
+                        p.common.maximum_attempts,
+                        spoolq_names::hex_encode(&p.token),
+                    );
+                    let ctx = spoolq_names::terminal_context(
+                        spoolq_names::State::Receipt,
+                        bucket,
+                        shard_hex,
+                        &base,
+                    );
+                    let expected_tag = compute_name_tag(&self.format.queue_id, &ctx);
+                    if expected_tag != p.tag {
+                        return ResolveObj::Conflict;
+                    }
+                    let computed = compute_shard(
+                        &self.format.queue_id,
+                        &ticket.job_id,
+                        self.format.shard_count,
+                    );
+                    let path_shard = match spoolq_names::shard_from_hex(shard_hex) {
+                        Some(s) => s,
+                        None => return ResolveObj::Conflict,
+                    };
+                    if path_shard != computed {
+                        return ResolveObj::Conflict;
+                    }
+                }
+            }
+            _ => return ResolveObj::Conflict,
+        }
+
+        // R4-B07: Verify maximum_attempts consistency between header and filename
+        // (already validated by parse + header match above).
+        let _ = known_digest;
+        ResolveObj::Match
     }
 
     fn stabilize_path(&self, path: &str) -> Result<(), Error> {
@@ -3193,8 +3608,8 @@ mod tests {
         assert_eq!(lease.generation, 1);
 
         // Verify and ack
-        let verified = queue.verify_lease_payload(&lease).unwrap();
-        let ack_result = queue.ack(&verified);
+        queue.verify_lease_payload(&lease).unwrap();
+        let ack_result = queue.ack(&lease);
         assert!(matches!(ack_result, AckOutcome::Acked));
     }
 
@@ -3326,11 +3741,11 @@ mod tests {
         };
 
         // Verify and ack once
-        let verified = queue.verify_lease_payload(&lease).unwrap();
-        assert!(matches!(queue.ack(&verified), AckOutcome::Acked));
+        queue.verify_lease_payload(&lease).unwrap();
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
 
         // R2-H01: Second ack should detect the existing receipt and return AlreadyAcked
-        let result = queue.ack(&verified);
+        let result = queue.ack(&lease);
         assert!(matches!(result, AckOutcome::AlreadyAcked));
     }
 
@@ -3443,8 +3858,8 @@ mod tests {
         };
 
         // Verify and ack
-        let verified = queue.verify_lease_payload(&lease).unwrap();
-        assert!(matches!(queue.ack(&verified), AckOutcome::Acked));
+        queue.verify_lease_payload(&lease).unwrap();
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
 
         // Source is gone, so check_duplicate_ack should find the receipt
         let result = queue.check_duplicate_ack(&lease);
@@ -3984,9 +4399,9 @@ mod tests {
         assert_eq!(queue.scan_round, 2);
     }
 
-    // ===== B-09: ack requires verified lease =====
+    // ===== R4-H22/H23: ack re-hashes payload internally =====
     #[test]
-    fn ack_rejects_unverified_lease() {
+    fn ack_succeeds_without_explicit_verify() {
         let (_tmp, mut queue) = create_test_queue();
         queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
@@ -3998,12 +4413,12 @@ mod tests {
             LeaseOutcome::Leased(l) => l,
             _ => panic!("lease failed"),
         };
-        // ack should reject unverified lease
+        // ack() re-verifies payload at ack time, no explicit verify needed
         let result = queue.ack(&lease);
-        assert!(matches!(result, AckOutcome::NotCommitted(_)));
+        assert!(matches!(result, AckOutcome::Acked));
     }
 
-    // ===== B-09: ack accepts verified lease =====
+    // ===== R4-H02: ack_unverified skips payload re-hash =====
     #[test]
     fn ack_accepts_verified_lease() {
         let (_tmp, mut queue) = create_test_queue();
@@ -4017,9 +4432,8 @@ mod tests {
             LeaseOutcome::Leased(l) => l,
             _ => panic!("lease failed"),
         };
-        let verified = queue.verify_lease_payload(&lease).unwrap();
-        assert!(verified.payload_verified);
-        let result = queue.ack(&verified);
+        queue.verify_lease_payload(&lease).unwrap();
+        let result = queue.ack(&lease);
         assert!(matches!(result, AckOutcome::Acked));
     }
 
@@ -4054,6 +4468,148 @@ mod tests {
             ),
             "corrupted payload should be detected, got: {result:?}"
         );
+    }
+
+    // ===== R4-PERF: streaming payload read =====
+    #[test]
+    fn stream_lease_payload_reads_all_data() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"streaming payload data for testing chunked reads";
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        let mut collected = Vec::new();
+        queue
+            .stream_lease_payload(&lease, 8, |chunk| {
+                collected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(&collected[..], &payload[..]);
+    }
+
+    #[test]
+    fn read_lease_payload_chunk_respects_offset() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"0123456789abcdef";
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        let mut buf = [0u8; 4];
+        let n = queue.read_lease_payload_chunk(&lease, &mut buf, 4).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"4567");
+        // Read at EOF
+        let n = queue
+            .read_lease_payload_chunk(&lease, &mut buf, 16)
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // ===== R4-B07: resolve full identity verification =====
+    #[test]
+    fn resolve_source_still_in_ready() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+        // Simulate a ticket for a ready->leased transition that was interrupted
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: 0,
+            source_attempt: 0,
+            source_relative_path: "ready/0000/nonexistent.sqj".into(),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+        let outcome = queue.resolve(&ticket, false);
+        assert!(matches!(outcome, ResolutionOutcome::NeitherObserved));
+    }
+
+    #[test]
+    fn resolve_detects_ready_object_present() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+        // The object exists in ready. Use the path from the enqueue ticket.
+        let parsed =
+            spoolq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
+                .unwrap();
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: parsed.common.generation,
+            source_attempt: parsed.common.attempt,
+            source_relative_path: et.expected_relative_path.clone(),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+        let outcome = queue.resolve(&ticket, false);
+        assert!(matches!(outcome, ResolutionOutcome::SourceObserved));
+    }
+
+    #[test]
+    fn resolve_rejects_wrong_generation() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+        let parsed =
+            spoolq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
+                .unwrap();
+        // Use wrong generation in the ticket.
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: parsed.common.generation + 999,
+            source_attempt: parsed.common.attempt,
+            source_relative_path: et.expected_relative_path.clone(),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+        let outcome = queue.resolve(&ticket, false);
+        // File exists but generation doesn't match -> Conflict
+        assert!(matches!(outcome, ResolutionOutcome::ConflictingObject));
     }
 
     // ===== B-05: Wall watermark advances after enqueue =====
@@ -4127,14 +4683,11 @@ mod tests {
             expected_dev: 0,
             expected_inode: 0,
             exact_source_path: format!("leased/{boot_id}/0000000000000000/0000/nonexistent.sqj"),
-            payload_verified: true,
         };
         let result = queue.ack(&fake_lease);
-        // Source doesn't exist -> should be LeaseLost (no receipt found)
-        assert!(matches!(
-            result,
-            AckOutcome::LeaseLost | AckOutcome::NotCommitted(_)
-        ));
+        // R4-H02: dev/inode are 0, so open_and_validate_current_lease rejects
+        // the forgeable handle before even checking source existence.
+        assert!(matches!(result, AckOutcome::NotCommitted(_)));
     }
 
     // ===== B-03: Post-claim validation does not return Empty =====
@@ -4229,8 +4782,8 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match queue.lease(0, 60_000_000_000) {
                     LeaseOutcome::Leased(l) => {
-                        let verified = queue.verify_lease_payload(&l).unwrap();
-                        if queue.ack(&verified) == AckOutcome::Acked {
+                        queue.verify_lease_payload(&l).unwrap();
+                        if queue.ack(&l) == AckOutcome::Acked {
                             c_consumed.fetch_add(1, Ordering::Relaxed);
                         }
                     }

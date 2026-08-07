@@ -133,7 +133,6 @@ pub struct LeaseInfo {
     pub expected_dev: u64,
     pub expected_inode: u64,
     pub exact_source_path: String,
-    pub payload_verified: bool,
 }
 
 impl LeaseInfo {
@@ -269,7 +268,6 @@ mod tests {
             expected_dev: 0,
             expected_inode: 0,
             exact_source_path: "ready/0000/x.sqj".to_string(),
-            payload_verified: false,
         };
         assert_eq!(lease.remaining_ns(5_000_000_000), 5_000_000_000);
         assert_eq!(lease.remaining_ns(10_000_000_000), 0);

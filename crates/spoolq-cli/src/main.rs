@@ -508,14 +508,11 @@ fn main() -> ExitCode {
                 }
             };
             // R2-H19: CLI uses strict ack path: verify payload first.
-            let verified = match queue.verify_lease_payload(&lease) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("payload verification failed: {e}");
-                    return ExitCode::from(EXIT_CORRUPTION);
-                }
-            };
-            match queue.ack(&verified) {
+            if let Err(e) = queue.verify_lease_payload(&lease) {
+                eprintln!("payload verification failed: {e}");
+                return ExitCode::from(EXIT_CORRUPTION);
+            }
+            match queue.ack(&lease) {
                 spoolq_core::AckOutcome::Acked => {
                     eprintln!("acked");
                     ExitCode::SUCCESS
@@ -1245,7 +1242,6 @@ struct HandleFile {
     expected_inode: u64,
     exact_source_path: String,
     envelope_digest: String,
-    payload_verified: bool,
 }
 
 fn save_handle_to_file(
@@ -1269,7 +1265,6 @@ fn save_handle_to_file(
         expected_inode: lease.expected_inode,
         exact_source_path: lease.exact_source_path.clone(),
         envelope_digest: spoolq_names::hex_encode(&lease.envelope_digest),
-        payload_verified: lease.payload_verified,
     };
     let json = serde_json::to_string_pretty(&handle)?;
 
@@ -1332,6 +1327,5 @@ fn load_handle(path: &std::path::Path) -> std::io::Result<spoolq_core::LeaseInfo
         expected_dev: handle.expected_dev,
         expected_inode: handle.expected_inode,
         exact_source_path: handle.exact_source_path,
-        payload_verified: handle.payload_verified,
     })
 }
