@@ -39,23 +39,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build fuzz targets
+        run: cargo build --manifest-path fuzz/Cargo.toml
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Fuzz smoke (format header)
-        run: |
-          timeout 60 cargo fuzz run --manifest-path fuzz/Cargo.toml fuzz_format_header -- -max_len=160 -runs=200
+        run: cd fuzz && timeout 60 cargo +nightly fuzz run fuzz_format_header -- -max_len=160 -runs=200
       - name: Fuzz smoke (filename parser)
-        run: |
-          timeout 60 cargo fuzz run --manifest-path fuzz/Cargo.toml fuzz_filename_parser -- -max_len=256 -runs=200
+        run: cd fuzz && timeout 60 cargo +nightly fuzz run fuzz_filename_parser -- -max_len=256 -runs=200
       - name: Fuzz smoke (CBOR decoder)
-        run: |
-          timeout 60 cargo fuzz run --manifest-path fuzz/Cargo.toml fuzz_cbor_decoder -- -max_len=1024 -runs=200
+        run: cd fuzz && timeout 60 cargo +nightly fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=200
       - name: Fuzz smoke (bucket arithmetic)
-        run: |
-          timeout 60 cargo fuzz run --manifest-path fuzz/Cargo.toml fuzz_bucket_arithmetic -- -max_len=64 -runs=200
+        run: cd fuzz && timeout 60 cargo +nightly fuzz run fuzz_bucket_arithmetic -- -max_len=64 -runs=200
 
   # TLA+ model verification
   tla-model-check:
