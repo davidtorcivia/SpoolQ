@@ -1,2 +1,1 @@
-# Placeholder - actual config is in .cargo/mutants.toml
-# See that file for exclude_re patterns.
+# Actual config is in .cargo/mutants.toml

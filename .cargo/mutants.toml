@@ -1,14 +1,8 @@
-# Exclude defensive error-path guards from mutation testing.
-# These require a fault injection framework (audit cross-cutting improvement #2)
-# to meaningfully test, as they protect against corruption/races not
-# triggerable through the public API alone.
+# Mutation testing configuration.
+# Most defensive error paths are now covered by targeted tests.
+# Remaining exclusions are for paths that require filesystem fault injection
+# (swapping files between verify and rename, etc.) which will be addressed
+# by the FsOps/Clock seam (audit cross-cutting improvement #2).
 exclude_re = [
-    "receipt_is_authentic",
-    "stream_lease_payload",
-    "ack_impl.*AlreadyExists",
     "ack_impl.*dest_stat.*vf",
-    "open_and_validate_current_lease.*ENOENT.*false",
-    "open_and_validate_current_lease.*ENOTDIR.*true",
-    "move_to_dead.*Ok",
-    "fsck_verify_name_tag.*with true$",
 ]

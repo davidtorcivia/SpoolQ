@@ -5304,6 +5304,60 @@ mod tests {
         );
     }
 
+    // ===== ack on gone source returns AlreadyAcked (ENOENT path) =====
+    #[test]
+    fn ack_on_gone_source_returns_already_acked() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // First ack succeeds.
+        let result = queue.ack_unverified(&lease);
+        assert!(matches!(result, AckOutcome::Acked));
+        // Second ack: source is gone (ENOENT in open_and_validate).
+        // Should return AlreadyAcked, not NotCommitted(QueueCorrupt).
+        let result2 = queue.ack_unverified(&lease);
+        assert!(
+            matches!(result2, AckOutcome::AlreadyAcked),
+            "second ack should be AlreadyAcked, got {result2:?}"
+        );
+    }
+
+    // ===== move_to_dead actually moves exhausted objects =====
+    #[test]
+    fn exhausted_attempts_move_to_dead() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        // Lease increments attempt to 1. Retry puts it back in ready with attempt=1.
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        let _ = queue.retry_now(&lease);
+        // Now ready has attempt=1 >= max=1. Next lease scan should move to dead.
+        let result = queue.lease(0, 30_000_000_000);
+        assert!(matches!(result, LeaseOutcome::Empty));
+        // Verify the object was moved to dead, not left in ready.
+        // Check that dead directory is non-empty.
+        let dead_root = _tmp.path().join("dead");
+        let has_dead = std::fs::read_dir(&dead_root)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        assert!(has_dead, "exhausted object should be in dead directory");
+    }
+
     // ===== fsck on delayed/dead/receipt states =====
     #[test]
     fn fsck_finds_valid_delayed_job() {
@@ -5474,10 +5528,15 @@ mod tests {
         std::fs::write(full_dir.join(&receipt_name), b"not a receipt").unwrap();
         // Use ack_unverified to skip payload verification and reach rename directly.
         let result = queue.ack_unverified(&lease);
-        assert!(
-            matches!(result, AckOutcome::NotCommitted(_)),
-            "EEXIST with garbage receipt should be NotCommitted, got {result:?}"
-        );
+        // Must be NotCommitted with QueueCorrupt (from EEXIST handler),
+        // NOT IoFailure (from generic handler that mutant "guard == false" would route to).
+        match result {
+            AckOutcome::NotCommitted(Error::QueueCorrupt(_)) => { /* correct */ }
+            AckOutcome::NotCommitted(other) => {
+                panic!("expected QueueCorrupt from EEXIST handler, got {other:?}")
+            }
+            other => panic!("expected NotCommitted, got {other:?}"),
+        }
     }
 
     // ===== stream_lease_payload boundary tests =====
@@ -5524,6 +5583,69 @@ mod tests {
             })
             .unwrap();
         assert_eq!(&collected, payload);
+    }
+
+    // ===== verify_shard_placement rejects wrong shard =====
+    #[test]
+    fn resolve_rejects_wrong_shard_in_path() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+        // Move the ready file to a wrong shard directory.
+        let actual_path = et.expected_relative_path.clone();
+        let actual_full = _tmp.path().join(&actual_path);
+        let parts: Vec<&str> = actual_path.split('/').collect();
+        let wrong_shard = if parts[1] == "0000" { "0001" } else { "0000" };
+        let wrong_dir = _tmp.path().join("ready").join(wrong_shard);
+        std::fs::create_dir_all(&wrong_dir).unwrap();
+        let wrong_path = wrong_dir.join(parts[2]);
+        std::fs::rename(&actual_full, &wrong_path).unwrap();
+        // Resolve with the wrong-shard path should return Conflict.
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: 0,
+            source_attempt: 0,
+            source_relative_path: format!("ready/{wrong_shard}/{}", parts[2]),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+        let outcome = queue.resolve(&ticket, false);
+        assert!(
+            matches!(outcome, ResolutionOutcome::ConflictingObject),
+            "wrong shard should be Conflict, got {outcome:?}"
+        );
+    }
+
+    // ===== P0-05: verified fd dev/ino check =====
+    #[test]
+    fn ack_verified_fd_held_open_across_rename() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"verified payload".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Normal ack should succeed and return Acked (not NotCommitted).
+        let result = queue.ack(&lease);
+        assert!(
+            matches!(result, AckOutcome::Acked),
+            "normal ack should succeed, got {result:?}"
+        );
     }
 
     // ===== P0-05: verified fd check detects swap =====
