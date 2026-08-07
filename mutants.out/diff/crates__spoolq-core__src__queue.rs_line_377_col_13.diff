@@ -1,0 +1,23 @@
+--- crates/spoolq-core/src/queue.rs
++++ delete match arm spoolq_format::FormatError::DigestMismatch in Queue::open
+@@ -369,19 +369,17 @@
+                 }
+             }
+         }
+         let format_rec = FormatRecord::decode(&format_bytes).map_err(|e| match e {
+             spoolq_format::FormatError::BadMagic | spoolq_format::FormatError::WrongSize { .. } => {
+                 Error::QueueCorrupt(format!("FORMAT decode: {e}"))
+             }
+             spoolq_format::FormatError::UnsupportedVersion(_, _) => Error::UnsupportedFormat,
+-            spoolq_format::FormatError::DigestMismatch => {
+-                Error::QueueCorrupt("FORMAT digest mismatch".into())
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             _ => Error::QueueCorrupt(format!("FORMAT decode: {e}")),
+         })?;
+ 
+         // Validate retention bound: ceil(retention / terminal_width) + 2 <= 4096
+         let probe_count = ceiling_bucket(
+             opts.receipt_retention_ns,
+             format_rec.terminal_bucket_width_ns,
+         )

@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::format -> &FormatRecord with Box::leak(Box::new(Default::default()))
+@@ -470,17 +470,17 @@
+             worker_nonce,
+             options: opts.clone(),
+             maint_lock_fd: Some(maint_fd),
+             recovery_cursor: RecoveryCursor::default(),
+         })
+     }
+ 
+     pub fn format(&self) -> &FormatRecord {
+-        &self.format
++        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     pub fn queue_id(&self) -> &[u8; 16] {
+         &self.format.queue_id
+     }
+ 
+     pub fn boot_id(&self) -> &str {
+         &self.boot_id

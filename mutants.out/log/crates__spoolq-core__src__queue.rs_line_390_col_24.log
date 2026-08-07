@@ -1,0 +1,300 @@
+
+*** crates/spoolq-core/src/queue.rs:390:24: replace > with == in Queue::open
+
+*** mutation diff:
+--- crates/spoolq-core/src/queue.rs
++++ replace > with == in Queue::open
+@@ -382,17 +382,17 @@
+ 
+         // Validate retention bound: ceil(retention / terminal_width) + 2 <= 4096
+         let probe_count = ceiling_bucket(
+             opts.receipt_retention_ns,
+             format_rec.terminal_bucket_width_ns,
+         )
+         .unwrap_or(0)
+         .saturating_add(2);
+-        if probe_count > 4096 {
++        if probe_count == /* ~ changed by cargo-mutants ~ */ 4096 {
+             return Err(Error::InvalidInput(
+                 "receipt retention exceeds duplicate-ack probe bound".into(),
+             ));
+         }
+ 
+         // Check filesystem type
+         if !opts.allow_unsupported_fs {
+             let magic = fs::statfs(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+
+
+*** /home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=spoolq-core@0.1.0
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh version_check v0.9.5
+       Fresh cfg-if v1.0.4
+       Fresh typenum v1.20.1
+       Fresh autocfg v1.5.1
+       Fresh cpufeatures v0.2.17
+       Fresh either v1.17.0
+       Fresh ciborium-io v0.2.2
+       Fresh clap_lex v1.1.0
+       Fresh plotters-backend v0.3.7
+       Fresh itoa v1.0.18
+       Fresh regex-syntax v0.8.11
+       Fresh memchr v2.8.3
+       Fresh anstyle v1.0.14
+       Fresh quote v1.0.47
+       Fresh libc v0.2.189
+       Fresh serde_core v1.0.229
+       Fresh crossbeam-utils v0.8.22
+       Fresh zmij v1.0.23
+       Fresh clap_builder v4.6.6
+       Fresh regex-automata v0.4.18
+       Fresh plotters-svg v0.3.7
+       Fresh itertools v0.10.5
+       Fresh same-file v1.0.6
+       Fresh once_cell v1.21.4
+       Fresh cast v0.3.0
+       Fresh bitflags v2.13.1
+       Fresh linux-raw-sys v0.12.1
+       Fresh oorandom v11.1.5
+       Fresh anes v0.1.6
+       Fresh fastrand v2.5.0
+       Fresh syn v2.0.119
+       Fresh generic-array v0.14.7
+       Fresh syn v3.0.3
+       Fresh crossbeam-epoch v0.9.20
+       Fresh num-traits v0.2.19
+       Fresh serde_json v1.0.151
+       Fresh is-terminal v0.4.17
+       Fresh spoolq-fs-linux v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-fs-linux)
+       Fresh getrandom v0.4.3
+       Fresh criterion-plot v0.5.0
+       Fresh clap v4.6.6
+       Fresh regex v1.13.1
+       Fresh walkdir v2.5.0
+       Fresh rustix v1.1.4
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh thiserror-impl v1.0.69
+       Fresh zerocopy-derive v0.8.56
+       Fresh serde_derive v1.0.229
+       Fresh crossbeam-deque v0.8.7
+       Fresh plotters v0.3.7
+       Fresh tempfile v3.27.0
+       Fresh digest v0.10.7
+       Fresh thiserror v1.0.69
+       Fresh zerocopy v0.8.56
+       Fresh serde v1.0.229
+       Fresh rayon-core v1.13.0
+       Fresh sha2 v0.10.9
+       Fresh half v2.7.1
+       Fresh rayon v1.12.0
+       Fresh tinytemplate v1.2.1
+       Fresh spoolq-format v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-format)
+       Fresh ciborium-ll v0.2.2
+       Fresh spoolq-math v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-math)
+       Fresh ciborium v0.2.2
+       Fresh spoolq-names v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-names)
+       Fresh criterion v0.5.1
+       Dirty spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core): the file `crates/spoolq-core/src/queue.rs` has changed (1786134588.342466369s, 4s after last build at 1786134584.324370586s)
+   Compiling spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core)
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=03247d8421bced53 -C extra-filename=-c52a591e79bab391 --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern criterion=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libcriterion-336e364b27c03862.rlib --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rlib --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rlib --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rlib --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rlib --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rlib --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rlib --extern tempfile=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libtempfile-ecef740f18c6b843.rlib --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rlib`
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=e4f6ed4dd60641bc -C extra-filename=-2f8fee100c77ff4a --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rmeta --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rmeta --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rmeta --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rmeta --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rmeta --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rmeta --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rmeta`
+warning: unused variable: `e`
+    --> crates/spoolq-core/src/queue.rs:5270:38
+     |
+5270 |             AckOutcome::NotCommitted(e) => {
+     |                                      ^ help: if this is intentional, prefix it with an underscore: `_e`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: `spoolq-core` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+  Executable `/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/spoolq_core-c52a591e79bab391`
+
+*** result: Success
+
+*** /home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo test --verbose --package=spoolq-core@0.1.0
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh version_check v0.9.5
+       Fresh cfg-if v1.0.4
+       Fresh typenum v1.20.1
+       Fresh cpufeatures v0.2.17
+       Fresh autocfg v1.5.1
+       Fresh either v1.17.0
+       Fresh syn v2.0.119
+       Fresh syn v3.0.3
+       Fresh anstyle v1.0.14
+       Fresh clap_lex v1.1.0
+       Fresh regex-syntax v0.8.11
+       Fresh itoa v1.0.18
+       Fresh libc v0.2.189
+       Fresh serde_core v1.0.229
+       Fresh crossbeam-utils v0.8.22
+       Fresh thiserror-impl v1.0.69
+       Fresh zerocopy-derive v0.8.56
+       Fresh serde_derive v1.0.229
+       Fresh zmij v1.0.23
+       Fresh plotters-backend v0.3.7
+       Fresh ciborium-io v0.2.2
+       Fresh memchr v2.8.3
+       Fresh regex-automata v0.4.18
+       Fresh clap_builder v4.6.6
+       Fresh itertools v0.10.5
+       Fresh cast v0.3.0
+       Fresh linux-raw-sys v0.12.1
+       Fresh once_cell v1.21.4
+       Fresh generic-array v0.14.7
+       Fresh crossbeam-epoch v0.9.20
+       Fresh zerocopy v0.8.56
+       Fresh thiserror v1.0.69
+       Fresh serde v1.0.229
+       Fresh serde_json v1.0.151
+       Fresh plotters-svg v0.3.7
+       Fresh num-traits v0.2.19
+       Fresh bitflags v2.13.1
+       Fresh same-file v1.0.6
+       Fresh getrandom v0.4.3
+       Fresh spoolq-fs-linux v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-fs-linux)
+       Fresh regex v1.13.1
+       Fresh clap v4.6.6
+       Fresh criterion-plot v0.5.0
+       Fresh is-terminal v0.4.17
+       Fresh anes v0.1.6
+       Fresh oorandom v11.1.5
+       Fresh fastrand v2.5.0
+       Fresh block-buffer v0.10.4
+       Fresh crypto-common v0.1.7
+       Fresh crossbeam-deque v0.8.7
+       Fresh half v2.7.1
+       Fresh plotters v0.3.7
+       Fresh walkdir v2.5.0
+       Fresh rustix v1.1.4
+       Fresh tinytemplate v1.2.1
+       Fresh digest v0.10.7
+       Fresh ciborium-ll v0.2.2
+       Fresh rayon-core v1.13.0
+       Fresh tempfile v3.27.0
+       Fresh sha2 v0.10.9
+       Fresh ciborium v0.2.2
+       Fresh rayon v1.12.0
+       Fresh spoolq-format v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-format)
+       Fresh spoolq-math v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-math)
+       Fresh criterion v0.5.1
+       Fresh spoolq-names v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-names)
+warning: unused variable: `e`
+    --> crates/spoolq-core/src/queue.rs:5270:38
+     |
+5270 |             AckOutcome::NotCommitted(e) => {
+     |                                      ^ help: if this is intentional, prefix it with an underscore: `_e`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: `spoolq-core` (lib test) generated 1 warning
+       Fresh spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running `/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/spoolq_core-c52a591e79bab391`
+
+running 89 tests
+test errors::tests::dead_reason_round_trip ... ok
+test errors::tests::lease_remaining ... ok
+test errors::tests::quarantine_reason_round_trip ... ok
+test quarantine::tests::fsck_clean_queue ... ok
+test queue::tests::ack_preserves_error_categories ... ok
+test queue::tests::enqueue_basic ... ok
+test quarantine::tests::fsck_deep_verifies_payload ... ok
+test quarantine::tests::fsck_finds_valid_job ... ok
+test queue::tests::empty_queue_returns_empty_not_error ... ok
+test queue::tests::concurrent_lease_uniqueness ... ok
+test queue::tests::ack_conflicting_receipt_is_not_already_acked ... ok
+test quarantine::tests::fsck_repair_quarantines_corrupt_header ... ok
+test quarantine::tests::fsck_detects_header_corruption ... ok
+test queue::tests::ack_succeeds_without_explicit_verify ... ok
+test queue::tests::enotdir_in_lease_path_is_corruption ... ok
+test queue::tests::duplicate_ack_returns_already_acked ... ok
+test queue::tests::bury_after_lease ... ok
+test queue::tests::ack_accepts_verified_lease ... ok
+test queue::tests::ack_verified_fd_dev_ino_check ... ok
+test queue::tests::delay_preserves_attempt ... ok
+test queue::tests::enqueue_rejects_oversize_payload ... ok
+test queue::tests::ack_already_lost_returns_lease_lost ... ok
+test queue::tests::enqueue_zero_attempts_rejected ... ok
+test queue::tests::format_file_exists_after_init ... ok
+test queue::tests::format_file_is_readonly ... ok
+test queue::tests::enqueue_survives_reopen ... ok
+test queue::tests::enqueue_delayed ... ok
+test queue::tests::init_validates_zero_delayed_width ... ok
+test queue::tests::init_validates_zero_lease_width ... ok
+test queue::tests::enqueue_zero_payload ... ok
+test queue::tests::fd_leak_stress ... ok
+test queue::tests::fsck_finds_valid_dead_job ... ok
+test queue::tests::init_and_open ... ok
+test queue::tests::init_refuses_existing_queue ... ok
+test queue::tests::fsck_finds_valid_leased_job ... ok
+test queue::tests::enqueue_large_payload ... ok
+test queue::tests::fsck_finds_valid_delayed_job ... ok
+test queue::tests::guard_link_count ... ok
+test queue::tests::guard_file_sync_before_publish ... ok
+test queue::tests::full_lifecycle ... ok
+test queue::tests::guard_name_tag_verification ... ok
+test queue::tests::guard_payload_verification_prevents_ack ... ok
+test queue::tests::fsck_finds_valid_receipt ... ok
+test queue::tests::inspect_finds_leased_job ... ok
+test queue::tests::full_lifecycle_with_verify ... ok
+test queue::tests::guard_attempt_limit_enforced ... ok
+test queue::tests::guard_shard_verification ... ok
+test queue::tests::inspect_returns_empty_for_unknown ... ok
+test queue::tests::inspect_finds_ready_job ... ok
+test queue::tests::lease_duration_validation ... ok
+test queue::tests::open_rejects_missing_state_dir ... ok
+test queue::tests::poisoned_queue_rejects_operations ... ok
+test queue::tests::lease_empty_queue ... ok
+test queue::tests::reject_generation_overflow ... ok
+test queue::tests::reject_invalid_lease_duration ... ok
+test queue::tests::reject_ack_on_empty_queue ... ok
+test queue::tests::reject_retry_on_empty_queue ... ok
+test queue::tests::payload_verification ... ok
+test queue::tests::post_claim_returns_lease_on_success ... ok
+test queue::tests::reject_zero_dev_inode_lease ... ok
+test queue::tests::resolve_detects_ready_object_present ... ok
+test queue::tests::one_attempt_job_single_lease ... ok
+test queue::tests::read_lease_payload_chunk_respects_offset ... ok
+test state_machine::tests::ack_does_not_change_attempt ... ok
+test state_machine::tests::all_transitions_use_no_overwrite ... ok
+test state_machine::tests::claim_increments_attempt ... ok
+test state_machine::tests::illegal_transitions ... ok
+test queue::tests::resolve_rejects_wrong_job_id ... ok
+test state_machine::tests::legal_transitions ... ok
+test state_machine::tests::renew_preserves_token ... ok
+test state_machine::tests::transition_count ... ok
+test queue::tests::resolve_source_still_in_ready ... ok
+test queue::tests::scan_round_advances ... ok
+test queue::tests::renew_extends_lease ... ok
+test recovery::tests::recovery_empty_queue ... ok
+test queue::tests::retry_after_lease ... ok
+test queue::tests::wall_floor_error_poisons_mutating_ops ... ok
+test queue::tests::retry_at_in_past_is_retry_now ... ok
+test queue::tests::wall_watermark_advances ... ok
+test queue::tests::retry_exhausted_goes_to_dead ... ok
+test queue::tests::source_validation_rejects_wrong_generation ... ok
+test queue::tests::verify_lease_payload_detects_corruption ... ok
+test queue::tests::retry_with_policy_works ... ok
+test queue::tests::stream_lease_payload_reads_all_data ... ok
+test queue::tests::verify_payload_detects_wrong_data ... ok
+test queue::tests::concurrent_producers_consumers ... ok
+test queue::tests::oracle_driven_closed_loop ... ok
+test recovery::tests::recovery_reaps_expired_lease ... ok
+test queue::tests::concurrent_producers_consumers_overlap ... ok
+
+test result: ok. 89 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+   Doc-tests spoolq_core
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2021 --crate-type lib --color auto --crate-name spoolq_core --test crates/spoolq-core/src/lib.rs --test-run-directory /tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern criterion=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libcriterion-336e364b27c03862.rlib --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rlib --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rlib --extern spoolq_core=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_core-2f8fee100c77ff4a.rlib --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rlib --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rlib --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rlib --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rlib --extern tempfile=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libtempfile-ecef740f18c6b843.rlib --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rlib -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' --error-format human`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+*** result: Success

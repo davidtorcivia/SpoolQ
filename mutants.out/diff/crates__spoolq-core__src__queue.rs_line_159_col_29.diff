@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace == with != in Queue::init
+@@ -151,17 +151,17 @@
+                 "queue already initialized; use open() to access an existing queue",
+             ));
+         }
+ 
+         // R2-B01: Create an exclusive initialization marker BEFORE any other state.
+         // Only one initializer can win this race. Use O_CREAT|O_EXCL on .initializing.
+         let _init_marker = fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600)
+             .map_err(|e| {
+-                if e.kind() == io::ErrorKind::AlreadyExists {
++                if e.kind() != /* ~ changed by cargo-mutants ~ */ io::ErrorKind::AlreadyExists {
+                     io::Error::new(
+                         io::ErrorKind::AlreadyExists,
+                         "another initializer is in progress or a previous init was interrupted",
+                     )
+                 } else {
+                     e
+                 }
+             })?;

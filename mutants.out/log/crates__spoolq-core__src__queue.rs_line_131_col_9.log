@@ -1,0 +1,355 @@
+
+*** crates/spoolq-core/src/queue.rs:131:9: replace Queue::init -> io::Result<FormatRecord> with Ok(Default::default())
+
+*** mutation diff:
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::init -> io::Result<FormatRecord> with Ok(Default::default())
+@@ -123,229 +123,17 @@
+     Conflict,
+     Error(Error),
+ }
+ 
+ impl Queue {
+     /// Initialize a new queue at the given path.
+     pub fn init(root: &Path, opts: &CreateOptions) -> io::Result<FormatRecord> {
+         // C-01: Validate all options before any filesystem mutation
+-        validate_create_options(opts)
+-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+-
+-        // Create root directory if needed
+-        if !root.exists() {
+-            std::fs::create_dir_all(root)?;
+-            // Sync the parent directory so the root entry persists
+-            if let Some(parent) = root.parent() {
+-                let parent_fd = fs::open_dir_absolute(parent)?;
+-                fs::fsync_dir_fd(parent_fd.as_raw_fd())?;
+-            }
+-        }
+-
+-        let root_fd = fs::open_dir_absolute(root)?;
+-
+-        // R2-B01: Refuse to overwrite an existing queue.
+-        let format_exists = fs::fstatat(root_fd.as_raw_fd(), "FORMAT").is_ok();
+-        if format_exists {
+-            return Err(io::Error::new(
+-                io::ErrorKind::AlreadyExists,
+-                "queue already initialized; use open() to access an existing queue",
+-            ));
+-        }
+-
+-        // R2-B01: Create an exclusive initialization marker BEFORE any other state.
+-        // Only one initializer can win this race. Use O_CREAT|O_EXCL on .initializing.
+-        let _init_marker = fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600)
+-            .map_err(|e| {
+-                if e.kind() == io::ErrorKind::AlreadyExists {
+-                    io::Error::new(
+-                        io::ErrorKind::AlreadyExists,
+-                        "another initializer is in progress or a previous init was interrupted",
+-                    )
+-                } else {
+-                    e
+-                }
+-            })?;
+-
+-        // R2-B01: Use RAII guard to clean up the init marker on any failure.
+-        struct InitGuard {
+-            root_fd: std::os::unix::io::RawFd,
+-            armed: bool,
+-        }
+-        impl Drop for InitGuard {
+-            fn drop(&mut self) {
+-                if self.armed {
+-                    // Remove the marker so a failed init can be retried
+-                    let _ = fs::unlinkat(self.root_fd, ".initializing");
+-                }
+-            }
+-        }
+-        let mut init_guard = InitGuard {
+-            root_fd: root_fd.as_raw_fd(),
+-            armed: true,
+-        };
+-
+-        // R2-B01: Create control/ early so we can hold the maintenance lock
+-        // with RAII (no mem::forget leak).
+-        fs::mkdirat_eexist_ok(root_fd.as_raw_fd(), "control", 0o700)?;
+-        let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
+-        fs::create_exclusive(control_fd.as_raw_fd(), "maintenance.lock", 0o600).or_else(|e| {
+-            if e.kind() == io::ErrorKind::AlreadyExists {
+-                fs::openat(
+-                    control_fd.as_raw_fd(),
+-                    "maintenance.lock",
+-                    libc::O_RDWR,
+-                    0o600,
+-                )
+-            } else {
+-                Err(e)
+-            }
+-        })?;
+-        let lock_fd = fs::openat(
+-            control_fd.as_raw_fd(),
+-            "maintenance.lock",
+-            libc::O_RDWR,
+-            0o600,
+-        )?;
+-        let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())?;
+-        if !locked {
+-            return Err(io::Error::new(
+-                io::ErrorKind::WouldBlock,
+-                "another initializer or maintenance process holds the lock",
+-            ));
+-        }
+-        // H1: Hold the maintenance lock for the duration of init by binding it.
+-        // It will be released when _init_lock goes out of scope at function end.
+-        let _init_lock = lock_fd;
+-
+-        // Generate queue ID
+-        let queue_id = fs::random_128bit()?;
+-        let created_at = fs::clock_realtime_ns()?;
+-
+-        let format_rec = FormatRecord {
+-            queue_id,
+-            created_at_unix_ns: created_at,
+-            shard_count: opts.shard_count,
+-            lease_bucket_width_ns: opts.lease_bucket_width_ns,
+-            delayed_bucket_width_ns: opts.delayed_bucket_width_ns,
+-            terminal_bucket_width_ns: opts.terminal_bucket_width_ns,
+-            max_payload_length: opts.max_payload_length,
+-        };
+-
+-        // Create static directories
+-        for dir in [
+-            "control",
+-            "tmp",
+-            "ready",
+-            "leased",
+-            "delayed",
+-            "receipts",
+-            "dead",
+-            "quarantine",
+-        ] {
+-            fs::mkdirat_eexist_ok(root_fd.as_raw_fd(), dir, 0o700)?;
+-        }
+-        // Sync root after directory creation
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // Create static shard directories under ready/
+-        let ready_fd = fs::open_directory(root_fd.as_raw_fd(), "ready")?;
+-        for i in 0..opts.shard_count {
+-            let shard_name = format!("{i:04x}");
+-            fs::mkdirat_eexist_ok(ready_fd.as_raw_fd(), &shard_name, 0o700)?;
+-        }
+-        // Sync ready/ after shard creation
+-        fs::fsync_dir_fd(ready_fd.as_raw_fd())?;
+-        // Sync root
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // Create control lock files
+-        let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
+-        for lock_file in ["maintenance.lock", "wall-watermark.lock"] {
+-            let fd =
+-                fs::create_exclusive(control_fd.as_raw_fd(), lock_file, 0o600).or_else(|e| {
+-                    if e.kind() == io::ErrorKind::AlreadyExists {
+-                        fs::openat(control_fd.as_raw_fd(), lock_file, 0o2, 0o600)
+-                    } else {
+-                        Err(e)
+-                    }
+-                })?;
+-            fs::fsync(fd.as_raw_fd())?;
+-        }
+-        fs::fsync_dir_fd(control_fd.as_raw_fd())?;
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // Write initial wall watermark
+-        let wall_now = fs::clock_realtime_ns()?;
+-        let wall_bucket =
+-            bucket_number(wall_now, opts.delayed_bucket_width_ns).ok_or_else(|| {
+-                io::Error::new(io::ErrorKind::InvalidInput, "zero bucket width in init")
+-            })?;
+-        let wm = WatermarkRecord {
+-            highest_observed_bucket: wall_bucket,
+-            sequence: 0,
+-        };
+-        let wm_bytes = wm.encode();
+-        // Write via temp file then rename
+-        // C-03: Use unique temp name to avoid collision on partial init rerun
+-        let wm_tmp_name = format!(
+-            ".wm.tmp.{}",
+-            spoolq_names::hex_encode(&fs::random_128bit()?)
+-        );
+-        let wm_tmp = fs::create_exclusive(control_fd.as_raw_fd(), &wm_tmp_name, 0o600)?;
+-        fs::write_all(wm_tmp.as_raw_fd(), &wm_bytes)?;
+-        fs::fsync(wm_tmp.as_raw_fd())?;
+-        fs::renameat(
+-            control_fd.as_raw_fd(),
+-            &wm_tmp_name,
+-            control_fd.as_raw_fd(),
+-            "wall-watermark",
+-        )?;
+-        fs::fsync_dir_fd(control_fd.as_raw_fd())?;
+-
+-        // Write FORMAT file
+-        let format_bytes = format_rec.encode();
+-        // C-03: Unique temp name for partial init recovery
+-        let fmt_tmp_name = format!(
+-            ".format.tmp.{}",
+-            spoolq_names::hex_encode(&fs::random_128bit()?)
+-        );
+-        let fmt_tmp = fs::create_exclusive(root_fd.as_raw_fd(), &fmt_tmp_name, 0o600)?;
+-        fs::write_all(fmt_tmp.as_raw_fd(), &format_bytes)?;
+-        fs::fsync(fmt_tmp.as_raw_fd())?;
+-        // R2-B01: Publish FORMAT with RENAME_NOREPLACE so two concurrent
+-        // initializers cannot overwrite each other.
+-        match fs::renameat2_noreplace(
+-            root_fd.as_raw_fd(),
+-            &fmt_tmp_name,
+-            root_fd.as_raw_fd(),
+-            "FORMAT",
+-        ) {
+-            Ok(()) => {}
+-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+-                // Another initializer won the race. Clean up our temp and bail.
+-                let _ = fs::unlinkat(root_fd.as_raw_fd(), &fmt_tmp_name);
+-                return Err(io::Error::new(
+-                    io::ErrorKind::AlreadyExists,
+-                    "another initializer published FORMAT first",
+-                ));
+-            }
+-            Err(e) => return Err(e),
+-        }
+-        // C-02: Set FORMAT to read-only before final dir fsync, propagate failure
+-        fs::fchmodat(root_fd.as_raw_fd(), "FORMAT", 0o400)?;
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // R2-B01: Remove the init marker now that FORMAT is published durably.
+-        init_guard.armed = false;
+-        fs::unlinkat(root_fd.as_raw_fd(), ".initializing")?;
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        Ok(format_rec)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Open an existing queue.
+     pub fn open(root: &Path, opts: &OpenOptions) -> Result<Self, Error> {
+         // B-11: Open root first using descriptor-relative, no-symlink semantics
+         let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+ 
+         // B-11: Validate root is a directory
+
+
+*** /home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=spoolq-core@0.1.0
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh cfg-if v1.0.4
+       Fresh version_check v0.9.5
+       Fresh typenum v1.20.1
+       Fresh autocfg v1.5.1
+       Fresh cpufeatures v0.2.17
+       Fresh either v1.17.0
+       Fresh anstyle v1.0.14
+       Fresh quote v1.0.47
+       Fresh itoa v1.0.18
+       Fresh clap_lex v1.1.0
+       Fresh ciborium-io v0.2.2
+       Fresh memchr v2.8.3
+       Fresh regex-syntax v0.8.11
+       Fresh plotters-backend v0.3.7
+       Fresh syn v2.0.119
+       Fresh libc v0.2.189
+       Fresh serde_core v1.0.229
+       Fresh syn v3.0.3
+       Fresh crossbeam-utils v0.8.22
+       Fresh zmij v1.0.23
+       Fresh regex-automata v0.4.18
+       Fresh clap_builder v4.6.6
+       Fresh plotters-svg v0.3.7
+       Fresh itertools v0.10.5
+       Fresh once_cell v1.21.4
+       Fresh same-file v1.0.6
+       Fresh linux-raw-sys v0.12.1
+       Fresh cast v0.3.0
+       Fresh bitflags v2.13.1
+       Fresh anes v0.1.6
+       Fresh oorandom v11.1.5
+       Fresh generic-array v0.14.7
+       Fresh zerocopy-derive v0.8.56
+       Fresh thiserror-impl v1.0.69
+       Fresh serde_derive v1.0.229
+       Fresh crossbeam-epoch v0.9.20
+       Fresh serde_json v1.0.151
+       Fresh num-traits v0.2.19
+       Fresh clap v4.6.6
+       Fresh regex v1.13.1
+       Fresh is-terminal v0.4.17
+       Fresh criterion-plot v0.5.0
+       Fresh getrandom v0.4.3
+       Fresh spoolq-fs-linux v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-fs-linux)
+       Fresh walkdir v2.5.0
+       Fresh fastrand v2.5.0
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh zerocopy v0.8.56
+       Fresh thiserror v1.0.69
+       Fresh crossbeam-deque v0.8.7
+       Fresh serde v1.0.229
+       Fresh plotters v0.3.7
+       Fresh rustix v1.1.4
+       Fresh digest v0.10.7
+       Fresh half v2.7.1
+       Fresh rayon-core v1.13.0
+       Fresh tinytemplate v1.2.1
+       Fresh tempfile v3.27.0
+       Fresh sha2 v0.10.9
+       Fresh ciborium-ll v0.2.2
+       Fresh rayon v1.12.0
+       Fresh spoolq-format v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-format)
+       Fresh ciborium v0.2.2
+       Fresh spoolq-math v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-math)
+       Fresh spoolq-names v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-names)
+       Fresh criterion v0.5.1
+       Dirty spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core): the file `crates/spoolq-core/src/queue.rs` has changed (1786134544.103411796s, 1s after last build at 1786134543.441396014s)
+   Compiling spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core)
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=03247d8421bced53 -C extra-filename=-c52a591e79bab391 --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern criterion=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libcriterion-336e364b27c03862.rlib --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rlib --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rlib --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rlib --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rlib --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rlib --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rlib --extern tempfile=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libtempfile-ecef740f18c6b843.rlib --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rlib`
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=e4f6ed4dd60641bc -C extra-filename=-2f8fee100c77ff4a --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rmeta --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rmeta --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rmeta --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rmeta --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rmeta --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rmeta --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rmeta`
+warning: unused import: `WatermarkRecord`
+  --> crates/spoolq-core/src/queue.rs:10:65
+   |
+10 |     envelope_digest, payload_digest, FixedHeader, FormatRecord, WatermarkRecord,
+   |                                                                 ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `bucket_number`
+  --> crates/spoolq-core/src/queue.rs:14:25
+   |
+14 | use spoolq_math::{self, bucket_number, ceiling_bucket, eligibility_bucket_and_ns};
+   |                         ^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `FormatRecord: Default` is not satisfied
+   --> crates/spoolq-core/src/queue.rs:131:12
+    |
+131 |         Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+    |            ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `FormatRecord`
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `spoolq-core` (lib) generated 2 warnings
+error: could not compile `spoolq-core` (lib) due to 1 previous error; 2 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=e4f6ed4dd60641bc -C extra-filename=-2f8fee100c77ff4a --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rmeta --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rmeta --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rmeta --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rmeta --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rmeta --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rmeta --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rmeta` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+warning: unused variable: `e`
+    --> crates/spoolq-core/src/queue.rs:5058:38
+     |
+5058 |             AckOutcome::NotCommitted(e) => {
+     |                                      ^ help: if this is intentional, prefix it with an underscore: `_e`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: `spoolq-core` (lib test) generated 3 warnings (2 duplicates)
+error: could not compile `spoolq-core` (lib test) due to 1 previous error; 3 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=03247d8421bced53 -C extra-filename=-c52a591e79bab391 --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern criterion=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libcriterion-336e364b27c03862.rlib --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rlib --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rlib --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rlib --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rlib --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rlib --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rlib --extern tempfile=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libtempfile-ecef740f18c6b843.rlib --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rlib` (exit status: 1)
+
+*** result: Failure(101)

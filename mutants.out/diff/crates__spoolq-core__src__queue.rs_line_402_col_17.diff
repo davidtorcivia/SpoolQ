@@ -1,0 +1,23 @@
+--- crates/spoolq-core/src/queue.rs
++++ delete match arm fs::TMPFS_MAGIC in Queue::open
+@@ -394,19 +394,17 @@
+         }
+ 
+         // Check filesystem type
+         if !opts.allow_unsupported_fs {
+             let magic = fs::statfs(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+             let ft = magic.f_type as i64;
+             match ft {
+                 fs::EXT4_SUPER_MAGIC | fs::XFS_SUPER_MAGIC => {}
+-                fs::TMPFS_MAGIC => {
+-                    return Err(Error::UnsupportedFilesystem);
+-                }
++                 /* ~ changed by cargo-mutants ~ */
+                 fs::NFS_SUPER_MAGIC | fs::FUSE_SUPER_MAGIC | fs::OVERLAYFS_SUPER_MAGIC => {
+                     return Err(Error::UnsupportedFilesystem);
+                 }
+                 _ => {
+                     return Err(Error::UnsupportedFilesystem);
+                 }
+             }
+         }

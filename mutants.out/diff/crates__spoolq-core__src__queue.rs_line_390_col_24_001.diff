@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace > with < in Queue::open
+@@ -382,17 +382,17 @@
+ 
+         // Validate retention bound: ceil(retention / terminal_width) + 2 <= 4096
+         let probe_count = ceiling_bucket(
+             opts.receipt_retention_ns,
+             format_rec.terminal_bucket_width_ns,
+         )
+         .unwrap_or(0)
+         .saturating_add(2);
+-        if probe_count > 4096 {
++        if probe_count < /* ~ changed by cargo-mutants ~ */ 4096 {
+             return Err(Error::InvalidInput(
+                 "receipt retention exceeds duplicate-ack probe bound".into(),
+             ));
+         }
+ 
+         // Check filesystem type
+         if !opts.allow_unsupported_fs {
+             let magic = fs::statfs(root).map_err(|e| Error::IoFailure(e.to_string()))?;

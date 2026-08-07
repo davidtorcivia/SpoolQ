@@ -5260,11 +5260,20 @@ mod tests {
         std::fs::create_dir_all(&full_dir).unwrap();
         std::fs::write(full_dir.join(&receipt_name), b"not a receipt at all").unwrap();
         // Ack should not succeed because the destination already has a conflicting object.
+        // First verify that ack can find the lease (it's valid).
+        // Then the EEXIST path should trigger because we pre-planted a file.
         let result = queue.ack(&lease);
-        assert!(
-            matches!(result, AckOutcome::NotCommitted(_)),
-            "conflicting receipt should be NotCommitted, got {result:?}"
-        );
+        // The result should be NotCommitted because either:
+        // (a) the EEXIST handler authenticates the garbage receipt and fails, or
+        // (b) the rename fails with EEXIST and receipt_is_authentic returns false.
+        match result {
+            AckOutcome::NotCommitted(_) => {
+                // Good - the conflicting receipt was not treated as AlreadyAcked.
+            }
+            AckOutcome::Acked => panic!("conflicting receipt should not be Acked"),
+            AckOutcome::AlreadyAcked => panic!("conflicting receipt should not be AlreadyAcked"),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 
     // ===== P1-06: ENOTDIR is QueueCorrupt =====
@@ -5383,6 +5392,138 @@ mod tests {
         .unwrap();
         let report = queue2.fsck(&FsckOptions::default());
         assert_eq!(report.findings.len(), 0, "findings: {:?}", report.findings);
+    }
+
+    // ===== fsck on leased state =====
+    #[test]
+    fn fsck_finds_valid_leased_job() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let _lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Don't drop the queue - run fsck while object is leased.
+        let report = queue.fsck(&FsckOptions::default());
+        assert_eq!(
+            report.findings.len(),
+            0,
+            "valid leased object should have no findings: {:?}",
+            report.findings
+        );
+        assert!(report.total_objects >= 1);
+    }
+
+    // ===== ack_unverified reaches rename and triggers EEXIST =====
+    #[test]
+    fn ack_unverified_eexist_triggers_not_committed() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Compute exact receipt path.
+        let shard = compute_shard(
+            &queue.format.queue_id,
+            &lease.job_id,
+            queue.format.shard_count,
+        );
+        let shard_str = shard_hex(shard);
+        let wall = queue.effective_wall_floor_ns_checked().unwrap();
+        let bucket =
+            spoolq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap_or(0);
+        let bucket_str = bucket_hex(bucket);
+        let new_gen = lease.generation + 1;
+        let receipt_common = CommonFields {
+            job_id: lease.job_id,
+            generation: new_gen,
+            attempt: lease.attempt,
+            maximum_attempts: lease.maximum_attempts,
+        };
+        let receipt_base = format!(
+            "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
+            spoolq_names::hex_encode(&receipt_common.job_id),
+            receipt_common.generation,
+            receipt_common.attempt,
+            receipt_common.maximum_attempts,
+            spoolq_names::hex_encode(&lease.token),
+        );
+        let receipt_ctx = spoolq_names::terminal_context(
+            spoolq_names::State::Receipt,
+            &bucket_str,
+            &shard_str,
+            &receipt_base,
+        );
+        let receipt_tag = compute_name_tag(&queue.format.queue_id, &receipt_ctx);
+        let receipt_name =
+            spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
+        let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
+        let full_dir = _tmp.path().join(&receipt_dir);
+        std::fs::create_dir_all(&full_dir).unwrap();
+        std::fs::write(full_dir.join(&receipt_name), b"not a receipt").unwrap();
+        // Use ack_unverified to skip payload verification and reach rename directly.
+        let result = queue.ack_unverified(&lease);
+        assert!(
+            matches!(result, AckOutcome::NotCommitted(_)),
+            "EEXIST with garbage receipt should be NotCommitted, got {result:?}"
+        );
+    }
+
+    // ===== stream_lease_payload boundary tests =====
+    #[test]
+    fn stream_payload_exact_byte_math() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"0123456789ABCDEF"; // 16 bytes
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Read with small chunk to test exact offset math.
+        let mut collected = Vec::new();
+        queue
+            .stream_lease_payload(&lease, 4096, |chunk| {
+                collected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(&collected, payload);
+
+        // Read with chunk size equal to payload.
+        collected.clear();
+        queue
+            .stream_lease_payload(&lease, 16, |chunk| {
+                collected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(&collected, payload);
+
+        // Read with chunk larger than payload.
+        collected.clear();
+        queue
+            .stream_lease_payload(&lease, 1024, |chunk| {
+                collected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(&collected, payload);
     }
 
     // ===== P0-05: verified fd check detects swap =====

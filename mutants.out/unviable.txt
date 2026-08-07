@@ -1,0 +1,3 @@
+crates/spoolq-core/src/queue.rs:131:9: replace Queue::init -> io::Result<FormatRecord> with Ok(Default::default())
+crates/spoolq-core/src/queue.rs:349:9: replace Queue::open -> Result<Self, Error> with Ok(Default::default())
+crates/spoolq-core/src/queue.rs:478:9: replace Queue::format -> &FormatRecord with Box::leak(Box::new(Default::default()))

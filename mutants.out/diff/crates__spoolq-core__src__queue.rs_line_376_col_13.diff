@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ delete match arm spoolq_format::FormatError::UnsupportedVersion(_, _) in Queue::open
+@@ -368,17 +368,17 @@
+                     Err(e) => return Err(Error::IoFailure(e.to_string())),
+                 }
+             }
+         }
+         let format_rec = FormatRecord::decode(&format_bytes).map_err(|e| match e {
+             spoolq_format::FormatError::BadMagic | spoolq_format::FormatError::WrongSize { .. } => {
+                 Error::QueueCorrupt(format!("FORMAT decode: {e}"))
+             }
+-            spoolq_format::FormatError::UnsupportedVersion(_, _) => Error::UnsupportedFormat,
++             /* ~ changed by cargo-mutants ~ */
+             spoolq_format::FormatError::DigestMismatch => {
+                 Error::QueueCorrupt("FORMAT digest mismatch".into())
+             }
+             _ => Error::QueueCorrupt(format!("FORMAT decode: {e}")),
+         })?;
+ 
+         // Validate retention bound: ceil(retention / terminal_width) + 2 <= 4096
+         let probe_count = ceiling_bucket(

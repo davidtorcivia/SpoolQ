@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace > with >= in validate_create_options
+@@ -60,17 +60,17 @@
+     if opts.terminal_bucket_width_ns == 0 {
+         return Err(Error::InvalidInput(
+             "terminal bucket width must be non-zero".into(),
+         ));
+     }
+     if !(60_000_000_000..=86_400_000_000_000).contains(&opts.terminal_bucket_width_ns) {
+         return Err(Error::InvalidInput("invalid terminal bucket width".into()));
+     }
+-    if opts.max_payload_length > MAX_PAYLOAD_LENGTH {
++    if opts.max_payload_length >= /* ~ changed by cargo-mutants ~ */ MAX_PAYLOAD_LENGTH {
+         return Err(Error::InvalidInput("payload limit exceeds maximum".into()));
+     }
+     Ok(())
+ }
+ 
+ /// Operational options for opening a queue.
+ #[derive(Clone, Debug)]
+ pub struct OpenOptions {

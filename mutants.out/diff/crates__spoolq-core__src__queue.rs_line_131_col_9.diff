@@ -1,0 +1,233 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace Queue::init -> io::Result<FormatRecord> with Ok(Default::default())
+@@ -123,229 +123,17 @@
+     Conflict,
+     Error(Error),
+ }
+ 
+ impl Queue {
+     /// Initialize a new queue at the given path.
+     pub fn init(root: &Path, opts: &CreateOptions) -> io::Result<FormatRecord> {
+         // C-01: Validate all options before any filesystem mutation
+-        validate_create_options(opts)
+-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+-
+-        // Create root directory if needed
+-        if !root.exists() {
+-            std::fs::create_dir_all(root)?;
+-            // Sync the parent directory so the root entry persists
+-            if let Some(parent) = root.parent() {
+-                let parent_fd = fs::open_dir_absolute(parent)?;
+-                fs::fsync_dir_fd(parent_fd.as_raw_fd())?;
+-            }
+-        }
+-
+-        let root_fd = fs::open_dir_absolute(root)?;
+-
+-        // R2-B01: Refuse to overwrite an existing queue.
+-        let format_exists = fs::fstatat(root_fd.as_raw_fd(), "FORMAT").is_ok();
+-        if format_exists {
+-            return Err(io::Error::new(
+-                io::ErrorKind::AlreadyExists,
+-                "queue already initialized; use open() to access an existing queue",
+-            ));
+-        }
+-
+-        // R2-B01: Create an exclusive initialization marker BEFORE any other state.
+-        // Only one initializer can win this race. Use O_CREAT|O_EXCL on .initializing.
+-        let _init_marker = fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600)
+-            .map_err(|e| {
+-                if e.kind() == io::ErrorKind::AlreadyExists {
+-                    io::Error::new(
+-                        io::ErrorKind::AlreadyExists,
+-                        "another initializer is in progress or a previous init was interrupted",
+-                    )
+-                } else {
+-                    e
+-                }
+-            })?;
+-
+-        // R2-B01: Use RAII guard to clean up the init marker on any failure.
+-        struct InitGuard {
+-            root_fd: std::os::unix::io::RawFd,
+-            armed: bool,
+-        }
+-        impl Drop for InitGuard {
+-            fn drop(&mut self) {
+-                if self.armed {
+-                    // Remove the marker so a failed init can be retried
+-                    let _ = fs::unlinkat(self.root_fd, ".initializing");
+-                }
+-            }
+-        }
+-        let mut init_guard = InitGuard {
+-            root_fd: root_fd.as_raw_fd(),
+-            armed: true,
+-        };
+-
+-        // R2-B01: Create control/ early so we can hold the maintenance lock
+-        // with RAII (no mem::forget leak).
+-        fs::mkdirat_eexist_ok(root_fd.as_raw_fd(), "control", 0o700)?;
+-        let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
+-        fs::create_exclusive(control_fd.as_raw_fd(), "maintenance.lock", 0o600).or_else(|e| {
+-            if e.kind() == io::ErrorKind::AlreadyExists {
+-                fs::openat(
+-                    control_fd.as_raw_fd(),
+-                    "maintenance.lock",
+-                    libc::O_RDWR,
+-                    0o600,
+-                )
+-            } else {
+-                Err(e)
+-            }
+-        })?;
+-        let lock_fd = fs::openat(
+-            control_fd.as_raw_fd(),
+-            "maintenance.lock",
+-            libc::O_RDWR,
+-            0o600,
+-        )?;
+-        let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())?;
+-        if !locked {
+-            return Err(io::Error::new(
+-                io::ErrorKind::WouldBlock,
+-                "another initializer or maintenance process holds the lock",
+-            ));
+-        }
+-        // H1: Hold the maintenance lock for the duration of init by binding it.
+-        // It will be released when _init_lock goes out of scope at function end.
+-        let _init_lock = lock_fd;
+-
+-        // Generate queue ID
+-        let queue_id = fs::random_128bit()?;
+-        let created_at = fs::clock_realtime_ns()?;
+-
+-        let format_rec = FormatRecord {
+-            queue_id,
+-            created_at_unix_ns: created_at,
+-            shard_count: opts.shard_count,
+-            lease_bucket_width_ns: opts.lease_bucket_width_ns,
+-            delayed_bucket_width_ns: opts.delayed_bucket_width_ns,
+-            terminal_bucket_width_ns: opts.terminal_bucket_width_ns,
+-            max_payload_length: opts.max_payload_length,
+-        };
+-
+-        // Create static directories
+-        for dir in [
+-            "control",
+-            "tmp",
+-            "ready",
+-            "leased",
+-            "delayed",
+-            "receipts",
+-            "dead",
+-            "quarantine",
+-        ] {
+-            fs::mkdirat_eexist_ok(root_fd.as_raw_fd(), dir, 0o700)?;
+-        }
+-        // Sync root after directory creation
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // Create static shard directories under ready/
+-        let ready_fd = fs::open_directory(root_fd.as_raw_fd(), "ready")?;
+-        for i in 0..opts.shard_count {
+-            let shard_name = format!("{i:04x}");
+-            fs::mkdirat_eexist_ok(ready_fd.as_raw_fd(), &shard_name, 0o700)?;
+-        }
+-        // Sync ready/ after shard creation
+-        fs::fsync_dir_fd(ready_fd.as_raw_fd())?;
+-        // Sync root
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // Create control lock files
+-        let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
+-        for lock_file in ["maintenance.lock", "wall-watermark.lock"] {
+-            let fd =
+-                fs::create_exclusive(control_fd.as_raw_fd(), lock_file, 0o600).or_else(|e| {
+-                    if e.kind() == io::ErrorKind::AlreadyExists {
+-                        fs::openat(control_fd.as_raw_fd(), lock_file, 0o2, 0o600)
+-                    } else {
+-                        Err(e)
+-                    }
+-                })?;
+-            fs::fsync(fd.as_raw_fd())?;
+-        }
+-        fs::fsync_dir_fd(control_fd.as_raw_fd())?;
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // Write initial wall watermark
+-        let wall_now = fs::clock_realtime_ns()?;
+-        let wall_bucket =
+-            bucket_number(wall_now, opts.delayed_bucket_width_ns).ok_or_else(|| {
+-                io::Error::new(io::ErrorKind::InvalidInput, "zero bucket width in init")
+-            })?;
+-        let wm = WatermarkRecord {
+-            highest_observed_bucket: wall_bucket,
+-            sequence: 0,
+-        };
+-        let wm_bytes = wm.encode();
+-        // Write via temp file then rename
+-        // C-03: Use unique temp name to avoid collision on partial init rerun
+-        let wm_tmp_name = format!(
+-            ".wm.tmp.{}",
+-            spoolq_names::hex_encode(&fs::random_128bit()?)
+-        );
+-        let wm_tmp = fs::create_exclusive(control_fd.as_raw_fd(), &wm_tmp_name, 0o600)?;
+-        fs::write_all(wm_tmp.as_raw_fd(), &wm_bytes)?;
+-        fs::fsync(wm_tmp.as_raw_fd())?;
+-        fs::renameat(
+-            control_fd.as_raw_fd(),
+-            &wm_tmp_name,
+-            control_fd.as_raw_fd(),
+-            "wall-watermark",
+-        )?;
+-        fs::fsync_dir_fd(control_fd.as_raw_fd())?;
+-
+-        // Write FORMAT file
+-        let format_bytes = format_rec.encode();
+-        // C-03: Unique temp name for partial init recovery
+-        let fmt_tmp_name = format!(
+-            ".format.tmp.{}",
+-            spoolq_names::hex_encode(&fs::random_128bit()?)
+-        );
+-        let fmt_tmp = fs::create_exclusive(root_fd.as_raw_fd(), &fmt_tmp_name, 0o600)?;
+-        fs::write_all(fmt_tmp.as_raw_fd(), &format_bytes)?;
+-        fs::fsync(fmt_tmp.as_raw_fd())?;
+-        // R2-B01: Publish FORMAT with RENAME_NOREPLACE so two concurrent
+-        // initializers cannot overwrite each other.
+-        match fs::renameat2_noreplace(
+-            root_fd.as_raw_fd(),
+-            &fmt_tmp_name,
+-            root_fd.as_raw_fd(),
+-            "FORMAT",
+-        ) {
+-            Ok(()) => {}
+-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+-                // Another initializer won the race. Clean up our temp and bail.
+-                let _ = fs::unlinkat(root_fd.as_raw_fd(), &fmt_tmp_name);
+-                return Err(io::Error::new(
+-                    io::ErrorKind::AlreadyExists,
+-                    "another initializer published FORMAT first",
+-                ));
+-            }
+-            Err(e) => return Err(e),
+-        }
+-        // C-02: Set FORMAT to read-only before final dir fsync, propagate failure
+-        fs::fchmodat(root_fd.as_raw_fd(), "FORMAT", 0o400)?;
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        // R2-B01: Remove the init marker now that FORMAT is published durably.
+-        init_guard.armed = false;
+-        fs::unlinkat(root_fd.as_raw_fd(), ".initializing")?;
+-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+-
+-        Ok(format_rec)
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Open an existing queue.
+     pub fn open(root: &Path, opts: &OpenOptions) -> Result<Self, Error> {
+         // B-11: Open root first using descriptor-relative, no-symlink semantics
+         let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+ 
+         // B-11: Validate root is a directory

@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ delete ! in Queue::open
+@@ -389,17 +389,17 @@
+         .saturating_add(2);
+         if probe_count > 4096 {
+             return Err(Error::InvalidInput(
+                 "receipt retention exceeds duplicate-ack probe bound".into(),
+             ));
+         }
+ 
+         // Check filesystem type
+-        if !opts.allow_unsupported_fs {
++        if  /* ~ changed by cargo-mutants ~ */opts.allow_unsupported_fs {
+             let magic = fs::statfs(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+             let ft = magic.f_type as i64;
+             match ft {
+                 fs::EXT4_SUPER_MAGIC | fs::XFS_SUPER_MAGIC => {}
+                 fs::TMPFS_MAGIC => {
+                     return Err(Error::UnsupportedFilesystem);
+                 }
+                 fs::NFS_SUPER_MAGIC | fs::FUSE_SUPER_MAGIC | fs::OVERLAYFS_SUPER_MAGIC => {

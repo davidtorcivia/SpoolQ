@@ -1,0 +1,756 @@
+
+*** crates/spoolq-core/src/queue.rs:354:30: replace & with | in Queue::open
+
+*** mutation diff:
+--- crates/spoolq-core/src/queue.rs
++++ replace & with | in Queue::open
+@@ -346,17 +346,17 @@
+     /// Open an existing queue.
+     pub fn open(root: &Path, opts: &OpenOptions) -> Result<Self, Error> {
+         // B-11: Open root first using descriptor-relative, no-symlink semantics
+         let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+ 
+         // B-11: Validate root is a directory
+         let root_stat =
+             fs::fstat(root_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+-        if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
++        if root_stat.st_mode | /* ~ changed by cargo-mutants ~ */ libc::S_IFMT != libc::S_IFDIR {
+             return Err(Error::QueueCorrupt("root path is not a directory".into()));
+         }
+ 
+         // B-11: Read FORMAT through descriptor-relative open, not pathname
+         let format_fd = fs::openat(root_fd.as_raw_fd(), "FORMAT", libc::O_RDONLY, 0)
+             .map_err(|e| Error::IoFailure(e.to_string()))?;
+         let mut format_bytes = Vec::new();
+         {
+
+
+*** /home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=spoolq-core@0.1.0
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh version_check v0.9.5
+       Fresh cfg-if v1.0.4
+       Fresh syn v2.0.119
+       Fresh typenum v1.20.1
+       Fresh syn v3.0.3
+       Fresh autocfg v1.5.1
+       Fresh cpufeatures v0.2.17
+       Fresh either v1.17.0
+       Fresh ciborium-io v0.2.2
+       Fresh anstyle v1.0.14
+       Fresh thiserror-impl v1.0.69
+       Fresh zerocopy-derive v0.8.56
+       Fresh serde_derive v1.0.229
+       Fresh memchr v2.8.3
+       Fresh plotters-backend v0.3.7
+       Fresh clap_lex v1.1.0
+       Fresh itoa v1.0.18
+       Fresh generic-array v0.14.7
+       Fresh libc v0.2.189
+       Fresh serde_core v1.0.229
+       Fresh crossbeam-utils v0.8.22
+       Fresh zerocopy v0.8.56
+       Fresh thiserror v1.0.69
+       Fresh zmij v1.0.23
+       Fresh regex-syntax v0.8.11
+       Fresh clap_builder v4.6.6
+       Fresh plotters-svg v0.3.7
+       Fresh itertools v0.10.5
+       Fresh linux-raw-sys v0.12.1
+       Fresh same-file v1.0.6
+       Fresh once_cell v1.21.4
+       Fresh bitflags v2.13.1
+       Fresh cast v0.3.0
+       Fresh fastrand v2.5.0
+       Fresh oorandom v11.1.5
+       Fresh block-buffer v0.10.4
+       Fresh crypto-common v0.1.7
+       Fresh crossbeam-epoch v0.9.20
+       Fresh half v2.7.1
+       Fresh serde v1.0.229
+       Fresh serde_json v1.0.151
+       Fresh regex-automata v0.4.18
+       Fresh num-traits v0.2.19
+       Fresh criterion-plot v0.5.0
+       Fresh getrandom v0.4.3
+       Fresh rustix v1.1.4
+       Fresh walkdir v2.5.0
+       Fresh is-terminal v0.4.17
+       Fresh clap v4.6.6
+       Fresh spoolq-fs-linux v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-fs-linux)
+       Fresh anes v0.1.6
+       Fresh digest v0.10.7
+       Fresh crossbeam-deque v0.8.7
+       Fresh ciborium-ll v0.2.2
+       Fresh regex v1.13.1
+       Fresh plotters v0.3.7
+       Fresh tinytemplate v1.2.1
+       Fresh tempfile v3.27.0
+       Fresh sha2 v0.10.9
+       Fresh rayon-core v1.13.0
+       Fresh ciborium v0.2.2
+       Fresh spoolq-format v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-format)
+       Fresh rayon v1.12.0
+       Fresh spoolq-math v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-math)
+       Fresh spoolq-names v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-names)
+       Fresh criterion v0.5.1
+       Dirty spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core): the file `crates/spoolq-core/src/queue.rs` has changed (1786134574.500136396s, 1s after last build at 1786134573.734118136s)
+   Compiling spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core)
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=03247d8421bced53 -C extra-filename=-c52a591e79bab391 --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern criterion=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libcriterion-336e364b27c03862.rlib --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rlib --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rlib --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rlib --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rlib --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rlib --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rlib --extern tempfile=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libtempfile-ecef740f18c6b843.rlib --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rlib`
+     Running `/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name spoolq_core --edition=2021 crates/spoolq-core/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=e4f6ed4dd60641bc -C extra-filename=-2f8fee100c77ff4a --out-dir /tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps --extern libc=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/liblibc-9e88ed3c5bf2ccdf.rmeta --extern sha2=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libsha2-65c10a9fa375dc42.rmeta --extern spoolq_format=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_format-d8914526dd26579d.rmeta --extern spoolq_fs_linux=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_fs_linux-fa1f830202f762e6.rmeta --extern spoolq_math=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_math-849003bb3180c716.rmeta --extern spoolq_names=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libspoolq_names-eba0d2135d1428a1.rmeta --extern thiserror=/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/libthiserror-b3cb4170505cb99c.rmeta`
+warning: unused variable: `e`
+    --> crates/spoolq-core/src/queue.rs:5270:38
+     |
+5270 |             AckOutcome::NotCommitted(e) => {
+     |                                      ^ help: if this is intentional, prefix it with an underscore: `_e`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: `spoolq-core` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s
+  Executable `/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/spoolq_core-c52a591e79bab391`
+
+*** result: Success
+
+*** /home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo test --verbose --package=spoolq-core@0.1.0
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh version_check v0.9.5
+       Fresh cfg-if v1.0.4
+       Fresh typenum v1.20.1
+       Fresh quote v1.0.47
+       Fresh cpufeatures v0.2.17
+       Fresh autocfg v1.5.1
+       Fresh either v1.17.0
+       Fresh plotters-backend v0.3.7
+       Fresh regex-syntax v0.8.11
+       Fresh memchr v2.8.3
+       Fresh itoa v1.0.18
+       Fresh syn v2.0.119
+       Fresh libc v0.2.189
+       Fresh serde_core v1.0.229
+       Fresh syn v3.0.3
+       Fresh clap_lex v1.1.0
+       Fresh anstyle v1.0.14
+       Fresh ciborium-io v0.2.2
+       Fresh regex-automata v0.4.18
+       Fresh generic-array v0.14.7
+       Fresh thiserror-impl v1.0.69
+       Fresh zerocopy-derive v0.8.56
+       Fresh crossbeam-utils v0.8.22
+       Fresh serde_derive v1.0.229
+       Fresh zmij v1.0.23
+       Fresh clap_builder v4.6.6
+       Fresh plotters-svg v0.3.7
+       Fresh itertools v0.10.5
+       Fresh once_cell v1.21.4
+       Fresh bitflags v2.13.1
+       Fresh cast v0.3.0
+       Fresh same-file v1.0.6
+       Fresh linux-raw-sys v0.12.1
+       Fresh is-terminal v0.4.17
+       Fresh regex v1.13.1
+       Fresh spoolq-fs-linux v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-fs-linux)
+       Fresh fastrand v2.5.0
+       Fresh anes v0.1.6
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh zerocopy v0.8.56
+       Fresh crossbeam-epoch v0.9.20
+       Fresh thiserror v1.0.69
+       Fresh serde v1.0.229
+       Fresh serde_json v1.0.151
+       Fresh num-traits v0.2.19
+       Fresh clap v4.6.6
+       Fresh walkdir v2.5.0
+       Fresh getrandom v0.4.3
+       Fresh criterion-plot v0.5.0
+       Fresh rustix v1.1.4
+       Fresh oorandom v11.1.5
+       Fresh digest v0.10.7
+       Fresh crossbeam-deque v0.8.7
+       Fresh half v2.7.1
+       Fresh plotters v0.3.7
+       Fresh tinytemplate v1.2.1
+       Fresh tempfile v3.27.0
+       Fresh sha2 v0.10.9
+       Fresh ciborium-ll v0.2.2
+       Fresh rayon-core v1.13.0
+       Fresh spoolq-format v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-format)
+       Fresh ciborium v0.2.2
+       Fresh spoolq-math v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-math)
+       Fresh rayon v1.12.0
+       Fresh spoolq-names v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-names)
+       Fresh criterion v0.5.1
+warning: unused variable: `e`
+    --> crates/spoolq-core/src/queue.rs:5270:38
+     |
+5270 |             AckOutcome::NotCommitted(e) => {
+     |                                      ^ help: if this is intentional, prefix it with an underscore: `_e`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: `spoolq-core` (lib test) generated 1 warning
+       Fresh spoolq-core v0.1.0 (/tmp/cargo-mutants-spoolq-3oe28L.tmp/crates/spoolq-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running `/tmp/cargo-mutants-spoolq-3oe28L.tmp/target/debug/deps/spoolq_core-c52a591e79bab391`
+
+running 89 tests
+test errors::tests::dead_reason_round_trip ... ok
+test errors::tests::lease_remaining ... ok
+test errors::tests::quarantine_reason_round_trip ... ok
+test queue::tests::ack_already_lost_returns_lease_lost ... FAILED
+test queue::tests::concurrent_producers_consumers_overlap ... FAILED
+test quarantine::tests::fsck_clean_queue ... FAILED
+test queue::tests::concurrent_lease_uniqueness ... FAILED
+test queue::tests::empty_queue_returns_empty_not_error ... FAILED
+test queue::tests::duplicate_ack_returns_already_acked ... FAILED
+test quarantine::tests::fsck_detects_header_corruption ... FAILED
+test queue::tests::ack_verified_fd_dev_ino_check ... FAILED
+test queue::tests::ack_preserves_error_categories ... FAILED
+test quarantine::tests::fsck_repair_quarantines_corrupt_header ... FAILED
+test quarantine::tests::fsck_finds_valid_job ... FAILED
+test queue::tests::enotdir_in_lease_path_is_corruption ... FAILED
+test queue::tests::enqueue_basic ... FAILED
+test queue::tests::ack_succeeds_without_explicit_verify ... FAILED
+test queue::tests::delay_preserves_attempt ... FAILED
+test queue::tests::concurrent_producers_consumers ... FAILED
+test quarantine::tests::fsck_deep_verifies_payload ... FAILED
+test queue::tests::ack_conflicting_receipt_is_not_already_acked ... FAILED
+test queue::tests::bury_after_lease ... FAILED
+test queue::tests::ack_accepts_verified_lease ... FAILED
+test queue::tests::enqueue_delayed ... FAILED
+test queue::tests::fsck_finds_valid_leased_job ... FAILED
+test queue::tests::enqueue_rejects_oversize_payload ... FAILED
+test queue::tests::enqueue_survives_reopen ... FAILED
+test queue::tests::enqueue_zero_payload ... FAILED
+test queue::tests::init_validates_zero_delayed_width ... ok
+test queue::tests::enqueue_zero_attempts_rejected ... FAILED
+test queue::tests::init_validates_zero_lease_width ... ok
+test queue::tests::fsck_finds_valid_dead_job ... FAILED
+test queue::tests::format_file_is_readonly ... ok
+test queue::tests::enqueue_large_payload ... FAILED
+test queue::tests::guard_attempt_limit_enforced ... FAILED
+test queue::tests::full_lifecycle_with_verify ... FAILED
+test queue::tests::fd_leak_stress ... FAILED
+test queue::tests::full_lifecycle ... FAILED
+test queue::tests::fsck_finds_valid_delayed_job ... FAILED
+test queue::tests::format_file_exists_after_init ... ok
+test queue::tests::guard_file_sync_before_publish ... FAILED
+test queue::tests::fsck_finds_valid_receipt ... FAILED
+test queue::tests::guard_name_tag_verification ... FAILED
+test queue::tests::guard_link_count ... FAILED
+test queue::tests::guard_payload_verification_prevents_ack ... FAILED
+test queue::tests::payload_verification ... FAILED
+test queue::tests::post_claim_returns_lease_on_success ... FAILED
+test queue::tests::init_and_open ... FAILED
+test queue::tests::guard_shard_verification ... FAILED
+test queue::tests::inspect_returns_empty_for_unknown ... FAILED
+test queue::tests::open_rejects_missing_state_dir ... ok
+test queue::tests::reject_retry_on_empty_queue ... FAILED
+test queue::tests::reject_ack_on_empty_queue ... FAILED
+test queue::tests::lease_empty_queue ... FAILED
+test queue::tests::inspect_finds_ready_job ... FAILED
+test queue::tests::init_refuses_existing_queue ... ok
+test queue::tests::read_lease_payload_chunk_respects_offset ... FAILED
+test queue::tests::inspect_finds_leased_job ... FAILED
+test queue::tests::reject_generation_overflow ... FAILED
+test queue::tests::oracle_driven_closed_loop ... FAILED
+test queue::tests::poisoned_queue_rejects_operations ... FAILED
+test queue::tests::reject_invalid_lease_duration ... FAILED
+test queue::tests::lease_duration_validation ... FAILED
+test state_machine::tests::ack_does_not_change_attempt ... ok
+test state_machine::tests::all_transitions_use_no_overwrite ... ok
+test state_machine::tests::claim_increments_attempt ... ok
+test state_machine::tests::illegal_transitions ... ok
+test state_machine::tests::legal_transitions ... ok
+test state_machine::tests::renew_preserves_token ... ok
+test state_machine::tests::transition_count ... ok
+test queue::tests::one_attempt_job_single_lease ... FAILED
+test queue::tests::reject_zero_dev_inode_lease ... FAILED
+test queue::tests::verify_lease_payload_detects_corruption ... FAILED
+test recovery::tests::recovery_empty_queue ... FAILED
+test queue::tests::retry_at_in_past_is_retry_now ... FAILED
+test queue::tests::resolve_detects_ready_object_present ... FAILED
+test queue::tests::retry_exhausted_goes_to_dead ... FAILED
+test queue::tests::scan_round_advances ... FAILED
+test queue::tests::retry_after_lease ... FAILED
+test queue::tests::resolve_source_still_in_ready ... FAILED
+test queue::tests::wall_floor_error_poisons_mutating_ops ... FAILED
+test recovery::tests::recovery_reaps_expired_lease ... FAILED
+test queue::tests::wall_watermark_advances ... FAILED
+test queue::tests::retry_with_policy_works ... FAILED
+test queue::tests::renew_extends_lease ... FAILED
+test queue::tests::stream_lease_payload_reads_all_data ... FAILED
+test queue::tests::verify_payload_detects_wrong_data ... FAILED
+test queue::tests::resolve_rejects_wrong_job_id ... FAILED
+test queue::tests::source_validation_rejects_wrong_generation ... FAILED
+
+failures:
+
+---- queue::tests::ack_already_lost_returns_lease_lost stdout ----
+
+thread 'queue::tests::ack_already_lost_returns_lease_lost' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- queue::tests::concurrent_producers_consumers_overlap stdout ----
+
+thread '<unnamed>' panicked at crates/spoolq-core/src/queue.rs:4828:14:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+thread 'queue::tests::concurrent_producers_consumers_overlap' panicked at crates/spoolq-core/src/queue.rs:4870:25:
+called `Result::unwrap()` on an `Err` value: Any { .. }
+
+thread '<unnamed>' panicked at crates/spoolq-core/src/queue.rs:4852:14:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- quarantine::tests::fsck_clean_queue stdout ----
+
+thread 'quarantine::tests::fsck_clean_queue' panicked at crates/spoolq-core/src/quarantine.rs:851:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::concurrent_lease_uniqueness stdout ----
+
+thread 'queue::tests::concurrent_lease_uniqueness' panicked at crates/spoolq-core/src/queue.rs:4068:14:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::empty_queue_returns_empty_not_error stdout ----
+
+thread 'queue::tests::empty_queue_returns_empty_not_error' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::duplicate_ack_returns_already_acked stdout ----
+
+thread 'queue::tests::duplicate_ack_returns_already_acked' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- quarantine::tests::fsck_detects_header_corruption stdout ----
+
+thread 'quarantine::tests::fsck_detects_header_corruption' panicked at crates/spoolq-core/src/quarantine.rs:940:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::ack_verified_fd_dev_ino_check stdout ----
+
+thread 'queue::tests::ack_verified_fd_dev_ino_check' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::ack_preserves_error_categories stdout ----
+
+thread 'queue::tests::ack_preserves_error_categories' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- quarantine::tests::fsck_repair_quarantines_corrupt_header stdout ----
+
+thread 'quarantine::tests::fsck_repair_quarantines_corrupt_header' panicked at crates/spoolq-core/src/quarantine.rs:990:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- quarantine::tests::fsck_finds_valid_job stdout ----
+
+thread 'quarantine::tests::fsck_finds_valid_job' panicked at crates/spoolq-core/src/quarantine.rs:868:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enotdir_in_lease_path_is_corruption stdout ----
+
+thread 'queue::tests::enotdir_in_lease_path_is_corruption' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enqueue_basic stdout ----
+
+thread 'queue::tests::enqueue_basic' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::ack_succeeds_without_explicit_verify stdout ----
+
+thread 'queue::tests::ack_succeeds_without_explicit_verify' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::delay_preserves_attempt stdout ----
+
+thread 'queue::tests::delay_preserves_attempt' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::concurrent_producers_consumers stdout ----
+
+thread '<unnamed>' panicked at crates/spoolq-core/src/queue.rs:3978:18:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+thread '<unnamed>' panicked at crates/spoolq-core/src/queue.rs:3978:18:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+thread 'queue::tests::concurrent_producers_consumers' panicked at crates/spoolq-core/src/queue.rs:3994:22:
+called `Result::unwrap()` on an `Err` value: Any { .. }
+
+thread '<unnamed>' panicked at crates/spoolq-core/src/queue.rs:3978:18:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+thread '<unnamed>' panicked at crates/spoolq-core/src/queue.rs:3978:18:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- quarantine::tests::fsck_deep_verifies_payload stdout ----
+
+thread 'quarantine::tests::fsck_deep_verifies_payload' panicked at crates/spoolq-core/src/quarantine.rs:902:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::ack_conflicting_receipt_is_not_already_acked stdout ----
+
+thread 'queue::tests::ack_conflicting_receipt_is_not_already_acked' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::bury_after_lease stdout ----
+
+thread 'queue::tests::bury_after_lease' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::ack_accepts_verified_lease stdout ----
+
+thread 'queue::tests::ack_accepts_verified_lease' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enqueue_delayed stdout ----
+
+thread 'queue::tests::enqueue_delayed' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::fsck_finds_valid_leased_job stdout ----
+
+thread 'queue::tests::fsck_finds_valid_leased_job' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enqueue_rejects_oversize_payload stdout ----
+
+thread 'queue::tests::enqueue_rejects_oversize_payload' panicked at crates/spoolq-core/src/queue.rs:4453:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enqueue_survives_reopen stdout ----
+
+thread 'queue::tests::enqueue_survives_reopen' panicked at crates/spoolq-core/src/queue.rs:4124:14:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enqueue_zero_payload stdout ----
+
+thread 'queue::tests::enqueue_zero_payload' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enqueue_zero_attempts_rejected stdout ----
+
+thread 'queue::tests::enqueue_zero_attempts_rejected' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::fsck_finds_valid_dead_job stdout ----
+
+thread 'queue::tests::fsck_finds_valid_dead_job' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::enqueue_large_payload stdout ----
+
+thread 'queue::tests::enqueue_large_payload' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::guard_attempt_limit_enforced stdout ----
+
+thread 'queue::tests::guard_attempt_limit_enforced' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::full_lifecycle_with_verify stdout ----
+
+thread 'queue::tests::full_lifecycle_with_verify' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::fd_leak_stress stdout ----
+
+thread 'queue::tests::fd_leak_stress' panicked at crates/spoolq-core/src/queue.rs:4901:14:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::full_lifecycle stdout ----
+
+thread 'queue::tests::full_lifecycle' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::fsck_finds_valid_delayed_job stdout ----
+
+thread 'queue::tests::fsck_finds_valid_delayed_job' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::guard_file_sync_before_publish stdout ----
+
+thread 'queue::tests::guard_file_sync_before_publish' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::fsck_finds_valid_receipt stdout ----
+
+thread 'queue::tests::fsck_finds_valid_receipt' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::guard_name_tag_verification stdout ----
+
+thread 'queue::tests::guard_name_tag_verification' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::guard_link_count stdout ----
+
+thread 'queue::tests::guard_link_count' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::guard_payload_verification_prevents_ack stdout ----
+
+thread 'queue::tests::guard_payload_verification_prevents_ack' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::payload_verification stdout ----
+
+thread 'queue::tests::payload_verification' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::post_claim_returns_lease_on_success stdout ----
+
+thread 'queue::tests::post_claim_returns_lease_on_success' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::init_and_open stdout ----
+
+thread 'queue::tests::init_and_open' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::guard_shard_verification stdout ----
+
+thread 'queue::tests::guard_shard_verification' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::inspect_returns_empty_for_unknown stdout ----
+
+thread 'queue::tests::inspect_returns_empty_for_unknown' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::reject_retry_on_empty_queue stdout ----
+
+thread 'queue::tests::reject_retry_on_empty_queue' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::reject_ack_on_empty_queue stdout ----
+
+thread 'queue::tests::reject_ack_on_empty_queue' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::lease_empty_queue stdout ----
+
+thread 'queue::tests::lease_empty_queue' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::inspect_finds_ready_job stdout ----
+
+thread 'queue::tests::inspect_finds_ready_job' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::read_lease_payload_chunk_respects_offset stdout ----
+
+thread 'queue::tests::read_lease_payload_chunk_respects_offset' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::inspect_finds_leased_job stdout ----
+
+thread 'queue::tests::inspect_finds_leased_job' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::reject_generation_overflow stdout ----
+
+thread 'queue::tests::reject_generation_overflow' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::oracle_driven_closed_loop stdout ----
+
+thread 'queue::tests::oracle_driven_closed_loop' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::poisoned_queue_rejects_operations stdout ----
+
+thread 'queue::tests::poisoned_queue_rejects_operations' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::reject_invalid_lease_duration stdout ----
+
+thread 'queue::tests::reject_invalid_lease_duration' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::lease_duration_validation stdout ----
+
+thread 'queue::tests::lease_duration_validation' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::one_attempt_job_single_lease stdout ----
+
+thread 'queue::tests::one_attempt_job_single_lease' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::reject_zero_dev_inode_lease stdout ----
+
+thread 'queue::tests::reject_zero_dev_inode_lease' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::verify_lease_payload_detects_corruption stdout ----
+
+thread 'queue::tests::verify_lease_payload_detects_corruption' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- recovery::tests::recovery_empty_queue stdout ----
+
+thread 'recovery::tests::recovery_empty_queue' panicked at crates/spoolq-core/src/recovery.rs:1181:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::retry_at_in_past_is_retry_now stdout ----
+
+thread 'queue::tests::retry_at_in_past_is_retry_now' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::resolve_detects_ready_object_present stdout ----
+
+thread 'queue::tests::resolve_detects_ready_object_present' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::retry_exhausted_goes_to_dead stdout ----
+
+thread 'queue::tests::retry_exhausted_goes_to_dead' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::scan_round_advances stdout ----
+
+thread 'queue::tests::scan_round_advances' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::retry_after_lease stdout ----
+
+thread 'queue::tests::retry_after_lease' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::resolve_source_still_in_ready stdout ----
+
+thread 'queue::tests::resolve_source_still_in_ready' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::wall_floor_error_poisons_mutating_ops stdout ----
+
+thread 'queue::tests::wall_floor_error_poisons_mutating_ops' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- recovery::tests::recovery_reaps_expired_lease stdout ----
+
+thread 'recovery::tests::recovery_reaps_expired_lease' panicked at crates/spoolq-core/src/recovery.rs:1181:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::wall_watermark_advances stdout ----
+
+thread 'queue::tests::wall_watermark_advances' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::retry_with_policy_works stdout ----
+
+thread 'queue::tests::retry_with_policy_works' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::renew_extends_lease stdout ----
+
+thread 'queue::tests::renew_extends_lease' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::stream_lease_payload_reads_all_data stdout ----
+
+thread 'queue::tests::stream_lease_payload_reads_all_data' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::verify_payload_detects_wrong_data stdout ----
+
+thread 'queue::tests::verify_payload_detects_wrong_data' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::resolve_rejects_wrong_job_id stdout ----
+
+thread 'queue::tests::resolve_rejects_wrong_job_id' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+---- queue::tests::source_validation_rejects_wrong_generation stdout ----
+
+thread 'queue::tests::source_validation_rejects_wrong_generation' panicked at crates/spoolq-core/src/queue.rs:3582:10:
+called `Result::unwrap()` on an `Err` value: QueueCorrupt("root path is not a directory")
+
+
+failures:
+    quarantine::tests::fsck_clean_queue
+    quarantine::tests::fsck_deep_verifies_payload
+    quarantine::tests::fsck_detects_header_corruption
+    quarantine::tests::fsck_finds_valid_job
+    quarantine::tests::fsck_repair_quarantines_corrupt_header
+    queue::tests::ack_accepts_verified_lease
+    queue::tests::ack_already_lost_returns_lease_lost
+    queue::tests::ack_conflicting_receipt_is_not_already_acked
+    queue::tests::ack_preserves_error_categories
+    queue::tests::ack_succeeds_without_explicit_verify
+    queue::tests::ack_verified_fd_dev_ino_check
+    queue::tests::bury_after_lease
+    queue::tests::concurrent_lease_uniqueness
+    queue::tests::concurrent_producers_consumers
+    queue::tests::concurrent_producers_consumers_overlap
+    queue::tests::delay_preserves_attempt
+    queue::tests::duplicate_ack_returns_already_acked
+    queue::tests::empty_queue_returns_empty_not_error
+    queue::tests::enotdir_in_lease_path_is_corruption
+    queue::tests::enqueue_basic
+    queue::tests::enqueue_delayed
+    queue::tests::enqueue_large_payload
+    queue::tests::enqueue_rejects_oversize_payload
+    queue::tests::enqueue_survives_reopen
+    queue::tests::enqueue_zero_attempts_rejected
+    queue::tests::enqueue_zero_payload
+    queue::tests::fd_leak_stress
+    queue::tests::fsck_finds_valid_dead_job
+    queue::tests::fsck_finds_valid_delayed_job
+    queue::tests::fsck_finds_valid_leased_job
+    queue::tests::fsck_finds_valid_receipt
+    queue::tests::full_lifecycle
+    queue::tests::full_lifecycle_with_verify
+    queue::tests::guard_attempt_limit_enforced
+    queue::tests::guard_file_sync_before_publish
+    queue::tests::guard_link_count
+    queue::tests::guard_name_tag_verification
+    queue::tests::guard_payload_verification_prevents_ack
+    queue::tests::guard_shard_verification
+    queue::tests::init_and_open
+    queue::tests::inspect_finds_leased_job
+    queue::tests::inspect_finds_ready_job
+    queue::tests::inspect_returns_empty_for_unknown
+    queue::tests::lease_duration_validation
+    queue::tests::lease_empty_queue
+    queue::tests::one_attempt_job_single_lease
+    queue::tests::oracle_driven_closed_loop
+    queue::tests::payload_verification
+    queue::tests::poisoned_queue_rejects_operations
+    queue::tests::post_claim_returns_lease_on_success
+    queue::tests::read_lease_payload_chunk_respects_offset
+    queue::tests::reject_ack_on_empty_queue
+    queue::tests::reject_generation_overflow
+    queue::tests::reject_invalid_lease_duration
+    queue::tests::reject_retry_on_empty_queue
+    queue::tests::reject_zero_dev_inode_lease
+    queue::tests::renew_extends_lease
+    queue::tests::resolve_detects_ready_object_present
+    queue::tests::resolve_rejects_wrong_job_id
+    queue::tests::resolve_source_still_in_ready
+    queue::tests::retry_after_lease
+    queue::tests::retry_at_in_past_is_retry_now
+    queue::tests::retry_exhausted_goes_to_dead
+    queue::tests::retry_with_policy_works
+    queue::tests::scan_round_advances
+    queue::tests::source_validation_rejects_wrong_generation
+    queue::tests::stream_lease_payload_reads_all_data
+    queue::tests::verify_lease_payload_detects_corruption
+    queue::tests::verify_payload_detects_wrong_data
+    queue::tests::wall_floor_error_poisons_mutating_ops
+    queue::tests::wall_watermark_advances
+    recovery::tests::recovery_empty_queue
+    recovery::tests::recovery_reaps_expired_lease
+
+test result: FAILED. 16 passed; 73 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p spoolq-core --lib`
+
+*** result: Failure(101)

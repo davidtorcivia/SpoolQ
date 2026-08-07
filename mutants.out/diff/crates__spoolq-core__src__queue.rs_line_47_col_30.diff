@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace || with && in validate_create_options
+@@ -39,17 +39,17 @@
+             max_payload_length: MAX_PAYLOAD_LENGTH,
+         }
+     }
+ }
+ 
+ /// Validate all CreateOptions before any filesystem mutation (C-01).
+ /// Same validation used in encoding and tests.
+ pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
+-    if opts.shard_count == 0 || !opts.shard_count.is_power_of_two() || opts.shard_count > 4096 {
++    if opts.shard_count == 0 && /* ~ changed by cargo-mutants ~ */ !opts.shard_count.is_power_of_two() || opts.shard_count > 4096 {
+         return Err(Error::InvalidInput("invalid shard count".into()));
+     }
+     if opts.lease_bucket_width_ns == 0 {
+         return Err(Error::InvalidInput(
+             "lease bucket width must be non-zero".into(),
+         ));
+     }
+     if opts.delayed_bucket_width_ns == 0 {

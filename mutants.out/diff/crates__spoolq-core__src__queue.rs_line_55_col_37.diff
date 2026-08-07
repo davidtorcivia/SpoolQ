@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace == with != in validate_create_options
+@@ -47,17 +47,17 @@
+     if opts.shard_count == 0 || !opts.shard_count.is_power_of_two() || opts.shard_count > 4096 {
+         return Err(Error::InvalidInput("invalid shard count".into()));
+     }
+     if opts.lease_bucket_width_ns == 0 {
+         return Err(Error::InvalidInput(
+             "lease bucket width must be non-zero".into(),
+         ));
+     }
+-    if opts.delayed_bucket_width_ns == 0 {
++    if opts.delayed_bucket_width_ns != /* ~ changed by cargo-mutants ~ */ 0 {
+         return Err(Error::InvalidInput(
+             "delayed bucket width must be non-zero".into(),
+         ));
+     }
+     if opts.terminal_bucket_width_ns == 0 {
+         return Err(Error::InvalidInput(
+             "terminal bucket width must be non-zero".into(),
+         ));

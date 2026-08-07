@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace == with != in Queue::init
+@@ -184,17 +184,17 @@
+             armed: true,
+         };
+ 
+         // R2-B01: Create control/ early so we can hold the maintenance lock
+         // with RAII (no mem::forget leak).
+         fs::mkdirat_eexist_ok(root_fd.as_raw_fd(), "control", 0o700)?;
+         let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
+         fs::create_exclusive(control_fd.as_raw_fd(), "maintenance.lock", 0o600).or_else(|e| {
+-            if e.kind() == io::ErrorKind::AlreadyExists {
++            if e.kind() != /* ~ changed by cargo-mutants ~ */ io::ErrorKind::AlreadyExists {
+                 fs::openat(
+                     control_fd.as_raw_fd(),
+                     "maintenance.lock",
+                     libc::O_RDWR,
+                     0o600,
+                 )
+             } else {
+                 Err(e)

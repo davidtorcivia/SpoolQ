@@ -1,0 +1,25 @@
+crates/spoolq-core/src/queue.rs:47:5: replace validate_create_options -> Result<(), Error> with Ok(())
+crates/spoolq-core/src/queue.rs:47:25: replace == with != in validate_create_options
+crates/spoolq-core/src/queue.rs:47:33: delete ! in validate_create_options
+crates/spoolq-core/src/queue.rs:47:89: replace > with < in validate_create_options
+crates/spoolq-core/src/queue.rs:50:35: replace == with != in validate_create_options
+crates/spoolq-core/src/queue.rs:55:37: replace == with != in validate_create_options
+crates/spoolq-core/src/queue.rs:60:38: replace == with != in validate_create_options
+crates/spoolq-core/src/queue.rs:65:8: delete ! in validate_create_options
+crates/spoolq-core/src/queue.rs:68:32: replace > with == in validate_create_options
+crates/spoolq-core/src/queue.rs:68:32: replace > with < in validate_create_options
+crates/spoolq-core/src/queue.rs:68:32: replace > with >= in validate_create_options
+crates/spoolq-core/src/queue.rs:192:25: replace == with != in Queue::init
+crates/spoolq-core/src/queue.rs:210:12: delete ! in Queue::init
+crates/spoolq-core/src/queue.rs:266:33: replace == with != in Queue::init
+crates/spoolq-core/src/queue.rs:324:23: replace match guard e.kind() == io::ErrorKind::AlreadyExists with false in Queue::init
+crates/spoolq-core/src/queue.rs:324:32: replace == with != in Queue::init
+crates/spoolq-core/src/queue.rs:354:45: replace != with == in Queue::open
+crates/spoolq-core/src/queue.rs:354:30: replace & with | in Queue::open
+crates/spoolq-core/src/queue.rs:354:30: replace & with ^ in Queue::open
+crates/spoolq-core/src/queue.rs:390:24: replace > with < in Queue::open
+crates/spoolq-core/src/queue.rs:427:36: replace != with == in Queue::open
+crates/spoolq-core/src/queue.rs:432:52: replace != with == in Queue::open
+crates/spoolq-core/src/queue.rs:432:37: replace & with | in Queue::open
+crates/spoolq-core/src/queue.rs:432:37: replace & with ^ in Queue::open
+crates/spoolq-core/src/queue.rs:459:12: delete ! in Queue::open

@@ -1,0 +1,21 @@
+--- crates/spoolq-core/src/queue.rs
++++ replace == with != in Queue::init
+@@ -258,17 +258,17 @@
+         // Sync root
+         fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+ 
+         // Create control lock files
+         let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
+         for lock_file in ["maintenance.lock", "wall-watermark.lock"] {
+             let fd =
+                 fs::create_exclusive(control_fd.as_raw_fd(), lock_file, 0o600).or_else(|e| {
+-                    if e.kind() == io::ErrorKind::AlreadyExists {
++                    if e.kind() != /* ~ changed by cargo-mutants ~ */ io::ErrorKind::AlreadyExists {
+                         fs::openat(control_fd.as_raw_fd(), lock_file, 0o2, 0o600)
+                     } else {
+                         Err(e)
+                     }
+                 })?;
+             fs::fsync(fd.as_raw_fd())?;
+         }
+         fs::fsync_dir_fd(control_fd.as_raw_fd())?;

@@ -1,0 +1,23 @@
+--- crates/spoolq-core/src/queue.rs
++++ delete match arm fs::NFS_SUPER_MAGIC | fs::FUSE_SUPER_MAGIC | fs::OVERLAYFS_SUPER_MAGIC in Queue::open
+@@ -397,19 +397,17 @@
+         if !opts.allow_unsupported_fs {
+             let magic = fs::statfs(root).map_err(|e| Error::IoFailure(e.to_string()))?;
+             let ft = magic.f_type as i64;
+             match ft {
+                 fs::EXT4_SUPER_MAGIC | fs::XFS_SUPER_MAGIC => {}
+                 fs::TMPFS_MAGIC => {
+                     return Err(Error::UnsupportedFilesystem);
+                 }
+-                fs::NFS_SUPER_MAGIC | fs::FUSE_SUPER_MAGIC | fs::OVERLAYFS_SUPER_MAGIC => {
+-                    return Err(Error::UnsupportedFilesystem);
+-                }
++                 /* ~ changed by cargo-mutants ~ */
+                 _ => {
+                     return Err(Error::UnsupportedFilesystem);
+                 }
+             }
+         }
+ 
+         // B-11: Require all state directories to exist and be on the same device.
+         for state_dir in &[
