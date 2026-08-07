@@ -275,6 +275,108 @@ impl CommonFields {
     }
 }
 
+// ---------- Canonical context reconstruction ----------
+// P0-02/P0-03: Single source of truth for name-tag context.
+// Every consumer (resolver, fsck, recovery, duplicate-ack) calls these
+// instead of reconstructing the context independently.
+
+impl ReadyName {
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, shard_hex: &str) -> String {
+        ready_context(shard_hex, &self.common.base_name())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl LeasedName {
+    fn leased_base(&self) -> String {
+        format!(
+            "{}.b{}.w{}.t{}",
+            self.common.base_name(),
+            hex_u64(self.boottime_deadline_ns),
+            hex_u64(self.wall_deadline_ns),
+            hex_encode(&self.token),
+        )
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, boot_id: &str, bucket: &str, shard_hex: &str) -> String {
+        leased_context(boot_id, bucket, shard_hex, &self.leased_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(
+        &self,
+        queue_id: &[u8; 16],
+        boot_id: &str,
+        bucket: &str,
+        shard_hex: &str,
+    ) -> bool {
+        let ctx = self.canonical_context(boot_id, bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl DelayedName {
+    fn delayed_base(&self) -> String {
+        format!(
+            "{}.d{}",
+            self.common.base_name(),
+            hex_u64(self.not_before_ns),
+        )
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, bucket: &str, shard_hex: &str) -> String {
+        delayed_context(bucket, shard_hex, &self.delayed_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl DeadName {
+    fn dead_base(&self) -> String {
+        format!("{}.x{}", self.common.base_name(), hex_u16(self.reason),)
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, bucket: &str, shard_hex: &str) -> String {
+        terminal_context(State::Dead, bucket, shard_hex, &self.dead_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl ReceiptName {
+    fn receipt_base(&self) -> String {
+        format!("{}.t{}", self.common.base_name(), hex_encode(&self.token),)
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, bucket: &str, shard_hex: &str) -> String {
+        terminal_context(State::Receipt, bucket, shard_hex, &self.receipt_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
 // Ready: <job-id>.g<gen>.a<att>.m<max>.k<tag>.sqj
 pub fn ready_filename(fields: &CommonFields, tag: &[u8; 8]) -> String {
     format!("{}.k{}.sqj", fields.base_name(), name_tag_hex(tag))

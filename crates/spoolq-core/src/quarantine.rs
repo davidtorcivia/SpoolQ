@@ -706,88 +706,83 @@ impl Queue {
         token: Option<[u8; 16]>,
         queue_id: &[u8; 16],
     ) -> bool {
-        let job_hex = spoolq_names::hex_encode(&common.job_id);
-        let base_no_token = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}",
-            job_hex, common.generation, common.attempt, common.maximum_attempts,
-        );
-
-        let expected_tag = match state_name {
+        // P0-03: Use canonical authentication from spoolq-names instead of
+        // reconstructing tag contexts independently. Wrong path shapes fail
+        // closed (return false) instead of returning true.
+        match state_name {
             "ready" => {
-                // ready/<shard>/<filename> = 3 parts
                 if path_parts.len() != 3 {
-                    return true;
+                    return false;
                 }
                 let shard_hex = path_parts[1];
-                let ctx = spoolq_names::ready_context(shard_hex, &base_no_token);
-                spoolq_names::compute_name_tag(queue_id, &ctx)
+                let name = spoolq_names::ReadyName {
+                    common: common.clone(),
+                    tag: parsed_tag,
+                };
+                name.authenticate_tag(queue_id, shard_hex)
             }
             "leased" => {
-                // leased/<boot>/<bucket>/<shard>/<filename> = 5 parts
                 if path_parts.len() != 5 {
-                    return true;
+                    return false;
                 }
                 let boot = path_parts[1];
                 let bucket = path_parts[2];
                 let shard_hex = path_parts[3];
-                let token_hex = match token {
-                    Some(t) => spoolq_names::hex_encode(&t),
-                    None => return true,
+                let _tok = match token {
+                    Some(t) => t,
+                    None => return false,
                 };
-                let base = format!("{base_no_token}.t{token_hex}");
-                let ctx = spoolq_names::leased_context(boot, bucket, shard_hex, &base);
-                spoolq_names::compute_name_tag(queue_id, &ctx)
+                // Reconstruct the leased name with deadlines from the parsed fields.
+                // We don't have the deadline values here, but the tag was computed
+                // over them. We need to re-parse the filename to get all fields.
+                // Since the caller already parsed and extracted common + tag + token,
+                // we need the full parse result. Fall back to re-parsing.
+                let filename = path_parts[4];
+                match spoolq_names::parse_leased(filename) {
+                    Ok(p) => p.authenticate_tag(queue_id, boot, bucket, shard_hex),
+                    Err(_) => false,
+                }
             }
             "delayed" => {
-                // delayed/<bucket>/<shard>/<filename> = 4 parts
-                // Delayed filenames include retry_after_ns in the tag context.
-                // We cannot reconstruct the full context here without the
-                // retry_after_ns field, so skip tag verification for delayed.
-                // Shard placement is still verified by fsck_extract_shard_hex.
-                return true;
+                if path_parts.len() != 4 {
+                    return false;
+                }
+                let bucket = path_parts[1];
+                let shard_hex = path_parts[2];
+                let filename = path_parts[3];
+                match spoolq_names::parse_delayed(filename) {
+                    Ok(p) => p.authenticate_tag(queue_id, bucket, shard_hex),
+                    Err(_) => false,
+                }
             }
             "dead" => {
-                // dead/<bucket>/<shard>/<filename> = 4 parts
                 if path_parts.len() != 4 {
-                    return true;
+                    return false;
                 }
                 let bucket = path_parts[1];
                 let shard_hex = path_parts[2];
-                let ctx = spoolq_names::terminal_context(
-                    spoolq_names::State::Dead,
-                    bucket,
-                    shard_hex,
-                    &base_no_token,
-                );
-                spoolq_names::compute_name_tag(queue_id, &ctx)
+                let filename = path_parts[3];
+                match spoolq_names::parse_dead(filename) {
+                    Ok(p) => p.authenticate_tag(queue_id, bucket, shard_hex),
+                    Err(_) => false,
+                }
             }
             "receipts" => {
-                // receipts/<bucket>/<shard>/<filename> = 4 parts
                 if path_parts.len() != 4 {
-                    return true;
+                    return false;
                 }
                 let bucket = path_parts[1];
                 let shard_hex = path_parts[2];
-                let token_hex = match token {
-                    Some(t) => spoolq_names::hex_encode(&t),
-                    None => return true,
-                };
-                let base = format!("{base_no_token}.t{token_hex}");
-                let ctx = spoolq_names::terminal_context(
-                    spoolq_names::State::Receipt,
-                    bucket,
-                    shard_hex,
-                    &base,
-                );
-                spoolq_names::compute_name_tag(queue_id, &ctx)
+                let filename = path_parts[3];
+                match spoolq_names::parse_receipt(filename) {
+                    Ok(p) => p.authenticate_tag(queue_id, bucket, shard_hex),
+                    Err(_) => false,
+                }
             }
-            _ => return true,
-        };
-
-        expected_tag == parsed_tag
+            _ => false,
+        }
     }
 
-    /// Extract the shard hex from the path based on state structure.
     fn fsck_extract_shard_hex<'a>(
         &self,
         state_name: &str,
