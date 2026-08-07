@@ -1159,7 +1159,7 @@ impl Queue {
                         DeadReason::AttemptsExhausted,
                     ) {
                         Ok(()) => continue,
-                        Err(e) => {
+                        Err(_) => {
                             // P1-07: Don't ignore cleanup failure.
                             scan_had_error = true;
                             self.poison();
@@ -2638,21 +2638,50 @@ impl Queue {
         Ok(n)
     }
 
-    /// R4-PERF: Stream a leased job's payload through a callback.
-    /// Reads in chunks of chunk_size, calling f for each chunk.
-    /// Validates source identity before reading (B-04).
+    /// P1-14: Stream a leased job's payload with O(1) validation/open.
+    /// Opens the file once, validates identity once, reads header once,
+    /// then performs pread calls on the held fd.
     pub fn stream_lease_payload<F: FnMut(&[u8]) -> Result<(), Error>>(
         &self,
         lease: &LeaseInfo,
         chunk_size: usize,
         mut f: F,
     ) -> Result<(), Error> {
-        let mut buf = vec![0u8; chunk_size.clamp(4096, 1 << 20)];
+        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
+            Some(pair) => pair,
+            None => return Err(Error::QueueCorrupt("lease source not found".into())),
+        };
+        let file_fd = fs::openat(
+            src_dir_fd.as_raw_fd(),
+            &src_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        )
+        .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        let mut header_buf = [0u8; 128];
+        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let header =
+            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
+
+        let ext_len = header.extension_header_length as usize;
+        let payload_start = (128 + ext_len) as u64;
+        let payload_len = header.payload_length;
+
+        let cap = chunk_size.clamp(4096, 1 << 20);
+        let mut buf = vec![0u8; cap];
         let mut offset = 0u64;
-        loop {
-            let n = self.read_lease_payload_chunk(lease, &mut buf, offset)?;
+        while offset < payload_len {
+            let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
+            let n = fs::pread(
+                file_fd.as_raw_fd(),
+                &mut buf[..to_read],
+                payload_start + offset,
+            )
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
             if n == 0 {
-                break;
+                return Err(Error::QueueCorrupt("unexpected EOF during stream".into()));
             }
             f(&buf[..n])?;
             offset += n as u64;

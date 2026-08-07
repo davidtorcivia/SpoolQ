@@ -111,6 +111,7 @@ impl Mutation {
 
 /// Run a mutation test: verify that the mutation causes a detectable difference.
 /// P1-26: Each mutation now actually alters the modeled behavior.
+#[allow(clippy::needless_return)]
 pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
     let mut sim = Simulator::new(seed);
     let mut oracle = Oracle::new();
@@ -130,7 +131,7 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
             sim.crash();
             let oracle_expects_visible = oracle
                 .get(&job)
-                .map(|j| j.state != crate::oracle::OracleState::Hidden)
+                .map(|j| j.state != OracleState::Hidden)
                 .unwrap_or(false);
             let sim_has_file = sim.exists("ready/0000/job.sqj");
             return MutationResult {
@@ -160,7 +161,7 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
             oracle.record_crash();
             let oracle_visible = oracle
                 .get(&job)
-                .map(|j| j.state != crate::oracle::OracleState::Hidden)
+                .map(|j| j.state != OracleState::Hidden)
                 .unwrap_or(false);
             let sim_has =
                 sim.exists("leased/boot/0/0000/job.sqj") || sim.exists("ready/0000/job.sqj");
@@ -226,31 +227,6 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
                 sim_has_file: sim.exists("ready/0000/job.sqj"),
             };
         }
-    }
-
-    // Default path for RemoveFileSyncBeforePublish
-    sim.fsync_file("ready/0000/job.sqj");
-    oracle.record_file_sync(&job);
-    oracle.record_publish(&job, true);
-
-    oracle.record_crash();
-    sim.crash();
-
-    let oracle_job = oracle.get(&job);
-    let sim_has_file = sim.exists("ready/0000/job.sqj");
-    let oracle_expects_visible = oracle_job
-        .map(|j| j.state != crate::oracle::OracleState::Hidden)
-        .unwrap_or(false);
-    let detected = oracle_expects_visible != sim_has_file;
-
-    MutationResult {
-        mutation,
-        seed,
-        detected,
-        oracle_state: oracle_job
-            .map(|j| format!("{:?}", j.state))
-            .unwrap_or("none".into()),
-        sim_has_file,
     }
 }
 
