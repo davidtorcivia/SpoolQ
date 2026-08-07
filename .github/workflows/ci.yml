@@ -61,6 +61,7 @@ jobs:
   # Mutation testing - parallelized per crate via matrix
   mutants:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     continue-on-error: true
     strategy:
       fail-fast: false
