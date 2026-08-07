@@ -561,7 +561,7 @@ fn main() -> ExitCode {
             // effective wall clock.
             let outcome = match after_seconds {
                 Some(s) => {
-                    let duration_ns = s.checked_mul(1_000_000_000).unwrap_or(u64::MAX);
+                    let duration_ns = s.saturating_mul(1_000_000_000);
                     queue.retry_after(&lease, duration_ns)
                 }
                 None => queue.retry_now(&lease),
