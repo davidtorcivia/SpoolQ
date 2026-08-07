@@ -52,10 +52,32 @@ impl Queue {
     /// Run one bounded recovery pass.
     pub fn recover(&mut self, budget: &WorkBudget) -> RecoveryStats {
         let mut stats = RecoveryStats::default();
-        let boottime_now = fs::clock_boottime_ns().unwrap_or(0);
+        let boottime_now = match fs::clock_boottime_ns() {
+            Ok(t) => t,
+            Err(e) => {
+                let mut s = RecoveryStats::default();
+                s.errors.push(RecoveryError {
+                    operation: "clock_boottime".into(),
+                    relative_path: "/".into(),
+                    error: e.to_string(),
+                });
+                return s;
+            }
+        };
         let wall_now = self.effective_wall_floor_ns();
         // C-31: Use CLOCK_MONOTONIC for budget enforcement
-        let start_mono = fs::clock_monotonic_ns().unwrap_or(0);
+        let start_mono = match fs::clock_monotonic_ns() {
+            Ok(t) => t,
+            Err(e) => {
+                let mut s = RecoveryStats::default();
+                s.errors.push(RecoveryError {
+                    operation: "clock_monotonic".into(),
+                    relative_path: "/".into(),
+                    error: e.to_string(),
+                });
+                return s;
+            }
+        };
         let deadline_mono =
             start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
 
@@ -144,12 +166,18 @@ impl Queue {
         // Scan leased/ directories
         let leased_fd = match fs::open_directory(root_fd, "leased") {
             Ok(fd) => fd,
-            Err(_) => return,
+            Err(e) => {
+                Self::record_error(stats, "open_leased_dir", "leased", &e.to_string());
+                return;
+            }
         };
 
         let boot_dirs = match fs::read_dir_entries_owned(leased_fd.as_raw_fd()) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(e) => {
+                Self::record_error(stats, "read_leased_dirs", "leased", &e.to_string());
+                return;
+            }
         };
 
         for boot_dir_name in &boot_dirs {
@@ -271,6 +299,27 @@ impl Queue {
                                     crate::QuarantineReason::EnvelopeCorrupt,
                                 );
                             }
+                            continue;
+                        }
+
+                        // R4-B02: Verify bucket placement matches deadline-derived bucket
+                        let expected_lease_bucket = spoolq_math::lease_bucket(
+                            parsed.boottime_deadline_ns,
+                            self.format.lease_bucket_width_ns,
+                        )
+                        .unwrap_or(0);
+                        let actual_bucket = u64::from_str_radix(bucket_name, 16).unwrap_or(0);
+                        if actual_bucket != expected_lease_bucket {
+                            Self::record_error(
+                                stats,
+                                "reap_bucket_check",
+                                &format!(
+                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                ),
+                                &format!(
+                                    "bucket mismatch: dir {actual_bucket} != deadline-derived {expected_lease_bucket}"
+                                ),
+                            );
                             continue;
                         }
 
@@ -718,7 +767,7 @@ impl Queue {
                 };
 
                 for entry in &entries {
-                    if stats.operations_attempted >= budget.max_operations {
+                    if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -780,6 +829,14 @@ impl Queue {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
+
+                    // R4-H11: Authenticate consistency before compaction
+                    if header.job_id != parsed.common.job_id {
+                        continue;
+                    }
+                    if header.maximum_attempts != parsed.common.maximum_attempts {
+                        continue;
+                    }
 
                     // Compute bucket start time
                     let bucket_num = u64::from_str_radix(bucket_name, 16).unwrap_or(0);

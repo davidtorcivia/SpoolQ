@@ -26,7 +26,9 @@ typedef struct {
 } SpoolqJobId;
 
 /* Thread safety: SpoolqQueue is safe to share across C threads.
- * SpoolqLease handles are NOT thread-safe; use them from one thread at a time. */
+ * SpoolqLease handles are NOT thread-safe; use from one thread at a time.
+ * R4-FFI02: If a panic occurs during an operation, the mutex is poisoned
+ * and subsequent calls return SPOOLQ_CORRUPTION. Reopen the queue to recover. */
 
 SpoolqQueue *spoolq_init(const char *path, unsigned int shard_count);
 SpoolqQueue *spoolq_open(const char *path);
@@ -54,10 +56,19 @@ int spoolq_recover(SpoolqQueue *queue);
 void spoolq_lease_job_id(const SpoolqLease *lease, SpoolqJobId *out);
 uint64_t spoolq_lease_generation(const SpoolqLease *lease);
 unsigned int spoolq_lease_attempt(const SpoolqLease *lease);
+uint64_t spoolq_lease_payload_length(const SpoolqLease *lease);
+
+/* R4-FFI05: Lease metadata accessors. Copy string fields into caller buffer.
+ * Returns SPOOLQ_OK on success, SPOOLQ_NOT_COMMITTED if buffer too small. */
+int spoolq_lease_boot_id(const SpoolqLease *lease, char *out, size_t out_len);
+int spoolq_lease_content_type(const SpoolqLease *lease, char *out, size_t out_len);
+int spoolq_lease_source_path(const SpoolqLease *lease, char *out, size_t out_len);
+
 void spoolq_lease_free(SpoolqLease *lease);
 
 /* Last-error mechanism. Returns pointer to thread-local storage.
- * Valid until the next SpoolQ call on the same thread. Do not free. */
+ * Valid until the next SpoolQ call on the same thread. Do not free.
+ * R4-FFI01: Error is cleared at the start of each operation. */
 const char *spoolq_last_error(void);
 /* No-op kept for ABI compatibility. */
 void spoolq_free_string(const char *s);
