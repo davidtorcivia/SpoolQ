@@ -4,7 +4,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::unnecessary_cast)]
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr;
@@ -16,11 +16,21 @@ use spoolq_core::{
 };
 
 thread_local! {
-    static LAST_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_RET: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-fn set_last_error(msg: &'static str) {
-    LAST_ERROR.with(|cell| cell.set(Some(msg)));
+#[allow(dead_code)]
+fn clear_last_error() {
+    LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+fn set_last_error(msg: &str) {
+    LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = CString::new(msg).ok();
+    });
 }
 
 /// R2-H17: Centralized error-to-code mapping.
@@ -69,24 +79,22 @@ pub struct SpoolqJobId {
     pub bytes: [u8; 16],
 }
 
-/// Get the last error message as a C string pointer. Caller must free with spoolq_free_string.
+/// C1: Get last error as a C string. Returns pointer to thread-local storage.
+/// The pointer is valid until the next SpoolQ call on the same thread.
+/// Do not free.
 #[no_mangle]
 pub extern "C" fn spoolq_last_error() -> *const c_char {
-    LAST_ERROR.with(|cell| match cell.get() {
-        Some(msg) => {
-            let cs = CString::new(msg).unwrap_or_else(|_| CString::new("error").unwrap());
-            cs.into_raw()
-        }
-        None => ptr::null(),
+    LAST_ERROR.with(|cell| {
+        let b = cell.borrow();
+        b.as_ref().map_or(ptr::null(), |cs| cs.as_ptr())
     })
 }
 
-/// Free a string returned by spoolq_last_error.
+/// C1: No-op. spoolq_last_error() returns thread-local storage that does not
+/// need to be freed. Provided for ABI compatibility.
 #[no_mangle]
-pub extern "C" fn spoolq_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe { drop(CString::from_raw(s)) };
-    }
+pub extern "C" fn spoolq_free_string(_s: *const c_char) {
+    // No-op: last error uses thread-local storage, not heap allocation.
 }
 
 /// Query the ABI version.
@@ -122,7 +130,7 @@ pub extern "C" fn spoolq_init(path: *const c_char, shard_count: c_uint) -> *mut 
             inner: Mutex::new(q),
         })),
         Ok(Err(e)) => {
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             ptr::null_mut()
         }
         Err(_) => {
@@ -151,7 +159,7 @@ pub extern "C" fn spoolq_open(path: *const c_char) -> *mut SpoolqQueue {
             inner: Mutex::new(q),
         })),
         Ok(Err(e)) => {
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             ptr::null_mut()
         }
         Err(_) => {
@@ -185,7 +193,7 @@ pub extern "C" fn spoolq_enqueue(
     }
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
-        let mut guard = queue.inner.lock().unwrap();
+        let mut guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
         let payload = if payload.is_null() {
             if payload_len != 0 {
                 return Err(("null payload with nonzero length", SPOOLQ_NOT_COMMITTED));
@@ -219,14 +227,14 @@ pub extern "C" fn spoolq_enqueue(
         }
         Ok(Ok(EnqueueOutcome::NotCommitted(_, e))) => {
             let code = error_to_code(&e);
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             code
         }
         Ok(Ok(EnqueueOutcome::OutcomeUnknown(ticket, e))) => {
             if !job_id_out.is_null() {
                 unsafe { (*job_id_out).bytes = ticket.job_id };
             }
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             SPOOLQ_INDETERMINATE
         }
         Ok(Err((msg, code))) => {
@@ -253,7 +261,7 @@ pub extern "C" fn spoolq_lease(
     }
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
-        let mut guard = queue.inner.lock().unwrap();
+        let mut guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.lease(0, lease_duration_ns)
     });
     match result {
@@ -267,7 +275,7 @@ pub extern "C" fn spoolq_lease(
         }
         Ok(LeaseOutcome::NotCommitted(e)) => {
             let code = error_to_code(&e);
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             code
         }
         Ok(LeaseOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
@@ -288,7 +296,7 @@ pub extern "C" fn spoolq_lease_verify(queue: *mut SpoolqQueue, lease: *mut Spool
     }
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
-        let guard = queue.inner.lock().unwrap();
+        let guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
         let lease_ref = unsafe { &mut *lease };
         guard.verify_lease_payload(&lease_ref.inner)
     });
@@ -300,7 +308,7 @@ pub extern "C" fn spoolq_lease_verify(queue: *mut SpoolqQueue, lease: *mut Spool
         }
         Ok(Err(e)) => {
             let code = error_to_code(&e);
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             code
         }
         Err(_) => {
@@ -319,7 +327,7 @@ pub extern "C" fn spoolq_ack(queue: *mut SpoolqQueue, lease: *mut SpoolqLease) -
     }
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
-        let mut guard = queue.inner.lock().unwrap();
+        let mut guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
         let lease_ref = unsafe { &*lease };
         guard.ack(&lease_ref.inner)
     });
@@ -332,7 +340,7 @@ pub extern "C" fn spoolq_ack(queue: *mut SpoolqQueue, lease: *mut SpoolqLease) -
         }
         Ok(spoolq_core::AckOutcome::NotCommitted(e)) => {
             let code = error_to_code(&e);
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             code
         }
         Ok(spoolq_core::AckOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
@@ -352,7 +360,7 @@ pub extern "C" fn spoolq_retry(queue: *mut SpoolqQueue, lease: *mut SpoolqLease)
     }
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
-        let mut guard = queue.inner.lock().unwrap();
+        let mut guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
         let lease_ref = unsafe { &*lease };
         guard.retry_now(&lease_ref.inner)
     });
@@ -364,7 +372,7 @@ pub extern "C" fn spoolq_retry(queue: *mut SpoolqQueue, lease: *mut SpoolqLease)
         }
         Ok(TransitionOutcome::NotCommitted(e)) => {
             let code = error_to_code(&e);
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             code
         }
         Ok(TransitionOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
@@ -388,7 +396,7 @@ pub extern "C" fn spoolq_bury(
     }
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
-        let mut guard = queue.inner.lock().unwrap();
+        let mut guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
         let lease_ref = unsafe { &*lease };
         let reason = spoolq_core::DeadReason::from_u16(reason as u16)
             .unwrap_or(spoolq_core::DeadReason::Unspecified);
@@ -402,7 +410,7 @@ pub extern "C" fn spoolq_bury(
         }
         Ok(TransitionOutcome::NotCommitted(e)) => {
             let code = error_to_code(&e);
-            set_last_error(leak_error(e));
+            set_last_error(&leak_error(e));
             code
         }
         Ok(TransitionOutcome::OutcomeUnknown(_)) => SPOOLQ_INDETERMINATE,
@@ -422,11 +430,16 @@ pub extern "C" fn spoolq_recover(queue: *mut SpoolqQueue) -> c_int {
     }
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
-        let mut guard = queue.inner.lock().unwrap();
-        guard.recover(&WorkBudget::default());
+        let mut guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let stats = guard.recover(&WorkBudget::default());
+        stats.errors.len()
     });
     match result {
-        Ok(()) => SPOOLQ_OK,
+        Ok(0) => SPOOLQ_OK,
+        Ok(_) => {
+            set_last_error("recovery completed with errors");
+            SPOOLQ_IO_FAILURE
+        }
         Err(_) => {
             set_last_error("panic in spoolq_recover");
             SPOOLQ_IO_FAILURE
@@ -470,10 +483,7 @@ pub extern "C" fn spoolq_lease_attempt(lease: *const SpoolqLease) -> c_uint {
     unsafe { (*lease).inner.attempt as c_uint }
 }
 
-/// Leak an Error into a 'static str for the thread-local last-error store.
-fn leak_error(e: Error) -> &'static str {
-    // The Error Display impl produces an owned String; we leak it to get 'static.
-    // This is acceptable for a last-error mechanism where the string is consumed once.
-    let s = format!("{e}");
-    Box::leak(s.into_boxed_str())
+/// Format an error for the thread-local last-error store.
+fn leak_error(e: Error) -> String {
+    format!("{e}")
 }

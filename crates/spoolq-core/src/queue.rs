@@ -207,9 +207,9 @@ impl Queue {
                 "another initializer or maintenance process holds the lock",
             ));
         }
-        // R2-B01: lock_fd is held as OwnedFd and released on Drop when init
-        // returns (success or failure). No mem::forget leak.
-        drop(lock_fd);
+        // H1: Hold the maintenance lock for the duration of init by binding it.
+        // It will be released when _init_lock goes out of scope at function end.
+        let _init_lock = lock_fd;
 
         // Generate queue ID
         let queue_id = fs::random_128bit()?;
@@ -1372,17 +1372,68 @@ impl Queue {
                             });
                         }
 
-                        // C-21: Read content_type from extension header
-                        let content_type = if header.extension_header_length > 0
-                            && header.extension_header_length <= 65536
-                        {
+                        // B2: Extension read/decode failure after claim is a post-linearization
+                        // corruption. Do not return an ordinary lease with empty content_type.
+                        let content_type = if header.extension_header_length > 0 {
+                            if header.extension_header_length > 65536 {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: header.envelope_digest,
+                                });
+                            }
                             let mut ext_buf = vec![0u8; header.extension_header_length as usize];
-                            if fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf, 128).is_ok() {
-                                spoolq_format::cbor::ExtensionHeader::decode(&ext_buf)
-                                    .map(|e| e.content_type)
-                                    .unwrap_or_default()
-                            } else {
-                                String::new()
+                            match fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf, 128) {
+                                Ok(()) => {
+                                    match spoolq_format::cbor::ExtensionHeader::decode(&ext_buf) {
+                                        Ok(e) => e.content_type,
+                                        Err(_) => {
+                                            self.poison();
+                                            return LeaseOutcome::OutcomeUnknown(
+                                                TransitionTicket {
+                                                    job_id: parsed.common.job_id,
+                                                    source_state: "ready".into(),
+                                                    source_generation: parsed.common.generation,
+                                                    source_attempt: parsed.common.attempt,
+                                                    source_relative_path: format!(
+                                                        "{ready_dir}/{entry}"
+                                                    ),
+                                                    attempted_destination_state: "leased".into(),
+                                                    attempted_destination_relative_path: format!(
+                                                        "{leased_dir}/{leased_name}"
+                                                    ),
+                                                    lease_token: Some(lease_token),
+                                                    envelope_digest: header.envelope_digest,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    self.poison();
+                                    return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                        job_id: parsed.common.job_id,
+                                        source_state: "ready".into(),
+                                        source_generation: parsed.common.generation,
+                                        source_attempt: parsed.common.attempt,
+                                        source_relative_path: format!("{ready_dir}/{entry}"),
+                                        attempted_destination_state: "leased".into(),
+                                        attempted_destination_relative_path: format!(
+                                            "{leased_dir}/{leased_name}"
+                                        ),
+                                        lease_token: Some(lease_token),
+                                        envelope_digest: header.envelope_digest,
+                                    });
+                                }
                             }
                         } else {
                             String::new()
@@ -1981,6 +2032,14 @@ impl Queue {
             ));
         }
 
+        // H5: Verify header maximum_attempts matches filename/handle
+        if header.maximum_attempts != lease.maximum_attempts {
+            return Err(Error::QueueCorrupt(format!(
+                "header maximum_attempts {} does not match handle {}",
+                header.maximum_attempts, lease.maximum_attempts
+            )));
+        }
+
         // R2-H03: Extension read failure is a real error, not a silent pass.
         let ext_len = header.extension_header_length as usize;
         if ext_len > 65536 {
@@ -2440,6 +2499,129 @@ impl Queue {
 
         AckOutcome::LeaseLost
     }
+
+    /// B1: Authenticate an active-state object structurally.
+    /// Validates: file type, link count, header, envelope digest, file size,
+    /// name tag, shard placement, and header/name consistency.
+    /// Returns the validated header on success.
+    pub(crate) fn validate_active_object(
+        &self,
+        dir_fd: std::os::unix::io::RawFd,
+        name: &str,
+        state: &str,
+        shard_str: &str,
+        queue_id: &[u8; 16],
+    ) -> Result<FixedHeader, Error> {
+        // Stat with NOFOLLOW
+        let stat = fs::fstatat(dir_fd, name).map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        // Regular file
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(Error::QueueCorrupt(format!(
+                "{state}/{shard_str}/{name}: not a regular file"
+            )));
+        }
+
+        // Link count
+        if stat.st_nlink != 1 {
+            return Err(Error::QueueCorrupt(format!(
+                "{state}/{shard_str}/{name}: unexpected link count {}",
+                stat.st_nlink
+            )));
+        }
+
+        // Read header
+        let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let mut header_buf = [0u8; 128];
+        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let header = FixedHeader::decode(&header_buf)
+            .map_err(|e| Error::QueueCorrupt(format!("header decode: {e}")))?;
+
+        // Verify extension + envelope digest
+        let ext_len = header.extension_header_length as usize;
+        if ext_len > 65536 {
+            return Err(Error::QueueCorrupt("extension header too large".into()));
+        }
+        if ext_len > 0 {
+            let mut ext_buf = vec![0u8; ext_len];
+            fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
+                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
+            }
+        }
+
+        // Verify file size
+        let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
+        if stat.st_size as u64 != expected_size {
+            return Err(Error::QueueCorrupt(format!(
+                "{state}/{shard_str}/{name}: size mismatch expected {} got {}",
+                expected_size, stat.st_size
+            )));
+        }
+
+        // Parse the filename for the appropriate state and verify identity
+        let (job_id, _gen, _attempt, max_att) = match state {
+            "ready" => {
+                let p = spoolq_names::parse_ready(name)
+                    .map_err(|_| Error::QueueCorrupt("invalid ready filename".into()))?;
+                (
+                    p.common.job_id,
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                )
+            }
+            "leased" => {
+                let p = spoolq_names::parse_leased(name)
+                    .map_err(|_| Error::QueueCorrupt("invalid leased filename".into()))?;
+                (
+                    p.common.job_id,
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                )
+            }
+            "delayed" => {
+                let p = spoolq_names::parse_delayed(name)
+                    .map_err(|_| Error::QueueCorrupt("invalid delayed filename".into()))?;
+                (
+                    p.common.job_id,
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                )
+            }
+            _ => return Err(Error::InvalidInput(format!("unsupported state: {state}"))),
+        };
+
+        // Verify header matches filename
+        if header.job_id != job_id {
+            return Err(Error::QueueCorrupt(
+                "header job_id does not match filename".into(),
+            ));
+        }
+        if header.maximum_attempts != max_att {
+            return Err(Error::QueueCorrupt(
+                "header maximum_attempts does not match filename".into(),
+            ));
+        }
+
+        // Verify shard placement
+        let computed_shard = compute_shard(queue_id, &job_id, self.format.shard_count);
+        let path_shard = spoolq_names::shard_from_hex(shard_str)
+            .ok_or_else(|| Error::QueueCorrupt(format!("invalid shard hex: {shard_str}")))?;
+        if path_shard != computed_shard {
+            return Err(Error::QueueCorrupt(format!(
+                "shard mismatch: path {path_shard} != computed {computed_shard}"
+            )));
+        }
+
+        Ok(header)
+    }
+
     /// C-23: Bounded duplicate-ack check.
     /// Constructs at most the finite set of exact retained receipt paths
     /// and checks them via fstatat, not by listing receipt contents.
@@ -2558,22 +2740,33 @@ impl Queue {
             Err(e) => return ResolveObj::Error(Error::IoFailure(e.to_string())),
         };
 
-        // Must be a regular file
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
             return ResolveObj::Conflict;
         }
 
-        // R2-B03: Read header and verify job_id
         let file_fd = match fs::openat(dir_fd.as_raw_fd(), name, libc::O_RDONLY, 0) {
             Ok(fd) => fd,
             Err(e) => return ResolveObj::Error(Error::IoFailure(e.to_string())),
         };
 
+        // B3: Try fixed job header first, then compact receipt
         let mut header_buf = [0u8; 128];
         if fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0).is_err() {
             return ResolveObj::Conflict;
         }
 
+        // Check for compact receipt magic first (128 bytes)
+        if stat.st_size as usize == spoolq_format::COMPACT_RECEIPT_SIZE
+            && &header_buf[0..8] == spoolq_format::RECEIPT_MAGIC
+        {
+            match spoolq_format::CompactReceipt::decode(&header_buf) {
+                Ok(cr) if cr.job_id == expected_job_id => return ResolveObj::Match,
+                Ok(_) => return ResolveObj::Conflict,
+                Err(_) => return ResolveObj::Conflict,
+            }
+        }
+
+        // Check for full job header
         match FixedHeader::decode(&header_buf) {
             Ok(header) if header.job_id == expected_job_id => ResolveObj::Match,
             Ok(_) => ResolveObj::Conflict,

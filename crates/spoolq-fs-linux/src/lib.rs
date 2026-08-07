@@ -528,8 +528,16 @@ fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
     }
 
     loop {
+        // B5: Set errno to 0 before readdir to distinguish EOF from error.
+        unsafe { *libc::__errno_location() = 0 };
         let entry = unsafe { libc::readdir(dir) };
         if entry.is_null() {
+            // B5: Check errno to distinguish EOF from error.
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != 0 {
+                unsafe { libc::closedir(dir) };
+                return Err(io::Error::from_raw_os_error(errno));
+            }
             break;
         }
         let name_bytes = unsafe {
