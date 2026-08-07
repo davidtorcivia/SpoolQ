@@ -34,10 +34,14 @@ jobs:
           cargo build -p spoolq-capi
           cc crates/spoolq-capi/tests/test_capi.c             -I crates/spoolq-capi/include             -L target/debug -lspoolq_capi             -o target/capi_test -Wl,-rpath,target/debug
           ./target/capi_test
-      - name: Generated file drift check (C-69)
+      - name: Generated file drift check (P1-34)
         run: |
           cargo test -p spoolq-core -- state_machine
           test -f generated/state-machine.rs
+          # P1-34: Verify generated file matches checked-in version.
+          # The state_machine test regenerates; check for drift.
+          git diff --exit-code -- generated/state-machine.rs || \
+            (echo "Generated state-machine.rs is out of date. Run: cargo test -p spoolq-core -- state_machine" && exit 1)
 
   # Fuzz smoke test - gating on PRs
   fuzz-smoke:
@@ -142,7 +146,8 @@ jobs:
         run: cargo test -p spoolq-core -- descriptor
       - name: FD leak stress (T5)
         run: cargo test -p spoolq-core -- fd_leak_stress --release
-      - name: Benchmarks (P3)
+      - name: Benchmarks (P2-35: no regression gate yet, tracking only)
+      # P2-35: Benchmark results are informational. Establish baselines
         run: cargo bench -p spoolq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
       - name: Full mutation suite (all crates, no timeout cap)
         continue-on-error: true

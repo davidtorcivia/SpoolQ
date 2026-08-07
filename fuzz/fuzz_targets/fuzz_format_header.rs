@@ -8,3 +8,4 @@ use spoolq_format::FixedHeader;
 fuzz_target!(|data: &[u8]| {
     let _ = FixedHeader::decode(data);
 });
+    }

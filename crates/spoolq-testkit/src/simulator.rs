@@ -40,6 +40,9 @@ pub struct SimFile {
 }
 
 /// The seeded in-memory filesystem simulator. Uses a flat path map.
+/// P1-27: This simulator does NOT model directory-entry durability.
+/// crash() retains synced files but does not restore durable namespace state.
+/// A proper model would track volatile vs durable directory entry sets.
 #[derive(Clone, Debug)]
 pub struct Simulator {
     files: HashMap<String, SimFile>,
