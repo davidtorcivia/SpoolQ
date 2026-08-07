@@ -181,8 +181,8 @@ enum AdminCommands {
     CompactReceipts { path: PathBuf },
 }
 
-fn parse_duration_seconds(s: u64) -> u64 {
-    s * 1_000_000_000
+fn parse_duration_seconds(s: u64) -> Option<u64> {
+    s.checked_mul(1_000_000_000)
 }
 
 fn main() -> ExitCode {
@@ -297,7 +297,13 @@ fn main() -> ExitCode {
             };
             let mut queue = queue;
 
-            let duration_ns = parse_duration_seconds(duration_seconds);
+            let duration_ns = match parse_duration_seconds(duration_seconds) {
+                Some(ns) => ns,
+                None => {
+                    eprintln!("invalid duration: overflow");
+                    return ExitCode::FAILURE;
+                }
+            };
             match queue.lease(0, duration_ns) {
                 LeaseOutcome::Leased(lease) => {
                     if let Some(ref hf) = handle_file {
@@ -508,10 +514,8 @@ fn main() -> ExitCode {
                 }
             };
             // R2-H19: CLI uses strict ack path: verify payload first.
-            if let Err(e) = queue.verify_lease_payload(&lease) {
-                eprintln!("payload verification failed: {e}");
-                return ExitCode::from(EXIT_CORRUPTION);
-            }
+            // P1-17: ack() already performs strict payload verification.
+            // Don't call verify_lease_payload() separately to avoid double hashing.
             match queue.ack(&lease) {
                 spoolq_core::AckOutcome::Acked => {
                     eprintln!("acked");

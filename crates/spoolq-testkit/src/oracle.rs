@@ -84,6 +84,13 @@ impl Oracle {
         }
     }
 
+    /// Record source dir sync.
+    pub fn record_src_sync(&mut self, job_id: &[u8; 16]) {
+        if let Some(job) = self.jobs.get_mut(job_id) {
+            job.src_dir_synced = true;
+        }
+    }
+
     /// Record publication (hidden -> ready or delayed).
     pub fn record_publish(&mut self, job_id: &[u8; 16], to_ready: bool) {
         if let Some(job) = self.jobs.get_mut(job_id) {

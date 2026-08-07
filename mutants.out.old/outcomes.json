@@ -1,0 +1,47 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Failure",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 8.116300142,
+          "process_status": "Success",
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=spoolq-core@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.051350853,
+          "process_status": {
+            "Failure": 1
+          },
+          "argv": [
+            "/home/davidtorcivia/.rustup/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=spoolq-core@0.1.0",
+            "--test-threads=4"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 0,
+  "missed": 0,
+  "caught": 0,
+  "timeout": 0,
+  "unviable": 0,
+  "success": 0,
+  "start_time": "2026-08-07T21:00:24.009252986Z",
+  "end_time": "2026-08-07T21:00:32.180983723Z",
+  "cargo_mutants_version": "26.0.0"
+}

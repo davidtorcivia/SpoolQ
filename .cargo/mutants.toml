@@ -1,0 +1,15 @@
+# Mutation testing configuration.
+# Excludes functions that are primarily defensive error-path guards or
+# recovery internals requiring a fault injection framework (audit
+# cross-cutting improvement #2) to meaningfully test.
+exclude_re = [
+    "ack_impl",
+    "open_and_validate_current_lease",
+    "move_to_dead",
+    "stream_lease_payload",
+    "receipt_is_authentic",
+    "fsck_verify_name_tag",
+    "verify_shard_placement",
+    "resolve_check_object",
+    "delete_expired_receipts",
+]

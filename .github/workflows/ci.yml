@@ -58,11 +58,19 @@ jobs:
       - name: Fuzz smoke (bucket arithmetic)
         run: timeout 90 cargo +nightly fuzz run fuzz_bucket_arithmetic -- -max_len=64 -runs=5000
 
-  # Mutation testing - diff-based for PRs, full suite for main
+  # Mutation testing - diff-based, gating, parallelized by crate
   mutants:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - spoolq-format
+          - spoolq-names
+          - spoolq-math
+          - spoolq-fs-linux
+          - spoolq-core
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,17 +78,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-mutants
         run: cargo install cargo-mutants
-      - name: Run mutants (changed code only)
+      - name: Run mutants for ${{ matrix.crate }} (diff-scoped)
         run: |
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             git diff origin/$GITHUB_BASE_REF...HEAD > /tmp/pr.diff
             if [ -s /tmp/pr.diff ]; then
-              cargo mutants --workspace -j 2 --timeout 20 --in-diff /tmp/pr.diff --cap-lints true || true
+              # Filter diff to files in this crate
+              if grep -q "${{ matrix.crate }}" /tmp/pr.diff; then
+                cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 --in-diff /tmp/pr.diff --cap-lints true
+              else
+                echo "No changes in ${{ matrix.crate }}, skipping"
+              fi
             else
-              echo "No diff to test"
+              echo "Empty diff, skipping"
             fi
           else
-            cargo mutants --workspace -j 2 --timeout 20 --cap-lints true || true
+            cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 --cap-lints true
           fi
 
   # Deep fuzz - extended runs (continue-on-error)
@@ -100,8 +113,8 @@ jobs:
           timeout 300 cargo +nightly fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
           timeout 300 cargo +nightly fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=50000
 
-  # TLA+ model verification
-  tla-model-check:
+  # TLA+ model presence check (not model checking)
+  tla-model-presence:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

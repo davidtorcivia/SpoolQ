@@ -275,6 +275,108 @@ impl CommonFields {
     }
 }
 
+// ---------- Canonical context reconstruction ----------
+// P0-02/P0-03: Single source of truth for name-tag context.
+// Every consumer (resolver, fsck, recovery, duplicate-ack) calls these
+// instead of reconstructing the context independently.
+
+impl ReadyName {
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, shard_hex: &str) -> String {
+        ready_context(shard_hex, &self.common.base_name())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl LeasedName {
+    fn leased_base(&self) -> String {
+        format!(
+            "{}.b{}.w{}.t{}",
+            self.common.base_name(),
+            hex_u64(self.boottime_deadline_ns),
+            hex_u64(self.wall_deadline_ns),
+            hex_encode(&self.token),
+        )
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, boot_id: &str, bucket: &str, shard_hex: &str) -> String {
+        leased_context(boot_id, bucket, shard_hex, &self.leased_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(
+        &self,
+        queue_id: &[u8; 16],
+        boot_id: &str,
+        bucket: &str,
+        shard_hex: &str,
+    ) -> bool {
+        let ctx = self.canonical_context(boot_id, bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl DelayedName {
+    fn delayed_base(&self) -> String {
+        format!(
+            "{}.d{}",
+            self.common.base_name(),
+            hex_u64(self.not_before_ns),
+        )
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, bucket: &str, shard_hex: &str) -> String {
+        delayed_context(bucket, shard_hex, &self.delayed_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl DeadName {
+    fn dead_base(&self) -> String {
+        format!("{}.x{}", self.common.base_name(), hex_u16(self.reason),)
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, bucket: &str, shard_hex: &str) -> String {
+        terminal_context(State::Dead, bucket, shard_hex, &self.dead_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
+impl ReceiptName {
+    fn receipt_base(&self) -> String {
+        format!("{}.t{}", self.common.base_name(), hex_encode(&self.token),)
+    }
+
+    /// Reconstruct the exact canonical context used by the writer.
+    pub fn canonical_context(&self, bucket: &str, shard_hex: &str) -> String {
+        terminal_context(State::Receipt, bucket, shard_hex, &self.receipt_base())
+    }
+
+    /// Authenticate the name tag against the queue ID.
+    pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
+        let ctx = self.canonical_context(bucket, shard_hex);
+        compute_name_tag(queue_id, &ctx) == self.tag
+    }
+}
+
 // Ready: <job-id>.g<gen>.a<att>.m<max>.k<tag>.sqj
 pub fn ready_filename(fields: &CommonFields, tag: &[u8; 8]) -> String {
     format!("{}.k{}.sqj", fields.base_name(), name_tag_hex(tag))
@@ -1241,5 +1343,206 @@ mod tests {
         let max = 162; // leased is longest
         assert!(max <= 255, "longest name {max} exceeds NAME_MAX 255");
         assert_eq!(255 - max, 93, "remaining budget must be 93");
+    }
+
+    // ===== Canonical authenticate_tag tests (P1-25 mutation coverage) =====
+
+    fn make_common() -> CommonFields {
+        CommonFields {
+            job_id: test_job_id(),
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+        }
+    }
+
+    #[test]
+    fn ready_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let shard = "01ab";
+        let ctx = ready_context(shard, &common.base_name());
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = ReadyName {
+            common: common.clone(),
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], shard));
+        assert!(!name.authenticate_tag(&qid, "0000"));
+    }
+
+    #[test]
+    fn leased_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let boot = "00000000-0000-0000-0000-000000000000";
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let token = [0xCD; 16];
+        let name = LeasedName {
+            common: common.clone(),
+            boottime_deadline_ns: 30000000000,
+            wall_deadline_ns: 1234567890,
+            token,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(boot, bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = LeasedName {
+            common: common.clone(),
+            boottime_deadline_ns: 30000000000,
+            wall_deadline_ns: 1234567890,
+            token,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, boot, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], boot, bucket, shard));
+        assert!(!name.authenticate_tag(&qid, "wrong", bucket, shard));
+    }
+
+    #[test]
+    fn delayed_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let nb: u64 = 9999999999;
+        let name = DelayedName {
+            common: common.clone(),
+            not_before_ns: nb,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = DelayedName {
+            common: common.clone(),
+            not_before_ns: nb,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
+        assert!(!name.authenticate_tag(&qid, "0000000000000000", shard));
+    }
+
+    #[test]
+    fn dead_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let name = DeadName {
+            common: common.clone(),
+            reason: 0x0004,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = DeadName {
+            common: common.clone(),
+            reason: 0x0004,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
+    }
+
+    #[test]
+    fn receipt_authenticate_tag_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000001";
+        let shard = "01ab";
+        let token = [0xEE; 16];
+        let name = ReceiptName {
+            common: common.clone(),
+            token,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context(bucket, shard);
+        let tag = compute_name_tag(&qid, &ctx);
+        let name = ReceiptName {
+            common: common.clone(),
+            token,
+            tag,
+        };
+        assert!(name.authenticate_tag(&qid, bucket, shard));
+        assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
+    }
+
+    // ===== canonical_context output verification (mutation coverage) =====
+
+    #[test]
+    fn ready_canonical_context_format() {
+        let common = make_common();
+        let name = ReadyName {
+            common: common.clone(),
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("01ab");
+        assert!(ctx.starts_with("ready/-/-/01ab/"));
+        assert!(ctx.contains(&common.base_name()));
+        // Non-empty and correct structure
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn leased_canonical_context_format() {
+        let common = make_common();
+        let name = LeasedName {
+            common: common.clone(),
+            boottime_deadline_ns: 30000000000,
+            wall_deadline_ns: 1234567890,
+            token: [0xCD; 16],
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("boot-id", "bucket1", "01ab");
+        assert!(ctx.starts_with("leased/boot-id/bucket1/01ab/"));
+        assert!(ctx.contains(".b"));
+        assert!(ctx.contains(".w"));
+        assert!(ctx.contains(".t"));
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn delayed_canonical_context_format() {
+        let common = make_common();
+        let name = DelayedName {
+            common: common.clone(),
+            not_before_ns: 9999999999,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("bucket1", "01ab");
+        assert!(ctx.starts_with("delayed/-/bucket1/01ab/"));
+        assert!(ctx.contains(".d"));
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn dead_canonical_context_format() {
+        let common = make_common();
+        let name = DeadName {
+            common: common.clone(),
+            reason: 0x0004,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("bucket1", "01ab");
+        assert!(ctx.starts_with("dead/-/bucket1/01ab/"));
+        assert!(ctx.contains(".x"));
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn receipt_canonical_context_format() {
+        let common = make_common();
+        let name = ReceiptName {
+            common: common.clone(),
+            token: [0xEE; 16],
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("bucket1", "01ab");
+        assert!(ctx.starts_with("receipts/-/bucket1/01ab/"));
+        assert!(ctx.contains(".t"));
+        assert!(!ctx.is_empty());
     }
 }

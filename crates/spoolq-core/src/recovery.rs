@@ -1120,17 +1120,17 @@ impl Queue {
                     }
 
                     if fs::unlinkat(shard_fd.as_raw_fd(), entry).is_ok() {
-                        // B-06: Sync the shard directory after deletion
-                        if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_err() {
-                            stats.errors.push(RecoveryError {
-                                operation: "receipt_delete_sync".into(),
-                                relative_path: format!(
-                                    "receipts/{bucket_name}/{shard_name}/{entry}"
-                                ),
-                                error: "shard dir sync failed after receipt deletion".into(),
-                            });
+                        // P1-11: Only count as durable success after fsync.
+                        if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_ok() {
+                            stats.receipts_expired += 1;
+                        } else {
+                            Self::record_error(
+                                stats,
+                                "receipt_expire_indeterminate",
+                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                                "unlink succeeded but shard dir fsync failed",
+                            );
                         }
-                        stats.receipts_expired += 1;
                     }
                 }
 

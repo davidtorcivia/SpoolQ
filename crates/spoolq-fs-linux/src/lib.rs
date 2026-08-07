@@ -566,6 +566,8 @@ pub fn read_dir_for_each<F: FnMut(&str) -> bool>(dir_fd: RawFd, mut f: F) -> io:
     }
     let dir = unsafe { libc::fdopendir(dup_fd) };
     if dir.is_null() {
+        // P1-16: Close the dup'd fd before returning to avoid descriptor leak.
+        unsafe { libc::close(dup_fd) };
         return Err(io::Error::last_os_error());
     }
     let mut count = 0usize;
@@ -953,5 +955,52 @@ mod tests {
         assert!(validate_path_component("").is_err());
         assert!(validate_path_component("/abs").is_err());
         assert!(validate_path_component("ok").is_ok());
+    }
+
+    #[test]
+    fn read_dir_for_each_visits_all_entries() {
+        let tmp = std::env::temp_dir();
+        let dir_name = format!("spoolq_rdfe_test_{}", std::process::id());
+        let dir_path = tmp.join(&dir_name);
+        std::fs::create_dir_all(&dir_path).unwrap();
+        std::fs::write(dir_path.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir_path.join("b.txt"), b"y").unwrap();
+
+        let fd = std::fs::File::open(&dir_path).unwrap();
+        use std::os::unix::io::AsRawFd;
+        let mut names = Vec::new();
+        let count = read_dir_for_each(fd.as_raw_fd(), |name| {
+            names.push(name.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(names.contains(&"b.txt".to_string()));
+
+        std::fs::remove_dir_all(&dir_path).ok();
+    }
+
+    #[test]
+    fn read_dir_for_each_stops_early() {
+        let tmp = std::env::temp_dir();
+        let dir_name = format!("spoolq_rdfe_stop_{}", std::process::id());
+        let dir_path = tmp.join(&dir_name);
+        std::fs::create_dir_all(&dir_path).unwrap();
+        std::fs::write(dir_path.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir_path.join("b.txt"), b"y").unwrap();
+        std::fs::write(dir_path.join("c.txt"), b"z").unwrap();
+
+        let fd = std::fs::File::open(&dir_path).unwrap();
+        use std::os::unix::io::AsRawFd;
+        let mut count_seen = 0;
+        let _count = read_dir_for_each(fd.as_raw_fd(), |_| {
+            count_seen += 1;
+            false // stop immediately
+        })
+        .unwrap();
+        assert_eq!(count_seen, 1);
+
+        std::fs::remove_dir_all(&dir_path).ok();
     }
 }
