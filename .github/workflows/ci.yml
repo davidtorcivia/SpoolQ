@@ -146,8 +146,7 @@ jobs:
         run: cargo test -p spoolq-core -- descriptor
       - name: FD leak stress (T5)
         run: cargo test -p spoolq-core -- fd_leak_stress --release
-      - name: Benchmarks (P2-35: no regression gate yet, tracking only)
-      # P2-35: Benchmark results are informational. Establish baselines
+      - name: Benchmarks (P2-35 tracking only, no regression gate)
         run: cargo bench -p spoolq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
       - name: Full mutation suite (all crates, no timeout cap)
         continue-on-error: true
