@@ -97,8 +97,19 @@ impl Default for OpenOptions {
 
 /// Internal queue state.
 #[allow(dead_code)]
+/// R4-RES: In-memory cursor for resumable recovery. Tracks the last
+/// fully processed bucket per phase so the next pass resumes from there.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RecoveryCursor {
+    pub reap_lease_bucket: Option<String>,
+    pub promote_delayed_bucket: Option<String>,
+    pub compact_receipts_bucket: Option<String>,
+    pub delete_receipts_bucket: Option<String>,
+}
+
 pub struct Queue {
     pub(crate) root_fd: OwnedFd,
+    #[allow(dead_code)]
     pub(crate) root_path: PathBuf,
     pub(crate) format: FormatRecord,
     pub(crate) boot_id: String,
@@ -107,7 +118,9 @@ pub struct Queue {
     pub(crate) scan_round: u64,
     pub(crate) worker_nonce: [u8; 16],
     pub(crate) options: OpenOptions,
+    #[allow(dead_code)]
     pub(crate) maint_lock_fd: Option<OwnedFd>,
+    pub(crate) recovery_cursor: RecoveryCursor,
 }
 
 /// Internal helper enum for resolver object authentication.
@@ -452,6 +465,7 @@ impl Queue {
             worker_nonce,
             options: opts.clone(),
             maint_lock_fd: Some(maint_fd),
+            recovery_cursor: RecoveryCursor::default(),
         })
     }
 

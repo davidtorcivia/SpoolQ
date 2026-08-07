@@ -477,14 +477,23 @@ impl Queue {
             Err(_) => return,
         };
 
-        let bucket_dirs = match fs::read_dir_entries_owned(delayed_fd.as_raw_fd()) {
+        let mut bucket_dirs = match fs::read_dir_entries_owned(delayed_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
+        bucket_dirs.sort();
 
         for bucket_name in &bucket_dirs {
+            // R4-RES: Skip buckets already processed in a prior pass.
+            if let Some(ref cursor) = self.recovery_cursor.promote_delayed_bucket {
+                if bucket_name.as_str() <= cursor.as_str() {
+                    continue;
+                }
+            }
+
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
+                self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
                 return;
             }
 
@@ -635,7 +644,13 @@ impl Queue {
                     }
                 }
             }
+
+            // R4-RES: Bucket fully processed, advance cursor.
+            self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
         }
+
+        // R4-RES: All buckets processed, reset cursor for next full pass.
+        self.recovery_cursor.promote_delayed_bucket = None;
     }
 
     fn cleanup_temp_files(
@@ -734,14 +749,23 @@ impl Queue {
             Err(_) => return,
         };
 
-        let bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
+        bucket_dirs.sort();
 
         for bucket_name in &bucket_dirs {
+            // R4-RES: Skip buckets already processed in a prior pass.
+            if let Some(ref cursor) = self.recovery_cursor.compact_receipts_bucket {
+                if bucket_name.as_str() <= cursor.as_str() {
+                    continue;
+                }
+            }
+
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
+                self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
                 return;
             }
 
@@ -955,7 +979,13 @@ impl Queue {
                     }
                 }
             }
+
+            // R4-RES: Bucket fully processed, advance cursor.
+            self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
         }
+
+        // R4-RES: All buckets processed, reset cursor for next full pass.
+        self.recovery_cursor.compact_receipts_bucket = None;
     }
 
     /// Delete expired receipts based on retention policy.
@@ -974,14 +1004,23 @@ impl Queue {
             Err(_) => return,
         };
 
-        let bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
+        bucket_dirs.sort();
 
         for bucket_name in &bucket_dirs {
+            // R4-RES: Skip buckets already processed in a prior pass.
+            if let Some(ref cursor) = self.recovery_cursor.delete_receipts_bucket {
+                if bucket_name.as_str() <= cursor.as_str() {
+                    continue;
+                }
+            }
+
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
+                self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
                 return;
             }
 
@@ -1112,7 +1151,13 @@ impl Queue {
                     );
                 }
             }
+
+            // R4-RES: Bucket fully processed, advance cursor.
+            self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
         }
+
+        // R4-RES: All buckets processed, reset cursor for next full pass.
+        self.recovery_cursor.delete_receipts_bucket = None;
     }
 }
 
