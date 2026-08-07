@@ -39,11 +39,12 @@ jobs:
           cargo test -p spoolq-core -- state_machine
           test -f generated/state-machine.rs
 
-  # B6: Fuzz smoke test per PR - gating
-  fuzz-smoke:
+  # Fuzz and mutation testing - runs on PRs and main push
+  fuzz-and-mutants:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -57,6 +58,17 @@ jobs:
         run: timeout 90 cargo +nightly fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=5000
       - name: Fuzz smoke (bucket arithmetic)
         run: timeout 90 cargo +nightly fuzz run fuzz_bucket_arithmetic -- -max_len=64 -runs=5000
+      - name: Mutation testing
+        continue-on-error: true
+        run: |
+          cargo install cargo-mutants
+          cargo mutants --workspace -j 2 --in-place || true
+      - name: Deep fuzz (50000 runs per target)
+        continue-on-error: true
+        run: |
+          timeout 300 cargo +nightly fuzz run fuzz_format_header -- -max_len=160 -runs=50000
+          timeout 300 cargo +nightly fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
+          timeout 300 cargo +nightly fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=50000
 
   # TLA+ model verification
   tla-model-check:
@@ -74,26 +86,14 @@ jobs:
             echo "Warning: No TLA+ model found"
           fi
 
-  # Nightly lane: extended tests
+  # Nightly lane: release-mode extended tests
   nightly:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Extended test run
+      - name: Extended test run (release)
         run: cargo test --all --release
       - name: Descriptor leak regression (B-02)
         run: cargo test -p spoolq-core -- descriptor
-      - name: Mutation testing (R4-B10)
-        continue-on-error: true
-        run: |
-          cargo install cargo-mutants
-          cargo mutants --workspace -j 2 || true
-      - name: Deep fuzz extended
-        continue-on-error: true
-        run: |
-          cargo install cargo-fuzz
-          timeout 300 cargo +nightly fuzz run fuzz_format_header -- -max_len=160 -runs=50000
-          timeout 300 cargo +nightly fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
-          timeout 300 cargo +nightly fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=50000
