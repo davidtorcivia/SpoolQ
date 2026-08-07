@@ -56,7 +56,7 @@ impl Queue {
         let wall_now = self.effective_wall_floor_ns();
         // C-31: Use CLOCK_MONOTONIC for budget enforcement
         let start_mono = fs::clock_monotonic_ns().unwrap_or(0);
-        let _deadline_mono =
+        let deadline_mono =
             start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
 
         // 1. Reap expired leases
@@ -64,21 +64,52 @@ impl Queue {
 
         // 2. Promote eligible delayed jobs
         if !stats.budget_exhausted {
-            self.promote_delayed(wall_now, budget, &mut stats);
+            self.promote_delayed(wall_now, budget, &mut stats, deadline_mono);
         }
 
         // 3. Clean up old temp files
         if !stats.budget_exhausted {
-            self.cleanup_temp_files(boottime_now, budget, &mut stats);
+            self.cleanup_temp_files(boottime_now, budget, &mut stats, deadline_mono);
         }
         if !stats.budget_exhausted {
-            self.compact_receipts(budget, &mut stats);
+            self.compact_receipts(budget, &mut stats, deadline_mono);
         }
         if !stats.budget_exhausted {
-            self.delete_expired_receipts(self.options.receipt_retention_ns, budget, &mut stats);
+            self.delete_expired_receipts(
+                self.options.receipt_retention_ns,
+                budget,
+                &mut stats,
+                deadline_mono,
+            );
         }
 
         stats
+    }
+
+    /// R2-H05: Check if the monotonic deadline has been exceeded.
+    fn budget_time_exceeded(deadline_mono: u64) -> bool {
+        match fs::clock_monotonic_ns() {
+            Ok(now) => now >= deadline_mono,
+            Err(_) => false,
+        }
+    }
+
+    /// Check if either operations or time budget is exhausted.
+    fn budget_exhausted(stats: &RecoveryStats, budget: &WorkBudget, deadline_mono: u64) -> bool {
+        if stats.operations_attempted >= budget.max_operations {
+            return true;
+        }
+        Self::budget_time_exceeded(deadline_mono)
+    }
+
+    /// R2-H06: Record a recovery error with full context.
+    #[allow(dead_code)]
+    fn record_error(stats: &mut RecoveryStats, op: &str, path: &str, err: &str) {
+        stats.errors.push(RecoveryError {
+            operation: op.into(),
+            relative_path: path.into(),
+            error: err.into(),
+        });
     }
 
     fn reap_expired_leases(
@@ -334,7 +365,13 @@ impl Queue {
         Ok(())
     }
 
-    fn promote_delayed(&mut self, wall_now: u64, budget: &WorkBudget, stats: &mut RecoveryStats) {
+    fn promote_delayed(
+        &mut self,
+        wall_now: u64,
+        budget: &WorkBudget,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) {
         let root_fd = self.root_fd();
         let delayed_fd = match fs::open_directory(root_fd, "delayed") {
             Ok(fd) => fd,
@@ -347,7 +384,7 @@ impl Queue {
         };
 
         for bucket_name in &bucket_dirs {
-            if stats.operations_attempted >= budget.max_operations {
+            if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -389,7 +426,9 @@ impl Queue {
                 };
 
                 for entry in &entries {
-                    if stats.operations_attempted >= budget.max_operations {
+                    if stats.operations_attempted >= budget.max_operations
+                        || Self::budget_time_exceeded(deadline_mono)
+                    {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -473,6 +512,7 @@ impl Queue {
         boottime_now: u64,
         budget: &WorkBudget,
         stats: &mut RecoveryStats,
+        deadline_mono: u64,
     ) {
         let root_fd = self.root_fd();
         let tmp_fd = match fs::open_directory(root_fd, "tmp") {
@@ -486,7 +526,7 @@ impl Queue {
         };
 
         for boot_dir_name in &boot_dirs {
-            if stats.operations_attempted >= budget.max_operations {
+            if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -515,7 +555,7 @@ impl Queue {
                 };
 
                 for entry in &entries {
-                    if stats.operations_attempted >= budget.max_operations {
+                    if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -551,7 +591,12 @@ impl Queue {
 
     /// Compact full-job receipts into compact receipts.
     /// Replaces a full-job .rct file with a 128-byte compact receipt at the same pathname.
-    pub fn compact_receipts(&mut self, budget: &WorkBudget, stats: &mut RecoveryStats) {
+    pub fn compact_receipts(
+        &mut self,
+        budget: &WorkBudget,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) {
         let root_fd = self.root_fd();
         let receipts_fd = match fs::open_directory(root_fd, "receipts") {
             Ok(fd) => fd,
@@ -564,7 +609,7 @@ impl Queue {
         };
 
         for bucket_name in &bucket_dirs {
-            if stats.operations_attempted >= budget.max_operations {
+            if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -621,8 +666,15 @@ impl Queue {
 
                     let file_size = stat.st_size as usize;
 
-                    // If already 128 bytes with compact magic, skip
+                    // R2-H08: Validate 128-byte file is actually a compact receipt
                     if file_size == spoolq_format::COMPACT_RECEIPT_SIZE {
+                        let mut compact_buf = [0u8; spoolq_format::COMPACT_RECEIPT_SIZE];
+                        if fs::pread_exact(receipt_fd.as_raw_fd(), &mut compact_buf, 0).is_ok()
+                            && spoolq_format::CompactReceipt::decode(&compact_buf).is_ok()
+                        {
+                            continue; // Valid compact receipt
+                        }
+                        // Invalid 128-byte file: skip
                         continue;
                     }
 
@@ -668,11 +720,13 @@ impl Queue {
                     // Write to a temp file in the same directory
                     let tmp_name = format!(
                         ".compact-{}.tmp",
-                        spoolq_fs_linux::random_128bit()
-                            .unwrap_or([0; 16])
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
+                        match spoolq_fs_linux::random_128bit() {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        }
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
                     );
 
                     let tmp_fd = match fs::create_exclusive(shard_fd.as_raw_fd(), &tmp_name, 0o600)
@@ -714,6 +768,7 @@ impl Queue {
         retention_ns: u64,
         budget: &WorkBudget,
         stats: &mut RecoveryStats,
+        deadline_mono: u64,
     ) {
         let root_fd = self.root_fd();
         let wall_floor = self.effective_wall_floor_ns();
@@ -729,7 +784,7 @@ impl Queue {
         };
 
         for bucket_name in &bucket_dirs {
-            if stats.operations_attempted >= budget.max_operations {
+            if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }

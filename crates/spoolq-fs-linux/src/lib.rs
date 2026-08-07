@@ -45,12 +45,13 @@ fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CString> {
 
 /// Open a directory for reading.
 pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
+    // R2-B06: Use O_NOFOLLOW to prevent symlink traversal on state directories.
     let c_name = cstr_from_name(name)?;
     let fd = unsafe {
         libc::openat(
             dir_fd,
             c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -456,11 +457,12 @@ pub fn pread_exact(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<()> {
 /// Open a directory path (absolute) and return an OwnedFd.
 /// Uses OsStrExt for byte-safe path handling.
 pub fn open_dir_absolute(path: &Path) -> io::Result<OwnedFd> {
+    // R2-B06: Use O_NOFOLLOW to prevent the root from being a symlink.
     let c_path = cstr_from_bytes(path.as_os_str().as_bytes())?;
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -783,9 +785,10 @@ pub fn probe_rename_noreplace(dir_fd: RawFd) -> io::Result<bool> {
     drop(f1);
     drop(f2);
 
-    // Try to rename n1 -> n2 with NOREPLACE (should fail since n2 exists)
+    // Try to rename n1 -> n2 with NOREPLACE (should fail with EEXIST since n2 exists)
     let result = renameat2_noreplace(dir_fd, n1, dir_fd, n2);
-    let works = result.is_err();
+    // R2-H15: Only EEXIST proves RENAME_NOREPLACE support.
+    let works = result.is_err_and(|e| e.raw_os_error() == Some(libc::EEXIST));
 
     // Cleanup
     let _ = unlinkat(dir_fd, n1);

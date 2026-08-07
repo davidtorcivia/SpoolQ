@@ -482,7 +482,13 @@ fn main() -> ExitCode {
                     eprintln!("  {}: {}{}", k, v, if *ok { "" } else { " [FAIL]" });
                 }
             }
-            ExitCode::SUCCESS
+            // R2-H22: Exit failure if any check failed.
+            let all_ok = results.iter().all(|(_, _, ok)| *ok);
+            if all_ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(EXIT_IO_FAILURE)
+            }
         }
 
         Commands::Ack { path, handle_file } => {
@@ -500,7 +506,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match queue.ack_unverified(&lease) {
+            // R2-H19: CLI uses strict ack path: verify payload first.
+            let verified = match queue.verify_lease_payload(&lease) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("payload verification failed: {e}");
+                    return ExitCode::from(EXIT_CORRUPTION);
+                }
+            };
+            match queue.ack(&verified) {
                 spoolq_core::AckOutcome::Acked => {
                     eprintln!("acked");
                     ExitCode::SUCCESS
@@ -543,13 +557,13 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // R2-H20: Use Queue::retry_after() which uses the rollback-safe
+            // effective wall clock.
             let outcome = match after_seconds {
-                Some(s) => queue.retry_at(
-                    &lease,
-                    spoolq_fs_linux::clock_realtime_ns()
-                        .unwrap_or(0)
-                        .saturating_add(s.saturating_mul(1_000_000_000)),
-                ),
+                Some(s) => {
+                    let duration_ns = s.checked_mul(1_000_000_000).unwrap_or(u64::MAX);
+                    queue.retry_after(&lease, duration_ns)
+                }
                 None => queue.retry_now(&lease),
             };
             match outcome {
@@ -797,8 +811,15 @@ fn main() -> ExitCode {
                         ""
                     },
                 );
+                if !stats.errors.is_empty() {
+                    eprintln!("{} recovery errors", stats.errors.len());
+                }
                 if !watch {
-                    break;
+                    if stats.errors.is_empty() {
+                        break;
+                    } else {
+                        return ExitCode::from(EXIT_IO_FAILURE);
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
@@ -807,7 +828,7 @@ fn main() -> ExitCode {
         Commands::Resolve {
             path,
             result_file,
-            stabilize: _,
+            stabilize,
         } => {
             let data = match std::fs::read(&result_file) {
                 Ok(d) => d,
@@ -816,7 +837,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
-            // Parse the transition ticket from the result file
+            // R2-H21: Parse typed ticket and call core resolver
             let ticket_json: serde_json::Value = match serde_json::from_slice(&data) {
                 Ok(v) => v,
                 Err(e) => {
@@ -824,17 +845,26 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_ORDINARY);
                 }
             };
+            let job_id_hex = ticket_json
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let job_id = match spoolq_names::hex_decode_16(job_id_hex) {
+                Some(id) => id,
+                None => {
+                    eprintln!("invalid job_id in ticket");
+                    return ExitCode::from(EXIT_ORDINARY);
+                }
+            };
             let source_path = ticket_json
                 .get("source_relative_path")
-                .or_else(|| ticket_json.get("attempted_destination_relative_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let dest_path = ticket_json
                 .get("attempted_destination_relative_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            eprintln!("source: {source_path}");
-            eprintln!("destination: {dest_path}");
+
             let queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
                 Err(e) => {
@@ -842,22 +872,62 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_IO_FAILURE);
                 }
             };
-            // Use inspect to check states
-            let job_id_hex = ticket_json
-                .get("job_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if let Some(job_id) = spoolq_names::hex_decode_16(job_id_hex) {
-                let snapshots = queue.inspect(&job_id);
-                if snapshots.is_empty() {
-                    eprintln!("neither observed");
-                } else {
-                    for s in &snapshots {
-                        eprintln!("{} gen={} {}", s.state, s.generation, s.relative_path);
-                    }
+
+            let ticket = spoolq_core::TransitionTicket {
+                job_id,
+                source_state: ticket_json
+                    .get("source_state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                source_generation: ticket_json
+                    .get("source_generation")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                source_attempt: ticket_json
+                    .get("source_attempt")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                source_relative_path: source_path.to_string(),
+                attempted_destination_state: ticket_json
+                    .get("attempted_destination_state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                attempted_destination_relative_path: dest_path.to_string(),
+                lease_token: None,
+                envelope_digest: [0; 32],
+            };
+
+            let outcome = queue.resolve(&ticket, stabilize);
+            match outcome {
+                spoolq_core::ResolutionOutcome::DestinationObserved
+                | spoolq_core::ResolutionOutcome::DestinationStabilized => {
+                    eprintln!("destination observed: {dest_path}");
+                    ExitCode::SUCCESS
+                }
+                spoolq_core::ResolutionOutcome::SourceObserved
+                | spoolq_core::ResolutionOutcome::SourceStabilized => {
+                    eprintln!("source observed: {source_path}");
+                    ExitCode::SUCCESS
+                }
+                spoolq_core::ResolutionOutcome::BothObserved => {
+                    eprintln!("both source and destination observed (corruption)");
+                    ExitCode::from(EXIT_CORRUPTION)
+                }
+                spoolq_core::ResolutionOutcome::NeitherObserved => {
+                    eprintln!("neither source nor destination observed");
+                    ExitCode::from(EXIT_ORDINARY)
+                }
+                spoolq_core::ResolutionOutcome::ConflictingObject => {
+                    eprintln!("conflicting object at expected path");
+                    ExitCode::from(EXIT_CORRUPTION)
+                }
+                spoolq_core::ResolutionOutcome::ResolutionFailed(e) => {
+                    eprintln!("resolution failed: {e}");
+                    ExitCode::from(EXIT_IO_FAILURE)
                 }
             }
-            ExitCode::from(EXIT_SUCCESS)
         }
 
         Commands::Bench {
@@ -1185,8 +1255,11 @@ fn save_handle_to_file(
     };
     let json = serde_json::to_string_pretty(&handle)?;
 
-    // C-55: Atomic write: temp file -> fsync -> rename -> fsync parent
-    let tmp_path = handle_path.with_extension("tmp");
+    // R2-M14: Atomic write with unique temp name (not deterministic)
+    let rand_bytes = spoolq_fs_linux::random_128bit()
+        .map(|b| spoolq_names::hex_encode(&b))
+        .unwrap_or_else(|_| "fallback".to_string());
+    let tmp_path = handle_path.with_extension(format!("tmp.{rand_bytes}"));
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
