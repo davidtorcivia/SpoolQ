@@ -505,12 +505,26 @@ impl Queue {
         self.poisoned = true;
     }
     /// Compute the effective wall floor: max(CLOCK_REALTIME, stored watermark bucket * width)
+    /// Wall floor for mutating operations (enqueue, ack, retry, bury, renew).
+    /// B3: Poisons on failure instead of silently falling back.
+    pub(crate) fn wall_floor_or_poison(&mut self) -> u64 {
+        match self.effective_wall_floor_ns_checked() {
+            Ok(ns) => ns,
+            Err(e) => {
+                self.poison();
+                // Return 0 to avoid panicking callers; the poisoned flag
+                // will reject the next operation.
+                eprintln!("spoolq: poisoned due to wall floor error: {e}");
+                0
+            }
+        }
+    }
+
+    /// Wall floor for read-only or recovery operations. Falls back to raw
+    /// CLOCK_REALTIME on error without poisoning, since recovery must continue.
     pub(crate) fn effective_wall_floor_ns(&self) -> u64 {
         match self.effective_wall_floor_ns_checked() {
             Ok(ns) => ns,
-            // On error, fall back to raw realtime but note the degradation.
-            // A truly safe implementation would poison here, but that would
-            // break recovery which needs to read the floor.
             Err(_) => spoolq_fs_linux::clock_realtime_ns().unwrap_or(0),
         }
     }
@@ -742,7 +756,7 @@ impl Queue {
         let shard_str = shard_hex(shard);
 
         // Determine initial state: ready or delayed
-        let now_wall = self.effective_wall_floor_ns();
+        let now_wall = self.wall_floor_or_poison();
         let (initial_state, eligibility_bucket) = match job.initial_not_before {
             Some(nb) if nb > now_wall => {
                 let (eb, _) =
@@ -1632,7 +1646,7 @@ impl Queue {
         }
 
         // C-25/B-05: Use effective wall floor for terminal transitions
-        let wall_now = self.effective_wall_floor_ns();
+        let wall_now = self.wall_floor_or_poison();
         let terminal_bucket =
             spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(terminal_bucket);
@@ -1827,7 +1841,7 @@ impl Queue {
 
     /// Retry a lease after a duration.
     pub fn retry_after(&mut self, lease: &LeaseInfo, duration_ns: u64) -> TransitionOutcome {
-        let wall_now = self.effective_wall_floor_ns();
+        let wall_now = self.wall_floor_or_poison();
         let deadline = match spoolq_math::retry_wall_deadline(wall_now, duration_ns) {
             Some(d) => d,
             None => {
@@ -1870,7 +1884,7 @@ impl Queue {
                     ))
                 }
             };
-            let wall_now = self.effective_wall_floor_ns();
+            let wall_now = self.wall_floor_or_poison();
             let deadline = match spoolq_math::retry_wall_deadline(wall_now, delay_ns) {
                 Some(d) => d,
                 None => {
@@ -1992,7 +2006,7 @@ impl Queue {
         };
 
         // C-25/B-05: Use effective wall floor for terminal transitions
-        let wall_now = self.effective_wall_floor_ns();
+        let wall_now = self.wall_floor_or_poison();
         let terminal_bucket =
             spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(terminal_bucket);
@@ -2043,7 +2057,7 @@ impl Queue {
             Ok(t) => t,
             Err(e) => return RenewOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
-        let wall_now = self.effective_wall_floor_ns();
+        let wall_now = self.wall_floor_or_poison();
         let new_boottime_dl = match boottime_now.checked_add(lease_duration_ns) {
             Some(d) => d,
             None => {
@@ -2392,7 +2406,7 @@ impl Queue {
         reason: DeadReason,
     ) -> Result<(), io::Error> {
         let shard_str = ready_dir.rsplit('/').next().unwrap_or("0000");
-        let wall_now = self.effective_wall_floor_ns();
+        let wall_now = self.wall_floor_or_poison();
         let terminal_bucket =
             spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
         let bucket_str = bucket_hex(terminal_bucket);

@@ -39,12 +39,11 @@ jobs:
           cargo test -p spoolq-core -- state_machine
           test -f generated/state-machine.rs
 
-  # Fuzz and mutation testing - runs on PRs and main push
-  fuzz-and-mutants:
+  # Fuzz smoke test - gating on PRs
+  fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -58,13 +57,40 @@ jobs:
         run: timeout 90 cargo +nightly fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=5000
       - name: Fuzz smoke (bucket arithmetic)
         run: timeout 90 cargo +nightly fuzz run fuzz_bucket_arithmetic -- -max_len=64 -runs=5000
-      - name: Mutation testing
-        continue-on-error: true
-        run: |
-          cargo install cargo-mutants
-          cargo mutants             -p spoolq-core -p spoolq-format -p spoolq-names             -p spoolq-math -p spoolq-fs-linux             -j 2 --timeout 30 || true
+
+  # Mutation testing - parallelized per crate via matrix
+  mutants:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - spoolq-format
+          - spoolq-names
+          - spoolq-math
+          - spoolq-fs-linux
+          - spoolq-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants
+      - name: Run mutants for ${{ matrix.crate }}
+        run: cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 || true
+
+  # Deep fuzz - extended runs (continue-on-error)
+  deep-fuzz:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
       - name: Deep fuzz (50000 runs per target)
-        continue-on-error: true
         run: |
           timeout 300 cargo +nightly fuzz run fuzz_format_header -- -max_len=160 -runs=50000
           timeout 300 cargo +nightly fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
