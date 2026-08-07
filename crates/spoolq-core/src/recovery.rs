@@ -60,7 +60,7 @@ impl Queue {
             start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
 
         // 1. Reap expired leases
-        self.reap_expired_leases(boottime_now, wall_now, budget, &mut stats);
+        self.reap_expired_leases(boottime_now, wall_now, budget, &mut stats, deadline_mono);
 
         // 2. Promote eligible delayed jobs
         if !stats.budget_exhausted {
@@ -84,6 +84,25 @@ impl Queue {
         }
 
         stats
+    }
+
+    /// B1: Quarantine an object during recovery.
+    fn quarantine_recovery_object(
+        &self,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        full_path: &str,
+        reason: crate::QuarantineReason,
+    ) -> Result<(), Error> {
+        let qid = fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?;
+        let q_name = spoolq_names::quarantine_filename(&qid, reason as u16);
+        let _ = self.ensure_dir("quarantine");
+        let q_dir_fd = crate::queue::open_relative(self.root_fd(), "quarantine")
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::durable_move_noreplace(src_dir_fd, filename, q_dir_fd.as_raw_fd(), &q_name)
+            .map_err(|e| Error::IoFailure(format!("quarantine move failed: {e}")))?;
+        let _ = full_path; // logged by caller
+        Ok(())
     }
 
     /// R2-H05: Check if the monotonic deadline has been exceeded.
@@ -118,6 +137,7 @@ impl Queue {
         wall_now: u64,
         budget: &WorkBudget,
         stats: &mut RecoveryStats,
+        deadline_mono: u64,
     ) {
         let root_fd = self.root_fd();
 
@@ -133,7 +153,7 @@ impl Queue {
         };
 
         for boot_dir_name in &boot_dirs {
-            if stats.operations_attempted >= budget.max_operations {
+            if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -151,7 +171,7 @@ impl Queue {
             };
 
             for bucket_name in &bucket_dirs {
-                if stats.operations_attempted >= budget.max_operations {
+                if Self::budget_exhausted(stats, budget, deadline_mono) {
                     stats.budget_exhausted = true;
                     return;
                 }
@@ -221,6 +241,36 @@ impl Queue {
 
                         // For current boot, check actual deadline
                         if is_current_boot && parsed.boottime_deadline_ns > boottime_now {
+                            continue;
+                        }
+
+                        // B1: Validate object structure before recovery transition
+                        if let Err(e) = self.validate_active_object(
+                            shard_fd.as_raw_fd(),
+                            entry,
+                            "leased",
+                            shard_name,
+                            &self.format.queue_id,
+                        ) {
+                            Self::record_error(
+                                stats,
+                                "reap_validate",
+                                &format!(
+                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                ),
+                                &format!("{e}"),
+                            );
+                            // B1: Quarantine corrupt objects
+                            if matches!(e, Error::QueueCorrupt(_)) {
+                                let _ = self.quarantine_recovery_object(
+                                    shard_fd.as_raw_fd(),
+                                    entry,
+                                    &format!(
+                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                    ),
+                                    crate::QuarantineReason::EnvelopeCorrupt,
+                                );
+                            }
                             continue;
                         }
 
@@ -426,9 +476,7 @@ impl Queue {
                 };
 
                 for entry in &entries {
-                    if stats.operations_attempted >= budget.max_operations
-                        || Self::budget_time_exceeded(deadline_mono)
-                    {
+                    if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -443,6 +491,40 @@ impl Queue {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
+
+                    // B1: Validate object structure before promotion
+                    {
+                        let src_dir_fd = match open_relative(
+                            self.root_fd(),
+                            &format!("delayed/{bucket_name}/{shard_name}"),
+                        ) {
+                            Ok(fd) => fd,
+                            Err(_) => continue,
+                        };
+                        if let Err(e) = self.validate_active_object(
+                            src_dir_fd.as_raw_fd(),
+                            entry,
+                            "delayed",
+                            shard_name,
+                            &self.format.queue_id,
+                        ) {
+                            Self::record_error(
+                                stats,
+                                "promote_validate",
+                                &format!("delayed/{bucket_name}/{shard_name}/{entry}"),
+                                &format!("{e}"),
+                            );
+                            if matches!(e, Error::QueueCorrupt(_)) {
+                                let _ = self.quarantine_recovery_object(
+                                    src_dir_fd.as_raw_fd(),
+                                    entry,
+                                    &format!("delayed/{bucket_name}/{shard_name}/{entry}"),
+                                    crate::QuarantineReason::EnvelopeCorrupt,
+                                );
+                            }
+                            continue;
+                        }
+                    }
 
                     // Promote: move delayed -> ready
                     let src_dir = format!("delayed/{bucket_name}/{shard_name}");
@@ -872,10 +954,18 @@ impl Queue {
             }
 
             // Remove empty bucket dir
-            // B-06: Only count if removal succeeds
+            // H15: Only count if removal and sync both succeed
             if fs::unlinkat_dir(receipts_fd.as_raw_fd(), bucket_name).is_ok() {
-                let _ = fs::fsync_dir_fd(receipts_fd.as_raw_fd());
-                stats.buckets_removed += 1;
+                if fs::fsync_dir_fd(receipts_fd.as_raw_fd()).is_ok() {
+                    stats.buckets_removed += 1;
+                } else {
+                    Self::record_error(
+                        stats,
+                        "bucket_removal_sync",
+                        &format!("receipts/{bucket_name}"),
+                        "receipts dir sync failed after bucket removal",
+                    );
+                }
             }
         }
     }
