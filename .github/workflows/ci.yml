@@ -58,36 +58,29 @@ jobs:
       - name: Fuzz smoke (bucket arithmetic)
         run: timeout 90 cargo +nightly fuzz run fuzz_bucket_arithmetic -- -max_len=64 -runs=5000
 
-  # Mutation testing - parallelized by crate and file group
+  # Mutation testing - diff-based for PRs, full suite for main
   mutants:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - crate: spoolq-format
-          - crate: spoolq-names
-          - crate: spoolq-math
-          - crate: spoolq-fs-linux
-          - crate: spoolq-core
-            files: "*queue*"
-          - crate: spoolq-core
-            files: "*recovery*"
-          - crate: spoolq-core
-            files: "*quarantine* *errors* *state_machine*"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-mutants
         run: cargo install cargo-mutants
-      - name: Run mutants for ${{ matrix.crate }}${{ matrix.files && ' (files)' || '' }}
+      - name: Run mutants (changed code only)
         run: |
-          if [ -z "${{ matrix.files }}" ]; then
-            cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 || true
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git diff origin/$GITHUB_BASE_REF...HEAD > /tmp/pr.diff
+            if [ -s /tmp/pr.diff ]; then
+              cargo mutants --workspace -j 2 --timeout 20 --in-diff /tmp/pr.diff --cap-lints true || true
+            else
+              echo "No diff to test"
+            fi
           else
-            cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20               $(for f in ${{ matrix.files }}; do echo "-f $f"; done) || true
+            cargo mutants --workspace -j 2 --timeout 20 --cap-lints true || true
           fi
 
   # Deep fuzz - extended runs (continue-on-error)
@@ -138,3 +131,8 @@ jobs:
         run: cargo test -p spoolq-core -- fd_leak_stress --release
       - name: Benchmarks (P3)
         run: cargo bench -p spoolq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
+      - name: Full mutation suite (all crates, no timeout cap)
+        continue-on-error: true
+        run: |
+          cargo install cargo-mutants
+          cargo mutants --workspace -j 2 --cap-lints true || true
