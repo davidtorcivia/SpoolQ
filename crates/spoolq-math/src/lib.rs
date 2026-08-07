@@ -176,6 +176,11 @@ pub fn retry_delay_ms(
             return Ok(lower + offset);
         }
         counter += 1;
+        // B4: Cap iterations to prevent theoretical infinite loop.
+        // Fallback to the midpoint of the span, which is unbiased.
+        if counter >= 64 {
+            return Ok(lower + span / 2);
+        }
     }
 }
 
