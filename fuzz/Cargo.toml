@@ -33,3 +33,5 @@ name = "fuzz_bucket_arithmetic"
 path = "fuzz_targets/fuzz_bucket_arithmetic.rs"
 test = false
 doc = false
+
+[workspace]

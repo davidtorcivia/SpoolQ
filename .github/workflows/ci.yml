@@ -39,9 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build fuzz targets
-        run: cargo build --manifest-path fuzz/Cargo.toml
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
