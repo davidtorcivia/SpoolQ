@@ -3555,6 +3555,7 @@ fn nb_to_u64(opt: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FsckOptions;
 
     trait CommitOrPanic {
         fn commit_or_panic(&self);
@@ -5292,6 +5293,96 @@ mod tests {
             matches!(result, AckOutcome::NotCommitted(Error::QueueCorrupt(_))),
             "ENOTDIR should be QueueCorrupt, got {result:?}"
         );
+    }
+
+    // ===== fsck on delayed/dead/receipt states =====
+    #[test]
+    fn fsck_finds_valid_delayed_job() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Retry with delay to create a delayed object
+        let _ = queue.retry_after(&lease, 999999999999);
+        drop(queue);
+
+        let queue2 = Queue::open(
+            _tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = queue2.fsck(&FsckOptions::default());
+        assert_eq!(report.findings.len(), 0, "findings: {:?}", report.findings);
+    }
+
+    #[test]
+    fn fsck_finds_valid_dead_job() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Bury to create a dead object
+        let _ = queue.bury(&lease, DeadReason::ConsumerRejected);
+        drop(queue);
+
+        let queue2 = Queue::open(
+            _tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = queue2.fsck(&FsckOptions::default());
+        assert_eq!(report.findings.len(), 0, "findings: {:?}", report.findings);
+    }
+
+    #[test]
+    fn fsck_finds_valid_receipt() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            _ => panic!("lease failed"),
+        };
+        // Ack to create a receipt
+        queue.verify_lease_payload(&lease).unwrap();
+        let result = queue.ack(&lease);
+        assert!(matches!(result, AckOutcome::Acked));
+        drop(queue);
+
+        let queue2 = Queue::open(
+            _tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = queue2.fsck(&FsckOptions::default());
+        assert_eq!(report.findings.len(), 0, "findings: {:?}", report.findings);
     }
 
     // ===== P0-05: verified fd check detects swap =====

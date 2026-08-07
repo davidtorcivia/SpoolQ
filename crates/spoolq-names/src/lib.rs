@@ -1469,4 +1469,80 @@ mod tests {
         assert!(name.authenticate_tag(&qid, bucket, shard));
         assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
     }
+
+    // ===== canonical_context output verification (mutation coverage) =====
+
+    #[test]
+    fn ready_canonical_context_format() {
+        let common = make_common();
+        let name = ReadyName {
+            common: common.clone(),
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("01ab");
+        assert!(ctx.starts_with("ready/-/-/01ab/"));
+        assert!(ctx.contains(&common.base_name()));
+        // Non-empty and correct structure
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn leased_canonical_context_format() {
+        let common = make_common();
+        let name = LeasedName {
+            common: common.clone(),
+            boottime_deadline_ns: 30000000000,
+            wall_deadline_ns: 1234567890,
+            token: [0xCD; 16],
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("boot-id", "bucket1", "01ab");
+        assert!(ctx.starts_with("leased/boot-id/bucket1/01ab/"));
+        assert!(ctx.contains(".b"));
+        assert!(ctx.contains(".w"));
+        assert!(ctx.contains(".t"));
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn delayed_canonical_context_format() {
+        let common = make_common();
+        let name = DelayedName {
+            common: common.clone(),
+            not_before_ns: 9999999999,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("bucket1", "01ab");
+        assert!(ctx.starts_with("delayed/-/bucket1/01ab/"));
+        assert!(ctx.contains(".d"));
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn dead_canonical_context_format() {
+        let common = make_common();
+        let name = DeadName {
+            common: common.clone(),
+            reason: 0x0004,
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("bucket1", "01ab");
+        assert!(ctx.starts_with("dead/-/bucket1/01ab/"));
+        assert!(ctx.contains(".x"));
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn receipt_canonical_context_format() {
+        let common = make_common();
+        let name = ReceiptName {
+            common: common.clone(),
+            token: [0xEE; 16],
+            tag: [0; 8],
+        };
+        let ctx = name.canonical_context("bucket1", "01ab");
+        assert!(ctx.starts_with("receipts/-/bucket1/01ab/"));
+        assert!(ctx.contains(".t"));
+        assert!(!ctx.is_empty());
+    }
 }
