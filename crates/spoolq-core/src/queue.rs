@@ -4469,6 +4469,98 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    // ===== R4-B07: resolve full identity verification =====
+    #[test]
+    fn resolve_source_still_in_ready() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+        // Simulate a ticket for a ready->leased transition that was interrupted
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: 0,
+            source_attempt: 0,
+            source_relative_path: "ready/0000/nonexistent.sqj".into(),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+        let outcome = queue.resolve(&ticket, false);
+        assert!(matches!(outcome, ResolutionOutcome::NeitherObserved));
+    }
+
+    #[test]
+    fn resolve_detects_ready_object_present() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+        // The object exists in ready. Use the path from the enqueue ticket.
+        let parsed =
+            spoolq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
+                .unwrap();
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: parsed.common.generation,
+            source_attempt: parsed.common.attempt,
+            source_relative_path: et.expected_relative_path.clone(),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+        let outcome = queue.resolve(&ticket, false);
+        assert!(matches!(outcome, ResolutionOutcome::SourceObserved));
+    }
+
+    #[test]
+    fn resolve_rejects_wrong_generation() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(t) => t,
+            _ => panic!("enqueue failed"),
+        };
+        let parsed =
+            spoolq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
+                .unwrap();
+        // Use wrong generation in the ticket.
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: parsed.common.generation + 999,
+            source_attempt: parsed.common.attempt,
+            source_relative_path: et.expected_relative_path.clone(),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+        let outcome = queue.resolve(&ticket, false);
+        // File exists but generation doesn't match -> Conflict
+        assert!(matches!(outcome, ResolutionOutcome::ConflictingObject));
+    }
+
     // ===== B-05: Wall watermark advances after enqueue =====
     #[test]
     fn wall_watermark_advances() {
