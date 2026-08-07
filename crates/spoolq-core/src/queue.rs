@@ -2900,12 +2900,9 @@ impl Queue {
     /// Validates source/destination by opening them, reading headers, and
     /// comparing job_id and generation against the ticket.
     pub fn resolve(&self, ticket: &TransitionTicket, stabilize: bool) -> ResolutionOutcome {
-        let src_result =
-            self.resolve_check_object(&ticket.source_relative_path, ticket);
-        let dest_result = self.resolve_check_object(
-            &ticket.attempted_destination_relative_path,
-            ticket,
-        );
+        let src_result = self.resolve_check_object(&ticket.source_relative_path, ticket);
+        let dest_result =
+            self.resolve_check_object(&ticket.attempted_destination_relative_path, ticket);
 
         match (src_result, dest_result) {
             // Source exists but destination doesn't
@@ -2968,7 +2965,12 @@ impl Queue {
             return ResolveObj::Conflict;
         }
 
-        let file_fd = match fs::openat(dir_fd.as_raw_fd(), name, libc::O_RDONLY | libc::O_NOFOLLOW, 0) {
+        let file_fd = match fs::openat(
+            dir_fd.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        ) {
             Ok(fd) => fd,
             Err(e) => return ResolveObj::Error(Error::IoFailure(e.to_string())),
         };
@@ -3017,9 +3019,7 @@ impl Queue {
         }
 
         // R4-B07: Verify envelope digest when the ticket carries a known value.
-        if ticket.envelope_digest != [0u8; 32]
-            && header.envelope_digest != ticket.envelope_digest
-        {
+        if ticket.envelope_digest != [0u8; 32] && header.envelope_digest != ticket.envelope_digest {
             return ResolveObj::Conflict;
         }
 
@@ -3029,10 +3029,8 @@ impl Queue {
             return ResolveObj::Conflict;
         }
         let mut ext_buf = vec![0u8; ext_len];
-        if ext_len > 0 {
-            if fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128).is_err() {
-                return ResolveObj::Conflict;
-            }
+        if ext_len > 0 && fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128).is_err() {
+            return ResolveObj::Conflict;
         }
         if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
             return ResolveObj::Conflict;
