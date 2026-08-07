@@ -5161,6 +5161,7 @@ mod tests {
             Leased,
             Acked,
             Retried,
+            Dead,
         }
         let mut oracle: HashMap<[u8; 16], State> = HashMap::new();
         // Live lease handles keyed by real job_id.
@@ -5249,7 +5250,7 @@ mod tests {
                             if snaps.iter().any(|s| s.state == "ready") {
                                 oracle.insert(id, State::Retried);
                             } else if snaps.iter().any(|s| s.state == "dead") {
-                                oracle.insert(id, State::Acked); // terminal
+                                oracle.insert(id, State::Dead);
                             } else {
                                 panic!(
                                     "retry committed but inspect has {:?}",
@@ -5266,8 +5267,9 @@ mod tests {
         let leased_count = oracle.values().filter(|s| **s == State::Leased).count();
         let acked_count = oracle.values().filter(|s| **s == State::Acked).count();
         let retried_count = oracle.values().filter(|s| **s == State::Retried).count();
+        let dead_count = oracle.values().filter(|s| **s == State::Dead).count();
         assert!(
-            ready_count + leased_count + acked_count + retried_count > 0,
+            ready_count + leased_count + acked_count + retried_count + dead_count > 0,
             "oracle should have tracked some jobs"
         );
 
@@ -5295,7 +5297,7 @@ mod tests {
                         "oracle Leased job vanished without transition"
                     );
                 }
-                State::Acked | State::Retried => {}
+                State::Acked | State::Retried | State::Dead => {}
             }
         }
     }
@@ -5801,9 +5803,9 @@ mod tests {
     #[test]
     fn fault_ack_post_rename_fsync_is_outcome_unknown() {
         spoolq_fs_linux::fault::reset();
-        let (_tmp, mut queue) = create_test_queue();
+        let (tmp, mut queue) = create_test_queue();
 
-        // Warm up receipt directory layout so ensure_dir does not fsync.
+        // Warm up so at least one terminal receipt bucket exists.
         queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
             content_type: "x".to_string(),
@@ -5817,7 +5819,22 @@ mod tests {
         queue.verify_lease_payload(&warm).unwrap();
         assert!(matches!(queue.ack(&warm), AckOutcome::Acked));
 
-        // Real job under test.
+        // Pre-create every shard under existing receipt buckets so ensure_dir
+        // during the next ack performs no mkdir and no fsync_dir_fd. The next
+        // fsync_dir_fd is then strictly post-rename (OutcomeUnknown).
+        let receipts = tmp.path().join("receipts");
+        let shard_count = queue.format().shard_count;
+        if let Ok(buckets) = std::fs::read_dir(&receipts) {
+            for bucket in buckets.flatten() {
+                if !bucket.path().is_dir() {
+                    continue;
+                }
+                for shard in 0..shard_count {
+                    let _ = std::fs::create_dir_all(bucket.path().join(format!("{shard:04x}")));
+                }
+            }
+        }
+
         queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
             content_type: "x".to_string(),
@@ -5830,10 +5847,7 @@ mod tests {
         };
         queue.verify_lease_payload(&lease).unwrap();
 
-        // ensure_dir may still fsync once when creating a new shard for this
-        // job_id. Fail the second fsync_dir_fd, which is the post-rename
-        // receipt-directory sync (OutcomeUnknown).
-        spoolq_fs_linux::fault::inject("fsync_dir_fd", 2);
+        spoolq_fs_linux::fault::inject("fsync_dir_fd", 1);
         let result = queue.ack(&lease);
         spoolq_fs_linux::fault::reset();
         assert!(
@@ -5869,7 +5883,7 @@ mod tests {
     #[test]
     fn fault_retry_post_rename_fsync_is_outcome_unknown() {
         spoolq_fs_linux::fault::reset();
-        let (_tmp, mut queue) = create_test_queue();
+        let (tmp, mut queue) = create_test_queue();
         queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
             content_type: "x".to_string(),
@@ -5880,18 +5894,19 @@ mod tests {
             LeaseOutcome::Leased(l) => l,
             _ => panic!("lease failed"),
         };
-        // Fail the first dest-dir fsync after the linearizing rename.
+        // Pre-create every ready shard so ensure_dir during retry_now does not
+        // fsync. The next fsync_dir_fd is post-rename.
+        let ready = tmp.path().join("ready");
+        let shard_count = queue.format().shard_count;
+        for shard in 0..shard_count {
+            let _ = std::fs::create_dir_all(ready.join(format!("{shard:04x}")));
+        }
         spoolq_fs_linux::fault::inject("fsync_dir_fd", 1);
         let result = queue.retry_now(&lease);
         spoolq_fs_linux::fault::reset();
-        // ensure_dir may consume the first fsync when creating ready shards;
-        // accept either OutcomeUnknown (post-lin) or NotCommitted (pre-lin).
         assert!(
-            matches!(
-                result,
-                TransitionOutcome::OutcomeUnknown(_) | TransitionOutcome::NotCommitted(_)
-            ),
-            "expected faulted transition, got {result:?}"
+            matches!(result, TransitionOutcome::OutcomeUnknown(_)),
+            "expected OutcomeUnknown, got {result:?}"
         );
     }
 

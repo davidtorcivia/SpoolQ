@@ -9,8 +9,8 @@ use std::path::Path;
 
 // ---------- Fault injection (always compiled; idle until armed) ----------
 //
-// Tests arm faults via fault::inject / inject_errno. Production code paths
-// pay only an AtomicBool load when nothing is armed.
+// Tests arm faults via fault::inject / inject_errno. Idle threads take a
+// TLS path that finds an empty map and returns immediately.
 
 /// Fault injection control for deterministic failure testing.
 ///
@@ -1202,5 +1202,142 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn mkdirat_and_unlinkat_dir_round_trip() {
+        let dir = tempfile_dir("mkdir");
+        let fd = open_dir_absolute(&dir).unwrap();
+        mkdirat(fd.as_raw_fd(), "child", 0o700).unwrap();
+        // Open proves the directory was created (Ok(()) no-op mutant fails here).
+        let child = open_directory(fd.as_raw_fd(), "child").unwrap();
+        drop(child);
+        unlinkat_dir(fd.as_raw_fd(), "child").unwrap();
+        assert!(open_directory(fd.as_raw_fd(), "child").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlinkat_removes_file() {
+        let dir = tempfile_dir("unlink");
+        let fd = open_dir_absolute(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        fstatat(fd.as_raw_fd(), "f").unwrap();
+        unlinkat(fd.as_raw_fd(), "f").unwrap();
+        assert!(fstatat(fd.as_raw_fd(), "f").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renameat_moves_file() {
+        let dir = tempfile_dir("renameat");
+        let fd = open_dir_absolute(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"z").unwrap();
+        renameat(fd.as_raw_fd(), "a", fd.as_raw_fd(), "b").unwrap();
+        assert!(fstatat(fd.as_raw_fd(), "a").is_err());
+        assert!(fstatat(fd.as_raw_fd(), "b").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fsync_dir_and_fd_succeed() {
+        let dir = tempfile_dir("fsyncdir");
+        let fd = open_dir_absolute(&dir).unwrap();
+        std::fs::write(dir.join("x"), b"1").unwrap();
+        fsync_dir_fd(fd.as_raw_fd()).unwrap();
+        // Nested child dir
+        mkdirat(fd.as_raw_fd(), "nested", 0o700).unwrap();
+        fsync_dir(fd.as_raw_fd(), "nested").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clocks_return_plausible_values() {
+        // Kill Ok(1) whole-function mutants: real clocks are far above 1.
+        let boot = clock_boottime_ns().unwrap();
+        let mono = clock_monotonic_ns().unwrap();
+        let real = clock_realtime_ns().unwrap();
+        assert!(boot > 1_000_000, "boottime too small: {boot}");
+        assert!(mono > 1_000_000, "monotonic too small: {mono}");
+        // Realtime after 2020-01-01 in nanoseconds.
+        assert!(
+            real > 1_577_836_800_000_000_000,
+            "realtime too small: {real}"
+        );
+    }
+
+    #[test]
+    fn pwrite_pread_round_trip() {
+        let dir = tempfile_dir("pwrite");
+        let fd = open_dir_absolute(&dir).unwrap();
+        let file = openat(
+            fd.as_raw_fd(),
+            "blob",
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        let data = b"hello-spoolq";
+        let n = pwrite(file.as_raw_fd(), data, 0).unwrap();
+        assert_eq!(n, data.len());
+        fsync(file.as_raw_fd()).unwrap();
+        let mut buf = vec![0u8; data.len()];
+        let r = pread(file.as_raw_fd(), &mut buf, 0).unwrap();
+        assert_eq!(r, data.len());
+        assert_eq!(&buf, data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_move_noreplace_moves_and_syncs() {
+        let dir = tempfile_dir("dmnr");
+        let fd = open_dir_absolute(&dir).unwrap();
+        mkdirat(fd.as_raw_fd(), "src", 0o700).unwrap();
+        mkdirat(fd.as_raw_fd(), "dst", 0o700).unwrap();
+        let src = open_directory(fd.as_raw_fd(), "src").unwrap();
+        let dst = open_directory(fd.as_raw_fd(), "dst").unwrap();
+        std::fs::write(dir.join("src/f"), b"payload").unwrap();
+        durable_move_noreplace(src.as_raw_fd(), "f", dst.as_raw_fd(), "f").unwrap();
+        assert!(fstatat(src.as_raw_fd(), "f").is_err());
+        assert!(fstatat(dst.as_raw_fd(), "f").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_move_replace_overwrites() {
+        let dir = tempfile_dir("dmr");
+        let fd = open_dir_absolute(&dir).unwrap();
+        mkdirat(fd.as_raw_fd(), "src", 0o700).unwrap();
+        mkdirat(fd.as_raw_fd(), "dst", 0o700).unwrap();
+        let src = open_directory(fd.as_raw_fd(), "src").unwrap();
+        let dst = open_directory(fd.as_raw_fd(), "dst").unwrap();
+        std::fs::write(dir.join("src/f"), b"new").unwrap();
+        std::fs::write(dir.join("dst/f"), b"old").unwrap();
+        durable_move_replace(src.as_raw_fd(), "f", dst.as_raw_fd(), "f").unwrap();
+        assert!(fstatat(src.as_raw_fd(), "f").is_err());
+        let st = fstatat(dst.as_raw_fd(), "f").unwrap();
+        assert_eq!(st.st_size as usize, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linkat_tmpfile_publication_paths() {
+        let dir = tempfile_dir("tmpfile");
+        let fd = open_dir_absolute(&dir).unwrap();
+        // O_TMPFILE may be unsupported on some filesystems; skip if so.
+        let tmp = match open_tmpfile(fd.as_raw_fd()) {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        write_all(tmp.as_raw_fd(), b"tmp").unwrap();
+        // Prefer empty_path; fall back to proc path.
+        let linked = linkat_empty_path(tmp.as_raw_fd(), fd.as_raw_fd(), "pub1")
+            .or_else(|_| linkat_proc_self_fd(tmp.as_raw_fd(), fd.as_raw_fd(), "pub1"));
+        assert!(linked.is_ok(), "tmpfile link failed: {linked:?}");
+        assert!(fstatat(fd.as_raw_fd(), "pub1").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
