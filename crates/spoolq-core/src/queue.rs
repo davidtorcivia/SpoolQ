@@ -1192,13 +1192,19 @@ impl Queue {
                 // Ensure lease directory exists
                 let leased_dir = format!("leased/{}/{}/{}", self.boot_id, bucket_str, shard_str);
                 if let Err(e) = self.ensure_dir(&leased_dir) {
+                    // R4-B04: Propagate real errors, don't mask as scan miss
+                    scan_had_error = true;
                     let _ = e;
                     continue;
                 }
 
                 let leased_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &leased_dir) {
                     Ok(fd) => fd,
-                    Err(_) => continue,
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+                    Err(_) => {
+                        scan_had_error = true;
+                        continue;
+                    }
                 };
 
                 // Rename ready -> leased with NOREPLACE
@@ -1291,10 +1297,11 @@ impl Queue {
                         }
 
                         // Read and validate the fixed header
+                        // R4-B06: Open with O_NOFOLLOW to reject symlinks
                         let leased_file = match fs::openat(
                             leased_dir_fd.as_raw_fd(),
                             &leased_name,
-                            libc::O_RDONLY,
+                            libc::O_RDONLY | libc::O_NOFOLLOW,
                             0,
                         ) {
                             Ok(f) => f,
@@ -1370,6 +1377,117 @@ impl Queue {
                                 lease_token: Some(lease_token),
                                 envelope_digest: [0; 32],
                             });
+                        }
+
+                        // R4-B05: Full structural validation of the claimed object before return.
+                        // Verify envelope digest, exact size, and payload limit.
+                        {
+                            let ext_len_h = header.extension_header_length as usize;
+                            if ext_len_h > 65536 {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: header.envelope_digest,
+                                });
+                            }
+                            let mut ext_buf_claim = vec![0u8; ext_len_h];
+                            if ext_len_h > 0
+                                && fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf_claim, 128)
+                                    .is_err()
+                            {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: header.envelope_digest,
+                                });
+                            }
+                            if !spoolq_format::verify_envelope_digest(&header, &ext_buf_claim) {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: header.envelope_digest,
+                                });
+                            }
+                            // Verify exact file size
+                            let expected_claim_size =
+                                (128 + ext_len_h + header.payload_length as usize) as u64;
+                            if leased_stat.st_size as u64 != expected_claim_size {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: header.envelope_digest,
+                                });
+                            }
+                            // Verify payload limit
+                            if header.payload_length > self.format.max_payload_length {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: header.envelope_digest,
+                                });
+                            }
+                            // Verify header max_attempts matches filename
+                            if header.maximum_attempts != parsed.common.maximum_attempts {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                    job_id: parsed.common.job_id,
+                                    source_state: "ready".into(),
+                                    source_generation: parsed.common.generation,
+                                    source_attempt: parsed.common.attempt,
+                                    source_relative_path: format!("{ready_dir}/{entry}"),
+                                    attempted_destination_state: "leased".into(),
+                                    attempted_destination_relative_path: format!(
+                                        "{leased_dir}/{leased_name}"
+                                    ),
+                                    lease_token: Some(lease_token),
+                                    envelope_digest: header.envelope_digest,
+                                });
+                            }
                         }
 
                         // B2: Extension read/decode failure after claim is a post-linearization
@@ -1460,7 +1578,11 @@ impl Queue {
 
                         return LeaseOutcome::Leased(lease_info);
                     }
-                    Err(_) => continue,
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+                    Err(_) => {
+                        scan_had_error = true;
+                        continue;
+                    }
                 }
             }
         }
@@ -1845,7 +1967,10 @@ impl Queue {
             ));
         }
 
-        let boottime_now = fs::clock_boottime_ns().unwrap_or(0);
+        let boottime_now = match fs::clock_boottime_ns() {
+            Ok(t) => t,
+            Err(e) => return RenewOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+        };
         let wall_now = self.effective_wall_floor_ns();
         let new_boottime_dl = match boottime_now.checked_add(lease_duration_ns) {
             Some(d) => d,
@@ -2040,6 +2165,13 @@ impl Queue {
             )));
         }
 
+        // R4-H04: Verify envelope digest matches the handle
+        if header.envelope_digest != lease.envelope_digest {
+            return Err(Error::QueueCorrupt(
+                "envelope digest does not match handle".into(),
+            ));
+        }
+
         // R2-H03: Extension read failure is a real error, not a silent pass.
         let ext_len = header.extension_header_length as usize;
         if ext_len > 65536 {
@@ -2224,6 +2356,12 @@ impl Queue {
         fs::fsync_dir_fd(ready_dir_fd.as_raw_fd())?;
         Ok(())
     }
+    /// R4-H23: Read and verify the payload of a leased job.
+    /// NOTE: Verification establishes correctness at the time of the call.
+    /// Between verify_lease_payload() and ack(), the file must not be modified
+    /// by any external process. The strict ack path re-validates source identity
+    /// (B-04) but does not rehash payload. For maximum safety, ack immediately
+    /// after verify, or keep the file descriptor open.
     /// B-09: Read and verify the payload of a leased job.
     /// First validates source identity (B-04), then verifies envelope digest,
     /// then hashes the payload and compares to the header digest.
@@ -2544,13 +2682,22 @@ impl Queue {
         if ext_len > 65536 {
             return Err(Error::QueueCorrupt("extension header too large".into()));
         }
+        // R4-H05: Always read extension (even empty) and verify envelope digest
+        let mut ext_buf = vec![0u8; ext_len];
         if ext_len > 0 {
-            let mut ext_buf = vec![0u8; ext_len];
             fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
                 .map_err(|e| Error::IoFailure(e.to_string()))?;
-            if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-                return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-            }
+        }
+        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+            return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
+        }
+
+        // R4-H06: Check queue-configured payload limit
+        if header.payload_length > self.format.max_payload_length {
+            return Err(Error::QueueCorrupt(format!(
+                "payload length {} exceeds queue limit {}",
+                header.payload_length, self.format.max_payload_length
+            )));
         }
 
         // Verify file size
@@ -2563,7 +2710,7 @@ impl Queue {
         }
 
         // Parse the filename for the appropriate state and verify identity
-        let (job_id, _gen, _attempt, max_att) = match state {
+        let (job_id, parsed_gen, parsed_attempt, max_att, parsed_tag) = match state {
             "ready" => {
                 let p = spoolq_names::parse_ready(name)
                     .map_err(|_| Error::QueueCorrupt("invalid ready filename".into()))?;
@@ -2572,6 +2719,7 @@ impl Queue {
                     p.common.generation,
                     p.common.attempt,
                     p.common.maximum_attempts,
+                    p.tag,
                 )
             }
             "leased" => {
@@ -2582,6 +2730,7 @@ impl Queue {
                     p.common.generation,
                     p.common.attempt,
                     p.common.maximum_attempts,
+                    p.tag,
                 )
             }
             "delayed" => {
@@ -2592,6 +2741,7 @@ impl Queue {
                     p.common.generation,
                     p.common.attempt,
                     p.common.maximum_attempts,
+                    p.tag,
                 )
             }
             _ => return Err(Error::InvalidInput(format!("unsupported state: {state}"))),
@@ -2607,6 +2757,36 @@ impl Queue {
             return Err(Error::QueueCorrupt(
                 "header maximum_attempts does not match filename".into(),
             ));
+        }
+
+        // R4-B01: Verify name tag by reconstructing the canonical context
+        let base = format!(
+            "{}.g{:016x}.a{:08x}.m{:08x}",
+            spoolq_names::hex_encode(&job_id),
+            parsed_gen,
+            parsed_attempt,
+            max_att,
+        );
+        match state {
+            "ready" => {
+                let ctx = ready_context(shard_str, &base);
+                let expected_tag = compute_name_tag(queue_id, &ctx);
+                if expected_tag != parsed_tag {
+                    return Err(Error::QueueCorrupt("name tag mismatch".into()));
+                }
+            }
+            "leased" => {
+                // Tag context requires boot/bucket which the caller must provide.
+                // For recovery validation we skip tag verification on leased objects
+                // since the boot/bucket context comes from directory placement.
+                // R4-B02: The caller (recovery) validates placement by checking
+                // the directory path matches expected boot/bucket before calling.
+            }
+            "delayed" => {
+                // Tag context requires bucket. Recovery validates the bucket
+                // directory placement before calling this validator.
+            }
+            _ => {}
         }
 
         // Verify shard placement
@@ -2666,8 +2846,32 @@ impl Queue {
                 spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
             let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
             if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &receipt_dir) {
-                if fs::fstatat(dir_fd.as_raw_fd(), &receipt_name).is_ok() {
-                    return true;
+                // R4-B08: Authenticate the receipt, not just check existence
+                if let Ok(stat) = fs::fstatat(dir_fd.as_raw_fd(), &receipt_name) {
+                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                        continue;
+                    }
+                    if let Ok(file_fd) =
+                        fs::openat(dir_fd.as_raw_fd(), &receipt_name, libc::O_RDONLY, 0)
+                    {
+                        let mut buf = [0u8; 128];
+                        if fs::pread_exact(file_fd.as_raw_fd(), &mut buf, 0).is_ok() {
+                            // Accept full job header with matching job_id
+                            if let Ok(hdr) = FixedHeader::decode(&buf) {
+                                if hdr.job_id == lease.job_id {
+                                    return true;
+                                }
+                            }
+                            // Accept compact receipt with matching job_id
+                            if stat.st_size as usize == spoolq_format::COMPACT_RECEIPT_SIZE {
+                                if let Ok(cr) = spoolq_format::CompactReceipt::decode(&buf) {
+                                    if cr.job_id == lease.job_id {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

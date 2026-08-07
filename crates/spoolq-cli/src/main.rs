@@ -394,22 +394,23 @@ fn main() -> ExitCode {
                 match spoolq_fs_linux::statfs(&path) {
                     Ok(stat) => {
                         let ft = stat.f_type;
-                        let fs_name = if ft == spoolq_fs_linux::EXT4_SUPER_MAGIC {
-                            "ext4"
+                        // R4-H19: Refused filesystems are not OK
+                        let (fs_name, fs_ok) = if ft == spoolq_fs_linux::EXT4_SUPER_MAGIC {
+                            ("ext4", true)
                         } else if ft == spoolq_fs_linux::XFS_SUPER_MAGIC {
-                            "xfs"
+                            ("xfs", true)
                         } else if ft == spoolq_fs_linux::TMPFS_MAGIC {
-                            "tmpfs_not_certified"
+                            ("tmpfs_not_certified", false)
                         } else if ft == spoolq_fs_linux::NFS_SUPER_MAGIC {
-                            "nfs_refused"
+                            ("nfs_refused", false)
                         } else if ft == spoolq_fs_linux::FUSE_SUPER_MAGIC {
-                            "fuse_refused"
+                            ("fuse_refused", false)
                         } else if ft == spoolq_fs_linux::OVERLAYFS_SUPER_MAGIC {
-                            "overlay_refused"
+                            ("overlay_refused", false)
                         } else {
-                            "unknown_refused"
+                            ("unknown_refused", false)
                         };
-                        results.push(("filesystem", format!("{fs_name} (magic {ft:#x})"), true));
+                        results.push(("filesystem", format!("{fs_name} (magic {ft:#x})"), fs_ok));
                     }
                     Err(e) => results.push(("filesystem", e.to_string(), false)),
                 }
@@ -520,8 +521,8 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 spoolq_core::AckOutcome::AlreadyAcked => {
-                    eprintln!("already acked");
-                    ExitCode::FAILURE
+                    eprintln!("already acked (idempotent success)");
+                    ExitCode::SUCCESS
                 }
                 spoolq_core::AckOutcome::LeaseLost => {
                     eprintln!("lease lost");
@@ -873,6 +874,23 @@ fn main() -> ExitCode {
                 }
             };
 
+            // R4-H20: Preserve ticket identity from JSON
+            let lease_token = ticket_json
+                .get("lease_token")
+                .and_then(|v| v.as_str())
+                .and_then(|s| {
+                    if s.len() == 32 {
+                        spoolq_names::hex_decode_16(s)
+                    } else {
+                        None
+                    }
+                });
+            let env_digest_hex = ticket_json
+                .get("envelope_digest")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let envelope_digest = spoolq_names::hex_decode_32(env_digest_hex).unwrap_or([0; 32]);
+
             let ticket = spoolq_core::TransitionTicket {
                 job_id,
                 source_state: ticket_json
@@ -895,8 +913,8 @@ fn main() -> ExitCode {
                     .unwrap_or("")
                     .to_string(),
                 attempted_destination_relative_path: dest_path.to_string(),
-                lease_token: None,
-                envelope_digest: [0; 32],
+                lease_token,
+                envelope_digest,
             };
 
             let outcome = queue.resolve(&ticket, stabilize);
@@ -1258,7 +1276,7 @@ fn save_handle_to_file(
     // R2-M14: Atomic write with unique temp name (not deterministic)
     let rand_bytes = spoolq_fs_linux::random_128bit()
         .map(|b| spoolq_names::hex_encode(&b))
-        .unwrap_or_else(|_| "fallback".to_string());
+        .unwrap_or_else(|_| format!("{}", std::process::id()));
     let tmp_path = handle_path.with_extension(format!("tmp.{rand_bytes}"));
     {
         let mut opts = std::fs::OpenOptions::new();
