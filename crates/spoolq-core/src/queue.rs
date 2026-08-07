@@ -74,10 +74,6 @@ pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
 /// Operational options for opening a queue.
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
-    /// Deprecated: open-or-create is not implemented (C-04).
-    pub create: bool,
-    /// Deprecated: unused when create is false (C-04).
-    pub create_options: CreateOptions,
     pub allow_unsupported_fs: bool,
     pub receipt_retention_ns: u64,
     pub temporary_file_ttl_ns: u64,
@@ -86,8 +82,6 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
-            create: false,
-            create_options: CreateOptions::default(),
             allow_unsupported_fs: false,
             receipt_retention_ns: 7 * 24 * 60 * 60 * 1_000_000_000,
             temporary_file_ttl_ns: 24 * 60 * 60 * 1_000_000_000,
@@ -417,7 +411,7 @@ impl Queue {
             }
         }
 
-        // B-11: Verify state directories exist and are on the same device
+        // B-11: Require all state directories to exist and be on the same device.
         for state_dir in &[
             "control",
             "ready",
@@ -428,10 +422,22 @@ impl Queue {
             "quarantine",
             "tmp",
         ] {
-            if let Ok(stat) = fs::fstatat(root_fd.as_raw_fd(), state_dir) {
-                if stat.st_dev != root_stat.st_dev {
+            match fs::fstatat(root_fd.as_raw_fd(), state_dir) {
+                Ok(stat) => {
+                    if stat.st_dev != root_stat.st_dev {
+                        return Err(Error::QueueCorrupt(format!(
+                            "state directory '{state_dir}' is on a different device than root"
+                        )));
+                    }
+                    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                        return Err(Error::QueueCorrupt(format!(
+                            "state path '{state_dir}' is not a directory"
+                        )));
+                    }
+                }
+                Err(_) => {
                     return Err(Error::QueueCorrupt(format!(
-                        "state directory '{state_dir}' is on a different device than root"
+                        "required state directory '{state_dir}' is missing"
                     )));
                 }
             }
@@ -3501,7 +3507,6 @@ mod tests {
         let queue = Queue::open(
             path,
             &OpenOptions {
-                create: false,
                 allow_unsupported_fs: true,
                 ..Default::default()
             },

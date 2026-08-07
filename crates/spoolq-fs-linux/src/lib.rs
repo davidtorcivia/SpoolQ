@@ -713,24 +713,6 @@ pub fn syncfs(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Error classification: did a failure occur before or after the linearization point?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailurePoint {
-    /// Before the rename/link: the transition did not occur.
-    PreLinearization,
-    /// After the rename/link: the transition may have occurred.
-    PostLinearization,
-}
-
-/// Classify an io::Error by whether linearization may have occurred.
-pub fn classify_error(err: &io::Error) -> FailurePoint {
-    match err.raw_os_error() {
-        Some(libc::ENOSPC) | Some(libc::EDQUOT) => FailurePoint::PreLinearization,
-        Some(libc::EIO) | Some(libc::ESTALE) => FailurePoint::PreLinearization,
-        _ => FailurePoint::PreLinearization,
-    }
-}
-
 /// Check if an error indicates the source is gone (ENOENT).
 pub fn is_source_gone(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ENOENT)

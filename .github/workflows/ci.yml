@@ -62,7 +62,7 @@ jobs:
         continue-on-error: true
         run: |
           cargo install cargo-mutants
-          cargo mutants --workspace -j 2 || true
+          cargo mutants             -p spoolq-core -p spoolq-format -p spoolq-names             -p spoolq-math -p spoolq-fs-linux             -j 2 --timeout 30 || true
       - name: Deep fuzz (50000 runs per target)
         continue-on-error: true
         run: |
