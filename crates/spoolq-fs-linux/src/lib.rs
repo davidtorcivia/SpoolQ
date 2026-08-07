@@ -1359,4 +1359,28 @@ mod tests {
         assert!(fstatat(fd.as_raw_fd(), "pub1").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn linkat_proc_self_fd_honors_fault_injection() {
+        // empty_path may succeed first in the publication test and leave
+        // linkat_proc_self_fd unexercised. Arm a fault so the real body runs.
+        fault::reset();
+        let dir = tempfile_dir("linkat-proc-fault");
+        let fd = open_dir_absolute(&dir).unwrap();
+        let tmp = match open_tmpfile(fd.as_raw_fd()) {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        fault::inject("linkat_proc_self_fd", 1);
+        let err = linkat_proc_self_fd(tmp.as_raw_fd(), fd.as_raw_fd(), "pub-fault").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        fault::reset();
+        // Real publication via proc path when empty_path is not used.
+        linkat_proc_self_fd(tmp.as_raw_fd(), fd.as_raw_fd(), "pub-proc").unwrap();
+        assert!(fstatat(fd.as_raw_fd(), "pub-proc").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
