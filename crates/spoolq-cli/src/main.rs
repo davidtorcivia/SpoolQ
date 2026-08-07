@@ -508,10 +508,8 @@ fn main() -> ExitCode {
                 }
             };
             // R2-H19: CLI uses strict ack path: verify payload first.
-            if let Err(e) = queue.verify_lease_payload(&lease) {
-                eprintln!("payload verification failed: {e}");
-                return ExitCode::from(EXIT_CORRUPTION);
-            }
+            // P1-17: ack() already performs strict payload verification.
+            // Don't call verify_lease_payload() separately to avoid double hashing.
             match queue.ack(&lease) {
                 spoolq_core::AckOutcome::Acked => {
                     eprintln!("acked");

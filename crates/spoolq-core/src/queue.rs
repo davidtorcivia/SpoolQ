@@ -1152,13 +1152,20 @@ impl Queue {
                 // Check attempt limit
                 if parsed.common.attempt >= parsed.common.maximum_attempts {
                     // Move to dead
-                    let _ = self.move_to_dead(
+                    match self.move_to_dead(
                         &ready_dir,
                         entry,
                         &parsed.common,
                         DeadReason::AttemptsExhausted,
-                    );
-                    continue;
+                    ) {
+                        Ok(()) => continue,
+                        Err(e) => {
+                            // P1-07: Don't ignore cleanup failure.
+                            scan_had_error = true;
+                            self.poison();
+                            continue;
+                        }
+                    }
                 }
 
                 // C-16: Re-capture clocks immediately before the claim
@@ -2227,7 +2234,11 @@ impl Queue {
         let src_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &src_dir) {
             Ok(fd) => fd,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
-            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+                return Err(Error::QueueCorrupt(
+                    "intermediate lease path component is not a directory".into(),
+                ))
+            }
             Err(e) => return Err(Error::IoFailure(e.to_string())),
         };
 

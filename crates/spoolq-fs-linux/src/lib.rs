@@ -566,6 +566,8 @@ pub fn read_dir_for_each<F: FnMut(&str) -> bool>(dir_fd: RawFd, mut f: F) -> io:
     }
     let dir = unsafe { libc::fdopendir(dup_fd) };
     if dir.is_null() {
+        // P1-16: Close the dup'd fd before returning to avoid descriptor leak.
+        unsafe { libc::close(dup_fd) };
         return Err(io::Error::last_os_error());
     }
     let mut count = 0usize;
