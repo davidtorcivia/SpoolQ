@@ -120,21 +120,19 @@ jobs:
           timeout 300 cargo +nightly fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
           timeout 300 cargo +nightly fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=50000
 
-  # TLA+ model presence check (not model checking)
-  tla-model-presence:
+  # TLA+ model checking with TLC
+  tla:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Check TLA+ model exists and is non-empty
-        run: |
-          if [ -d "model" ] && [ -s "$(find model -name '*.tla' | head -1)" ]; then
-            echo "TLA+ model directory exists"
-            echo "Note: TLC integration requires Java runtime and model fixes (T6-T8)"
-            echo "Known model issues: I1/fileSynced conflict, stale token modeling"
-          else
-            echo "Warning: No TLA+ model found"
-          fi
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Download tla2tools
+        run: curl -fsSL https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar -o /tmp/tla2tools.jar
+      - name: TLC model checking
+        run: java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SpoolQ.cfg model/SpoolQ.tla -workers auto
 
   # Nightly lane: release-mode extended tests and benchmarks
   nightly:

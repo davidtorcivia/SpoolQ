@@ -4,11 +4,21 @@ TLA+ specification of the SpoolQ/1 queue protocol.
 
 ## Running
 
-Requires the TLA+ toolkit (TLA+ Toolbox or command-line TLC).
+Requires Java 17 and the TLA+ toolkit.
 
 ```
-java -jar tla2tools.jar model/SpoolQ.tla
+java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SpoolQ.cfg model/SpoolQ.tla -workers auto
 ```
+
+Download `tla2tools.jar` from https://github.com/tlaplus/tlaplus/releases.
+
+Local check (after `curl -fsSL .../tla2tools.jar -o /tmp/tla2tools.jar`):
+
+```
+java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SpoolQ.cfg model/SpoolQ.tla
+```
+
+CI runs the same command in the `tla` job.
 
 ## Model scope
 
@@ -22,12 +32,25 @@ I9: Committed lease returns never exceed MaxAttempts.
 
 I11: A delivered (leased) job has attempt >= 1.
 
+All three are conjoined as `Inv` in `model/SpoolQ.cfg`.
+
+## Fixes applied
+
+Enqueue now sets `fileSynced` to `TRUE` before publish, so `I1` holds for `Ready`.
+`Claim`, `Ack`, `RetryNow`, `Bury` carry a per-worker token `w \in Workers` and
+require `token[j] = w` with `w \notin poisoned`. `Crash` preserves file
+durability (`fileSynced[j]` stays `TRUE` if it was) and clears a stale lease
+token when `Leased /\ ~fileSynced` rolls back to `Ready`. `ELSEIF` syntax
+fixed to `ELSE IF`.
+
 ## Crash model
 
-The Crash action resets sync flags. In the strong profile, a leased job
-whose file was synced stays leased (atomic rename persistence). A leased
-job whose file was not synced rolls back to ready (claim never completed).
-A ready job that was never synced or dir-synced rolls back to hidden.
+The Crash action preserves file content durability and resets volatile
+directory sync flags. In the strong profile, a leased job whose file was
+synced stays leased (atomic rename persistence). A leased job whose file
+was not synced rolls back to ready (claim never completed) and its token
+is cleared. A ready job that was never synced or dir-synced rolls back to
+hidden.
 
 ## Not modeled
 
