@@ -9,11 +9,11 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | Finding | Reproducer/evidence plan | Dependency | Status | Owner |
 | --- | --- | --- | --- | --- |
 | [SQ-P0-001](https://github.com/davidtorcivia/SteadQ/issues/52) | Malicious ticket component corpus plus syscall trace proving no out-of-root open | A-001 | Open | @davidtorcivia |
-| [SQ-P0-002](https://github.com/davidtorcivia/SteadQ/issues/53) | Mutate operation and every identity field for each ticket/resolver row | A-002, ADR-0033 | Open | @davidtorcivia |
+| [SQ-P0-002](https://github.com/davidtorcivia/SteadQ/issues/53) | Mutate operation and every identity field for each ticket/resolver row | A-002 | Open | @davidtorcivia |
 | [SQ-P0-003](https://github.com/davidtorcivia/SteadQ/issues/54) | Source/destination/both/neither/conflict and second-crash matrix | A-003, A-009 | Open | @davidtorcivia |
 | [SQ-P0-004](https://github.com/davidtorcivia/SteadQ/issues/55) | Random readdir order, every budget boundary, faults, and reopen property | A-006 | Open | @davidtorcivia |
 | [SQ-P0-005](https://github.com/davidtorcivia/SteadQ/issues/56) | Clock/watermark syscall fault matrix and rollback property | A-004 | Open | @davidtorcivia |
-| [SQ-P0-006](https://github.com/davidtorcivia/SteadQ/issues/57) | Corrupt payload through every ack/compaction/receipt consumer | A-005, ADR-0033 | Open | @davidtorcivia |
+| [SQ-P0-006](https://github.com/davidtorcivia/SteadQ/issues/57) | Corrupt payload through every ack/compaction/receipt consumer | A-005 | Open | @davidtorcivia |
 | [SQ-P0-007](https://github.com/davidtorcivia/SteadQ/issues/58) | Generated fault at every mutation phase; no flattened post-linearization result | A-008 | Open | @davidtorcivia |
 | [SQ-P0-008](https://github.com/davidtorcivia/SteadQ/issues/59) | Deliberate barrier/token/generation model mutations and checked invariant list | A-013 | Open | @davidtorcivia |
 
@@ -42,6 +42,5 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 
 ## Freeze blockers
 
-- [ADR-0033 is absent](https://github.com/davidtorcivia/SteadQ/issues/60). A-007 protocol-IR closure and authority-bearing public API stabilization cannot complete until it is added and reconciled.
 - No filesystem profile is certified.
 - Independent Rust, Linux-filesystem, formal-methods, and adversarial-operator reviewers are unassigned.

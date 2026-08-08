@@ -22,5 +22,3 @@ cargo test --workspace --all-features
 ```
 
 Do not add direct authoritative filesystem mutation outside the transition executor, caller-controlled protocol paths, lossy namespace handling, ignored mutation results, invalid public defaults, or new claims broader than the evidence.
-
-ADR-0033 is not present in the audited snapshot. Changes that would freeze the protocol IR or a public authority-bearing API remain blocked until the accepted ADR is added and reconciled.

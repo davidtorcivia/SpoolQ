@@ -20,7 +20,3 @@ The development toolchain and minimum supported Rust version are both Rust 1.97.
 - Filesystem evidence: certification-profile version.
 
 No compatibility between unknown minor disk-format versions is promised until feature-bit and decoder policy is written and tested.
-
-## ADR-0033 freeze gate
-
-ADR-0033 was referenced by the audit but is absent from commit `80b8b20da3171509bccbde00ab021bb5b1f7c2dc`. Protocol-IR closure and stabilization of authority-bearing public APIs are blocked until the accepted ADR is committed, mapped into `docs/traceability.md`, and any conflicts are resolved by a superseding ADR.
