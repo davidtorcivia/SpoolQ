@@ -9,7 +9,8 @@ use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
 use crate::queue::{
-    open_relative, FourLevelCursor, Queue, RecoveryCursor, ThreeLevelCursor, WallFloor,
+    open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryPhase, ThreeLevelCursor,
+    WallFloor,
 };
 
 const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
@@ -289,32 +290,58 @@ impl Queue {
         let deadline_mono =
             start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
 
-        // 1. Reap expired leases
-        self.reap_expired_leases(boottime_now, wall_floor, budget, &mut stats, deadline_mono);
-
-        // 2. Promote eligible delayed jobs (requires trusted wall floor)
-        if Self::has_recovery_budget(&stats) {
-            if let Some(wall_floor) = wall_floor {
-                self.promote_delayed(wall_floor, budget, &mut stats, deadline_mono);
+        loop {
+            if !Self::has_recovery_budget(&stats) {
+                break;
             }
-        }
-
-        // 3. Clean up old temp files
-        if Self::has_recovery_budget(&stats) {
-            self.cleanup_temp_files(boottime_now, budget, &mut stats, deadline_mono);
-        }
-        if Self::has_recovery_budget(&stats) {
-            self.compact_receipts(budget, &mut stats, deadline_mono);
-        }
-        if Self::has_recovery_budget(&stats) {
-            if let Some(wall_floor) = wall_floor {
-                self.delete_expired_receipts(
-                    wall_floor,
-                    self.options.receipt_retention_ns,
-                    budget,
-                    &mut stats,
-                    deadline_mono,
-                );
+            match self.recovery_cursor.phase {
+                RecoveryPhase::ReapLeases => {
+                    self.reap_expired_leases(
+                        boottime_now,
+                        wall_floor,
+                        budget,
+                        &mut stats,
+                        deadline_mono,
+                    );
+                    if Self::has_recovery_budget(&stats) {
+                        self.recovery_cursor.phase = RecoveryPhase::PromoteDelayed;
+                    }
+                }
+                RecoveryPhase::PromoteDelayed => {
+                    if let Some(wall_floor) = wall_floor {
+                        self.promote_delayed(wall_floor, budget, &mut stats, deadline_mono);
+                    }
+                    if Self::has_recovery_budget(&stats) {
+                        self.recovery_cursor.phase = RecoveryPhase::CleanupTemp;
+                    }
+                }
+                RecoveryPhase::CleanupTemp => {
+                    self.cleanup_temp_files(boottime_now, budget, &mut stats, deadline_mono);
+                    if Self::has_recovery_budget(&stats) {
+                        self.recovery_cursor.phase = RecoveryPhase::CompactReceipts;
+                    }
+                }
+                RecoveryPhase::CompactReceipts => {
+                    self.compact_receipts(budget, &mut stats, deadline_mono);
+                    if Self::has_recovery_budget(&stats) {
+                        self.recovery_cursor.phase = RecoveryPhase::DeleteReceipts;
+                    }
+                }
+                RecoveryPhase::DeleteReceipts => {
+                    if let Some(wall_floor) = wall_floor {
+                        self.delete_expired_receipts(
+                            wall_floor,
+                            self.options.receipt_retention_ns,
+                            budget,
+                            &mut stats,
+                            deadline_mono,
+                        );
+                    }
+                    if Self::has_recovery_budget(&stats) {
+                        self.recovery_cursor.phase = RecoveryPhase::ReapLeases;
+                    }
+                    break;
+                }
             }
         }
 
@@ -1640,6 +1667,58 @@ mod tests {
         assert!(Queue::has_recovery_budget(&stats));
         stats.budget_exhausted = true;
         assert!(!Queue::has_recovery_budget(&stats));
+    }
+
+    #[test]
+    fn recovery_phase_progress_prevents_early_phase_starvation_after_reopen() {
+        let (tmp, mut queue) = create_test_queue();
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"expired lease".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        match queue.lease(0, 1_000_000_000) {
+            LeaseOutcome::Leased(_) => {}
+            outcome => panic!("lease failed: {outcome:?}"),
+        }
+        let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
+        std::fs::create_dir_all(&receipt_dir).unwrap();
+        std::fs::write(receipt_dir.join("invalid.rct"), b"invalid").unwrap();
+
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        let first = queue.recover(&budget);
+        assert_eq!(first.operations_attempted, 1, "errors: {:?}", first.errors);
+        assert_eq!(first.leases_reaped, 0, "errors: {:?}", first.errors);
+        assert!(first.budget_exhausted);
+        assert_eq!(queue.recovery_cursor.phase, RecoveryPhase::CompactReceipts);
+        drop(queue);
+
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.recovery_cursor.phase,
+            RecoveryPhase::CompactReceipts
+        );
+
+        let second = reopened.recover(&budget);
+        assert_eq!(second.operations_attempted, 1, "errors: {:?}", second.errors);
+        assert!(second
+            .errors
+            .iter()
+            .any(|error| error.operation == "receipt_compact_invalid"));
     }
 
     #[test]

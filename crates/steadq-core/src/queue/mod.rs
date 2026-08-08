@@ -157,9 +157,22 @@ impl FourLevelCursor {
 }
 
 /// Persisted progress for canonical, restartable recovery phases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryPhase {
+    #[default]
+    ReapLeases,
+    PromoteDelayed,
+    CleanupTemp,
+    CompactReceipts,
+    DeleteReceipts,
+}
+
+/// Persisted progress for canonical, restartable recovery phases.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryCursor {
+    pub(crate) phase: RecoveryPhase,
     pub(crate) reap_leases: Option<FourLevelCursor>,
     pub(crate) promote_delayed: Option<ThreeLevelCursor>,
     pub(crate) cleanup_temp: Option<ThreeLevelCursor>,
