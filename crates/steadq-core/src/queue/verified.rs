@@ -106,7 +106,7 @@ pub(crate) fn receipt_path_identity_matches(
     expected_device: u64,
     expected_inode: u64,
 ) -> bool {
-    stat.st_dev as u64 == expected_device && stat.st_ino as u64 == expected_inode
+    stat.st_dev == expected_device && stat.st_ino == expected_inode
 }
 
 fn receipt_attempt_is_valid(attempt: u32, maximum_attempts: u32) -> bool {
@@ -647,18 +647,18 @@ mod tests {
         let stat = fs::fstat(temp.as_raw_fd()).unwrap();
         assert!(receipt_path_identity_matches(
             &stat,
-            stat.st_dev as u64,
-            stat.st_ino as u64
+            stat.st_dev,
+            stat.st_ino
         ));
         assert!(!receipt_path_identity_matches(
             &stat,
-            (stat.st_dev as u64).wrapping_add(1),
-            stat.st_ino as u64
+            stat.st_dev.wrapping_add(1),
+            stat.st_ino
         ));
         assert!(!receipt_path_identity_matches(
             &stat,
-            stat.st_dev as u64,
-            (stat.st_ino as u64).wrapping_add(1)
+            stat.st_dev,
+            stat.st_ino.wrapping_add(1)
         ));
     }
 
