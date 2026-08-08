@@ -5608,6 +5608,76 @@ mod tests {
     }
 
     #[test]
+    fn validate_active_object_rejects_tag_mismatch() {
+        let (_tmp, mut queue) = create_test_queue();
+        match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"tag-test".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(_) => {}
+            other => panic!("enqueue must succeed, got {other:?}"),
+        }
+        let ready_root = _tmp.path().join("ready");
+        let mut found: Option<(String, String)> = None;
+        for shard in std::fs::read_dir(&ready_root).unwrap().flatten() {
+            for entry in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                let n = entry.file_name().to_string_lossy().to_string();
+                if n.ends_with(".sqj") {
+                    found = Some((shard.file_name().to_string_lossy().to_string(), n));
+                    break;
+                }
+            }
+        }
+        let (shard_name, file_name) = found.expect("ready file");
+        let correct_ctx = crate::ActivePathContext::Ready {
+            shard: shard_name.clone(),
+        };
+        let dir_fd = crate::queue::open_relative(
+            queue.root_fd().as_raw_fd(),
+            &format!("ready/{shard_name}"),
+        )
+        .unwrap();
+        let ok = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &correct_ctx);
+        assert!(ok.is_ok(), "correct tag must validate, got {ok:?}");
+        let wrong_ctx = crate::ActivePathContext::Ready {
+            shard: "ffff".to_string(),
+        };
+        let bad = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &wrong_ctx);
+        assert!(
+            matches!(bad, Err(Error::QueueCorrupt(_))),
+            "wrong shard must cause tag mismatch, got {bad:?}"
+        );
+    }
+
+    #[test]
+    fn check_duplicate_ack_bounded_is_false_when_no_receipt() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"dup-ack-test";
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            other => panic!("lease must succeed, got {other:?}"),
+        };
+        let before = queue.check_duplicate_ack_bounded(&lease);
+        assert!(!before, "no receipt yet, duplicate check must be false");
+        queue.verify_lease_payload(&lease).unwrap();
+        let ack = queue.ack(&lease);
+        assert!(
+            matches!(ack, AckOutcome::Acked),
+            "ack must succeed, got {ack:?}"
+        );
+        let after = queue.check_duplicate_ack_bounded(&lease);
+        assert!(after, "after ack, duplicate check must be true");
+    }
+
+    #[test]
     fn full_lifecycle_with_verify() {
         let (_tmp, mut queue) = create_test_queue();
         let payload = b"lifecycle test payload data";

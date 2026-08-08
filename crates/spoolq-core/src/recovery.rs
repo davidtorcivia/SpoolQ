@@ -1325,4 +1325,25 @@ mod tests {
         assert_eq!(stats.operations_attempted, 0);
         assert!(!stats.budget_exhausted);
     }
+
+    #[test]
+    fn reap_to_dead_rejects_generation_overflow() {
+        let (_tmp, queue) = create_test_queue();
+        let common = spoolq_names::CommonFields {
+            job_id: [0xAB; 16],
+            generation: u64::MAX,
+            attempt: 0,
+            maximum_attempts: 3,
+        };
+        let res = queue.reap_to_dead(
+            "boot",
+            "0000000000000000",
+            "0000",
+            "dummy",
+            &common,
+            crate::errors::DeadReason::AttemptsExhausted,
+            0,
+        );
+        assert!(res.is_err(), "generation overflow must be Err, got {res:?}");
+    }
 }
