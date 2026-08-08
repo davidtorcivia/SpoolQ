@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 steadq-format = { path = "../crates/steadq-format" }
 steadq-names = { path = "../crates/steadq-names" }
 steadq-math = { path = "../crates/steadq-math" }
+steadq-core = { path = "../crates/steadq-core" }
 
 [[bin]]
 name = "fuzz_format_header"
@@ -34,6 +35,12 @@ doc = false
 [[bin]]
 name = "fuzz_bucket_arithmetic"
 path = "fuzz_targets/fuzz_bucket_arithmetic.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_transition_ticket"
+path = "fuzz_targets/fuzz_transition_ticket.rs"
 test = false
 doc = false
 

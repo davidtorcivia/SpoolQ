@@ -969,14 +969,6 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_ORDINARY);
             }
 
-            let queue = match Queue::open(&path, &OpenOptions::default()) {
-                Ok(q) => q,
-                Err(e) => {
-                    eprintln!("open failed: {e}");
-                    return ExitCode::from(EXIT_IO_FAILURE);
-                }
-            };
-
             let ticket = steadq_core::TransitionTicket {
                 job_id,
                 source_state,
@@ -987,6 +979,18 @@ fn main() -> ExitCode {
                 attempted_destination_relative_path: dest_path.clone(),
                 lease_token,
                 envelope_digest,
+            };
+            if let Err(error) = ticket.validate_paths() {
+                eprintln!("invalid transition ticket: {error}");
+                return ExitCode::from(EXIT_ORDINARY);
+            }
+
+            let queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {e}");
+                    return ExitCode::from(EXIT_IO_FAILURE);
+                }
             };
 
             let outcome = queue.resolve(&ticket, stabilize);
