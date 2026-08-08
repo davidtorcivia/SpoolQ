@@ -1004,10 +1004,25 @@ pub fn validate_path_component(comp: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Validate a relative path for safety: split into components and validate each.
+/// Validate a relative path for safety: rejects absolute paths, '.' and '..'.
 pub fn validate_relative_path(path: &str) -> io::Result<Vec<&str>> {
-    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if path.starts_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "absolute path not allowed",
+        ));
+    }
+    if path.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path"));
+    }
+    let components: Vec<&str> = path.split('/').collect();
     for comp in &components {
+        if comp.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty path component in relative path",
+            ));
+        }
         validate_path_component(comp)?;
     }
     Ok(components)
@@ -1086,6 +1101,19 @@ mod tests {
         assert!(validate_path_component("").is_err());
         assert!(validate_path_component("/abs").is_err());
         assert!(validate_path_component("ok").is_ok());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_absolute_and_empty() {
+        assert!(validate_relative_path("/etc/passwd").is_err());
+        assert!(validate_relative_path("").is_err());
+        assert!(validate_relative_path("a//b").is_err());
+        assert!(validate_relative_path("a/b/c").is_ok());
+        assert_eq!(validate_relative_path("a/b").unwrap(), vec!["a", "b"]);
+        assert_eq!(
+            validate_relative_path("a/b/c").unwrap(),
+            vec!["a", "b", "c"]
+        );
     }
 
     #[test]

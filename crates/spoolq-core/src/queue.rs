@@ -1990,14 +1990,14 @@ impl Queue {
     }
 
     fn retry(&mut self, lease: &LeaseInfo, delayed_ns: Option<u64>) -> TransitionOutcome {
+        if let Err(e) = self.check_not_poisoned() {
+            return TransitionOutcome::NotCommitted(e);
+        }
         // If delayed target is at or before the effective wall floor, it's retry_now.
         let delayed_ns = match delayed_ns {
             Some(t) if t <= self.effective_wall_floor_ns() => None,
             other => other,
         };
-        if let Err(e) = self.check_not_poisoned() {
-            return TransitionOutcome::NotCommitted(e);
-        }
 
         // Check attempt limit for retry
         if lease.attempt >= lease.maximum_attempts {
