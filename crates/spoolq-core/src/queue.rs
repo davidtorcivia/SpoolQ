@@ -5429,6 +5429,78 @@ mod tests {
     }
 
     #[test]
+    fn validate_active_object_rejects_delayed_bucket_mismatch() {
+        let (_tmp, mut queue) = create_test_queue();
+        // Enqueue a delayed job.
+        let wall_now = spoolq_fs_linux::clock_realtime_ns().unwrap();
+        let not_before = wall_now + 5_000_000_000;
+        match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"delayed".to_vec(),
+            initial_not_before: Some(not_before),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(_) => {}
+            other => panic!("enqueue delayed must succeed, got {other:?}"),
+        }
+        // Locate the delayed file.
+        let delayed_root = _tmp.path().join("delayed");
+        let mut delayed_file: Option<(String, String, String)> = None;
+        for bucket in std::fs::read_dir(&delayed_root).unwrap().flatten() {
+            for shard in std::fs::read_dir(bucket.path()).unwrap().flatten() {
+                for entry in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".sqj") {
+                        let bucket_name = bucket.file_name().to_string_lossy().to_string();
+                        let shard_name = shard.file_name().to_string_lossy().to_string();
+                        delayed_file = Some((bucket_name, shard_name, name));
+                        break;
+                    }
+                }
+            }
+        }
+        let (bucket_name, shard_name, file_name) = delayed_file.expect("delayed file must exist");
+        // Correct context must succeed.
+        let correct_ctx = crate::ActivePathContext::Delayed {
+            bucket: bucket_name.clone(),
+            shard: shard_name.clone(),
+        };
+        let dir_fd = crate::queue::open_relative(
+            queue.root_fd().as_raw_fd(),
+            &format!("delayed/{bucket_name}/{shard_name}"),
+        )
+        .unwrap();
+        let ok = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &correct_ctx);
+        assert!(
+            ok.is_ok(),
+            "correct delayed bucket must validate, got {ok:?}"
+        );
+        // Wrong bucket must be rejected. Flip last hex digit to guarantee mismatch while keeping hex valid.
+        let mut wrong_bucket = bucket_name.clone();
+        let last = wrong_bucket.pop().unwrap();
+        let flipped = if last == '0' { '1' } else { '0' };
+        wrong_bucket.push(flipped);
+        let wrong_ctx = crate::ActivePathContext::Delayed {
+            bucket: wrong_bucket.clone(),
+            shard: shard_name.clone(),
+        };
+        let wrong_fd = crate::queue::open_relative(
+            queue.root_fd().as_raw_fd(),
+            &format!("delayed/{bucket_name}/{shard_name}"),
+        )
+        .unwrap();
+        // validate_active_object checks the filename bucket against the directory bucket.
+        // With a mismatched bucket in the context, it must return QueueCorrupt.
+        // Under the mutant that changes != to ==, this would incorrectly return Ok.
+        let wrong = queue.validate_active_object(wrong_fd.as_raw_fd(), &file_name, &wrong_ctx);
+        assert!(
+            matches!(wrong, Err(Error::QueueCorrupt(_))),
+            "wrong delayed bucket must be rejected, got {wrong:?}"
+        );
+    }
+
+    #[test]
     fn full_lifecycle_with_verify() {
         let (_tmp, mut queue) = create_test_queue();
         let payload = b"lifecycle test payload data";
