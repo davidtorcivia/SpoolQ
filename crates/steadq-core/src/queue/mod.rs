@@ -166,6 +166,26 @@ enum WitnessPathObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseDirectoryOpenFailure {
+    Gone,
+    InvalidDirectory,
+    Io,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolverObjectOpenFailure {
+    Absent,
+    Conflict,
+    Io,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceFailure {
+    Absent,
+    Io,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimSourceIdentity {
     Match,
     Mismatch,
@@ -219,6 +239,46 @@ fn resolver_file_open_flags() -> i32 {
 
 fn resolver_error_is_not_found(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ENOENT)
+}
+
+fn classify_lease_directory_open_failure(error: &io::Error) -> LeaseDirectoryOpenFailure {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => LeaseDirectoryOpenFailure::Gone,
+        Some(libc::ENOTDIR) => LeaseDirectoryOpenFailure::InvalidDirectory,
+        _ => LeaseDirectoryOpenFailure::Io,
+    }
+}
+
+fn classify_resolver_object_open_failure(error: &io::Error) -> ResolverObjectOpenFailure {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => ResolverObjectOpenFailure::Absent,
+        Some(libc::ELOOP) => ResolverObjectOpenFailure::Conflict,
+        _ => ResolverObjectOpenFailure::Io,
+    }
+}
+
+fn classify_presence_failure(error: &io::Error) -> PresenceFailure {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => PresenceFailure::Absent,
+        _ => PresenceFailure::Io,
+    }
+}
+
+fn same_directory_identity(source: Option<&libc::stat>, destination: Option<&libc::stat>) -> bool {
+    match (source, destination) {
+        (Some(source), Some(destination)) => {
+            source.st_dev == destination.st_dev && source.st_ino == destination.st_ino
+        }
+        _ => false,
+    }
+}
+
+fn is_compact_receipt_candidate(size: usize, magic: &[u8]) -> bool {
+    size == steadq_format::COMPACT_RECEIPT_SIZE && magic == steadq_format::RECEIPT_MAGIC
+}
+
+fn is_acknowledgement_receipt_path(operation: TransitionOperation, path_matches: bool) -> bool {
+    operation == TransitionOperation::Acknowledge && path_matches
 }
 
 fn resolved_identity_matches(
@@ -2264,19 +2324,25 @@ impl Queue {
         // R2-H02: Only ENOENT means "source gone". Other errors are real failures.
         let src_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &src_dir) {
             Ok(fd) => fd,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
-            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
-                return Err(Error::QueueCorrupt(
-                    "intermediate lease path component is not a directory".into(),
-                ))
-            }
-            Err(e) => return Err(Error::IoFailure(e.to_string())),
+            Err(error) => match classify_lease_directory_open_failure(&error) {
+                LeaseDirectoryOpenFailure::Gone => return Ok(None),
+                LeaseDirectoryOpenFailure::InvalidDirectory => {
+                    return Err(Error::QueueCorrupt(
+                        "intermediate lease path component is not a directory".into(),
+                    ));
+                }
+                LeaseDirectoryOpenFailure::Io => {
+                    return Err(Error::IoFailure(error.to_string()));
+                }
+            },
         };
 
         let src_stat = match fs::fstatat(src_dir_fd.as_raw_fd(), &src_name) {
             Ok(s) => s,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
-            Err(e) => return Err(Error::IoFailure(e.to_string())),
+            Err(error) => match classify_presence_failure(&error) {
+                PresenceFailure::Absent => return Ok(None),
+                PresenceFailure::Io => return Err(Error::IoFailure(error.to_string())),
+            },
         };
 
         if !is_singly_linked_regular(src_stat.st_mode, src_stat.st_nlink) {
@@ -2391,12 +2457,12 @@ impl Queue {
 
         // R2-H03: Extension read failure is a real error, not a silent pass.
         let ext_len = header.extension_header_length as usize;
-        if ext_len > 65536 {
+        if verified::is_extension_too_large(ext_len) {
             return Err(Error::QueueCorrupt("extension header too large".into()));
         }
         // R4-H05: Always verify envelope digest (even when extension is empty).
         let mut ext_buf = vec![0u8; ext_len];
-        if ext_len > 0 {
+        if verified::is_extension_present(ext_len) {
             fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
                 .map_err(|e| Error::IoFailure(e.to_string()))?;
         }
@@ -2504,10 +2570,7 @@ impl Queue {
                 // Check if source and destination are the same directory
                 let src_stat = fs::fstat(source.directory_fd.as_raw_fd()).ok();
                 let dest_stat = fs::fstat(dest_dir_fd.as_raw_fd()).ok();
-                let src_same = match (src_stat, dest_stat) {
-                    (Some(s), Some(d)) => s.st_dev == d.st_dev && s.st_ino == d.st_ino,
-                    _ => false,
-                };
+                let src_same = same_directory_identity(src_stat.as_ref(), dest_stat.as_ref());
                 if src_same {
                     if fs::fsync_dir_fd(dest_dir_fd.as_raw_fd()).is_err() {
                         self.poison();
@@ -3506,8 +3569,12 @@ impl Queue {
 
         let dir_fd = match fs::open_directory_beneath(self.root_fd.as_raw_fd(), path.directory) {
             Ok(fd) => fd,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return ResolveObj::Absent,
-            Err(e) => return ResolveObj::Error(Error::IoFailure(e.to_string())),
+            Err(error) => match classify_presence_failure(&error) {
+                PresenceFailure::Absent => return ResolveObj::Absent,
+                PresenceFailure::Io => {
+                    return ResolveObj::Error(Error::IoFailure(error.to_string()));
+                }
+            },
         };
         let directory_stat = match fs::fstat(dir_fd.as_raw_fd()) {
             Ok(stat) => stat,
@@ -3516,9 +3583,13 @@ impl Queue {
 
         let file_fd = match fs::openat(dir_fd.as_raw_fd(), name, resolver_file_open_flags(), 0) {
             Ok(fd) => fd,
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return ResolveObj::Absent,
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return ResolveObj::Conflict,
-            Err(e) => return ResolveObj::Error(Error::IoFailure(e.to_string())),
+            Err(error) => match classify_resolver_object_open_failure(&error) {
+                ResolverObjectOpenFailure::Absent => return ResolveObj::Absent,
+                ResolverObjectOpenFailure::Conflict => return ResolveObj::Conflict,
+                ResolverObjectOpenFailure::Io => {
+                    return ResolveObj::Error(Error::IoFailure(error.to_string()));
+                }
+            },
         };
         let stat = match fs::fstat(file_fd.as_raw_fd()) {
             Ok(stat) => stat,
@@ -3542,12 +3613,11 @@ impl Queue {
         let state = parts[0];
 
         // Compact receipts are valid only as authenticated receipt destinations.
-        if stat.st_size as usize == steadq_format::COMPACT_RECEIPT_SIZE
-            && &header_buf[0..8] == steadq_format::RECEIPT_MAGIC
-        {
-            if ticket.operation() != TransitionOperation::Acknowledge
-                || !self.resolve_receipt_path_matches(parts, name, ticket, expected_common)
-            {
+        if is_compact_receipt_candidate(stat.st_size as usize, &header_buf[0..8]) {
+            if !is_acknowledgement_receipt_path(
+                ticket.operation(),
+                self.resolve_receipt_path_matches(parts, name, ticket, expected_common),
+            ) {
                 return ResolveObj::Conflict;
             }
             match steadq_format::CompactReceipt::decode(&header_buf) {
@@ -3710,9 +3780,10 @@ impl Queue {
                 }
             }
             "receipts" => {
-                if ticket.operation() != TransitionOperation::Acknowledge
-                    || !self.resolve_receipt_path_matches(parts, name, ticket, expected_common)
-                {
+                if !is_acknowledgement_receipt_path(
+                    ticket.operation(),
+                    self.resolve_receipt_path_matches(parts, name, ticket, expected_common),
+                ) {
                     return ResolveObj::Conflict;
                 }
             }
@@ -3990,6 +4061,113 @@ mod tests {
         ] {
             let error = io::Error::from_raw_os_error(errno);
             assert_eq!(resolver_error_is_not_found(&error), expected);
+        }
+    }
+
+    #[test]
+    fn lease_directory_open_failure_table() {
+        for (errno, expected) in [
+            (libc::ENOENT, LeaseDirectoryOpenFailure::Gone),
+            (libc::ENOTDIR, LeaseDirectoryOpenFailure::InvalidDirectory),
+            (libc::EIO, LeaseDirectoryOpenFailure::Io),
+            (libc::EACCES, LeaseDirectoryOpenFailure::Io),
+        ] {
+            assert_eq!(
+                classify_lease_directory_open_failure(&io::Error::from_raw_os_error(errno)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_object_open_failure_table() {
+        for (errno, expected) in [
+            (libc::ENOENT, ResolverObjectOpenFailure::Absent),
+            (libc::ELOOP, ResolverObjectOpenFailure::Conflict),
+            (libc::EIO, ResolverObjectOpenFailure::Io),
+            (libc::EACCES, ResolverObjectOpenFailure::Io),
+        ] {
+            assert_eq!(
+                classify_resolver_object_open_failure(&io::Error::from_raw_os_error(errno)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn presence_failure_table() {
+        for (errno, expected) in [
+            (libc::ENOENT, PresenceFailure::Absent),
+            (libc::EIO, PresenceFailure::Io),
+            (libc::EACCES, PresenceFailure::Io),
+        ] {
+            assert_eq!(
+                classify_presence_failure(&io::Error::from_raw_os_error(errno)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn same_directory_identity_table() {
+        let (_tmp, queue) = create_test_queue();
+        let source = fs::fstat(queue.root_fd()).unwrap();
+        let mut different_device = source;
+        different_device.st_dev ^= 1;
+        let mut different_inode = source;
+        different_inode.st_ino ^= 1;
+
+        assert!(same_directory_identity(Some(&source), Some(&source)));
+        assert!(!same_directory_identity(
+            Some(&source),
+            Some(&different_device),
+        ));
+        assert!(!same_directory_identity(
+            Some(&source),
+            Some(&different_inode),
+        ));
+        assert!(!same_directory_identity(None, Some(&source)));
+        assert!(!same_directory_identity(Some(&source), None));
+        assert!(!same_directory_identity(None, None));
+    }
+
+    #[test]
+    fn compact_receipt_candidate_table() {
+        let mut wrong_magic = *steadq_format::RECEIPT_MAGIC;
+        wrong_magic[0] ^= 1;
+        for (size, magic, expected) in [
+            (
+                steadq_format::COMPACT_RECEIPT_SIZE,
+                steadq_format::RECEIPT_MAGIC.as_slice(),
+                true,
+            ),
+            (
+                steadq_format::COMPACT_RECEIPT_SIZE - 1,
+                steadq_format::RECEIPT_MAGIC.as_slice(),
+                false,
+            ),
+            (
+                steadq_format::COMPACT_RECEIPT_SIZE,
+                wrong_magic.as_slice(),
+                false,
+            ),
+        ] {
+            assert_eq!(is_compact_receipt_candidate(size, magic), expected);
+        }
+    }
+
+    #[test]
+    fn acknowledgement_receipt_path_table() {
+        for (operation, path_matches, expected) in [
+            (TransitionOperation::Acknowledge, true, true),
+            (TransitionOperation::Acknowledge, false, false),
+            (TransitionOperation::Claim, true, false),
+            (TransitionOperation::Claim, false, false),
+        ] {
+            assert_eq!(
+                is_acknowledgement_receipt_path(operation, path_matches),
+                expected,
+            );
         }
     }
 
