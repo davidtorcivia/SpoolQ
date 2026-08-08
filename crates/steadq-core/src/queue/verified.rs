@@ -6,8 +6,9 @@
 
 use sha2::Digest;
 
-use steadq_format::FixedHeader;
+use steadq_format::{CompactReceipt, FixedHeader, COMPACT_RECEIPT_SIZE, RECEIPT_MAGIC};
 use steadq_fs_linux as fs;
+use steadq_names::{CommonFields, ReceiptName};
 
 use crate::errors::Error;
 
@@ -48,6 +49,237 @@ pub struct VerifiedJob {
 }
 
 impl VerifiedJob {}
+
+/// Queue and path context required to authenticate a receipt.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReceiptContext<'a> {
+    pub(crate) queue_id: &'a [u8; 16],
+    pub(crate) shard_count: u32,
+    pub(crate) terminal_bucket_width_ns: u64,
+    pub(crate) max_payload_length: u64,
+    pub(crate) bucket: &'a str,
+    pub(crate) shard: &'a str,
+    pub(crate) filename: &'a str,
+}
+
+/// Optional operation identity that a receipt must represent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpectedReceipt {
+    pub(crate) common: CommonFields,
+    pub(crate) token: [u8; 16],
+    pub(crate) envelope_digest: [u8; 32],
+    pub(crate) payload_length: u64,
+}
+
+/// A receipt authenticated against its queue path and wire contents.
+#[derive(Debug, Clone)]
+pub(crate) enum VerifiedReceiptKind {
+    Full(VerifiedJob),
+    Compact,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedReceipt {
+    pub(crate) name: ReceiptName,
+    pub(crate) bucket_number: u64,
+    pub(crate) kind: VerifiedReceiptKind,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+pub(crate) fn receipt_read_open_flags() -> i32 {
+    libc::O_RDONLY
+        .checked_add(libc::O_CLOEXEC)
+        .and_then(|flags| flags.checked_add(libc::O_NOFOLLOW))
+        .expect("receipt read flags are disjoint")
+}
+
+pub(crate) fn receipt_write_open_flags() -> i32 {
+    libc::O_RDWR
+        .checked_add(libc::O_CLOEXEC)
+        .and_then(|flags| flags.checked_add(libc::O_NOFOLLOW))
+        .expect("receipt write flags are disjoint")
+}
+
+pub(crate) fn receipt_path_identity_matches(
+    stat: &libc::stat,
+    expected_device: u64,
+    expected_inode: u64,
+) -> bool {
+    stat.st_dev == expected_device && stat.st_ino == expected_inode
+}
+
+fn receipt_attempt_is_valid(attempt: u32, maximum_attempts: u32) -> bool {
+    if maximum_attempts == 0 {
+        return false;
+    }
+    if attempt == 0 {
+        return false;
+    }
+    attempt <= maximum_attempts
+}
+
+fn is_compact_receipt(file_size: u64, record: &[u8; COMPACT_RECEIPT_SIZE]) -> bool {
+    if file_size != COMPACT_RECEIPT_SIZE as u64 {
+        return false;
+    }
+    &record[0..RECEIPT_MAGIC.len()] == RECEIPT_MAGIC
+}
+
+fn payload_length_is_allowed(payload_length: u64, maximum: u64) -> bool {
+    payload_length <= maximum
+}
+
+fn compact_path_fields_match(
+    compact: &CompactReceipt,
+    name: &ReceiptName,
+    bucket_start: u64,
+) -> bool {
+    compact.job_id == name.common.job_id
+        && compact.lease_token == name.token
+        && compact.final_attempt == name.common.attempt
+        && compact.receipt_bucket_start_unix_ns == bucket_start
+}
+
+fn expected_name_matches(name: &ReceiptName, expected: &ExpectedReceipt) -> bool {
+    name.common == expected.common && name.token == expected.token
+}
+
+fn compact_evidence_matches(compact: &CompactReceipt, expected: &ExpectedReceipt) -> bool {
+    compact.envelope_digest == expected.envelope_digest
+        && compact.original_payload_length == expected.payload_length
+}
+
+fn full_path_fields_match(header: &FixedHeader, name: &ReceiptName) -> bool {
+    header.job_id == name.common.job_id && header.maximum_attempts == name.common.maximum_attempts
+}
+
+fn full_evidence_matches(header: &FixedHeader, expected: &ExpectedReceipt) -> bool {
+    header.envelope_digest == expected.envelope_digest
+        && header.payload_length == expected.payload_length
+}
+
+/// Authenticate a full or compact receipt using one strict policy.
+///
+/// Full receipts always receive payload verification. This is intentionally
+/// stronger than envelope-only inspection because compaction and duplicate
+/// acknowledgment must never erase or trust corrupt payload evidence.
+pub(crate) fn verify_receipt_on_fd(
+    fd: std::os::unix::io::RawFd,
+    context: ReceiptContext<'_>,
+    expected: Option<&ExpectedReceipt>,
+) -> Result<VerifiedReceipt, VerificationError> {
+    let stat = fs::fstat(fd).map_err(|error| VerificationError::Io(error.to_string()))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(VerificationError::Corrupt(
+            "receipt is not a regular file".into(),
+        ));
+    }
+    if stat.st_nlink != 1 {
+        return Err(VerificationError::Corrupt(format!(
+            "receipt link count is {}, expected 1",
+            stat.st_nlink
+        )));
+    }
+    let file_size = u64::try_from(stat.st_size)
+        .map_err(|_| VerificationError::Corrupt("receipt has a negative file size".into()))?;
+
+    let name = steadq_names::parse_receipt(context.filename)
+        .map_err(|error| VerificationError::Corrupt(format!("receipt filename: {error}")))?;
+    if !receipt_attempt_is_valid(name.common.attempt, name.common.maximum_attempts) {
+        return Err(VerificationError::Corrupt(
+            "receipt attempt fields are invalid".into(),
+        ));
+    }
+    if !name.authenticate_tag(context.queue_id, context.bucket, context.shard) {
+        return Err(VerificationError::Corrupt(
+            "receipt name tag mismatch".into(),
+        ));
+    }
+    let path_shard = steadq_names::shard_from_hex(context.shard)
+        .ok_or_else(|| VerificationError::Corrupt("receipt shard is invalid".into()))?;
+    let expected_shard =
+        steadq_names::compute_shard(context.queue_id, &name.common.job_id, context.shard_count);
+    if path_shard != expected_shard {
+        return Err(VerificationError::Corrupt(
+            "receipt shard placement mismatch".into(),
+        ));
+    }
+    let bucket_number = steadq_names::bucket_from_hex(context.bucket)
+        .ok_or_else(|| VerificationError::Corrupt("receipt bucket is invalid".into()))?;
+    let bucket_start = bucket_number
+        .checked_mul(context.terminal_bucket_width_ns)
+        .ok_or_else(|| VerificationError::Corrupt("receipt bucket start overflows".into()))?;
+
+    if let Some(expected) = expected {
+        if !expected_name_matches(&name, expected) {
+            return Err(VerificationError::Corrupt(
+                "receipt operation identity mismatch".into(),
+            ));
+        }
+    }
+
+    let mut record = [0u8; COMPACT_RECEIPT_SIZE];
+    fs::pread_exact(fd, &mut record, 0).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            VerificationError::Corrupt("receipt is shorter than its fixed record".into())
+        } else {
+            VerificationError::Io(error.to_string())
+        }
+    })?;
+
+    let kind = if is_compact_receipt(file_size, &record) {
+        let compact = CompactReceipt::decode(&record).map_err(|error| {
+            VerificationError::Corrupt(format!("compact receipt decode: {error}"))
+        })?;
+        if !compact_path_fields_match(&compact, &name, bucket_start) {
+            return Err(VerificationError::Corrupt(
+                "compact receipt semantics do not match its path".into(),
+            ));
+        }
+        if !payload_length_is_allowed(compact.original_payload_length, context.max_payload_length) {
+            return Err(VerificationError::Corrupt(
+                "compact receipt payload length exceeds queue limit".into(),
+            ));
+        }
+        if let Some(expected) = expected {
+            if !compact_evidence_matches(&compact, expected) {
+                return Err(VerificationError::Corrupt(
+                    "compact receipt evidence mismatch".into(),
+                ));
+            }
+        }
+        VerifiedReceiptKind::Compact
+    } else {
+        let job = verify_job_on_fd(fd)?;
+        if !full_path_fields_match(&job.header, &name) {
+            return Err(VerificationError::Corrupt(
+                "full receipt header does not match its path".into(),
+            ));
+        }
+        if !payload_length_is_allowed(job.header.payload_length, context.max_payload_length) {
+            return Err(VerificationError::Corrupt(
+                "full receipt payload length exceeds queue limit".into(),
+            ));
+        }
+        if let Some(expected) = expected {
+            if !full_evidence_matches(&job.header, expected) {
+                return Err(VerificationError::Corrupt(
+                    "full receipt evidence mismatch".into(),
+                ));
+            }
+        }
+        VerifiedReceiptKind::Full(job)
+    };
+
+    Ok(VerifiedReceipt {
+        name,
+        bucket_number,
+        kind,
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
+}
 
 /// Verify the envelope and payload on an already-open fd. The fd must remain
 /// open across any subsequent operation to prevent TOCTOU swap.
@@ -179,6 +411,7 @@ pub fn is_size_mismatch(expected: u64, actual: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn is_extension_too_large_table() {
@@ -191,6 +424,7 @@ mod tests {
     #[test]
     fn is_payload_digest_match_table() {
         let mut h = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 0,
             flags: 0,
@@ -255,6 +489,7 @@ mod tests {
     #[test]
     fn is_envelope_digest_valid_table() {
         let header = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 0,
             flags: 0,
@@ -283,10 +518,10 @@ mod tests {
 
     #[test]
     fn verify_size_detects_mismatch_via_tmpfile() {
-        use std::os::unix::io::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("size_test.raw");
         let header = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 10,
             flags: 0,
@@ -313,5 +548,307 @@ mod tests {
         let file2 = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let res2 = verify_size(file2.as_raw_fd(), &h, 0);
         assert!(res2.is_ok());
+    }
+
+    #[test]
+    fn compact_receipt_authenticates_path_and_operation_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_id = [0x11; 16];
+        let common = CommonFields {
+            job_id: [0x22; 16],
+            generation: 2,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let token = [0x33; 16];
+        let envelope_digest = [0x44; 32];
+        let shard_count = 64;
+        let shard = steadq_names::compute_shard(&queue_id, &common.job_id, shard_count);
+        let shard = steadq_names::shard_hex(shard);
+        let bucket_number = 7;
+        let bucket = steadq_names::bucket_hex(bucket_number);
+        let width = 3_600_000_000_000;
+        let filename = steadq_names::make_receipt_name(&queue_id, &bucket, &shard, &common, &token);
+        let expected = ExpectedReceipt {
+            common: common.clone(),
+            token,
+            envelope_digest,
+            payload_length: 5,
+        };
+        let receipt = CompactReceipt {
+            job_id: common.job_id,
+            envelope_digest,
+            final_attempt: common.attempt,
+            lease_token: token,
+            receipt_bucket_start_unix_ns: bucket_number * width,
+            original_payload_length: 5,
+        };
+        let path = dir.path().join("receipt.rct");
+        std::fs::write(&path, receipt.encode()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        let verify = |bucket: &str, shard: &str, filename: &str, expected: &ExpectedReceipt| {
+            verify_receipt_on_fd(
+                file.as_raw_fd(),
+                ReceiptContext {
+                    queue_id: &queue_id,
+                    shard_count,
+                    terminal_bucket_width_ns: width,
+                    max_payload_length: 1024,
+                    bucket,
+                    shard,
+                    filename,
+                },
+                Some(expected),
+            )
+        };
+
+        assert!(verify(&bucket, &shard, &filename, &expected).is_ok());
+        assert!(verify("0000000000000008", &shard, &filename, &expected).is_err());
+        assert!(verify(&bucket, "ffff", &filename, &expected).is_err());
+
+        let mut wrong_common = expected.clone();
+        wrong_common.common.generation += 1;
+        assert!(verify(&bucket, &shard, &filename, &wrong_common).is_err());
+
+        let mut wrong_token = expected.clone();
+        wrong_token.token[0] ^= 1;
+        assert!(verify(&bucket, &shard, &filename, &wrong_token).is_err());
+
+        let mut wrong_envelope = expected.clone();
+        wrong_envelope.envelope_digest[0] ^= 1;
+        assert!(verify(&bucket, &shard, &filename, &wrong_envelope).is_err());
+
+        let mut wrong_length = expected;
+        wrong_length.payload_length += 1;
+        assert!(verify(&bucket, &shard, &filename, &wrong_length).is_err());
+
+        file.set_len(64).unwrap();
+        assert!(matches!(
+            verify(&bucket, &shard, &filename, &wrong_length),
+            Err(VerificationError::Corrupt(ref message))
+                if message == "receipt is shorter than its fixed record"
+        ));
+    }
+
+    #[test]
+    fn legacy_full_receipt_remains_strictly_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_id = [0x11; 16];
+        let common = CommonFields {
+            job_id: [0x22; 16],
+            generation: 2,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let token = [0x33; 16];
+        let shard_count = 64;
+        let shard = steadq_names::shard_hex(steadq_names::compute_shard(
+            &queue_id,
+            &common.job_id,
+            shard_count,
+        ));
+        let bucket_number = 7;
+        let bucket = steadq_names::bucket_hex(bucket_number);
+        let width = 3_600_000_000_000;
+        let filename = steadq_names::make_receipt_name(&queue_id, &bucket, &shard, &common, &token);
+        let payload = b"hello";
+        let mut header = FixedHeader {
+            format_minor: 0,
+            extension_header_length: 0,
+            payload_length: payload.len() as u64,
+            flags: 0,
+            digest_algorithm: steadq_format::DIGEST_ALGORITHM_SHA256,
+            job_id: common.job_id,
+            maximum_attempts: common.maximum_attempts,
+            created_at_unix_ns: 1_700_000_000_000_000_000,
+            payload_digest: steadq_format::payload_digest(payload),
+            envelope_digest: [0; 32],
+        };
+        header.envelope_digest = steadq_format::envelope_digest(&header, &[]).unwrap();
+        let expected = ExpectedReceipt {
+            common,
+            token,
+            envelope_digest: header.envelope_digest,
+            payload_length: payload.len() as u64,
+        };
+        let mut bytes = header.encode(&[]).unwrap().to_vec();
+        bytes.extend_from_slice(payload);
+        let path = dir.path().join("legacy-full.rct");
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+
+        let verified = verify_receipt_on_fd(
+            file.as_raw_fd(),
+            ReceiptContext {
+                queue_id: &queue_id,
+                shard_count,
+                terminal_bucket_width_ns: width,
+                max_payload_length: 1024,
+                bucket: &bucket,
+                shard: &shard,
+                filename: &filename,
+            },
+            Some(&expected),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            verified.kind,
+            VerifiedReceiptKind::Full(ref job) if job.header.format_minor == 0
+        ));
+    }
+
+    #[test]
+    fn receipt_open_flags_are_exact() {
+        assert_eq!(
+            receipt_read_open_flags(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        );
+        assert_eq!(
+            receipt_write_open_flags(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        );
+
+        let temp = tempfile::tempfile().unwrap();
+        let stat = fs::fstat(temp.as_raw_fd()).unwrap();
+        assert!(receipt_path_identity_matches(
+            &stat,
+            stat.st_dev,
+            stat.st_ino
+        ));
+        assert!(!receipt_path_identity_matches(
+            &stat,
+            stat.st_dev.wrapping_add(1),
+            stat.st_ino
+        ));
+        assert!(!receipt_path_identity_matches(
+            &stat,
+            stat.st_dev,
+            stat.st_ino.wrapping_add(1)
+        ));
+    }
+
+    #[test]
+    fn receipt_attempt_validation_boundaries() {
+        for (attempt, maximum, expected) in [
+            (0, 0, false),
+            (0, 1, false),
+            (1, 0, false),
+            (1, 1, true),
+            (2, 1, false),
+            (u32::MAX, u32::MAX, true),
+        ] {
+            assert_eq!(receipt_attempt_is_valid(attempt, maximum), expected);
+        }
+    }
+
+    #[test]
+    fn compact_receipt_discrimination_requires_size_and_magic() {
+        let mut record = [0u8; COMPACT_RECEIPT_SIZE];
+        record[..RECEIPT_MAGIC.len()].copy_from_slice(RECEIPT_MAGIC);
+        assert!(is_compact_receipt(COMPACT_RECEIPT_SIZE as u64, &record));
+        assert!(!is_compact_receipt(
+            COMPACT_RECEIPT_SIZE as u64 - 1,
+            &record
+        ));
+        record[0] ^= 1;
+        assert!(!is_compact_receipt(COMPACT_RECEIPT_SIZE as u64, &record));
+    }
+
+    #[test]
+    fn payload_limit_is_inclusive() {
+        assert!(payload_length_is_allowed(0, 0));
+        assert!(payload_length_is_allowed(7, 7));
+        assert!(!payload_length_is_allowed(8, 7));
+        assert!(payload_length_is_allowed(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn receipt_field_matchers_reject_each_mismatch() {
+        let common = CommonFields {
+            job_id: [1; 16],
+            generation: 2,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let name = ReceiptName {
+            common: common.clone(),
+            token: [2; 16],
+            tag: [3; 8],
+        };
+        let expected = ExpectedReceipt {
+            common: common.clone(),
+            token: name.token,
+            envelope_digest: [4; 32],
+            payload_length: 5,
+        };
+        assert!(expected_name_matches(&name, &expected));
+        let mut changed = expected.clone();
+        changed.common.generation += 1;
+        assert!(!expected_name_matches(&name, &changed));
+        changed = expected.clone();
+        changed.token[0] ^= 1;
+        assert!(!expected_name_matches(&name, &changed));
+
+        let compact = CompactReceipt {
+            job_id: common.job_id,
+            envelope_digest: expected.envelope_digest,
+            final_attempt: common.attempt,
+            lease_token: name.token,
+            receipt_bucket_start_unix_ns: 6,
+            original_payload_length: expected.payload_length,
+        };
+        assert!(compact_path_fields_match(&compact, &name, 6));
+        let mut changed_compact = compact.clone();
+        changed_compact.job_id[0] ^= 1;
+        assert!(!compact_path_fields_match(&changed_compact, &name, 6));
+        changed_compact = compact.clone();
+        changed_compact.lease_token[0] ^= 1;
+        assert!(!compact_path_fields_match(&changed_compact, &name, 6));
+        changed_compact = compact.clone();
+        changed_compact.final_attempt += 1;
+        assert!(!compact_path_fields_match(&changed_compact, &name, 6));
+        assert!(!compact_path_fields_match(&compact, &name, 7));
+
+        assert!(compact_evidence_matches(&compact, &expected));
+        changed_compact = compact.clone();
+        changed_compact.envelope_digest[0] ^= 1;
+        assert!(!compact_evidence_matches(&changed_compact, &expected));
+        changed_compact = compact.clone();
+        changed_compact.original_payload_length += 1;
+        assert!(!compact_evidence_matches(&changed_compact, &expected));
+
+        let header = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
+            extension_header_length: 0,
+            payload_length: expected.payload_length,
+            flags: 0,
+            digest_algorithm: 1,
+            job_id: common.job_id,
+            maximum_attempts: common.maximum_attempts,
+            created_at_unix_ns: 0,
+            payload_digest: [0; 32],
+            envelope_digest: expected.envelope_digest,
+        };
+        assert!(full_path_fields_match(&header, &name));
+        let mut changed_header = header.clone();
+        changed_header.job_id[0] ^= 1;
+        assert!(!full_path_fields_match(&changed_header, &name));
+        changed_header = header.clone();
+        changed_header.maximum_attempts += 1;
+        assert!(!full_path_fields_match(&changed_header, &name));
+
+        assert!(full_evidence_matches(&header, &expected));
+        changed_header = header.clone();
+        changed_header.envelope_digest[0] ^= 1;
+        assert!(!full_evidence_matches(&changed_header, &expected));
+        changed_header = header;
+        changed_header.payload_length += 1;
+        assert!(!full_evidence_matches(&changed_header, &expected));
     }
 }

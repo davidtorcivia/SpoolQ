@@ -263,7 +263,8 @@ impl Queue {
                     details: format!("filename does not match {state_name} state grammar"),
                 });
                 if opts.mode == FsckMode::Repair {
-                    let _ = self.quarantine_object(
+                    self.repair_quarantine_candidate(
+                        state_name,
                         shard_fd,
                         filename,
                         full_path,
@@ -298,7 +299,8 @@ impl Queue {
                 details: "file is not a regular file".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.repair_quarantine_candidate(
+                    state_name,
                     shard_fd,
                     filename,
                     full_path,
@@ -318,7 +320,8 @@ impl Queue {
                 details: format!("link count is {} (expected 1)", stat.st_nlink),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.repair_quarantine_candidate(
+                    state_name,
                     shard_fd,
                     filename,
                     full_path,
@@ -331,7 +334,12 @@ impl Queue {
 
         // R4-H16: Read and decode the header.
         // Receipts may be compact (128 bytes with RECEIPT_MAGIC).
-        let file_fd = match fs::openat(shard_fd, filename, libc::O_RDONLY, 0) {
+        let open_flags = if state_name == "receipts" && opts.mode == FsckMode::Repair {
+            crate::queue::verified::receipt_write_open_flags()
+        } else {
+            crate::queue::verified::receipt_read_open_flags()
+        };
+        let file_fd = match fs::openat(shard_fd, filename, open_flags, 0) {
             Ok(f) => f,
             Err(_) => {
                 report.findings.push(CorruptionFinding {
@@ -343,6 +351,69 @@ impl Queue {
                 return;
             }
         };
+
+        if state_name == "receipts" {
+            let path_parts: Vec<&str> = full_path.split('/').collect();
+            let receipt_result = match path_parts.as_slice() {
+                ["receipts", bucket, shard, _] => crate::queue::verified::verify_receipt_on_fd(
+                    file_fd.as_raw_fd(),
+                    crate::queue::verified::ReceiptContext {
+                        queue_id,
+                        shard_count: self.format.shard_count,
+                        terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
+                        max_payload_length: self.format.max_payload_length,
+                        bucket,
+                        shard,
+                        filename,
+                    },
+                    None,
+                ),
+                _ => Err(crate::queue::verified::VerificationError::Corrupt(
+                    "receipt path has invalid depth".into(),
+                )),
+            };
+
+            match receipt_result {
+                Ok(receipt) => {
+                    report.structurally_verified += 1;
+                    if matches!(
+                        receipt.kind,
+                        crate::queue::verified::VerifiedReceiptKind::Full(_)
+                    ) {
+                        report.payloads_deep_verified += 1;
+                    }
+                }
+                Err(error) => {
+                    let reason = if matches!(
+                        error,
+                        crate::queue::verified::VerificationError::PayloadCorrupt
+                    ) {
+                        crate::QuarantineReason::PayloadCorrupt
+                    } else {
+                        crate::QuarantineReason::EnvelopeCorrupt
+                    };
+                    report.findings.push(CorruptionFinding {
+                        relative_path: full_path.to_string(),
+                        finding_type: "receipt_verification_failed".into(),
+                        severity: FindingSeverity::Error,
+                        details: error.to_string(),
+                    });
+                    if opts.mode == FsckMode::Repair {
+                        if let Err(repair_error) = self.quarantine_opened_object(
+                            shard_fd, filename, full_path, &file_fd, reason, report,
+                        ) {
+                            report.findings.push(CorruptionFinding {
+                                relative_path: full_path.to_string(),
+                                finding_type: "quarantine_failed".into(),
+                                severity: FindingSeverity::Error,
+                                details: repair_error.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            return;
+        }
 
         let mut header_buf = [0u8; 128];
         if fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0).is_err() {
@@ -362,55 +433,6 @@ impl Queue {
                 );
             }
             return;
-        }
-
-        // Handle compact receipts (128 bytes, RECEIPT_MAGIC prefix).
-        let is_compact_receipt = stat.st_size as usize == steadq_format::COMPACT_RECEIPT_SIZE
-            && &header_buf[0..8] == steadq_format::RECEIPT_MAGIC;
-
-        if is_compact_receipt {
-            match steadq_format::CompactReceipt::decode(&header_buf) {
-                Ok(cr) => {
-                    if cr.job_id != common.job_id {
-                        report.findings.push(CorruptionFinding {
-                            relative_path: full_path.to_string(),
-                            finding_type: "compact_receipt_job_id_mismatch".into(),
-                            severity: FindingSeverity::Error,
-                            details: "compact receipt job_id does not match filename".into(),
-                        });
-                        if opts.mode == FsckMode::Repair {
-                            let _ = self.quarantine_object(
-                                shard_fd,
-                                filename,
-                                full_path,
-                                crate::QuarantineReason::FilenameHeaderMismatch,
-                                report,
-                            );
-                        }
-                        return;
-                    }
-                    report.structurally_verified += 1;
-                    return;
-                }
-                Err(_) => {
-                    report.findings.push(CorruptionFinding {
-                        relative_path: full_path.to_string(),
-                        finding_type: "compact_receipt_decode_failed".into(),
-                        severity: FindingSeverity::Error,
-                        details: "compact receipt decode error".into(),
-                    });
-                    if opts.mode == FsckMode::Repair {
-                        let _ = self.quarantine_object(
-                            shard_fd,
-                            filename,
-                            full_path,
-                            crate::QuarantineReason::EnvelopeCorrupt,
-                            report,
-                        );
-                    }
-                    return;
-                }
-            }
         }
 
         // Full header decode for .sqj files.
@@ -830,6 +852,72 @@ impl Queue {
         Ok(())
     }
 
+    fn repair_quarantine_candidate(
+        &self,
+        state_name: &str,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        full_path: &str,
+        reason: crate::QuarantineReason,
+        report: &mut FsckReport,
+    ) {
+        let result = if state_name == "receipts" {
+            fs::openat(
+                src_dir_fd,
+                filename,
+                crate::queue::verified::receipt_write_open_flags(),
+                0,
+            )
+            .and_then(|opened| {
+                self.quarantine_opened_object(
+                    src_dir_fd, filename, full_path, &opened, reason, report,
+                )
+            })
+        } else {
+            self.quarantine_object(src_dir_fd, filename, full_path, reason, report)
+        };
+
+        if let Err(error) = result {
+            report.findings.push(CorruptionFinding {
+                relative_path: full_path.to_string(),
+                finding_type: "quarantine_failed".into(),
+                severity: FindingSeverity::Error,
+                details: error.to_string(),
+            });
+        }
+    }
+
+    fn quarantine_opened_object(
+        &self,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        full_path: &str,
+        opened: &std::os::fd::OwnedFd,
+        reason: crate::QuarantineReason,
+        report: &mut FsckReport,
+    ) -> Result<(), std::io::Error> {
+        if !steadq_fs_linux::try_ofd_write_lock(opened.as_raw_fd())? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "receipt is busy",
+            ));
+        }
+        let opened_stat = steadq_fs_linux::fstat(opened.as_raw_fd())?;
+        let current_stat = steadq_fs_linux::fstatat(src_dir_fd, filename)?;
+        if !crate::queue::verified::receipt_path_identity_matches(
+            &current_stat,
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "receipt path no longer names the verified inode",
+            ));
+        }
+
+        self.quarantine_object(src_dir_fd, filename, full_path, reason, report)
+    }
+
     /// List all quarantined objects under the queue root.
     ///
     /// Quarantine objects live as `quarantine/q{id}.x{reason}.raw` (flat).
@@ -1157,5 +1245,124 @@ mod tests {
         });
         assert!(!report.findings.is_empty());
         assert!(!report.quarantined.is_empty());
+    }
+
+    #[test]
+    fn quarantine_opened_receipt_rejects_path_replacement() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let filename = "candidate.rct";
+        let candidate = tmp.path().join(filename);
+        let displaced = tmp.path().join("displaced.rct");
+        std::fs::write(&candidate, b"corrupt").unwrap();
+        let opened = steadq_fs_linux::openat(
+            queue.root_fd(),
+            filename,
+            crate::queue::verified::receipt_write_open_flags(),
+            0,
+        )
+        .unwrap();
+        std::fs::rename(&candidate, &displaced).unwrap();
+        std::fs::write(&candidate, b"replacement").unwrap();
+        let mut report = FsckReport::default();
+
+        let error = queue
+            .quarantine_opened_object(
+                queue.root_fd(),
+                filename,
+                filename,
+                &opened,
+                crate::QuarantineReason::EnvelopeCorrupt,
+                &mut report,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"corrupt");
+        assert!(report.quarantined.is_empty());
+        assert!(queue.list_quarantine().is_empty());
+    }
+
+    #[test]
+    fn receipt_repair_requires_an_opened_regular_candidate() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let target = tmp.path().join("target.raw");
+        let candidate = tmp.path().join("candidate.rct");
+        std::fs::write(&target, b"target").unwrap();
+        std::os::unix::fs::symlink(&target, &candidate).unwrap();
+        let mut report = FsckReport::default();
+
+        queue.repair_quarantine_candidate(
+            "receipts",
+            queue.root_fd(),
+            "candidate.rct",
+            "candidate.rct",
+            crate::QuarantineReason::NonRegularFile,
+            &mut report,
+        );
+
+        assert!(candidate
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+        assert!(report.quarantined.is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.finding_type == "quarantine_failed"));
+    }
+
+    #[test]
+    fn receipt_repair_quarantines_locked_regular_candidate() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let candidate = tmp.path().join("candidate.rct");
+        std::fs::write(&candidate, b"corrupt").unwrap();
+        let mut report = FsckReport::default();
+
+        queue.repair_quarantine_candidate(
+            "receipts",
+            queue.root_fd(),
+            "candidate.rct",
+            "candidate.rct",
+            crate::QuarantineReason::EnvelopeCorrupt,
+            &mut report,
+        );
+
+        assert!(!candidate.exists());
+        assert_eq!(report.quarantined.len(), 1);
+        assert_eq!(queue.list_quarantine().len(), 1);
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.finding_type == "quarantine_failed"));
     }
 }

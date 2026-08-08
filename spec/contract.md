@@ -18,7 +18,9 @@ A successful strict enqueue remains represented by one recoverable or terminal o
 
 A stale or lost token cannot acknowledge, renew, retry, or bury a later lease. An unacknowledged committed lease eventually becomes ready or dead, subject to liveness assumptions.
 
-A successful acknowledgment creates a terminal receipt, and repeating acknowledgment is non-destructive.
+A successful acknowledgment re-verifies the payload and creates a terminal receipt. SteadQ/1 exposes no unverified acknowledgment operation. Repeating acknowledgment is non-destructive only when the existing receipt passes the same queue, path, identity, envelope, and payload-evidence checks used by recovery and integrity tooling.
+
+Receipt compaction is permitted only after strict verification of the complete full receipt, including its payload digest. A compact receipt preserves that verified evidence class; malformed or unverified full receipts are not compacted.
 
 Corrupt, malformed, or structurally ambiguous objects are never delivered automatically, and recovery may be interrupted after any filesystem operation and safely rerun without data loss.
 

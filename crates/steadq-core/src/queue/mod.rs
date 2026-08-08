@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use steadq_format::cbor::ExtensionHeader;
 use steadq_format::{
     envelope_digest, payload_digest, FixedHeader, FormatRecord, WatermarkRecord,
-    DIGEST_ALGORITHM_SHA256, MAX_PAYLOAD_LENGTH,
+    DIGEST_ALGORITHM_SHA256, FORMAT_MINOR, MAX_PAYLOAD_LENGTH,
 };
 use steadq_fs_linux as fs;
 use steadq_math::{self, bucket_number, ceiling_bucket, eligibility_bucket_and_ns};
@@ -279,14 +279,6 @@ fn same_directory_identity(source: Option<&libc::stat>, destination: Option<&lib
         }
         _ => false,
     }
-}
-
-fn is_compact_receipt_candidate(size: usize, magic: &[u8]) -> bool {
-    size == steadq_format::COMPACT_RECEIPT_SIZE && magic == steadq_format::RECEIPT_MAGIC
-}
-
-fn is_acknowledgement_receipt_path(operation: TransitionOperation, path_matches: bool) -> bool {
-    operation == TransitionOperation::Acknowledge && path_matches
 }
 
 fn resolved_identity_matches(
@@ -1143,6 +1135,7 @@ impl Queue {
 
         // Build fixed header
         let mut header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: ext_bytes.len() as u32,
             payload_length: job.payload.len() as u64,
             flags: 0,
@@ -1962,20 +1955,13 @@ impl Queue {
         }
     }
 
-    /// Acknowledge a lease: move to terminal receipt.
-    /// R4-H22/H23: Re-hashes the payload at ack time to close the TOCTOU
-    /// window between lease() and ack(). Use ack_unverified() to skip.
+    /// Acknowledge a lease: strictly verify its payload, then move it to a
+    /// terminal receipt.
+    ///
+    /// The payload is re-hashed at acknowledgment time to close the TOCTOU
+    /// window between lease delivery and terminal publication. SteadQ/1 has no
+    /// public unverified acknowledgment path.
     pub fn ack(&mut self, lease: &LeaseInfo) -> AckOutcome {
-        self.ack_impl(lease, true)
-    }
-
-    /// Acknowledge a lease without payload verification (unsafe).
-    /// Cannot detect payload corruption. Use ack() for the safe path.
-    pub fn ack_unverified(&mut self, lease: &LeaseInfo) -> AckOutcome {
-        self.ack_impl(lease, false)
-    }
-
-    fn ack_impl(&mut self, lease: &LeaseInfo, verify_payload: bool) -> AckOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return AckOutcome::NotCommitted(e);
         }
@@ -2041,11 +2027,9 @@ impl Queue {
             Err(e) => return AckOutcome::NotCommitted(e),
         };
 
-        if verify_payload {
-            if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
-                self.poison();
-                return AckOutcome::NotCommitted(e);
-            }
+        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
+            self.poison();
+            return AckOutcome::NotCommitted(e);
         }
 
         // Rename leased -> receipt with NOREPLACE
@@ -3264,16 +3248,43 @@ impl Queue {
                             for entry in entries {
                                 if let Ok(parsed) = steadq_names::parse_receipt(&entry) {
                                     if parsed.common.job_id == *job_id {
-                                        results.push(Snapshot {
-                                            job_id: *job_id,
-                                            state: "receipt".into(),
-                                            generation: parsed.common.generation,
-                                            attempt: parsed.common.attempt,
-                                            maximum_attempts: parsed.common.maximum_attempts,
-                                            shard,
-                                            relative_path: format!("{shard_path}/{entry}"),
-                                            size: 0,
-                                        });
+                                        let file_fd = match fs::openat(
+                                            shard_fd.as_raw_fd(),
+                                            &entry,
+                                            verified::receipt_read_open_flags(),
+                                            0,
+                                        ) {
+                                            Ok(file_fd) => file_fd,
+                                            Err(_) => continue,
+                                        };
+                                        if verified::verify_receipt_on_fd(
+                                            file_fd.as_raw_fd(),
+                                            verified::ReceiptContext {
+                                                queue_id: &self.format.queue_id,
+                                                shard_count: self.format.shard_count,
+                                                terminal_bucket_width_ns: self
+                                                    .format
+                                                    .terminal_bucket_width_ns,
+                                                max_payload_length: self.format.max_payload_length,
+                                                bucket: &bucket_dir,
+                                                shard: &shard_str,
+                                                filename: &entry,
+                                            },
+                                            None,
+                                        )
+                                        .is_ok()
+                                        {
+                                            results.push(Snapshot {
+                                                job_id: *job_id,
+                                                state: "receipt".into(),
+                                                generation: parsed.common.generation,
+                                                attempt: parsed.common.attempt,
+                                                maximum_attempts: parsed.common.maximum_attempts,
+                                                shard,
+                                                relative_path: format!("{shard_path}/{entry}"),
+                                                size: 0,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -3289,38 +3300,15 @@ impl Queue {
     /// Duplicate acknowledgment probe: check if a receipt exists for this lease.
     /// Probes exact receipt filenames across retained terminal buckets.
     pub fn check_duplicate_ack(&self, lease: &LeaseInfo) -> AckOutcome {
-        let shard = compute_shard(
-            &self.format.queue_id,
-            &lease.job_id,
-            self.format.shard_count,
-        );
-        let shard_str = shard_hex(shard);
-
-        // Scan receipt buckets
-        if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
-            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(receipts_root.as_raw_fd()) {
-                for bucket_dir in bucket_dirs {
-                    let shard_path = format!("receipts/{bucket_dir}/{shard_str}");
-                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
-                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
-                            for entry in entries {
-                                if let Ok(parsed) = steadq_names::parse_receipt(&entry) {
-                                    if parsed.common.job_id == lease.job_id
-                                        && parsed.token == lease.token
-                                        && parsed.common.generation
-                                            == lease.generation.saturating_add(1)
-                                    {
-                                        return AckOutcome::AlreadyAcked;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        let wall_floor = match self.authenticated_wall_floor() {
+            Ok(wall_floor) => wall_floor,
+            Err(error) => return AckOutcome::NotCommitted(error),
+        };
+        if self.check_duplicate_ack_bounded(lease, wall_floor) {
+            AckOutcome::AlreadyAcked
+        } else {
+            AckOutcome::LeaseLost
         }
-
-        AckOutcome::LeaseLost
     }
 
     /// B1: Authenticate an active-state object structurally.
@@ -3485,59 +3473,53 @@ impl Queue {
     /// and checks them via fstatat, not by listing receipt contents.
     /// P0-04: Authenticate a receipt at a specific path.
     fn receipt_is_authentic(&self, lease: &LeaseInfo, dir: &str, name: &str) -> bool {
+        let new_generation = match lease.generation.checked_add(1) {
+            Some(generation) => generation,
+            None => return false,
+        };
+        let expected = verified::ExpectedReceipt {
+            common: CommonFields {
+                job_id: lease.job_id,
+                generation: new_generation,
+                attempt: lease.attempt,
+                maximum_attempts: lease.maximum_attempts,
+            },
+            token: lease.token,
+            envelope_digest: lease.envelope_digest,
+            payload_length: lease.payload_length,
+        };
         let dir_fd = match open_relative(self.root_fd.as_raw_fd(), dir) {
             Ok(fd) => fd,
             Err(_) => return false,
         };
-        let stat = match fs::fstatat(dir_fd.as_raw_fd(), name) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return false;
-        }
-        // Parse the receipt filename and verify identity.
-        let parsed = match steadq_names::parse_receipt(name) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        if parsed.common.job_id != lease.job_id {
-            return false;
-        }
-        if parsed.token != lease.token {
-            return false;
-        }
-        // Verify name tag.
         let parts: Vec<&str> = dir.split('/').collect();
         let (bucket, shard_hex) = match parts.len() {
             3 => (parts[1], parts[2]),
             _ => return false,
         };
-        if !parsed.authenticate_tag(&self.format.queue_id, bucket, shard_hex) {
-            return false;
-        }
-        // Read and verify the receipt content.
-        let file_fd = match fs::openat(dir_fd.as_raw_fd(), name, libc::O_RDONLY, 0) {
+        let file_fd = match fs::openat(
+            dir_fd.as_raw_fd(),
+            name,
+            verified::receipt_read_open_flags(),
+            0,
+        ) {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let mut buf = [0u8; 128];
-        if fs::pread_exact(file_fd.as_raw_fd(), &mut buf, 0).is_err() {
-            return false;
-        }
-        if stat.st_size as usize == steadq_format::COMPACT_RECEIPT_SIZE
-            && &buf[0..8] == steadq_format::RECEIPT_MAGIC
-        {
-            match steadq_format::CompactReceipt::decode(&buf) {
-                Ok(cr) => cr.job_id == lease.job_id && cr.lease_token == lease.token,
-                Err(_) => false,
-            }
-        } else {
-            match FixedHeader::decode(&buf) {
-                Ok(h) => h.job_id == lease.job_id,
-                Err(_) => false,
-            }
-        }
+        verified::verify_receipt_on_fd(
+            file_fd.as_raw_fd(),
+            verified::ReceiptContext {
+                queue_id: &self.format.queue_id,
+                shard_count: self.format.shard_count,
+                terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
+                max_payload_length: self.format.max_payload_length,
+                bucket,
+                shard: shard_hex,
+                filename: name,
+            },
+            Some(&expected),
+        )
+        .is_ok()
     }
 
     fn check_duplicate_ack_bounded(&self, lease: &LeaseInfo, wall_floor: WallFloor) -> bool {
@@ -3558,12 +3540,21 @@ impl Queue {
             self.format.shard_count,
         );
         let shard_str = shard_hex(shard);
-        let new_generation = lease.generation.saturating_add(1);
+        let new_generation = match lease.generation.checked_add(1) {
+            Some(generation) => generation,
+            None => return false,
+        };
         let receipt_common = CommonFields {
             job_id: lease.job_id,
             generation: new_generation,
             attempt: lease.attempt,
             maximum_attempts: lease.maximum_attempts,
+        };
+        let expected = verified::ExpectedReceipt {
+            common: receipt_common.clone(),
+            token: lease.token,
+            envelope_digest: lease.envelope_digest,
+            payload_length: lease.payload_length,
         };
         for bucket_num in min_bucket..=now_bucket {
             let bucket_str = bucket_hex(bucket_num);
@@ -3576,31 +3567,28 @@ impl Queue {
             );
             let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
             if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &receipt_dir) {
-                // R4-B08: Authenticate the receipt, not just check existence
-                if let Ok(stat) = fs::fstatat(dir_fd.as_raw_fd(), &receipt_name) {
-                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-                        continue;
-                    }
-                    if let Ok(file_fd) =
-                        fs::openat(dir_fd.as_raw_fd(), &receipt_name, libc::O_RDONLY, 0)
+                if let Ok(file_fd) = fs::openat(
+                    dir_fd.as_raw_fd(),
+                    &receipt_name,
+                    verified::receipt_read_open_flags(),
+                    0,
+                ) {
+                    if verified::verify_receipt_on_fd(
+                        file_fd.as_raw_fd(),
+                        verified::ReceiptContext {
+                            queue_id: &self.format.queue_id,
+                            shard_count: self.format.shard_count,
+                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
+                            max_payload_length: self.format.max_payload_length,
+                            bucket: &bucket_str,
+                            shard: &shard_str,
+                            filename: &receipt_name,
+                        },
+                        Some(&expected),
+                    )
+                    .is_ok()
                     {
-                        let mut buf = [0u8; 128];
-                        if fs::pread_exact(file_fd.as_raw_fd(), &mut buf, 0).is_ok() {
-                            // Accept full job header with matching job_id
-                            if let Ok(hdr) = FixedHeader::decode(&buf) {
-                                if hdr.job_id == lease.job_id {
-                                    return true;
-                                }
-                            }
-                            // Accept compact receipt with matching job_id
-                            if stat.st_size as usize == steadq_format::COMPACT_RECEIPT_SIZE {
-                                if let Ok(cr) = steadq_format::CompactReceipt::decode(&buf) {
-                                    if cr.job_id == lease.job_id {
-                                        return true;
-                                    }
-                                }
-                            }
-                        }
+                        return true;
                     }
                 }
             }
@@ -3733,29 +3721,6 @@ impl Queue {
         Ok((source.relative_path(), destination.relative_path()))
     }
 
-    fn resolve_receipt_path_matches(
-        &self,
-        parts: &[&str],
-        name: &str,
-        ticket: &TransitionTicket,
-        expected_common: &CommonFields,
-    ) -> bool {
-        if parts.len() != 4 || parts[0] != "receipts" {
-            return false;
-        }
-        let parsed = match steadq_names::parse_receipt(name) {
-            Ok(parsed) => parsed,
-            Err(_) => return false,
-        };
-        if &parsed.common != expected_common || parsed.token != ticket.lease_token() {
-            return false;
-        }
-        let bucket = parts[1];
-        let shard = parts[2];
-        parsed.authenticate_tag(&self.format.queue_id, bucket, shard)
-            && self.verify_shard_placement(shard, &ticket.job_id())
-    }
-
     fn resolve_check_object(
         &self,
         path: &ResolvePath<'_>,
@@ -3810,41 +3775,33 @@ impl Queue {
 
         let state = parts[0];
 
-        // Compact receipts are valid only as authenticated receipt destinations.
-        if is_compact_receipt_candidate(stat.st_size as usize, &header_buf[0..8]) {
-            if !is_acknowledgement_receipt_path(
-                ticket.operation(),
-                self.resolve_receipt_path_matches(parts, name, ticket, expected_common),
-            ) {
+        if state == "receipts" {
+            if ticket.operation() != TransitionOperation::Acknowledge {
                 return ResolveObj::Conflict;
             }
-            match steadq_format::CompactReceipt::decode(&header_buf) {
-                Ok(cr) if cr.job_id == ticket.job_id() => {
-                    // R4-B07: Verify compact receipt fields against the ticket.
-                    // The envelope digest must match when known (non-zero).
-                    if cr.envelope_digest != ticket.envelope_digest() {
-                        return ResolveObj::Conflict;
-                    }
-                    if cr.original_payload_length != ticket.payload_length() {
-                        return ResolveObj::Conflict;
-                    }
-                    if cr.lease_token != ticket.lease_token() {
-                        return ResolveObj::Conflict;
-                    }
-                    if cr.final_attempt != expected_common.attempt {
-                        return ResolveObj::Conflict;
-                    }
-                    let expected_bucket_start = match parts
-                        .get(1)
-                        .and_then(|value| steadq_names::bucket_from_hex(value))
-                        .and_then(|bucket| bucket.checked_mul(self.format.terminal_bucket_width_ns))
-                    {
-                        Some(value) => value,
-                        None => return ResolveObj::Conflict,
-                    };
-                    if cr.receipt_bucket_start_unix_ns != expected_bucket_start {
-                        return ResolveObj::Conflict;
-                    }
+            if parts.len() != 4 {
+                return ResolveObj::Conflict;
+            }
+            let expected = verified::ExpectedReceipt {
+                common: expected_common.clone(),
+                token: ticket.lease_token(),
+                envelope_digest: ticket.envelope_digest(),
+                payload_length: ticket.payload_length(),
+            };
+            match verified::verify_receipt_on_fd(
+                file_fd.as_raw_fd(),
+                verified::ReceiptContext {
+                    queue_id: &self.format.queue_id,
+                    shard_count: self.format.shard_count,
+                    terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
+                    max_payload_length: self.format.max_payload_length,
+                    bucket: parts[1],
+                    shard: parts[2],
+                    filename: name,
+                },
+                Some(&expected),
+            ) {
+                Ok(_) => {
                     return ResolveObj::Match(ResolvedObject {
                         directory_fd: dir_fd,
                         directory_device: directory_stat.st_dev as u64,
@@ -3854,8 +3811,13 @@ impl Queue {
                         inode: stat.st_ino as u64,
                     });
                 }
-                Ok(_) => return ResolveObj::Conflict,
-                Err(_) => return ResolveObj::Conflict,
+                Err(verified::VerificationError::Io(error)) => {
+                    return ResolveObj::Error(Error::IoFailure(error));
+                }
+                Err(
+                    verified::VerificationError::Corrupt(_)
+                    | verified::VerificationError::PayloadCorrupt,
+                ) => return ResolveObj::Conflict,
             }
         }
 
@@ -3974,14 +3936,6 @@ impl Queue {
                     return ResolveObj::Conflict;
                 }
                 if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
-                    return ResolveObj::Conflict;
-                }
-            }
-            "receipts" => {
-                if !is_acknowledgement_receipt_path(
-                    ticket.operation(),
-                    self.resolve_receipt_path_matches(parts, name, ticket, expected_common),
-                ) {
                     return ResolveObj::Conflict;
                 }
             }
@@ -4357,46 +4311,6 @@ mod tests {
         assert!(!same_directory_identity(None, Some(&source)));
         assert!(!same_directory_identity(Some(&source), None));
         assert!(!same_directory_identity(None, None));
-    }
-
-    #[test]
-    fn compact_receipt_candidate_table() {
-        let mut wrong_magic = *steadq_format::RECEIPT_MAGIC;
-        wrong_magic[0] ^= 1;
-        for (size, magic, expected) in [
-            (
-                steadq_format::COMPACT_RECEIPT_SIZE,
-                steadq_format::RECEIPT_MAGIC.as_slice(),
-                true,
-            ),
-            (
-                steadq_format::COMPACT_RECEIPT_SIZE - 1,
-                steadq_format::RECEIPT_MAGIC.as_slice(),
-                false,
-            ),
-            (
-                steadq_format::COMPACT_RECEIPT_SIZE,
-                wrong_magic.as_slice(),
-                false,
-            ),
-        ] {
-            assert_eq!(is_compact_receipt_candidate(size, magic), expected);
-        }
-    }
-
-    #[test]
-    fn acknowledgement_receipt_path_table() {
-        for (operation, path_matches, expected) in [
-            (TransitionOperation::Acknowledge, true, true),
-            (TransitionOperation::Acknowledge, false, false),
-            (TransitionOperation::Claim, true, false),
-            (TransitionOperation::Claim, false, false),
-        ] {
-            assert_eq!(
-                is_acknowledgement_receipt_path(operation, path_matches),
-                expected,
-            );
-        }
     }
 
     #[test]
@@ -5119,12 +5033,24 @@ mod tests {
                 for _ in 0..jobs_per_producer {
                     let payload =
                         format!("payload-{}", steadq_fs_linux::random_128bit().unwrap()[0]);
-                    queue.enqueue(EnqueueInput {
+                    let input = EnqueueInput {
                         maximum_attempts: 3,
                         content_type: "text/plain".to_string(),
                         payload: payload.into_bytes(),
                         ..Default::default()
-                    });
+                    };
+                    let mut attempts = 0;
+                    loop {
+                        attempts += 1;
+                        assert!(attempts <= 1_000, "enqueue remained contended");
+                        match queue.enqueue(input.clone()) {
+                            EnqueueOutcome::Committed(_) => break,
+                            EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy) => {
+                                std::thread::yield_now();
+                            }
+                            outcome => panic!("concurrent enqueue failed: {outcome:?}"),
+                        }
+                    }
                 }
             });
             producer_handles.push(handle);
@@ -5152,7 +5078,7 @@ mod tests {
                 let mut attempts = 0;
                 loop {
                     attempts += 1;
-                    if attempts > total_jobs * 4 + 100 {
+                    if attempts > total_jobs * 32 + 1_000 {
                         panic!(
                             "concurrent test hung: attempts {attempts} exceeded bound, leased {} acked {}",
                             lc.load(Ordering::SeqCst),
@@ -5162,11 +5088,19 @@ mod tests {
                     match queue.lease(0, 30_000_000_000) {
                         LeaseOutcome::Leased(lease) => {
                             lc.fetch_add(1, Ordering::SeqCst);
-                            if queue.ack_unverified(&lease) == AckOutcome::Acked {
-                                ac.fetch_add(1, Ordering::SeqCst);
+                            match queue.ack(&lease) {
+                                AckOutcome::Acked => {
+                                    ac.fetch_add(1, Ordering::SeqCst);
+                                }
+                                outcome => panic!("concurrent ack failed: {outcome:?}"),
                             }
                         }
-                        LeaseOutcome::Empty => break,
+                        LeaseOutcome::Empty => {
+                            if ac.load(Ordering::SeqCst) == total_jobs {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
                         _ => {}
                     }
                 }
@@ -5650,7 +5584,7 @@ mod tests {
         assert!(matches!(result, AckOutcome::Acked));
     }
 
-    // ===== R4-H02: ack_unverified skips payload re-hash =====
+    // ===== R4-H02: explicit verification remains compatible with strict ack =====
     #[test]
     fn ack_accepts_verified_lease() {
         let (_tmp, mut queue) = create_test_queue();
@@ -6096,59 +6030,6 @@ mod tests {
         assert!(matches!(
             queue.resolve(&ticket, false),
             ResolutionOutcome::ConflictingObject
-        ));
-    }
-
-    #[test]
-    fn receipt_path_authentication_rejects_each_mismatch() {
-        let (_tmp, queue, ticket) = resolver_ticket_case("acknowledge");
-        let (_, destination) = queue.transition_ticket_paths(&ticket).unwrap();
-        let parts = destination.split('/').collect::<Vec<_>>();
-        let name = parts[3];
-        let expected_common = ticket.destination_common().unwrap();
-        assert!(queue.resolve_receipt_path_matches(&parts, name, &ticket, &expected_common,));
-
-        assert!(!queue.resolve_receipt_path_matches(&parts[..3], name, &ticket, &expected_common,));
-        let wrong_state = ["ready", parts[1], parts[2], parts[3]];
-        assert!(!queue.resolve_receipt_path_matches(&wrong_state, name, &ticket, &expected_common,));
-
-        let mut wrong_common = expected_common.clone();
-        wrong_common.generation += 1;
-        assert!(!queue.resolve_receipt_path_matches(&parts, name, &ticket, &wrong_common,));
-        let mut wrong_token_json: serde_json::Value =
-            serde_json::from_slice(&ticket.to_json().unwrap()).unwrap();
-        wrong_token_json["source_identity"]["lease_token"] =
-            serde_json::json!(steadq_names::hex_encode(&[0xff; 16]));
-        let wrong_token =
-            TransitionTicket::from_json(&serde_json::to_vec(&wrong_token_json).unwrap()).unwrap();
-        assert!(!queue.resolve_receipt_path_matches(&parts, name, &wrong_token, &expected_common,));
-
-        let mut wrong_tag = name.as_bytes().to_vec();
-        let tag_index = wrong_tag.len() - 5;
-        wrong_tag[tag_index] = if wrong_tag[tag_index] == b'0' {
-            b'1'
-        } else {
-            b'0'
-        };
-        let wrong_tag = String::from_utf8(wrong_tag).unwrap();
-        assert!(!queue.resolve_receipt_path_matches(&parts, &wrong_tag, &ticket, &expected_common,));
-
-        let actual_shard = steadq_names::shard_from_hex(parts[2]).unwrap();
-        let wrong_shard = (actual_shard + 1) % queue.format.shard_count;
-        let wrong_shard = shard_hex(wrong_shard);
-        let wrong_shard_name = steadq_names::make_receipt_name(
-            &queue.format.queue_id,
-            parts[1],
-            &wrong_shard,
-            &expected_common,
-            &ticket.lease_token(),
-        );
-        let wrong_shard_parts = ["receipts", parts[1], &wrong_shard, &wrong_shard_name];
-        assert!(!queue.resolve_receipt_path_matches(
-            &wrong_shard_parts,
-            &wrong_shard_name,
-            &ticket,
-            &expected_common,
         ));
     }
 
@@ -7131,12 +7012,18 @@ mod tests {
     fn fd_leak_stress() {
         let tmp = TempDir::new().unwrap();
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
-        fn open_fd_count() -> usize {
+        fn queue_fd_count(root: &Path) -> usize {
             std::fs::read_dir("/proc/self/fd")
-                .map(|d| d.count())
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                        .filter(|target| target.starts_with(root))
+                        .count()
+                })
                 .unwrap_or(0)
         }
-        let baseline = open_fd_count();
+        let baseline = queue_fd_count(tmp.path());
         for _ in 0..200 {
             let q = Queue::open(
                 tmp.path(),
@@ -7148,12 +7035,8 @@ mod tests {
             .unwrap();
             drop(q);
         }
-        let after = open_fd_count();
-        // Allow small variance for allocator internals, but no sustained growth.
-        assert!(
-            after <= baseline + 30,
-            "FD leak: baseline={baseline}, after={after}"
-        );
+        let after = queue_fd_count(tmp.path());
+        assert_eq!(after, baseline, "queue FD leak detected");
     }
 
     // ===== T3: Negative test matrix =====
@@ -7914,17 +7797,47 @@ mod tests {
         // First verify that ack can find the lease (it's valid).
         // Then the EEXIST path should trigger because we pre-planted a file.
         let result = queue.ack(&lease);
-        // The result should be NotCommitted because either:
-        // (a) the EEXIST handler authenticates the garbage receipt and fails, or
-        // (b) the rename fails with EEXIST and receipt_is_authentic returns false.
-        match result {
-            AckOutcome::NotCommitted(_) => {
-                // Good - the conflicting receipt was not treated as AlreadyAcked.
-            }
-            AckOutcome::Acked => panic!("conflicting receipt should not be Acked"),
-            AckOutcome::AlreadyAcked => panic!("conflicting receipt should not be AlreadyAcked"),
-            other => panic!("unexpected outcome: {other:?}"),
-        }
+        assert!(matches!(
+            result,
+            AckOutcome::NotCommitted(Error::QueueCorrupt(ref message))
+                if message == "conflicting object at receipt path"
+        ));
+    }
+
+    #[test]
+    fn ack_authenticates_existing_receipt_before_reporting_both_objects() {
+        let (tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("lease failed: {outcome:?}"),
+        };
+        let wall = queue.effective_wall_floor_ns_checked().unwrap();
+        let bucket = bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap();
+        let common = CommonFields {
+            job_id: lease.job_id,
+            generation: lease.generation.checked_add(1).unwrap(),
+            attempt: lease.attempt,
+            maximum_attempts: lease.maximum_attempts,
+        };
+        let target = queue
+            .layout()
+            .receipt_in_bucket(&common, &lease.token, bucket);
+        let receipt_path = tmp.path().join(target.relative_path());
+        std::fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        std::fs::copy(tmp.path().join(&lease.exact_source_path), &receipt_path).unwrap();
+
+        let result = queue.ack(&lease);
+        assert!(matches!(
+            result,
+            AckOutcome::NotCommitted(Error::QueueCorrupt(ref message))
+                if message == "source lease and receipt both exist"
+        ));
     }
 
     // ===== P1-06: ENOTDIR is QueueCorrupt =====
@@ -7970,11 +7883,11 @@ mod tests {
             _ => panic!("lease failed"),
         };
         // First ack succeeds.
-        let result = queue.ack_unverified(&lease);
+        let result = queue.ack(&lease);
         assert!(matches!(result, AckOutcome::Acked));
         // Second ack: source is gone (ENOENT in open_and_validate).
         // Should return AlreadyAcked, not NotCommitted(QueueCorrupt).
-        let result2 = queue.ack_unverified(&lease);
+        let result2 = queue.ack(&lease);
         assert!(
             matches!(result2, AckOutcome::AlreadyAcked),
             "second ack should be AlreadyAcked, got {result2:?}"
@@ -8100,6 +8013,8 @@ mod tests {
         .unwrap();
         let report = queue2.fsck(&FsckOptions::default());
         assert_eq!(report.findings.len(), 0, "findings: {:?}", report.findings);
+        assert_eq!(report.structurally_verified, 1);
+        assert_eq!(report.payloads_deep_verified, 1);
     }
 
     // ===== fsck on leased state =====
@@ -8127,9 +8042,9 @@ mod tests {
         assert!(report.total_objects >= 1);
     }
 
-    // ===== ack_unverified reaches rename and triggers EEXIST =====
+    // ===== strict ack reaches rename and triggers EEXIST =====
     #[test]
-    fn ack_unverified_eexist_triggers_not_committed() {
+    fn ack_eexist_triggers_not_committed() {
         let (_tmp, mut queue) = create_test_queue();
         queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
@@ -8180,8 +8095,7 @@ mod tests {
         let full_dir = _tmp.path().join(&receipt_dir);
         std::fs::create_dir_all(&full_dir).unwrap();
         std::fs::write(full_dir.join(&receipt_name), b"not a receipt").unwrap();
-        // Use ack_unverified to skip payload verification and reach rename directly.
-        let result = queue.ack_unverified(&lease);
+        let result = queue.ack(&lease);
         // Must be NotCommitted with QueueCorrupt (from EEXIST handler),
         // NOT IoFailure (from generic handler that mutant "guard == false" would route to).
         match result {
