@@ -140,6 +140,33 @@ struct ClaimSourceWitness {
     evidence: TicketEvidence,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimSourceIdentity {
+    Match,
+    Mismatch,
+}
+
+fn classify_claim_source_identity(
+    stat: &libc::stat,
+    witness: &ClaimSourceWitness,
+) -> ClaimSourceIdentity {
+    if resolved_identity_matches(
+        stat.st_mode,
+        stat.st_dev,
+        stat.st_ino,
+        witness.device,
+        witness.inode,
+    ) {
+        ClaimSourceIdentity::Match
+    } else {
+        ClaimSourceIdentity::Mismatch
+    }
+}
+
+fn is_singly_linked_regular(mode: libc::mode_t, link_count: libc::nlink_t) -> bool {
+    mode & libc::S_IFMT == libc::S_IFREG && link_count == 1
+}
+
 fn resolver_file_open_flags() -> i32 {
     libc::O_NOFOLLOW
         .checked_add(libc::O_CLOEXEC)
@@ -1406,19 +1433,14 @@ impl Queue {
                 };
 
                 match fs::fstatat(shard_fd.as_raw_fd(), entry) {
-                    Ok(stat)
-                        if resolved_identity_matches(
-                            stat.st_mode,
-                            stat.st_dev,
-                            stat.st_ino,
-                            claim_source.device,
-                            claim_source.inode,
-                        ) => {}
-                    Ok(_) => {
-                        return LeaseOutcome::NotCommitted(Error::QueueCorrupt(
-                            "ready source identity changed before claim".into(),
-                        ));
-                    }
+                    Ok(stat) => match classify_claim_source_identity(&stat, &claim_source) {
+                        ClaimSourceIdentity::Match => {}
+                        ClaimSourceIdentity::Mismatch => {
+                            return LeaseOutcome::NotCommitted(Error::QueueCorrupt(
+                                "ready source identity changed before claim".into(),
+                            ));
+                        }
+                    },
                     Err(error) => {
                         scan_had_error = true;
                         let _ = error;
@@ -1436,22 +1458,16 @@ impl Queue {
                     Ok(()) => {
                         let leased_stat = match fs::fstatat(leased_dir_fd.as_raw_fd(), &leased_name)
                         {
-                            Ok(stat)
-                                if resolved_identity_matches(
-                                    stat.st_mode,
-                                    stat.st_dev,
-                                    stat.st_ino,
-                                    claim_source.device,
-                                    claim_source.inode,
-                                ) =>
-                            {
-                                stat
-                            }
-                            Ok(_) => {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket.with_phase(TransitionPhase::Linearized),
-                                );
+                            Ok(stat) => {
+                                match classify_claim_source_identity(&stat, &claim_source) {
+                                    ClaimSourceIdentity::Match => stat,
+                                    ClaimSourceIdentity::Mismatch => {
+                                        self.poison();
+                                        return LeaseOutcome::OutcomeUnknown(
+                                            claim_ticket.with_phase(TransitionPhase::Linearized),
+                                        );
+                                    }
+                                }
                             }
                             Err(_) => {
                                 self.poison();
@@ -2519,7 +2535,7 @@ impl Queue {
             .map_err(|error| Error::IoFailure(error.to_string()))?;
         let stat =
             fs::fstat(file.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+        if !is_singly_linked_regular(stat.st_mode, stat.st_nlink) {
             return Err(Error::QueueCorrupt(
                 "ready source is not a singly-linked regular file".into(),
             ));
@@ -3918,13 +3934,23 @@ mod tests {
         std::fs::copy(&displaced, &source).unwrap();
         let replacement = fs::fstatat(directory_fd.as_raw_fd(), name).unwrap();
 
-        assert!(!resolved_identity_matches(
-            replacement.st_mode,
-            replacement.st_dev as u64,
-            replacement.st_ino as u64,
-            witness.device,
-            witness.inode,
-        ));
+        assert_eq!(
+            classify_claim_source_identity(&replacement, &witness),
+            ClaimSourceIdentity::Mismatch
+        );
+        let original = fs::fstat(witness.file_fd.as_raw_fd()).unwrap();
+        assert_eq!(
+            classify_claim_source_identity(&original, &witness),
+            ClaimSourceIdentity::Match
+        );
+    }
+
+    #[test]
+    fn claim_source_file_type_and_link_policy_table() {
+        assert!(is_singly_linked_regular(libc::S_IFREG | 0o400, 1));
+        assert!(!is_singly_linked_regular(libc::S_IFREG | 0o400, 2));
+        assert!(!is_singly_linked_regular(libc::S_IFDIR | 0o500, 1));
+        assert!(!is_singly_linked_regular(libc::S_IFLNK | 0o400, 1));
     }
 
     #[test]
@@ -5374,6 +5400,27 @@ mod tests {
         assert!(matches!(
             receipt_queue.resolve(&receipt_ticket, false),
             ResolutionOutcome::DestinationObserved
+        ));
+
+        let mut ticket_json: serde_json::Value =
+            serde_json::from_slice(&receipt_ticket.to_json().unwrap()).unwrap();
+        ticket_json["source_identity"]["payload_length"] =
+            serde_json::json!(receipt_ticket.payload_length() + 1);
+        let wrong_payload_length =
+            TransitionTicket::from_json(&serde_json::to_vec(&ticket_json).unwrap()).unwrap();
+        assert!(matches!(
+            receipt_queue.resolve(&wrong_payload_length, false),
+            ResolutionOutcome::ConflictingObject
+        ));
+        ticket_json["source_identity"]["payload_length"] =
+            serde_json::json!(receipt_ticket.payload_length());
+        ticket_json["source_identity"]["payload_digest"] =
+            serde_json::json!(steadq_names::hex_encode(&[0xff; 32]));
+        let wrong_payload_digest =
+            TransitionTicket::from_json(&serde_json::to_vec(&ticket_json).unwrap()).unwrap();
+        assert!(matches!(
+            receipt_queue.resolve(&wrong_payload_digest, false),
+            ResolutionOutcome::ConflictingObject
         ));
 
         std::fs::OpenOptions::new()
