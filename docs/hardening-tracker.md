@@ -13,7 +13,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P0-003](https://github.com/davidtorcivia/SteadQ/issues/54) | Source/destination/both/neither/conflict and second-crash matrix | A-003, A-009 | Open | @davidtorcivia |
 | [SQ-P0-004](https://github.com/davidtorcivia/SteadQ/issues/55) | Random readdir order, every budget boundary, faults, and reopen property | A-006 | Open | @davidtorcivia |
 | [SQ-P0-005](https://github.com/davidtorcivia/SteadQ/issues/56) | Clock/watermark syscall fault matrix and rollback property | A-004 | In progress: authenticated wall snapshots and fail-closed recovery/mutation paths implemented on `agent/a-004-fail-closed-wall` | @davidtorcivia |
-| [SQ-P0-006](https://github.com/davidtorcivia/SteadQ/issues/57) | Corrupt payload through every ack/compaction/receipt consumer | A-005 | Open | @davidtorcivia |
+| [SQ-P0-006](https://github.com/davidtorcivia/SteadQ/issues/57) | Corrupt payload through every ack/compaction/receipt consumer | A-005 | In progress on `agent/a-005-strict-receipts`: unverified ack removed and receipt consumers are converging on one strict verifier | @davidtorcivia |
 | [SQ-P0-007](https://github.com/davidtorcivia/SteadQ/issues/58) | Generated fault at every mutation phase; no flattened post-linearization result | A-008 | Open | @davidtorcivia |
 | [SQ-P0-008](https://github.com/davidtorcivia/SteadQ/issues/59) | Deliberate barrier/token/generation model mutations and checked invariant list | A-007, A-013 | Open | @davidtorcivia |
 
@@ -29,7 +29,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P1-006 Raw-FD ownership](https://github.com/davidtorcivia/SteadQ/issues/66) | A-009 | Open |
 | [SQ-P1-007 Init/open protocol](https://github.com/davidtorcivia/SteadQ/issues/67) | A-008 | Open |
 | [SQ-P1-008 Incomplete fsck namespace accounting](https://github.com/davidtorcivia/SteadQ/issues/68) | A-012 | Open |
-| [SQ-P1-009 Inconsistent compact receipt validation](https://github.com/davidtorcivia/SteadQ/issues/69) | A-005 | Open |
+| [SQ-P1-009 Inconsistent compact receipt validation](https://github.com/davidtorcivia/SteadQ/issues/69) | A-005 | In progress on `agent/a-005-strict-receipts` |
 | [SQ-P1-010 Destructive maintenance TOCTOU](https://github.com/davidtorcivia/SteadQ/issues/70) | A-008/A-012 | Open |
 | [SQ-P1-011 String-flattened errors](https://github.com/davidtorcivia/SteadQ/issues/71) | A-008/A-017/A-018 | Open |
 | [SQ-P1-012 Critical mutation exclusions](https://github.com/davidtorcivia/SteadQ/issues/72) | A-019 | Open |

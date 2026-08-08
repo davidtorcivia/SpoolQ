@@ -18,7 +18,8 @@ pub const DIGEST_ALGORITHM_SHA256: u8 = 1;
 pub const NAME_TAG_BITS: u8 = 64;
 
 pub const FORMAT_MAJOR: u16 = 1;
-pub const FORMAT_MINOR: u16 = 0;
+pub const FORMAT_MINOR: u16 = 1;
+pub const STRICT_COMPACT_RECEIPT_MINOR: u16 = 1;
 
 pub const MAX_PAYLOAD_LENGTH: u64 = (1u64 << 40) - 1;
 pub const MAX_EXTENSION_HEADER_LENGTH: u64 = 65_536;
@@ -411,7 +412,7 @@ impl CompactReceipt {
         }
         let major = u16::from_be_bytes(buf[8..10].try_into().unwrap());
         let minor = u16::from_be_bytes(buf[10..12].try_into().unwrap());
-        if major != FORMAT_MAJOR {
+        if major != FORMAT_MAJOR || minor < STRICT_COMPACT_RECEIPT_MINOR {
             return Err(ReceiptError::UnsupportedVersion(major, minor));
         }
 
@@ -724,6 +725,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_unverified_compact_receipt_is_rejected() {
+        let rec = CompactReceipt {
+            job_id: [1; 16],
+            envelope_digest: [2; 32],
+            final_attempt: 1,
+            lease_token: [3; 16],
+            receipt_bucket_start_unix_ns: 1_700_000_000_000_000_000,
+            original_payload_length: 4,
+        };
+        let mut encoded = rec.encode();
+        encoded[10..12].copy_from_slice(&0u16.to_be_bytes());
+        let digest = receipt_digest(&encoded[0..96]);
+        encoded[96..128].copy_from_slice(&digest);
+
+        assert!(matches!(
+            CompactReceipt::decode(&encoded),
+            Err(ReceiptError::UnsupportedVersion(1, 0))
+        ));
+    }
+
+    #[test]
     fn watermark_round_trip() {
         let rec = WatermarkRecord {
             highest_observed_bucket: 42,
@@ -962,7 +984,7 @@ mod tests {
         let ext: &[u8] = &[];
         let d = envelope_digest(&header, ext).unwrap();
         let expected =
-            hex_to_32("58490679fad0f92ecbea9ab1de222052f31e815331855c88bbfe5ac01503d88c");
+            hex_to_32("80ab8359194ffd2442d2bc3afdaebdc6089afb00bd04a772c2097b03723da561");
         assert_eq!(d, expected);
     }
 

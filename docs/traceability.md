@@ -12,7 +12,7 @@ Status: Phase 0 skeleton. A-007 will generate or mechanically validate this matr
 | Generation monotonicity | I6 | Duplicated production logic | Pending A-007 | Partial | Unit tests | Partial |
 | Attempt discipline | I7 | Duplicated production logic | Pending A-007 | Bounded I9/I11 | Unit tests | Partial |
 | Terminal monotonicity | I8 | Recovery and queue | Pending A-007 | Not complete | Partial | Open |
-| Strict receipt evidence | I9 | Ack/receipt/compaction | Pending A-005 | Not modeled | Partial | Open |
+| Strict receipt evidence | I9 | Strict ack and central receipt verifier | Operation-bound receipt verification | Not modeled | Payload corruption, legacy receipt, resolver, fsck, recovery, and mutation tests | Partial |
 | Resolver soundness | I10 | Resolver | Handwritten | Not modeled | Observation harness | Open |
 | Recovery idempotence/progress | I11/I12 | Recovery | N/A | Not modeled | Partial | Open |
 | Wall rollback safety | I13 | Watermark/recovery | N/A | Not modeled | Partial | Open |

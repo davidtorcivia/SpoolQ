@@ -981,7 +981,7 @@ fn main() -> ExitCode {
                         match queue.lease(0, lease_ns) {
                             steadq_core::LeaseOutcome::Leased(l) => {
                                 leased.fetch_add(1, Ordering::Relaxed);
-                                if queue.ack_unverified(&l) == steadq_core::AckOutcome::Acked {
+                                if queue.ack(&l) == steadq_core::AckOutcome::Acked {
                                     acked.fetch_add(1, Ordering::Relaxed);
                                 }
                             }

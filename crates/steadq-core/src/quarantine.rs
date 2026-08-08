@@ -331,7 +331,12 @@ impl Queue {
 
         // R4-H16: Read and decode the header.
         // Receipts may be compact (128 bytes with RECEIPT_MAGIC).
-        let file_fd = match fs::openat(shard_fd, filename, libc::O_RDONLY, 0) {
+        let file_fd = match fs::openat(
+            shard_fd,
+            filename,
+            crate::queue::verified::receipt_read_open_flags(),
+            0,
+        ) {
             Ok(f) => f,
             Err(_) => {
                 report.findings.push(CorruptionFinding {
@@ -343,6 +348,61 @@ impl Queue {
                 return;
             }
         };
+
+        if state_name == "receipts" {
+            let path_parts: Vec<&str> = full_path.split('/').collect();
+            let receipt_result = match path_parts.as_slice() {
+                ["receipts", bucket, shard, _] => crate::queue::verified::verify_receipt_on_fd(
+                    file_fd.as_raw_fd(),
+                    crate::queue::verified::ReceiptContext {
+                        queue_id,
+                        shard_count: self.format.shard_count,
+                        terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
+                        max_payload_length: self.format.max_payload_length,
+                        bucket,
+                        shard,
+                        filename,
+                    },
+                    None,
+                ),
+                _ => Err(crate::queue::verified::VerificationError::Corrupt(
+                    "receipt path has invalid depth".into(),
+                )),
+            };
+
+            match receipt_result {
+                Ok(receipt) => {
+                    report.structurally_verified += 1;
+                    if matches!(
+                        receipt.kind,
+                        crate::queue::verified::VerifiedReceiptKind::Full(_)
+                    ) {
+                        report.payloads_deep_verified += 1;
+                    }
+                }
+                Err(error) => {
+                    let reason = if matches!(
+                        error,
+                        crate::queue::verified::VerificationError::PayloadCorrupt
+                    ) {
+                        crate::QuarantineReason::PayloadCorrupt
+                    } else {
+                        crate::QuarantineReason::EnvelopeCorrupt
+                    };
+                    report.findings.push(CorruptionFinding {
+                        relative_path: full_path.to_string(),
+                        finding_type: "receipt_verification_failed".into(),
+                        severity: FindingSeverity::Error,
+                        details: error.to_string(),
+                    });
+                    if opts.mode == FsckMode::Repair {
+                        let _ =
+                            self.quarantine_object(shard_fd, filename, full_path, reason, report);
+                    }
+                }
+            }
+            return;
+        }
 
         let mut header_buf = [0u8; 128];
         if fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0).is_err() {
@@ -362,55 +422,6 @@ impl Queue {
                 );
             }
             return;
-        }
-
-        // Handle compact receipts (128 bytes, RECEIPT_MAGIC prefix).
-        let is_compact_receipt = stat.st_size as usize == steadq_format::COMPACT_RECEIPT_SIZE
-            && &header_buf[0..8] == steadq_format::RECEIPT_MAGIC;
-
-        if is_compact_receipt {
-            match steadq_format::CompactReceipt::decode(&header_buf) {
-                Ok(cr) => {
-                    if cr.job_id != common.job_id {
-                        report.findings.push(CorruptionFinding {
-                            relative_path: full_path.to_string(),
-                            finding_type: "compact_receipt_job_id_mismatch".into(),
-                            severity: FindingSeverity::Error,
-                            details: "compact receipt job_id does not match filename".into(),
-                        });
-                        if opts.mode == FsckMode::Repair {
-                            let _ = self.quarantine_object(
-                                shard_fd,
-                                filename,
-                                full_path,
-                                crate::QuarantineReason::FilenameHeaderMismatch,
-                                report,
-                            );
-                        }
-                        return;
-                    }
-                    report.structurally_verified += 1;
-                    return;
-                }
-                Err(_) => {
-                    report.findings.push(CorruptionFinding {
-                        relative_path: full_path.to_string(),
-                        finding_type: "compact_receipt_decode_failed".into(),
-                        severity: FindingSeverity::Error,
-                        details: "compact receipt decode error".into(),
-                    });
-                    if opts.mode == FsckMode::Repair {
-                        let _ = self.quarantine_object(
-                            shard_fd,
-                            filename,
-                            full_path,
-                            crate::QuarantineReason::EnvelopeCorrupt,
-                            report,
-                        );
-                    }
-                    return;
-                }
-            }
         }
 
         // Full header decode for .sqj files.

@@ -6,7 +6,7 @@
 |--------|------|-------|
 | 0 | 8 | magic = `SDQFMT1\0` |
 | 8 | 2 | format major = 1 |
-| 10 | 2 | format minor = 0 |
+| 10 | 2 | format minor = 1 |
 | 12 | 4 | flags = 0 |
 | 16 | 16 | queue_id |
 | 32 | 8 | created_at_unix_ns |
@@ -32,7 +32,7 @@ All integers use network byte order.
 |--------|------|-------|
 | 0 | 8 | magic = `SDQJOB1\0` |
 | 8 | 2 | format major = 1 |
-| 10 | 2 | format minor = 0 |
+| 10 | 2 | format minor = 1 |
 | 12 | 4 | extension_header_length |
 | 16 | 8 | payload_length |
 | 24 | 4 | flags = 0 |
@@ -51,7 +51,7 @@ All integers use network byte order.
 |--------|------|-------|
 | 0 | 8 | magic = `SDQRCPT\0` |
 | 8 | 2 | format major = 1 |
-| 10 | 2 | format minor = 0 |
+| 10 | 2 | format minor = 1 |
 | 12 | 16 | job_id |
 | 28 | 32 | envelope_digest |
 | 60 | 4 | final_attempt |
@@ -60,13 +60,15 @@ All integers use network byte order.
 | 88 | 8 | original_payload_length |
 | 96 | 32 | receipt_digest |
 
+Compact receipts with format minor 0 are legacy records whose payload-verification evidence cannot be established. SteadQ/1 minor 1 rejects them. A full minor-0 receipt remains readable and may be compacted only after the current implementation strictly verifies its complete payload.
+
 ## Wall Watermark Record (64 bytes)
 
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 8 | magic = `SDQWMR1\0` |
 | 8 | 2 | format major = 1 |
-| 10 | 2 | format minor = 0 |
+| 10 | 2 | format minor = 1 |
 | 12 | 4 | reserved, zero |
 | 16 | 8 | highest_observed_wall_bucket |
 | 24 | 8 | record_sequence |

@@ -44,8 +44,8 @@ int steadq_lease(SteadqQueue *queue,
                  uint64_t lease_duration_ns,
                  SteadqLease **lease_out);
 
-/* Verify a lease payload before acknowledgment.
- * Must be called before steadq_ack() for the safe acknowledgment path. */
+/* Verify a lease payload without acknowledging it.
+ * steadq_ack() always performs its own strict payload verification. */
 int steadq_lease_verify(SteadqQueue *queue, SteadqLease *lease);
 
 int steadq_ack(SteadqQueue *queue, SteadqLease *lease);

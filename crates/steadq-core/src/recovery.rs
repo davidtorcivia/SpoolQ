@@ -952,8 +952,12 @@ impl Queue {
                     stats.operations_attempted += 1;
 
                     // C-35: Open with write-capable mode for OFD write lock
-                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, libc::O_RDWR, 0)
-                    {
+                    let receipt_fd = match fs::openat(
+                        shard_fd.as_raw_fd(),
+                        entry,
+                        crate::queue::verified::receipt_write_open_flags(),
+                        0,
+                    ) {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
@@ -962,104 +966,44 @@ impl Queue {
                         continue; // busy, skip
                     }
 
-                    // Read the file to check if it's already compact (128 bytes)
-                    let stat = match fs::fstat(receipt_fd.as_raw_fd()) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    let file_size = stat.st_size as usize;
-
-                    // R2-H08: Validate 128-byte file is actually a compact receipt
-                    if file_size == steadq_format::COMPACT_RECEIPT_SIZE {
-                        let mut compact_buf = [0u8; steadq_format::COMPACT_RECEIPT_SIZE];
-                        if fs::pread_exact(receipt_fd.as_raw_fd(), &mut compact_buf, 0).is_ok()
-                            && steadq_format::CompactReceipt::decode(&compact_buf).is_ok()
-                        {
-                            continue; // Valid compact receipt
-                        }
-                        // Invalid 128-byte file: skip
-                        continue;
-                    }
-
-                    // Read the full job to extract compact receipt fields
-                    if file_size < steadq_format::FIXED_HEADER_SIZE {
-                        continue;
-                    }
-
-                    let mut header_buf = [0u8; 128];
-                    if !matches!(
-                        fs::pread(receipt_fd.as_raw_fd(), &mut header_buf, 0),
-                        Ok(128)
+                    let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
+                        receipt_fd.as_raw_fd(),
+                        crate::queue::verified::ReceiptContext {
+                            queue_id: &self.format.queue_id,
+                            shard_count: self.format.shard_count,
+                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
+                            max_payload_length: self.format.max_payload_length,
+                            bucket: bucket_name,
+                            shard: shard_name,
+                            filename: entry,
+                        },
+                        None,
                     ) {
-                        continue;
-                    }
-
-                    let header = match steadq_format::FixedHeader::decode(&header_buf) {
-                        Ok(h) => h,
-                        Err(_) => continue,
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            Self::record_error(
+                                stats,
+                                "receipt_compact_invalid",
+                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                                &error.to_string(),
+                            );
+                            continue;
+                        }
                     };
 
-                    // Parse the receipt filename to get generation and token
-                    let parsed = match steadq_names::parse_receipt(entry) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-
-                    // R4-H11: Full consistency proof before compaction.
-                    if header.job_id != parsed.common.job_id {
-                        continue;
-                    }
-                    if header.maximum_attempts != parsed.common.maximum_attempts {
-                        continue;
-                    }
-
-                    // R4-H11: Verify envelope digest.
-                    let ext_len = header.extension_header_length as usize;
-                    if ext_len > 65536 {
-                        continue;
-                    }
-                    let mut ext_buf = vec![0u8; ext_len];
-                    if ext_len > 0
-                        && fs::pread_exact(receipt_fd.as_raw_fd(), &mut ext_buf, 128).is_err()
-                    {
-                        continue;
-                    }
-                    if !crate::queue::verified::is_envelope_digest_valid(&header, &ext_buf) {
-                        continue;
-                    }
-
-                    // R4-H11: Verify file size matches expected.
-                    let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
-                    if file_size as u64 != expected_size {
-                        continue;
-                    }
-
-                    if !parsed.authenticate_tag(&self.format.queue_id, bucket_name, shard_name) {
-                        continue;
-                    }
-
-                    // R4-H11: Verify shard placement.
-                    let computed_shard = steadq_names::compute_shard(
-                        &self.format.queue_id,
-                        &parsed.common.job_id,
-                        self.format.shard_count,
-                    );
-                    let path_shard = match steadq_names::shard_from_hex(shard_name) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    if path_shard != computed_shard {
-                        continue;
-                    }
-
-                    // Compute bucket start time
-                    let bucket_num = match u64::from_str_radix(bucket_name, 16) {
-                        Ok(bucket) => bucket,
-                        Err(_) => continue,
+                    let crate::queue::verified::VerifiedReceipt {
+                        name: parsed,
+                        bucket_number,
+                        kind,
+                        device,
+                        inode,
+                    } = verified_receipt;
+                    let header = match kind {
+                        crate::queue::verified::VerifiedReceiptKind::Full(job) => job.header,
+                        crate::queue::verified::VerifiedReceiptKind::Compact => continue,
                     };
                     let bucket_start =
-                        match bucket_num.checked_mul(self.format.terminal_bucket_width_ns) {
+                        match bucket_number.checked_mul(self.format.terminal_bucket_width_ns) {
                             Some(bucket_start) => bucket_start,
                             None => continue,
                         };
@@ -1099,6 +1043,22 @@ impl Queue {
                         continue;
                     }
                     if fs::fsync(tmp_fd.as_raw_fd()).is_err() {
+                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+                        continue;
+                    }
+
+                    // The lock protects the opened inode, so prove the pathname
+                    // still names that inode before replacing it.
+                    let current = match fs::fstatat(shard_fd.as_raw_fd(), entry) {
+                        Ok(stat) => stat,
+                        Err(_) => {
+                            let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+                            continue;
+                        }
+                    };
+                    if !crate::queue::verified::receipt_path_identity_matches(
+                        &current, device, inode,
+                    ) {
                         let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
                         continue;
                     }
@@ -1264,8 +1224,12 @@ impl Queue {
                     }
 
                     // C-35: Open with write-capable mode for lock
-                    let receipt_fd = match fs::openat(shard_fd.as_raw_fd(), entry, libc::O_RDWR, 0)
-                    {
+                    let receipt_fd = match fs::openat(
+                        shard_fd.as_raw_fd(),
+                        entry,
+                        crate::queue::verified::receipt_write_open_flags(),
+                        0,
+                    ) {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
@@ -1274,17 +1238,44 @@ impl Queue {
                         continue;
                     }
 
-                    // R4-H08: Validate the receipt is a regular file.
-                    let file_stat = match fs::fstat(receipt_fd.as_raw_fd()) {
-                        Ok(s) => s,
+                    let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
+                        receipt_fd.as_raw_fd(),
+                        crate::queue::verified::ReceiptContext {
+                            queue_id: &self.format.queue_id,
+                            shard_count: self.format.shard_count,
+                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
+                            max_payload_length: self.format.max_payload_length,
+                            bucket: bucket_name,
+                            shard: shard_name,
+                            filename: entry,
+                        },
+                        None,
+                    ) {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            Self::record_error(
+                                stats,
+                                "receipt_delete_invalid",
+                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                                &error.to_string(),
+                            );
+                            continue;
+                        }
+                    };
+                    let current = match fs::fstatat(shard_fd.as_raw_fd(), entry) {
+                        Ok(stat) => stat,
                         Err(_) => continue,
                     };
-                    if file_stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    if !crate::queue::verified::receipt_path_identity_matches(
+                        &current,
+                        verified_receipt.device,
+                        verified_receipt.inode,
+                    ) {
                         Self::record_error(
                             stats,
-                            "receipt_delete_nonregular",
+                            "receipt_delete_replaced",
                             &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
-                            "receipt is not a regular file",
+                            "receipt pathname changed after verification",
                         );
                         continue;
                     }
@@ -1529,6 +1520,72 @@ mod tests {
         let stats = queue.recover(&WorkBudget::default());
         assert_eq!(stats.receipts_compacted, 1, "errors: {:?}", stats.errors);
         assert_eq!(std::fs::metadata(receipt).unwrap().len(), 128);
+    }
+
+    #[test]
+    fn corrupt_full_receipt_is_never_compacted_or_accepted_as_duplicate() {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_ack(&mut queue);
+        let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+        let mut bytes = std::fs::read(&receipt).unwrap();
+        let payload_byte = bytes.last_mut().expect("full receipt has payload bytes");
+        *payload_byte ^= 0xff;
+        std::fs::write(&receipt, &bytes).unwrap();
+
+        assert!(matches!(
+            queue.check_duplicate_ack(&lease),
+            AckOutcome::LeaseLost
+        ));
+        assert!(!queue
+            .inspect(&lease.job_id)
+            .iter()
+            .any(|snapshot| snapshot.state == "receipt"));
+
+        let stats = queue.recover(&WorkBudget::default());
+        assert_eq!(stats.receipts_compacted, 0);
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "receipt_compact_invalid"));
+        assert!(std::fs::metadata(&receipt).unwrap().len() > 128);
+
+        let report = queue.fsck(&crate::FsckOptions::default());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.finding_type == "receipt_verification_failed"));
+
+        let repair = queue.fsck(&crate::FsckOptions {
+            mode: crate::FsckMode::Repair,
+            depth: crate::FsckDepth::Structural,
+        });
+        assert_eq!(repair.quarantined.len(), 1);
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn legacy_compact_receipt_is_not_strict_evidence() {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_ack(&mut queue);
+        let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+        let stats = queue.recover(&WorkBudget::default());
+        assert_eq!(stats.receipts_compacted, 1, "errors: {:?}", stats.errors);
+
+        let mut bytes = std::fs::read(&receipt).unwrap();
+        bytes[10..12].copy_from_slice(&0u16.to_be_bytes());
+        let digest = steadq_format::receipt_digest(&bytes[0..96]);
+        bytes[96..128].copy_from_slice(&digest);
+        std::fs::write(&receipt, bytes).unwrap();
+
+        assert!(matches!(
+            queue.check_duplicate_ack(&lease),
+            AckOutcome::LeaseLost
+        ));
+        let report = queue.fsck(&crate::FsckOptions::default());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.finding_type == "receipt_verification_failed"));
     }
 
     #[test]
