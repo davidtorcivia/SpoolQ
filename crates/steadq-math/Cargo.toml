@@ -1,0 +1,12 @@
+[package]
+name = "steadq-math"
+description = "Deterministic shard, bucket, and jitter arithmetic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror = "1"

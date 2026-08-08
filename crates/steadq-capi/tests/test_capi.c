@@ -1,0 +1,60 @@
+/* SteadQ/1 C ABI test program - hermetic with unique temp dir */
+#include "steadq.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* Remove a directory tree recursively. */
+static void rmrf(const char *path) {
+    /* Best-effort cleanup for hermetic repeatability. */
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+    /* This is a test program, so system() is acceptable here. */
+    int rc = system(cmd);
+    (void)rc;
+}
+
+int main(void) {
+    /* P1-24: Use a unique temp directory and clean it up. */
+    char tmpl[] = "/tmp/steadq_capi_XXXXXX";
+    char *d = mkdtemp(tmpl);
+    if (!d) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/queue", d);
+    SteadqQueue *q = steadq_init(path, 64);
+    if (!q) { fprintf(stderr, "init failed\n"); return 1; }
+
+    SteadqJobId job_id;
+    const char *payload = "hello from C";
+    int rc = steadq_enqueue(q, (const uint8_t *)payload, strlen(payload),
+                            "text/plain", 3, &job_id);
+    if (rc != STEADQ_OK) { fprintf(stderr, "enqueue failed: %d\n", rc); return 1; }
+    printf("enqueued job\n");
+
+    SteadqLease *lease = NULL;
+    rc = steadq_lease(q, 30000000000ULL, &lease);
+    if (rc != STEADQ_OK || !lease) { fprintf(stderr, "lease failed: %d\n", rc); return 1; }
+
+    SteadqJobId leased_id;
+    steadq_lease_job_id(lease, &leased_id);
+    uint64_t gen = steadq_lease_generation(lease);
+    unsigned int attempt = steadq_lease_attempt(lease);
+    printf("leased: gen=%llu attempt=%u\n", (unsigned long long)gen, attempt);
+
+    rc = steadq_lease_verify(q, lease);
+    if (rc != STEADQ_OK) { fprintf(stderr, "verify failed: %d\n", rc); return 1; }
+    printf("payload verified\n");
+
+    rc = steadq_ack(q, lease);
+    if (rc != STEADQ_OK) { fprintf(stderr, "ack failed: %d\n", rc); return 1; }
+    printf("acked\n");
+
+    steadq_lease_free(lease);
+    steadq_close(q);
+    printf("C ABI test passed\n");
+    /* P1-24: Cleanup temp directory for repeatability. */
+    rmrf(d);
+    return 0;
+}

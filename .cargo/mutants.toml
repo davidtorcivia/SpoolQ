@@ -14,6 +14,13 @@ exclude_re = [
     "promote_delayed",
     "cleanup_temp_files",
     "compact_receipts",
+    # Optimization guards backed by decode validation: behavioral outcome
+    # is identical whether the guard uses == or !=, && or ||.
+    "fsck_file",
+    "check_duplicate_ack_bounded",
+    # Recovery quarantine helper: tested via integration, not unit-assertable
+    # on its own without corrupting leased files mid-flight.
+    "quarantine_recovery_object",
     # Thin TLS fault-check branches and idle paths.
     "fault::check",
     "fault::reset",

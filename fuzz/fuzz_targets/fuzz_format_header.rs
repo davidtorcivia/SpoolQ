@@ -1,9 +1,9 @@
-// Fuzz target: spoolq-format FixedHeader decoder.
+// Fuzz target: steadq-format FixedHeader decoder.
 // Property: no panic. Round-trip: decode -> re-encode -> decode equals original.
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use spoolq_format::FixedHeader;
+use steadq_format::FixedHeader;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(header) = FixedHeader::decode(data) {

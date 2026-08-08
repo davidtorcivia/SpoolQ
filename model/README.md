@@ -1,13 +1,13 @@
-# SpoolQ/1 Formal Model
+# SteadQ/1 Formal Model
 
-TLA+ specification of the SpoolQ/1 queue protocol.
+TLA+ specification of the SteadQ/1 queue protocol.
 
 ## Running
 
 Requires Java 17 and the TLA+ toolkit.
 
 ```
-java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SpoolQ.cfg model/SpoolQ.tla -workers auto
+java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SteadQ.cfg model/SteadQ.tla -workers auto
 ```
 
 Download `tla2tools.jar` from https://github.com/tlaplus/tlaplus/releases.
@@ -15,7 +15,7 @@ Download `tla2tools.jar` from https://github.com/tlaplus/tlaplus/releases.
 Local check (after `curl -fsSL .../tla2tools.jar -o /tmp/tla2tools.jar`):
 
 ```
-java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SpoolQ.cfg model/SpoolQ.tla
+java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SteadQ.cfg model/SteadQ.tla
 ```
 
 CI runs the same command in the `tla` job.
@@ -32,7 +32,7 @@ I9: Committed lease returns never exceed MaxAttempts.
 
 I11: A delivered (leased) job has attempt >= 1.
 
-All three are conjoined as `Inv` in `model/SpoolQ.cfg`.
+All three are conjoined as `Inv` in `model/SteadQ.cfg`.
 
 ## Fixes applied
 

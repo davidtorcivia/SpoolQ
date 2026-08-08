@@ -1,4 +1,4 @@
-# SpoolQ/1 Contract
+# SteadQ/1 Contract
 
 ## Assumptions
 
@@ -28,7 +28,7 @@ No transition overwrites a distinct active job.
 
 ## Non-Goals
 
-SpoolQ/1 does not provide exactly-once external side effects, transactions spanning jobs, atomic batches, strict FIFO ordering, or priorities, selectors, or routing expressions.
+SteadQ/1 does not provide exactly-once external side effects, transactions spanning jobs, atomic batches, strict FIFO ordering, or priorities, selectors, or routing expressions.
 
 It does not maintain a queue-wide exact counter or mutable index, does not support transparent online format migration, and does not provide hostile multi-tenant isolation for processes sharing direct filesystem access.
 

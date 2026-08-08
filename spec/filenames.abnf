@@ -1,4 +1,4 @@
-; SpoolQ/1 canonical filename grammar
+; SteadQ/1 canonical filename grammar
 
 hex-digit        = %x30-39 / %x61-66
 job-id           = 32hex-digit

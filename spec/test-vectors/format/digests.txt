@@ -1,4 +1,4 @@
-# SpoolQ/1 Digest Test Vectors
+# SteadQ/1 Digest Test Vectors
 
 ## Empty payload SHA-256
 
@@ -7,26 +7,26 @@ SHA-256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 
 ## FORMAT record digest
 
-Domain: "SpoolQ-1-format\0" || bytes[0:128]
+Domain: "SteadQ-1-format\0" || bytes[0:128]
 
 ## Job envelope digest
 
-Domain: "SpoolQ-1-envelope\0" || fixed_header_with_bytes_96_to_128_zeroed || extension_header
+Domain: "SteadQ-1-envelope\0" || fixed_header_with_bytes_96_to_128_zeroed || extension_header
 
 ## Compact receipt digest
 
-Domain: "SpoolQ-1-receipt\0" || bytes[0:96]
+Domain: "SteadQ-1-receipt\0" || bytes[0:96]
 
 ## Wall watermark digest
 
-Domain: "SpoolQ-1-wall-watermark\0" || bytes[0:32]
+Domain: "SteadQ-1-wall-watermark\0" || bytes[0:32]
 
 ## Name tag (64-bit truncated SHA-256)
 
-Domain: "SpoolQ-1-name\0" || queue_id(16) || ascii_context
+Domain: "SteadQ-1-name\0" || queue_id(16) || ascii_context
 Tag: first 8 bytes of digest, encoded as 16 lowercase hex chars
 
 ## Shard hash
 
-Domain: "SpoolQ-1-shard\0" || queue_id(16) || job_id(16)
+Domain: "SteadQ-1-shard\0" || queue_id(16) || job_id(16)
 Shard: low log2(shard_count) bits of first u32 of digest (big-endian)

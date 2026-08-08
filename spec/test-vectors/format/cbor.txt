@@ -1,4 +1,4 @@
-# SpoolQ/1 CBOR Test Vectors
+# SteadQ/1 CBOR Test Vectors
 
 All byte values are lowercase hex. Canonical encoding only.
 

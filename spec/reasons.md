@@ -1,4 +1,4 @@
-# SpoolQ/1 Reason Registries
+# SteadQ/1 Reason Registries
 
 ## Dead Reasons
 

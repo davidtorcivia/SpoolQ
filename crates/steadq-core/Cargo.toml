@@ -1,0 +1,25 @@
+[package]
+name = "steadq-core"
+description = "Core queue state machine and operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror = "1"
+steadq-format = { path = "../steadq-format" }
+steadq-names = { path = "../steadq-names" }
+steadq-math = { path = "../steadq-math" }
+steadq-fs-linux = { path = "../steadq-fs-linux" }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+criterion.workspace = true
+
+[[bench]]
+name = "queue_ops"
+harness = false

@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/spoolq-format",
-    "crates/spoolq-names",
-    "crates/spoolq-math",
-    "crates/spoolq-fs-linux",
-    "crates/spoolq-core",
-    "crates/spoolq-cli",
-    "crates/spoolq-testkit",
-    "crates/spoolq-capi",
+    "crates/steadq-format",
+    "crates/steadq-names",
+    "crates/steadq-math",
+    "crates/steadq-fs-linux",
+    "crates/steadq-core",
+    "crates/steadq-cli",
+    "crates/steadq-testkit",
+    "crates/steadq-capi",
 ]
 
 [workspace.package]
@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["David Torcivia <davidtorcivia@gmail.com>"]
-repository = "https://github.com/davidtorcivia/spoolq"
+repository = "https://github.com/davidtorcivia/SteadQ"
 
 [workspace.dependencies]
 sha2 = "0.10"

@@ -1,4 +1,4 @@
-# SpoolQ/1 Filename Lengths
+# SteadQ/1 Filename Lengths
 
 All lengths verified against NAME_MAX >= 255.
 

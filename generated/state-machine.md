@@ -1,4 +1,4 @@
-# SpoolQ/1 State Machine (Generated)
+# SteadQ/1 State Machine (Generated)
 
 ## Transitions
 
