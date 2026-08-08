@@ -561,6 +561,12 @@ impl Queue {
             };
 
             for shard_name in &shard_dirs {
+                // Entry level cursor: skip shards before cursor when bucket matches.
+                if let Some((cb, cs, _)) = &self.recovery_cursor.promote_delayed {
+                    if bucket_name == cb && shard_name.as_str() < cs.as_str() {
+                        continue;
+                    }
+                }
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(_) => {
@@ -583,8 +589,19 @@ impl Queue {
                 };
 
                 for entry in &entries {
+                    // Entry level cursor: skip entries at or before cursor when bucket and shard match.
+                    if let Some((cb, cs, ce)) = &self.recovery_cursor.promote_delayed {
+                        if bucket_name == cb
+                            && shard_name == cs.as_str()
+                            && entry.as_str() <= ce.as_str()
+                        {
+                            continue;
+                        }
+                    }
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
+                        self.recovery_cursor.promote_delayed =
+                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                         return;
                     }
 
@@ -690,6 +707,8 @@ impl Queue {
                                 error: "directory sync failed after promotion".into(),
                             });
                         }
+                        self.recovery_cursor.promote_delayed =
+                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                     }
                 }
             }
