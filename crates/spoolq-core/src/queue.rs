@@ -1658,22 +1658,6 @@ impl Queue {
                                     );
                                     return LeaseOutcome::NotCommitted(Error::PayloadCorrupt);
                                 }
-                                Error::QueueCorrupt(_) => {
-                                    self.poison();
-                                    return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                        job_id: parsed.common.job_id,
-                                        source_state: "ready".into(),
-                                        source_generation: parsed.common.generation,
-                                        source_attempt: parsed.common.attempt,
-                                        source_relative_path: format!("{ready_dir}/{entry}"),
-                                        attempted_destination_state: "leased".into(),
-                                        attempted_destination_relative_path: format!(
-                                            "{leased_dir}/{leased_name}"
-                                        ),
-                                        lease_token: Some(lease_token),
-                                        envelope_digest: header.envelope_digest,
-                                    });
-                                }
                                 _ => {
                                     self.poison();
                                     return LeaseOutcome::OutcomeUnknown(TransitionTicket {
@@ -5341,6 +5325,50 @@ mod tests {
             sr,
             Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))
         ));
+    }
+
+    #[test]
+    fn quarantine_held_fd_must_match_name() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"a".to_vec(),
+            ..Default::default()
+        });
+        let lease_a = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            other => panic!("lease a failed: {other:?}"),
+        };
+        // Hold fd for a dummy file in same leased dir but different inode. Dev same, ino differs.
+        let dir_path = lease_a
+            .exact_source_path
+            .rsplit_once('/')
+            .map(|(d, _)| d)
+            .unwrap();
+        let dir_fd = crate::queue::open_relative(queue.root_fd().as_raw_fd(), dir_path).unwrap();
+        // Create dummy file in same dir
+        let dummy_fd = spoolq_fs_linux::openat(
+            dir_fd.as_raw_fd(),
+            "dummy.sqj",
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        let name_a = lease_a
+            .exact_source_path
+            .rsplit_once('/')
+            .map(|(_, n)| n)
+            .unwrap();
+        // Same device, different inode should fail with NotFound.
+        let res = queue.quarantine_corrupt_lease(dir_fd.as_raw_fd(), name_a, dummy_fd.as_raw_fd());
+        let _ = dummy_fd;
+        assert!(
+            res.is_err(),
+            "quarantine with mismatched held fd should fail, got ok"
+        );
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
