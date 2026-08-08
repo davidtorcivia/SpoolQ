@@ -3698,6 +3698,22 @@ mod tests {
             .unwrap()
     }
 
+    fn enqueue_and_lease(queue: &mut Queue) -> LeaseInfo {
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".to_string(),
+                payload: b"resolver state".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("expected lease, got {outcome:?}"),
+        }
+    }
+
     #[test]
     fn resolver_error_is_not_found_table() {
         for (errno, expected) in [
@@ -5107,6 +5123,14 @@ mod tests {
             ResolutionOutcome::DestinationObserved
         ));
 
+        receipt.job_id[0] ^= 0xff;
+        std::fs::write(&destination_path, receipt.encode()).unwrap();
+        assert!(matches!(
+            queue.resolve(&ticket, false),
+            ResolutionOutcome::ConflictingObject
+        ));
+        receipt.job_id = job_id;
+
         receipt.final_attempt = 2;
         std::fs::write(&destination_path, receipt.encode()).unwrap();
         assert!(matches!(
@@ -5120,6 +5144,84 @@ mod tests {
         assert!(matches!(
             queue.resolve(&ticket, false),
             ResolutionOutcome::ConflictingObject
+        ));
+    }
+
+    #[test]
+    fn resolve_observes_delayed_dead_and_full_receipt_destinations() {
+        let (_tmp, mut delayed_queue) = create_test_queue();
+        let delayed_lease = enqueue_and_lease(&mut delayed_queue);
+        let not_before_ns = delayed_queue.wall_floor_for_mutation().unwrap() + 60_000_000_000;
+        let delayed_ticket = delayed_queue
+            .transition_ticket_for_lease(
+                &delayed_lease,
+                TransitionOperation::RetryLater,
+                TicketDestination::Delayed { not_before_ns },
+            )
+            .unwrap();
+        delayed_queue
+            .retry_at(&delayed_lease, not_before_ns)
+            .commit_or_panic();
+        assert!(matches!(
+            delayed_queue.resolve(&delayed_ticket, false),
+            ResolutionOutcome::DestinationObserved
+        ));
+
+        let (_tmp, mut dead_queue) = create_test_queue();
+        let dead_lease = enqueue_and_lease(&mut dead_queue);
+        dead_queue
+            .bury(&dead_lease, DeadReason::AdministrativeBury)
+            .commit_or_panic();
+        let dead_snapshot = dead_queue
+            .inspect(&dead_lease.job_id)
+            .into_iter()
+            .find(|snapshot| snapshot.state == "dead")
+            .unwrap();
+        let dead_bucket =
+            steadq_names::bucket_from_hex(dead_snapshot.relative_path.split('/').nth(1).unwrap())
+                .unwrap();
+        let dead_ticket = dead_queue
+            .transition_ticket_for_lease(
+                &dead_lease,
+                TransitionOperation::Bury,
+                TicketDestination::Dead {
+                    terminal_bucket: dead_bucket,
+                    reason: DeadReason::AdministrativeBury as u16,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            dead_queue.resolve(&dead_ticket, false),
+            ResolutionOutcome::DestinationObserved
+        ));
+
+        let (_tmp, mut receipt_queue) = create_test_queue();
+        let receipt_lease = enqueue_and_lease(&mut receipt_queue);
+        assert!(matches!(
+            receipt_queue.ack(&receipt_lease),
+            AckOutcome::Acked
+        ));
+        let receipt_snapshot = receipt_queue
+            .inspect(&receipt_lease.job_id)
+            .into_iter()
+            .find(|snapshot| snapshot.state == "receipt")
+            .unwrap();
+        let receipt_bucket = steadq_names::bucket_from_hex(
+            receipt_snapshot.relative_path.split('/').nth(1).unwrap(),
+        )
+        .unwrap();
+        let receipt_ticket = receipt_queue
+            .transition_ticket_for_lease(
+                &receipt_lease,
+                TransitionOperation::Acknowledge,
+                TicketDestination::Receipt {
+                    terminal_bucket: receipt_bucket,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            receipt_queue.resolve(&receipt_ticket, false),
+            ResolutionOutcome::DestinationObserved
         ));
     }
 
