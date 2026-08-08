@@ -3,6 +3,7 @@ name = "steadq-format"
 description = "SteadQ/1 binary format encoding and decoding"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
