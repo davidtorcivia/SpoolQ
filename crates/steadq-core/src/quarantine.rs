@@ -263,7 +263,8 @@ impl Queue {
                     details: format!("filename does not match {state_name} state grammar"),
                 });
                 if opts.mode == FsckMode::Repair {
-                    let _ = self.quarantine_object(
+                    self.repair_quarantine_candidate(
+                        state_name,
                         shard_fd,
                         filename,
                         full_path,
@@ -298,7 +299,8 @@ impl Queue {
                 details: "file is not a regular file".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.repair_quarantine_candidate(
+                    state_name,
                     shard_fd,
                     filename,
                     full_path,
@@ -318,7 +320,8 @@ impl Queue {
                 details: format!("link count is {} (expected 1)", stat.st_nlink),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.repair_quarantine_candidate(
+                    state_name,
                     shard_fd,
                     filename,
                     full_path,
@@ -849,6 +852,41 @@ impl Queue {
         Ok(())
     }
 
+    fn repair_quarantine_candidate(
+        &self,
+        state_name: &str,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        full_path: &str,
+        reason: crate::QuarantineReason,
+        report: &mut FsckReport,
+    ) {
+        let result = if state_name == "receipts" {
+            fs::openat(
+                src_dir_fd,
+                filename,
+                crate::queue::verified::receipt_write_open_flags(),
+                0,
+            )
+            .and_then(|opened| {
+                self.quarantine_opened_object(
+                    src_dir_fd, filename, full_path, &opened, reason, report,
+                )
+            })
+        } else {
+            self.quarantine_object(src_dir_fd, filename, full_path, reason, report)
+        };
+
+        if let Err(error) = result {
+            report.findings.push(CorruptionFinding {
+                relative_path: full_path.to_string(),
+                finding_type: "quarantine_failed".into(),
+                severity: FindingSeverity::Error,
+                details: error.to_string(),
+            });
+        }
+    }
+
     fn quarantine_opened_object(
         &self,
         src_dir_fd: std::os::unix::io::RawFd,
@@ -1252,5 +1290,79 @@ mod tests {
         assert_eq!(std::fs::read(&displaced).unwrap(), b"corrupt");
         assert!(report.quarantined.is_empty());
         assert!(queue.list_quarantine().is_empty());
+    }
+
+    #[test]
+    fn receipt_repair_requires_an_opened_regular_candidate() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let target = tmp.path().join("target.raw");
+        let candidate = tmp.path().join("candidate.rct");
+        std::fs::write(&target, b"target").unwrap();
+        std::os::unix::fs::symlink(&target, &candidate).unwrap();
+        let mut report = FsckReport::default();
+
+        queue.repair_quarantine_candidate(
+            "receipts",
+            queue.root_fd(),
+            "candidate.rct",
+            "candidate.rct",
+            crate::QuarantineReason::NonRegularFile,
+            &mut report,
+        );
+
+        assert!(candidate
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+        assert!(report.quarantined.is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.finding_type == "quarantine_failed"));
+    }
+
+    #[test]
+    fn receipt_repair_quarantines_locked_regular_candidate() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let candidate = tmp.path().join("candidate.rct");
+        std::fs::write(&candidate, b"corrupt").unwrap();
+        let mut report = FsckReport::default();
+
+        queue.repair_quarantine_candidate(
+            "receipts",
+            queue.root_fd(),
+            "candidate.rct",
+            "candidate.rct",
+            crate::QuarantineReason::EnvelopeCorrupt,
+            &mut report,
+        );
+
+        assert!(!candidate.exists());
+        assert_eq!(report.quarantined.len(), 1);
+        assert_eq!(queue.list_quarantine().len(), 1);
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.finding_type == "quarantine_failed"));
     }
 }
