@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "SpoolQ/1 State Machine",
+  "title": "SteadQ/1 State Machine",
   "type": "object",
   "required": [
     "transitions"

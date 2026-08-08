@@ -1,5 +1,5 @@
 [package]
-name = "spoolq-fuzz"
+name = "steadq-fuzz"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -9,9 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-spoolq-format = { path = "../crates/spoolq-format" }
-spoolq-names = { path = "../crates/spoolq-names" }
-spoolq-math = { path = "../crates/spoolq-math" }
+steadq-format = { path = "../crates/steadq-format" }
+steadq-names = { path = "../crates/steadq-names" }
+steadq-math = { path = "../crates/steadq-math" }
 
 [[bin]]
 name = "fuzz_format_header"

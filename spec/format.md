@@ -1,4 +1,4 @@
-# SpoolQ/1 Binary Format Reference
+# SteadQ/1 Binary Format Reference
 
 ## FORMAT Record (160 bytes)
 
@@ -75,11 +75,11 @@ All integers use network byte order.
 ## Digest Formulas
 
 ```
-format_digest = SHA256("SpoolQ-1-format\0" || bytes[0:128])
+format_digest = SHA256("SteadQ-1-format\0" || bytes[0:128])
 payload_digest = SHA256(payload)
-envelope_digest = SHA256("SpoolQ-1-envelope\0" || header_with_zero_env_digest || extension)
-receipt_digest = SHA256("SpoolQ-1-receipt\0" || bytes[0:96])
-watermark_digest = SHA256("SpoolQ-1-wall-watermark\0" || bytes[0:32])
-name_tag = first_8_bytes(SHA256("SpoolQ-1-name\0" || queue_id || context))
-shard_hash = SHA256("SpoolQ-1-shard\0" || queue_id || job_id)
+envelope_digest = SHA256("SteadQ-1-envelope\0" || header_with_zero_env_digest || extension)
+receipt_digest = SHA256("SteadQ-1-receipt\0" || bytes[0:96])
+watermark_digest = SHA256("SteadQ-1-wall-watermark\0" || bytes[0:32])
+name_tag = first_8_bytes(SHA256("SteadQ-1-name\0" || queue_id || context))
+shard_hash = SHA256("SteadQ-1-shard\0" || queue_id || job_id)
 ```

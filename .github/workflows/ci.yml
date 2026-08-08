@@ -28,20 +28,20 @@ jobs:
       - name: Test
         run: cargo test --all
       - name: C ABI build check (C-66)
-        run: cargo build -p spoolq-capi
+        run: cargo build -p steadq-capi
       - name: C ABI integration test (R4-B10)
         run: |
-          cargo build -p spoolq-capi
-          cc crates/spoolq-capi/tests/test_capi.c             -I crates/spoolq-capi/include             -L target/debug -lspoolq_capi             -o target/capi_test -Wl,-rpath,target/debug
+          cargo build -p steadq-capi
+          cc crates/steadq-capi/tests/test_capi.c             -I crates/steadq-capi/include             -L target/debug -lsteadq_capi             -o target/capi_test -Wl,-rpath,target/debug
           ./target/capi_test
       - name: Generated file drift check (P1-34)
         run: |
-          cargo test -p spoolq-core -- state_machine
+          cargo test -p steadq-core -- state_machine
           test -f generated/state-machine.rs
           # P1-34: Verify generated file matches checked-in version.
           # The state_machine test regenerates; check for drift.
           git diff --exit-code -- generated/state-machine.rs || \
-            (echo "Generated state-machine.rs is out of date. Run: cargo test -p spoolq-core -- state_machine" && exit 1)
+            (echo "Generated state-machine.rs is out of date. Run: cargo test -p steadq-core -- state_machine" && exit 1)
 
   # Fuzz smoke test - gating on PRs
   fuzz-smoke:
@@ -70,11 +70,11 @@ jobs:
       fail-fast: false
       matrix:
         crate:
-          - spoolq-format
-          - spoolq-names
-          - spoolq-math
-          - spoolq-fs-linux
-          - spoolq-core
+          - steadq-format
+          - steadq-names
+          - steadq-math
+          - steadq-fs-linux
+          - steadq-core
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,7 +132,7 @@ jobs:
       - name: Download tla2tools
         run: curl -fsSL https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar -o /tmp/tla2tools.jar
       - name: TLC model checking
-        run: java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SpoolQ.cfg model/SpoolQ.tla -workers auto
+        run: java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SteadQ.cfg model/SteadQ.tla -workers auto
 
   # Nightly lane: release-mode extended tests and benchmarks
   nightly:
@@ -144,11 +144,11 @@ jobs:
       - name: Extended test run (release)
         run: cargo test --all --release
       - name: Descriptor leak regression (B-02)
-        run: cargo test -p spoolq-core -- descriptor
+        run: cargo test -p steadq-core -- descriptor
       - name: FD leak stress (T5)
-        run: cargo test -p spoolq-core --release -- fd_leak_stress
+        run: cargo test -p steadq-core --release -- fd_leak_stress
       - name: Benchmarks (P2-35 tracking only, no regression gate)
-        run: cargo bench -p spoolq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
+        run: cargo bench -p steadq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
       - name: Full mutation suite (all crates, no timeout cap)
         continue-on-error: true
         run: |

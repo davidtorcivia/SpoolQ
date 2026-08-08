@@ -1,6 +1,6 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
 
-package spoolq
+package steadq
 
 type TransitionDef struct {
 	Operation       string
