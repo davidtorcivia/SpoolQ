@@ -7,11 +7,26 @@ use crate::errors::Error;
 /// Typed location of a queue object on disk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Location {
-    Ready { shard: u32 },
-    Leased { boot_id: String, bucket: u64, shard: u32 },
-    Delayed { bucket: u64, shard: u32 },
-    Receipt { bucket: u64, shard: u32 },
-    Dead { bucket: u64, shard: u32 },
+    Ready {
+        shard: u32,
+    },
+    Leased {
+        boot_id: String,
+        bucket: u64,
+        shard: u32,
+    },
+    Delayed {
+        bucket: u64,
+        shard: u32,
+    },
+    Receipt {
+        bucket: u64,
+        shard: u32,
+    },
+    Dead {
+        bucket: u64,
+        shard: u32,
+    },
 }
 
 /// Target filename plus its typed location.
@@ -25,8 +40,17 @@ impl Target {
     pub fn directory(&self) -> String {
         match &self.location {
             Location::Ready { shard } => format!("ready/{}", shard_hex(*shard)),
-            Location::Leased { boot_id, bucket, shard } => {
-                format!("leased/{}/{}/{}", boot_id, bucket_hex(*bucket), shard_hex(*shard))
+            Location::Leased {
+                boot_id,
+                bucket,
+                shard,
+            } => {
+                format!(
+                    "leased/{}/{}/{}",
+                    boot_id,
+                    bucket_hex(*bucket),
+                    shard_hex(*shard)
+                )
             }
             Location::Delayed { bucket, shard } => {
                 format!("delayed/{}/{}", bucket_hex(*bucket), shard_hex(*shard))
@@ -98,11 +122,9 @@ impl<'a> Layout<'a> {
     }
 
     pub fn delayed(&self, common: &CommonFields, not_before_ns: u64) -> Result<Target, Error> {
-        let (bucket, _) = spoolq_math::eligibility_bucket_and_ns(
-            not_before_ns,
-            self.delayed_bucket_width_ns,
-        )
-        .ok_or_else(|| Error::InvalidInput("eligibility overflow".into()))?;
+        let (bucket, _) =
+            spoolq_math::eligibility_bucket_and_ns(not_before_ns, self.delayed_bucket_width_ns)
+                .ok_or_else(|| Error::InvalidInput("eligibility overflow".into()))?;
         let shard = self.shard_for(&common.job_id);
         let filename = spoolq_names::make_delayed_name(
             self.queue_id,
@@ -124,7 +146,8 @@ impl<'a> Layout<'a> {
         wall_deadline_ns: u64,
         token: &[u8; 16],
     ) -> Result<Target, Error> {
-        let bucket = spoolq_math::lease_bucket(boottime_deadline_ns, self.lease_bucket_width_ns).unwrap_or(0);
+        let bucket = spoolq_math::lease_bucket(boottime_deadline_ns, self.lease_bucket_width_ns)
+            .unwrap_or(0);
         let shard = self.shard_for(&common.job_id);
         let filename = spoolq_names::make_leased_name(
             self.queue_id,
@@ -146,8 +169,14 @@ impl<'a> Layout<'a> {
         })
     }
 
-    pub fn receipt(&self, common: &CommonFields, token: &[u8; 16], wall_ns: u64) -> Result<Target, Error> {
-        let bucket = spoolq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
+    pub fn receipt(
+        &self,
+        common: &CommonFields,
+        token: &[u8; 16],
+        wall_ns: u64,
+    ) -> Result<Target, Error> {
+        let bucket =
+            spoolq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
         let shard = self.shard_for(&common.job_id);
         let filename = spoolq_names::make_receipt_name(
             self.queue_id,
@@ -163,7 +192,8 @@ impl<'a> Layout<'a> {
     }
 
     pub fn dead(&self, common: &CommonFields, reason: u16, wall_ns: u64) -> Result<Target, Error> {
-        let bucket = spoolq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
+        let bucket =
+            spoolq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
         let shard = self.shard_for(&common.job_id);
         let filename = spoolq_names::make_dead_name(
             self.queue_id,

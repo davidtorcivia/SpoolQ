@@ -1762,17 +1762,6 @@ impl Queue {
             Ok(v) => v,
             Err(e) => return AckOutcome::NotCommitted(e),
         };
-        let terminal_bucket =
-            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
-        let bucket_str = bucket_hex(terminal_bucket);
-
-        let shard = compute_shard(
-            &self.format.queue_id,
-            &lease.job_id,
-            self.format.shard_count,
-        );
-        let shard_str = shard_hex(shard);
-
         let new_generation = match lease.generation.checked_add(1) {
             Some(g) => g,
             None => return AckOutcome::NotCommitted(Error::StateExhausted),
@@ -1784,15 +1773,12 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let receipt_name = spoolq_names::make_receipt_name(
-            &self.format.queue_id,
-            &bucket_str,
-            &shard_str,
-            &receipt_common,
-            &lease.token,
-        );
-
-        let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
+        let target = self
+            .layout()
+            .receipt(&receipt_common, &lease.token, wall_now)
+            .unwrap();
+        let receipt_dir = target.directory();
+        let receipt_name = target.filename;
         if let Err(e) = self.ensure_dir(&receipt_dir) {
             return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
         }
@@ -2054,12 +2040,6 @@ impl Queue {
             };
         }
 
-        let shard = compute_shard(
-            &self.format.queue_id,
-            &lease.job_id,
-            self.format.shard_count,
-        );
-        let shard_str = shard_hex(shard);
         let new_gen = match lease.generation.checked_add(1) {
             Some(g) => g,
             None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
@@ -2067,33 +2047,14 @@ impl Queue {
 
         let (dest_dir, dest_name) = match delayed_ns {
             Some(nb) => {
-                let (elig_bucket, _) = match spoolq_math::eligibility_bucket_and_ns(
-                    nb,
-                    self.format.delayed_bucket_width_ns,
-                ) {
-                    Some(v) => v,
-                    None => {
-                        return TransitionOutcome::NotCommitted(Error::InvalidInput(
-                            "eligibility overflow".into(),
-                        ))
-                    }
-                };
-                let bucket_str = bucket_hex(elig_bucket);
                 let common = CommonFields {
                     job_id: lease.job_id,
                     generation: new_gen,
                     attempt: lease.attempt,
                     maximum_attempts: lease.maximum_attempts,
                 };
-                let fname = spoolq_names::make_delayed_name(
-                    &self.format.queue_id,
-                    &bucket_str,
-                    &shard_str,
-                    &common,
-                    nb,
-                );
-                let dir = format!("delayed/{bucket_str}/{shard_str}");
-                (dir, fname)
+                let target = self.layout().delayed(&common, nb).unwrap();
+                (target.directory(), target.filename)
             }
             None => {
                 let common = CommonFields {
@@ -2102,9 +2063,8 @@ impl Queue {
                     attempt: lease.attempt,
                     maximum_attempts: lease.maximum_attempts,
                 };
-                let fname =
-                    spoolq_names::make_ready_name(&self.format.queue_id, &shard_str, &common);
-                (format!("ready/{shard_str}"), fname)
+                let target = self.layout().ready(&common);
+                (target.directory(), target.filename)
             }
         };
 
@@ -2120,12 +2080,6 @@ impl Queue {
     }
 
     fn bury_internal(&mut self, lease: &LeaseInfo, reason: DeadReason) -> TransitionOutcome {
-        let shard = compute_shard(
-            &self.format.queue_id,
-            &lease.job_id,
-            self.format.shard_count,
-        );
-        let shard_str = shard_hex(shard);
         let new_gen = match lease.generation.checked_add(1) {
             Some(g) => g,
             None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
@@ -2136,9 +2090,6 @@ impl Queue {
             Ok(v) => v,
             Err(e) => return TransitionOutcome::NotCommitted(e),
         };
-        let terminal_bucket =
-            spoolq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
-        let bucket_str = bucket_hex(terminal_bucket);
 
         let common = CommonFields {
             job_id: lease.job_id,
@@ -2147,14 +2098,12 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let fname = spoolq_names::make_dead_name(
-            &self.format.queue_id,
-            &bucket_str,
-            &shard_str,
-            &common,
-            reason as u16,
-        );
-        let dest_dir = format!("dead/{bucket_str}/{shard_str}");
+        let target = self
+            .layout()
+            .dead(&common, reason as u16, wall_now)
+            .unwrap();
+        let dest_dir = target.directory();
+        let fname = target.filename;
 
         self.move_leased(lease, &dest_dir, &fname)
     }
@@ -2198,17 +2147,6 @@ impl Queue {
             None => return RenewOutcome::NotCommitted(Error::StateExhausted),
         };
 
-        let lease_bucket =
-            spoolq_math::lease_bucket(new_boottime_dl, self.format.lease_bucket_width_ns)
-                .unwrap_or(0);
-        let bucket_str = bucket_hex(lease_bucket);
-        let shard = compute_shard(
-            &self.format.queue_id,
-            &lease.job_id,
-            self.format.shard_count,
-        );
-        let shard_str = shard_hex(shard);
-
         let common = CommonFields {
             job_id: lease.job_id,
             generation: new_gen,
@@ -2216,17 +2154,12 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let fname = spoolq_names::make_leased_name(
-            &self.format.queue_id,
-            &self.boot_id,
-            &bucket_str,
-            &shard_str,
-            &common,
-            new_boottime_dl,
-            new_wall_dl,
-            &lease.token,
-        );
-        let dest_dir = format!("leased/{}/{}/{}", self.boot_id, bucket_str, shard_str);
+        let target = self
+            .layout()
+            .leased(&common, new_boottime_dl, new_wall_dl, &lease.token)
+            .unwrap();
+        let dest_dir = target.directory();
+        let fname = target.filename;
 
         match self.move_leased_renew(lease, &dest_dir, &fname) {
             TransitionOutcome::Committed => RenewOutcome::Renewed(LeaseInfo {
@@ -2249,40 +2182,45 @@ impl Queue {
         &self,
         lease: &LeaseInfo,
     ) -> Result<Option<(OwnedFd, String)>, Error> {
-        let parts: Vec<&str> = lease.exact_source_path.split('/').collect();
-        // R2-M05: Validate exact leased path structure: leased/<boot>/<bucket>/<shard>/<name>
-        if parts.len() != 5 || parts[0] != "leased" {
-            return Err(Error::InvalidInput(format!(
-                "source path does not match leased/<boot>/<bucket>/<shard>/<name>: got {}",
-                lease.exact_source_path
-            )));
-        }
+        let (loc, src_name) = self.layout().parse_leased_path(&lease.exact_source_path)?;
+        let (boot_id, path_shard) = match &loc {
+            layout::Location::Leased { boot_id, shard, .. } => (boot_id.clone(), *shard),
+            _ => unreachable!("parse_leased_path always returns Leased"),
+        };
 
-        // R2-M05: Verify boot ID matches the queue's current boot
-        if parts[1] != self.boot_id {
+        if boot_id != self.boot_id {
             return Err(Error::InvalidInput(format!(
                 "source boot_id '{}' does not match queue boot_id '{}'",
-                parts[1], self.boot_id
+                boot_id, self.boot_id
             )));
         }
 
-        // Verify shard matches queue derivation
         let computed_shard = compute_shard(
             &self.format.queue_id,
             &lease.job_id,
             self.format.shard_count,
         );
-        let path_shard = spoolq_names::shard_from_hex(parts[3]).ok_or_else(|| {
-            Error::InvalidInput(format!("invalid shard hex in path: {}", parts[3]))
-        })?;
         if path_shard != computed_shard {
             return Err(Error::QueueCorrupt(format!(
                 "source shard {path_shard} does not match queue-derived shard {computed_shard}"
             )));
         }
 
-        let src_name = parts[4].to_string();
-        let src_dir = parts[..4].join("/");
+        let src_dir = match loc {
+            layout::Location::Leased {
+                boot_id,
+                bucket,
+                shard,
+            } => {
+                format!(
+                    "leased/{}/{}/{}",
+                    boot_id,
+                    bucket_hex(bucket),
+                    shard_hex(shard)
+                )
+            }
+            _ => unreachable!(),
+        };
 
         // R2-H02: Only ENOENT means "source gone". Other errors are real failures.
         let src_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &src_dir) {
