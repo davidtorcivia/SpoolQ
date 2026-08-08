@@ -8,11 +8,11 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 
 | Finding | Reproducer/evidence plan | Dependency | Status | Owner |
 | --- | --- | --- | --- | --- |
-| [SQ-P0-001](https://github.com/davidtorcivia/SteadQ/issues/52) | Malicious ticket component corpus plus syscall trace proving no out-of-root open | A-001/A-002 | Implemented: [#80](https://github.com/davidtorcivia/SteadQ/pull/80) blocks root escape; A-002 removes authority-bearing paths and recomputes locations from identity; pending review and merge | @davidtorcivia |
-| [SQ-P0-002](https://github.com/davidtorcivia/SteadQ/issues/53) | Mutate operation and every identity field for each ticket/resolver row | A-002 | Implemented: tickets bind queue, operation, phase, source identity, envelope digest, and payload length; pending review and merge | @davidtorcivia |
+| [SQ-P0-001](https://github.com/davidtorcivia/SteadQ/issues/52) | Malicious ticket component corpus plus syscall trace proving no out-of-root open | A-001/A-002 | Complete in [#80](https://github.com/davidtorcivia/SteadQ/pull/80) and [#81](https://github.com/davidtorcivia/SteadQ/pull/81): paths are contained and recomputed from queue-bound ticket identity | @davidtorcivia |
+| [SQ-P0-002](https://github.com/davidtorcivia/SteadQ/issues/53) | Mutate operation and every identity field for each ticket/resolver row | A-002 | Complete in [#81](https://github.com/davidtorcivia/SteadQ/pull/81): tickets bind queue, operation, phase, source identity, envelope digest, and payload length | @davidtorcivia |
 | [SQ-P0-003](https://github.com/davidtorcivia/SteadQ/issues/54) | Source/destination/both/neither/conflict and second-crash matrix | A-003, A-009 | Open | @davidtorcivia |
 | [SQ-P0-004](https://github.com/davidtorcivia/SteadQ/issues/55) | Random readdir order, every budget boundary, faults, and reopen property | A-006 | Open | @davidtorcivia |
-| [SQ-P0-005](https://github.com/davidtorcivia/SteadQ/issues/56) | Clock/watermark syscall fault matrix and rollback property | A-004 | Open | @davidtorcivia |
+| [SQ-P0-005](https://github.com/davidtorcivia/SteadQ/issues/56) | Clock/watermark syscall fault matrix and rollback property | A-004 | In progress: authenticated wall snapshots and fail-closed recovery/mutation paths implemented on `agent/a-004-fail-closed-wall` | @davidtorcivia |
 | [SQ-P0-006](https://github.com/davidtorcivia/SteadQ/issues/57) | Corrupt payload through every ack/compaction/receipt consumer | A-005 | Open | @davidtorcivia |
 | [SQ-P0-007](https://github.com/davidtorcivia/SteadQ/issues/58) | Generated fault at every mutation phase; no flattened post-linearization result | A-008 | Open | @davidtorcivia |
 | [SQ-P0-008](https://github.com/davidtorcivia/SteadQ/issues/59) | Deliberate barrier/token/generation model mutations and checked invariant list | A-007, A-013 | Open | @davidtorcivia |

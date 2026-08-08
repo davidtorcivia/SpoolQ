@@ -65,6 +65,14 @@ pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
     if !(60_000_000_000..=86_400_000_000_000).contains(&opts.terminal_bucket_width_ns) {
         return Err(Error::InvalidInput("invalid terminal bucket width".into()));
     }
+    if !opts
+        .terminal_bucket_width_ns
+        .is_multiple_of(opts.delayed_bucket_width_ns)
+    {
+        return Err(Error::InvalidInput(
+            "delayed bucket width must divide terminal bucket width".into(),
+        ));
+    }
     if opts.max_payload_length > MAX_PAYLOAD_LENGTH {
         return Err(Error::InvalidInput("payload limit exceeds maximum".into()));
     }
@@ -320,9 +328,8 @@ impl<'a> ResolvePath<'a> {
     }
 }
 
-/// Typed wall watermark read error. Distinguishes pre-watermark (NotFound) from
-/// corruption and I/O failures so callers can decide between raw-clock fallback
-/// and hard error.
+/// Typed wall watermark read error. Distinguishes a missing authority record
+/// from corruption and I/O failures without weakening wall-sensitive work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatermarkReadError {
     NotFound,
@@ -331,11 +338,49 @@ pub enum WatermarkReadError {
     Io(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WallFloor {
+    unix_ns: u64,
+    watermark_bucket: u64,
+    watermark_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryTiming {
+    Immediate,
+    Delayed {
+        not_before_ns: u64,
+        wall_floor: WallFloor,
+    },
+}
+
+impl WallFloor {
+    pub(crate) fn unix_ns(self) -> u64 {
+        self.unix_ns
+    }
+
+    #[cfg(test)]
+    fn watermark_bucket(self) -> u64 {
+        self.watermark_bucket
+    }
+
+    #[cfg(test)]
+    fn watermark_sequence(self) -> u64 {
+        self.watermark_sequence
+    }
+}
+
 /// Pure helper for watermark open error classification. Returns true only for
 /// NotFound, false for all other kinds. Extracted so match guard mutants are
 /// killable by table tests.
 fn watermark_open_is_not_found(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::NotFound
+}
+
+fn watermark_open_flags() -> i32 {
+    libc::O_NOFOLLOW
+        .checked_add(libc::O_CLOEXEC)
+        .expect("watermark open flags must not overlap")
 }
 
 /// Pure helper for watermark advance decision. Returns true when observed
@@ -549,7 +594,7 @@ impl Queue {
         fs::fsync_dir_fd(root_fd.as_raw_fd())?;
 
         // Write initial wall watermark
-        let wall_now = fs::clock_realtime_ns()?;
+        let wall_now = created_at;
         let wall_bucket =
             bucket_number(wall_now, opts.delayed_bucket_width_ns).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "zero bucket width in init")
@@ -655,7 +700,7 @@ impl Queue {
             opts.receipt_retention_ns,
             format_rec.terminal_bucket_width_ns,
         )
-        .unwrap_or(0)
+        .ok_or_else(|| Error::QueueCorrupt("invalid terminal bucket width".into()))?
         .saturating_add(2);
         if probe_count > 4096 {
             return Err(Error::InvalidInput(
@@ -789,9 +834,10 @@ impl Queue {
     /// Compute the effective wall floor: max(CLOCK_REALTIME, stored watermark bucket * width)
     /// Wall floor for mutating operations. P0-01: Returns Err and poisons
     /// on failure so callers abort before computing destination paths.
-    pub(crate) fn wall_floor_for_mutation(&mut self) -> Result<u64, Error> {
-        match self.effective_wall_floor_ns_checked() {
-            Ok(ns) => Ok(ns),
+    pub(crate) fn wall_floor_for_mutation(&mut self) -> Result<WallFloor, Error> {
+        match self.stabilized_wall_floor() {
+            Ok(floor) => Ok(floor),
+            Err(Error::MaintenanceBusy) => Err(Error::MaintenanceBusy),
             Err(e) => {
                 self.poison();
                 Err(e)
@@ -799,35 +845,66 @@ impl Queue {
         }
     }
 
-    /// Wall floor for read-only or recovery operations. Falls back to raw
-    /// CLOCK_REALTIME on error without poisoning, since recovery must continue.
-    pub(crate) fn effective_wall_floor_ns(&self) -> u64 {
-        match self.effective_wall_floor_ns_checked() {
-            Ok(ns) => ns,
-            Err(_) => steadq_fs_linux::clock_realtime_ns().unwrap_or(0),
-        }
-    }
-
     /// R2-B05: Fallible version of effective_wall_floor_ns.
     pub fn effective_wall_floor_ns_checked(&self) -> Result<u64, Error> {
-        let clock = steadq_fs_linux::clock_realtime_ns()
-            .map_err(|e| Error::IoFailure(format!("CLOCK_REALTIME: {e}")))?;
-        match self.read_wall_watermark() {
-            Ok(wm) => steadq_math::effective_wall_floor(
-                clock,
-                wm.highest_observed_bucket,
-                self.format.delayed_bucket_width_ns,
-            )
-            .ok_or_else(|| Error::QueueCorrupt("watermark computation overflow".into())),
-            Err(WatermarkReadError::NotFound) => Ok(clock),
+        self.authenticated_wall_floor().map(WallFloor::unix_ns)
+    }
+
+    pub(crate) fn authenticated_wall_floor(&self) -> Result<WallFloor, Error> {
+        let watermark = match self.read_wall_watermark() {
+            Ok(watermark) => watermark,
+            Err(WatermarkReadError::NotFound) => {
+                return Err(Error::QueueCorrupt("wall watermark missing".into()));
+            }
             Err(WatermarkReadError::Truncated(msg)) => {
-                Err(Error::QueueCorrupt(format!("watermark truncated: {msg}")))
+                return Err(Error::QueueCorrupt(format!("watermark truncated: {msg}")));
             }
             Err(WatermarkReadError::Corrupt(msg)) => {
-                Err(Error::QueueCorrupt(format!("watermark corrupt: {msg}")))
+                return Err(Error::QueueCorrupt(format!("watermark corrupt: {msg}")));
             }
-            Err(WatermarkReadError::Io(msg)) => Err(Error::IoFailure(msg)),
+            Err(WatermarkReadError::Io(msg)) => return Err(Error::IoFailure(msg)),
+        };
+        let clock = steadq_fs_linux::clock_realtime_ns()
+            .map_err(|e| Error::IoFailure(format!("CLOCK_REALTIME: {e}")))?;
+        let unix_ns = steadq_math::effective_wall_floor(
+            clock,
+            watermark.highest_observed_bucket,
+            self.format.delayed_bucket_width_ns,
+        )
+        .ok_or_else(|| Error::QueueCorrupt("watermark computation overflow".into()))?;
+        Ok(WallFloor {
+            unix_ns,
+            watermark_bucket: watermark.highest_observed_bucket,
+            watermark_sequence: watermark.sequence,
+        })
+    }
+
+    pub(crate) fn stabilized_wall_floor(&self) -> Result<WallFloor, Error> {
+        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let lock_fd = fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark.lock",
+            libc::O_RDWR,
+            0o600,
+        )
+        .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let locked = fs::try_ofd_read_lock(lock_fd.as_raw_fd())
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        if !locked {
+            return Err(Error::MaintenanceBusy);
         }
+
+        let observed = self.authenticated_wall_floor()?;
+        let observed_bucket =
+            steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
+                .ok_or(Error::StateExhausted)?;
+        if !watermark_should_advance(observed_bucket, observed.watermark_bucket) {
+            return Ok(observed);
+        }
+
+        drop(lock_fd);
+        self.advance_wall_watermark(observed)
     }
 
     /// Read the wall watermark record from control/wall-watermark.
@@ -836,7 +913,12 @@ impl Queue {
     fn read_wall_watermark(&self) -> Result<steadq_format::WatermarkRecord, WatermarkReadError> {
         let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
             .map_err(|e| WatermarkReadError::Io(e.to_string()))?;
-        let data = match fs::openat(control_fd.as_raw_fd(), "wall-watermark", libc::O_RDONLY, 0) {
+        let data = match fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark",
+            watermark_open_flags(),
+            0,
+        ) {
             Ok(fd) => fd,
             Err(e) => {
                 if watermark_open_is_not_found(&e) {
@@ -845,9 +927,34 @@ impl Queue {
                 return Err(WatermarkReadError::Io(e.to_string()));
             }
         };
+        let stat =
+            fs::fstat(data.as_raw_fd()).map_err(|e| WatermarkReadError::Io(e.to_string()))?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+            return Err(WatermarkReadError::Corrupt(
+                "watermark is not a singly-linked regular file".into(),
+            ));
+        }
+        if stat.st_size < steadq_format::WATERMARK_SIZE as i64 {
+            return Err(WatermarkReadError::Truncated(format!(
+                "expected {} bytes, found {}",
+                steadq_format::WATERMARK_SIZE,
+                stat.st_size
+            )));
+        }
+        if stat.st_size != steadq_format::WATERMARK_SIZE as i64 {
+            return Err(WatermarkReadError::Corrupt(format!(
+                "expected {} bytes, found {}",
+                steadq_format::WATERMARK_SIZE,
+                stat.st_size
+            )));
+        }
         let mut buf = [0u8; steadq_format::WATERMARK_SIZE];
-        if let Err(e) = fs::pread_exact(data.as_raw_fd(), &mut buf, 0) {
-            return Err(WatermarkReadError::Truncated(e.to_string()));
+        if let Err(error) = fs::pread_exact(data.as_raw_fd(), &mut buf, 0) {
+            return if error.kind() == io::ErrorKind::UnexpectedEof {
+                Err(WatermarkReadError::Truncated(error.to_string()))
+            } else {
+                Err(WatermarkReadError::Io(error.to_string()))
+            };
         }
         steadq_format::WatermarkRecord::decode(&buf)
             .map_err(|e| WatermarkReadError::Corrupt(e.to_string()))
@@ -855,7 +962,11 @@ impl Queue {
 
     /// B-05: Advance the wall watermark to max(stored, observed).
     /// Re-reads under lock, computes max, writes atomically with sequence increment.
-    pub fn advance_wall_watermark(&self, observed_ns: u64) -> Result<(), Error> {
+    fn advance_wall_watermark(&self, observed: WallFloor) -> Result<WallFloor, Error> {
+        let observed_bucket =
+            steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
+                .ok_or(Error::StateExhausted)?;
+
         let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
             .map_err(|e| Error::IoFailure(e.to_string()))?;
 
@@ -875,19 +986,25 @@ impl Queue {
 
         // Re-read current watermark under lock
         let current = self.read_wall_watermark();
-        let observed_bucket =
-            steadq_math::bucket_number(observed_ns, self.format.delayed_bucket_width_ns)
-                .unwrap_or(0);
-
         let (new_bucket, new_seq) = match current {
             Ok(wm) => {
                 if !watermark_should_advance(observed_bucket, wm.highest_observed_bucket) {
-                    return Ok(());
+                    let durable_ns = wm
+                        .highest_observed_bucket
+                        .checked_mul(self.format.delayed_bucket_width_ns)
+                        .ok_or(Error::StateExhausted)?;
+                    return Ok(WallFloor {
+                        unix_ns: observed.unix_ns().max(durable_ns),
+                        watermark_bucket: wm.highest_observed_bucket,
+                        watermark_sequence: wm.sequence,
+                    });
                 }
                 let new_seq = wm.sequence.checked_add(1).ok_or(Error::StateExhausted)?;
                 (observed_bucket, new_seq)
             }
-            Err(WatermarkReadError::NotFound) => (observed_bucket, 1),
+            Err(WatermarkReadError::NotFound) => {
+                return Err(Error::QueueCorrupt("wall watermark missing".into()));
+            }
             Err(WatermarkReadError::Truncated(msg)) => {
                 return Err(Error::QueueCorrupt(format!("watermark truncated: {msg}")))
             }
@@ -924,7 +1041,11 @@ impl Queue {
         .map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::fsync_dir_fd(control_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
 
-        Ok(())
+        Ok(WallFloor {
+            unix_ns: observed.unix_ns(),
+            watermark_bucket: new_bucket,
+            watermark_sequence: new_seq,
+        })
     }
 
     /// Enqueue a job with the given payload and metadata.
@@ -953,18 +1074,19 @@ impl Queue {
             }
         };
 
-        let created_at = match fs::clock_realtime_ns() {
-            Ok(t) => t,
-            Err(e) => {
+        let wall_floor = match self.wall_floor_for_mutation() {
+            Ok(floor) => floor,
+            Err(error) => {
                 let ticket = EnqueueTicket {
                     job_id,
                     envelope_digest: [0; 32],
                     expected_initial_state: InitialState::Ready,
                     expected_relative_path: String::new(),
                 };
-                return EnqueueOutcome::NotCommitted(ticket, Error::IoFailure(e.to_string()));
+                return EnqueueOutcome::NotCommitted(ticket, error);
             }
         };
+        let created_at = wall_floor.unix_ns();
 
         // Validate maximum_attempts
         if job.maximum_attempts == 0 {
@@ -1049,20 +1171,7 @@ impl Queue {
         header.envelope_digest = env_dig;
 
         // Determine initial state: ready or delayed
-        let now_wall = match self.wall_floor_for_mutation() {
-            Ok(v) => v,
-            Err(e) => {
-                return EnqueueOutcome::NotCommitted(
-                    EnqueueTicket {
-                        job_id: [0; 16],
-                        envelope_digest: [0; 32],
-                        expected_initial_state: crate::errors::InitialState::Ready,
-                        expected_relative_path: String::new(),
-                    },
-                    e,
-                )
-            }
-        };
+        let now_wall = wall_floor.unix_ns();
         let (initial_state, _) = match job.initial_not_before {
             Some(nb) if nb > now_wall => {
                 let (eb, _) =
@@ -1101,10 +1210,31 @@ impl Queue {
                 (target.directory(), target.filename, path)
             }
             InitialState::Delayed => {
-                let target = self
-                    .layout()
-                    .delayed(&common, nb_to_u64(job.initial_not_before))
-                    .unwrap();
+                let Some(not_before_ns) = job.initial_not_before else {
+                    return EnqueueOutcome::NotCommitted(
+                        EnqueueTicket {
+                            job_id,
+                            envelope_digest: header.envelope_digest,
+                            expected_initial_state: initial_state,
+                            expected_relative_path: String::new(),
+                        },
+                        Error::QueueCorrupt("delayed enqueue lost its deadline".into()),
+                    );
+                };
+                let target = match self.layout().delayed(&common, not_before_ns) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return EnqueueOutcome::NotCommitted(
+                            EnqueueTicket {
+                                job_id,
+                                envelope_digest: header.envelope_digest,
+                                expected_initial_state: initial_state,
+                                expected_relative_path: String::new(),
+                            },
+                            error,
+                        );
+                    }
+                };
                 let path = target.relative_path();
                 (target.directory(), target.filename, path)
             }
@@ -1127,17 +1257,7 @@ impl Queue {
         );
 
         match result {
-            Ok(()) => {
-                // R2-B05: Advance wall watermark. Failure is not fatal to the
-                // committed enqueue but is logged via the poison flag for
-                // diagnostics. The watermark is advisory monotonicity, not
-                // a correctness barrier for the enqueue itself.
-                if self.advance_wall_watermark(created_at).is_err() {
-                    // Watermark advancement failed; the enqueue is still committed.
-                    // Future clock-rollback protection is degraded for this bucket.
-                }
-                EnqueueOutcome::Committed(ticket)
-            }
+            Ok(()) => EnqueueOutcome::Committed(ticket),
             Err(PublishError::NotCommitted(e)) => EnqueueOutcome::NotCommitted(ticket, e),
             Err(PublishError::OutcomeUnknown(e)) => {
                 self.poison();
@@ -1354,10 +1474,10 @@ impl Queue {
 
         // C-16: Clocks are re-captured inside the scan loop before each claim
         let _boottime_now = fs::clock_boottime_ns().ok();
-        let _wall_now = fs::clock_realtime_ns().ok();
 
         // C-19: Track scan completeness to distinguish Empty from I/O error
         let mut scan_had_error = false;
+        let mut wall_floor = None;
 
         // C-15: Use and advance the per-worker scan round
         let scan_round = self.scan_round;
@@ -1420,12 +1540,23 @@ impl Queue {
 
                 // Check attempt limit
                 if parsed.common.attempt >= parsed.common.maximum_attempts {
+                    let operation_wall_floor = match wall_floor {
+                        Some(floor) => floor,
+                        None => match self.wall_floor_for_mutation() {
+                            Ok(floor) => {
+                                wall_floor = Some(floor);
+                                floor
+                            }
+                            Err(error) => return LeaseOutcome::NotCommitted(error),
+                        },
+                    };
                     // Move to dead
                     match self.move_to_dead(
                         &ready_dir,
                         entry,
                         &parsed.common,
                         DeadReason::AttemptsExhausted,
+                        operation_wall_floor,
                     ) {
                         Ok(()) => continue,
                         Err(_) => {
@@ -1442,9 +1573,15 @@ impl Queue {
                     Ok(t) => t,
                     Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
                 };
-                let wall_claim = match fs::clock_realtime_ns() {
-                    Ok(t) => t,
-                    Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+                let wall_claim = match wall_floor {
+                    Some(floor) => floor.unix_ns(),
+                    None => match self.wall_floor_for_mutation() {
+                        Ok(floor) => {
+                            wall_floor = Some(floor);
+                            floor.unix_ns()
+                        }
+                        Err(error) => return LeaseOutcome::NotCommitted(error),
+                    },
                 };
                 // Attempt claim: rename ready -> leased
                 let lease_token = match fs::random_128bit() {
@@ -1459,9 +1596,13 @@ impl Queue {
                     Some(d) => d,
                     None => continue,
                 };
-                let lease_bucket =
-                    steadq_math::lease_bucket(boottime_deadline, self.format.lease_bucket_width_ns)
-                        .unwrap_or(0);
+                let lease_bucket = match steadq_math::lease_bucket(
+                    boottime_deadline,
+                    self.format.lease_bucket_width_ns,
+                ) {
+                    Some(bucket) => bucket,
+                    None => return LeaseOutcome::NotCommitted(Error::StateExhausted),
+                };
                 let bucket_str = bucket_hex(lease_bucket);
 
                 // Checked generation increment: a source at u64::MAX cannot transition.
@@ -1840,8 +1981,8 @@ impl Queue {
         }
 
         // C-25/B-05: Use effective wall floor for terminal transitions
-        let wall_now = match self.wall_floor_for_mutation() {
-            Ok(v) => v,
+        let wall_floor = match self.wall_floor_for_mutation() {
+            Ok(floor) => floor,
             Err(e) => return AckOutcome::NotCommitted(e),
         };
         let new_generation = match lease.generation.checked_add(1) {
@@ -1855,10 +1996,11 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let terminal_bucket = match bucket_number(wall_now, self.format.terminal_bucket_width_ns) {
-            Some(bucket) => bucket,
-            None => return AckOutcome::NotCommitted(Error::StateExhausted),
-        };
+        let terminal_bucket =
+            match bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns) {
+                Some(bucket) => bucket,
+                None => return AckOutcome::NotCommitted(Error::StateExhausted),
+            };
         let target =
             self.layout()
                 .receipt_in_bucket(&receipt_common, &lease.token, terminal_bucket);
@@ -1887,7 +2029,7 @@ impl Queue {
             Ok(None) => {
                 // R2-H01: Source is gone. Before returning LeaseLost,
                 // check if this was a duplicate ack by probing receipts.
-                if self.check_duplicate_ack_bounded(lease) {
+                if self.check_duplicate_ack_bounded(lease, wall_floor) {
                     return AckOutcome::AlreadyAcked;
                 }
                 return AckOutcome::LeaseLost;
@@ -1957,7 +2099,7 @@ impl Queue {
                 // C-22: On source absence, do a bounded receipt probe.
                 // Construct the finite set of exact retained receipt paths
                 // and check them directly (C-23: bounded, not full scan).
-                if self.check_duplicate_ack_bounded(lease) {
+                if self.check_duplicate_ack_bounded(lease, wall_floor) {
                     AckOutcome::AlreadyAcked
                 } else {
                     AckOutcome::LeaseLost
@@ -1975,21 +2117,31 @@ impl Queue {
 
     /// Retry a lease immediately (move to ready).
     pub fn retry_now(&mut self, lease: &LeaseInfo) -> TransitionOutcome {
-        self.retry(lease, None)
+        self.retry(lease, RetryTiming::Immediate)
     }
 
     /// Retry a lease at a future time (move to delayed).
     pub fn retry_at(&mut self, lease: &LeaseInfo, not_before_ns: u64) -> TransitionOutcome {
-        self.retry(lease, Some(not_before_ns))
+        let wall_floor = match self.wall_floor_for_mutation() {
+            Ok(floor) => floor,
+            Err(error) => return TransitionOutcome::NotCommitted(error),
+        };
+        self.retry(
+            lease,
+            RetryTiming::Delayed {
+                not_before_ns,
+                wall_floor,
+            },
+        )
     }
 
     /// Retry a lease after a duration.
     pub fn retry_after(&mut self, lease: &LeaseInfo, duration_ns: u64) -> TransitionOutcome {
-        let wall_now = match self.wall_floor_for_mutation() {
-            Ok(v) => v,
+        let wall_floor = match self.wall_floor_for_mutation() {
+            Ok(floor) => floor,
             Err(e) => return TransitionOutcome::NotCommitted(e),
         };
-        let deadline = match steadq_math::retry_wall_deadline(wall_now, duration_ns) {
+        let deadline = match steadq_math::retry_wall_deadline(wall_floor.unix_ns(), duration_ns) {
             Some(d) => d,
             None => {
                 return TransitionOutcome::NotCommitted(Error::InvalidInput(
@@ -1997,7 +2149,13 @@ impl Queue {
                 ))
             }
         };
-        self.retry_at(lease, deadline)
+        self.retry(
+            lease,
+            RetryTiming::Delayed {
+                not_before_ns: deadline,
+                wall_floor,
+            },
+        )
     }
 
     /// Retry with a policy (computes delay from attempt and policy).
@@ -2031,11 +2189,11 @@ impl Queue {
                     ))
                 }
             };
-            let wall_now = match self.wall_floor_for_mutation() {
-                Ok(v) => v,
+            let wall_floor = match self.wall_floor_for_mutation() {
+                Ok(floor) => floor,
                 Err(e) => return TransitionOutcome::NotCommitted(e),
             };
-            let deadline = match steadq_math::retry_wall_deadline(wall_now, delay_ns) {
+            let deadline = match steadq_math::retry_wall_deadline(wall_floor.unix_ns(), delay_ns) {
                 Some(d) => d,
                 None => {
                     return TransitionOutcome::NotCommitted(Error::InvalidInput(
@@ -2043,24 +2201,45 @@ impl Queue {
                     ))
                 }
             };
-            self.retry_at(lease, deadline)
+            self.retry(
+                lease,
+                RetryTiming::Delayed {
+                    not_before_ns: deadline,
+                    wall_floor,
+                },
+            )
         }
     }
 
-    fn retry(&mut self, lease: &LeaseInfo, delayed_ns: Option<u64>) -> TransitionOutcome {
+    fn retry(&mut self, lease: &LeaseInfo, timing: RetryTiming) -> TransitionOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return TransitionOutcome::NotCommitted(e);
         }
         // If delayed target is at or before the effective wall floor, it's retry_now.
-        let delayed_ns = match delayed_ns {
-            Some(t) if t <= self.effective_wall_floor_ns() => None,
-            other => other,
+        let (delayed_ns, wall_floor) = match timing {
+            RetryTiming::Immediate => (None, None),
+            RetryTiming::Delayed {
+                not_before_ns,
+                wall_floor,
+            } if not_before_ns <= wall_floor.unix_ns() => (None, Some(wall_floor)),
+            RetryTiming::Delayed {
+                not_before_ns,
+                wall_floor,
+            } => (Some(not_before_ns), Some(wall_floor)),
         };
 
         // Check attempt limit for retry
         if lease.attempt >= lease.maximum_attempts {
+            let wall_floor = match wall_floor {
+                Some(floor) => floor,
+                None => match self.wall_floor_for_mutation() {
+                    Ok(floor) => floor,
+                    Err(error) => return TransitionOutcome::NotCommitted(error),
+                },
+            };
             // Move to dead with attempts_exhausted
-            return match self.bury_internal(lease, DeadReason::AttemptsExhausted) {
+            return match self.bury_with_wall_floor(lease, DeadReason::AttemptsExhausted, wall_floor)
+            {
                 TransitionOutcome::Committed => TransitionOutcome::Committed,
                 other => other,
             };
@@ -2079,7 +2258,10 @@ impl Queue {
                     attempt: lease.attempt,
                     maximum_attempts: lease.maximum_attempts,
                 };
-                let target = self.layout().delayed(&common, nb).unwrap();
+                let target = match self.layout().delayed(&common, nb) {
+                    Ok(target) => target,
+                    Err(error) => return TransitionOutcome::NotCommitted(error),
+                };
                 (
                     target.directory(),
                     target.filename,
@@ -2120,15 +2302,22 @@ impl Queue {
     }
 
     fn bury_internal(&mut self, lease: &LeaseInfo, reason: DeadReason) -> TransitionOutcome {
+        let wall_floor = match self.wall_floor_for_mutation() {
+            Ok(floor) => floor,
+            Err(error) => return TransitionOutcome::NotCommitted(error),
+        };
+        self.bury_with_wall_floor(lease, reason, wall_floor)
+    }
+
+    fn bury_with_wall_floor(
+        &mut self,
+        lease: &LeaseInfo,
+        reason: DeadReason,
+        wall_floor: WallFloor,
+    ) -> TransitionOutcome {
         let new_gen = match lease.generation.checked_add(1) {
             Some(g) => g,
             None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
-        };
-
-        // C-25/B-05: Use effective wall floor for terminal transitions
-        let wall_now = match self.wall_floor_for_mutation() {
-            Ok(v) => v,
-            Err(e) => return TransitionOutcome::NotCommitted(e),
         };
 
         let common = CommonFields {
@@ -2138,10 +2327,11 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let terminal_bucket = match bucket_number(wall_now, self.format.terminal_bucket_width_ns) {
-            Some(bucket) => bucket,
-            None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
-        };
+        let terminal_bucket =
+            match bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns) {
+                Some(bucket) => bucket,
+                None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
+            };
         let target = self
             .layout()
             .dead_in_bucket(&common, reason as u16, terminal_bucket);
@@ -2181,7 +2371,7 @@ impl Queue {
             Err(e) => return RenewOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
         let wall_now = match self.wall_floor_for_mutation() {
-            Ok(v) => v,
+            Ok(floor) => floor.unix_ns(),
             Err(e) => return RenewOutcome::NotCommitted(e),
         };
         let new_boottime_dl = match boottime_now.checked_add(lease_duration_ns) {
@@ -2735,11 +2925,14 @@ impl Queue {
         ready_name: &str,
         common: &CommonFields,
         reason: DeadReason,
+        wall_floor: WallFloor,
     ) -> Result<(), io::Error> {
         let shard_str = ready_dir.rsplit('/').next().unwrap_or("0000");
-        let wall_now = self.effective_wall_floor_ns();
         let terminal_bucket =
-            steadq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
+            steadq_math::bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "terminal bucket overflow")
+                })?;
         let bucket_str = bucket_hex(terminal_bucket);
 
         let new_gen = common
@@ -3212,7 +3405,7 @@ impl Queue {
                     p.boottime_deadline_ns,
                     self.format.lease_bucket_width_ns,
                 )
-                .unwrap_or(0);
+                .ok_or_else(|| Error::QueueCorrupt("invalid lease bucket width".into()))?;
                 let expected_bucket_str = steadq_names::bucket_hex(expected_bucket);
                 if expected_bucket_str != *bucket {
                     return Err(Error::QueueCorrupt(format!(
@@ -3239,7 +3432,7 @@ impl Queue {
                     p.not_before_ns,
                     self.format.delayed_bucket_width_ns,
                 )
-                .unwrap_or(0);
+                .ok_or_else(|| Error::QueueCorrupt("invalid delayed bucket width".into()))?;
                 let expected_bucket_str = steadq_names::bucket_hex(expected_bucket);
                 if expected_bucket_str != *bucket {
                     return Err(Error::QueueCorrupt(format!(
@@ -3347,12 +3540,17 @@ impl Queue {
         }
     }
 
-    fn check_duplicate_ack_bounded(&self, lease: &LeaseInfo) -> bool {
-        let wall_now = self.effective_wall_floor_ns();
+    fn check_duplicate_ack_bounded(&self, lease: &LeaseInfo, wall_floor: WallFloor) -> bool {
         let retention = self.options.receipt_retention_ns;
         let width = self.format.terminal_bucket_width_ns;
-        let now_bucket = steadq_math::bucket_number(wall_now, width).unwrap_or(0);
-        let retention_buckets = steadq_math::ceiling_bucket(retention, width).unwrap_or(0);
+        let now_bucket = match steadq_math::bucket_number(wall_floor.unix_ns(), width) {
+            Some(bucket) => bucket,
+            None => return false,
+        };
+        let retention_buckets = match steadq_math::ceiling_bucket(retention, width) {
+            Some(buckets) => buckets,
+            None => return false,
+        };
         let min_bucket = now_bucket.saturating_sub(retention_buckets + 2);
         let shard = compute_shard(
             &self.format.queue_id,
@@ -3904,10 +4102,6 @@ impl PublishError {
     }
 }
 
-fn nb_to_u64(opt: Option<u64>) -> u64 {
-    opt.unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3938,6 +4132,40 @@ mod tests {
         )
         .unwrap();
         (tmp, queue)
+    }
+
+    fn remove_wall_watermark(tmp: &TempDir) {
+        std::fs::remove_file(tmp.path().join("control/wall-watermark")).unwrap();
+    }
+
+    fn write_wall_watermark(tmp: &TempDir, highest_observed_bucket: u64, sequence: u64) {
+        let watermark = steadq_format::WatermarkRecord {
+            highest_observed_bucket,
+            sequence,
+        };
+        std::fs::write(
+            tmp.path().join("control/wall-watermark"),
+            watermark.encode(),
+        )
+        .unwrap();
+    }
+
+    fn find_file_with_suffix(root: &Path, suffix: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(root).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = find_file_with_suffix(&path, suffix) {
+                    return Some(found);
+                }
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+            {
+                return Some(path);
+            }
+        }
+        None
     }
 
     fn test_claim_ticket(
@@ -5176,7 +5404,7 @@ mod tests {
         assert_eq!(lease.attempt, 1);
 
         // Retry with delay
-        let future = steadq_fs_linux::clock_realtime_ns().unwrap_or(0) + 60_000_000_000;
+        let future = steadq_fs_linux::clock_realtime_ns().unwrap() + 60_000_000_000;
         let result = queue.retry_at(&lease, future);
         assert!(matches!(result, TransitionOutcome::Committed));
 
@@ -5352,6 +5580,17 @@ mod tests {
             ..Default::default()
         };
         assert!(Queue::init(tmp.path(), &opts).is_err());
+    }
+
+    #[test]
+    fn init_requires_delayed_width_to_divide_terminal_width() {
+        let tmp = TempDir::new().unwrap();
+        let opts = CreateOptions {
+            delayed_bucket_width_ns: 7_000_000_000,
+            ..Default::default()
+        };
+        assert!(Queue::init(tmp.path(), &opts).is_err());
+        assert!(!tmp.path().join("FORMAT").exists());
     }
 
     // ===== C-11: Payload size checked before hashing =====
@@ -5972,7 +6211,8 @@ mod tests {
     fn resolve_observes_delayed_dead_and_full_receipt_destinations() {
         let (_tmp, mut delayed_queue) = create_test_queue();
         let delayed_lease = enqueue_and_lease(&mut delayed_queue);
-        let not_before_ns = delayed_queue.wall_floor_for_mutation().unwrap() + 60_000_000_000;
+        let not_before_ns =
+            delayed_queue.wall_floor_for_mutation().unwrap().unix_ns() + 60_000_000_000;
         let delayed_ticket = delayed_queue
             .transition_ticket_for_lease(
                 &delayed_lease,
@@ -6095,30 +6335,35 @@ mod tests {
     }
 
     #[test]
-    fn watermark_typed_read_notfound_ok_and_corrupt_is_queue_corrupt() {
-        let (tmp, mut queue) = create_test_queue();
-        let before = queue.read_wall_watermark();
-        assert!(
-            matches!(before, Err(WatermarkReadError::NotFound) | Ok(_)),
-            "initial watermark should be NotFound or Ok, got {before:?}"
-        );
-        let floor_ok = queue.effective_wall_floor_ns_checked();
-        assert!(
-            floor_ok.is_ok(),
-            "NotFound should fallback to clock, got {floor_ok:?}"
-        );
-
-        queue.enqueue(EnqueueInput {
-            maximum_attempts: 3,
-            content_type: "x".to_string(),
-            payload: b"data".to_vec(),
-            ..Default::default()
-        });
-        let wm = queue
+    fn watermark_missing_and_corrupt_fail_closed() {
+        let (tmp, queue) = create_test_queue();
+        let watermark = queue
             .read_wall_watermark()
-            .expect("watermark should exist after enqueue");
-        let _ = wm.highest_observed_bucket;
+            .expect("initialized queue has a watermark");
+        let floor = queue.authenticated_wall_floor().unwrap();
+        assert_eq!(floor.watermark_bucket(), watermark.highest_observed_bucket);
+        assert_eq!(floor.watermark_sequence(), watermark.sequence);
+        assert!(
+            floor.unix_ns()
+                >= watermark.highest_observed_bucket * queue.format.delayed_bucket_width_ns
+        );
 
+        let wm_path = tmp.path().join("control/wall-watermark");
+        std::fs::remove_file(&wm_path).unwrap();
+        assert!(matches!(
+            queue.read_wall_watermark(),
+            Err(WatermarkReadError::NotFound)
+        ));
+        fs::fault::reset();
+        fs::fault::inject("clock_realtime_ns", 1);
+        assert!(matches!(
+            queue.effective_wall_floor_ns_checked(),
+            Err(Error::QueueCorrupt(_))
+        ));
+        assert_eq!(fs::fault::call_count("clock_realtime_ns"), 0);
+        fs::fault::reset();
+
+        let (tmp, queue) = create_test_queue();
         let wm_path = tmp.path().join("control/wall-watermark");
         {
             use std::io::Write;
@@ -6142,11 +6387,50 @@ mod tests {
             matches!(floor_err, Err(Error::QueueCorrupt(_))),
             "corrupt watermark floor should be QueueCorrupt, got {floor_err:?}"
         );
-        let advance_err = queue.advance_wall_watermark(u64::MAX);
+        let advance_err = queue.stabilized_wall_floor();
         assert!(
             matches!(advance_err, Err(Error::QueueCorrupt(_))),
             "advance with corrupt watermark should be QueueCorrupt, got {advance_err:?}"
         );
+    }
+
+    #[test]
+    fn authenticated_wall_floor_never_regresses_below_watermark() {
+        let (tmp, queue) = create_test_queue();
+        let current = queue.read_wall_watermark().unwrap();
+        let future_bucket = current.highest_observed_bucket.checked_add(10).unwrap();
+        let watermark = steadq_format::WatermarkRecord {
+            highest_observed_bucket: future_bucket,
+            sequence: current.sequence.checked_add(1).unwrap(),
+        };
+        std::fs::write(
+            tmp.path().join("control/wall-watermark"),
+            watermark.encode(),
+        )
+        .unwrap();
+
+        let floor = queue.authenticated_wall_floor().unwrap();
+        let minimum = future_bucket
+            .checked_mul(queue.format.delayed_bucket_width_ns)
+            .unwrap();
+        assert_eq!(floor.unix_ns(), minimum);
+        assert_eq!(floor.watermark_bucket(), future_bucket);
+        assert_eq!(floor.watermark_sequence(), watermark.sequence);
+    }
+
+    #[test]
+    fn mutation_wall_floor_is_durable_before_return() {
+        let (tmp, mut queue) = create_test_queue();
+        write_wall_watermark(&tmp, 0, 1);
+
+        let floor = queue.wall_floor_for_mutation().unwrap();
+        let stored = queue.read_wall_watermark().unwrap();
+        let observed_bucket =
+            steadq_math::bucket_number(floor.unix_ns(), queue.format.delayed_bucket_width_ns)
+                .unwrap();
+        assert_eq!(stored.highest_observed_bucket, observed_bucket);
+        assert_eq!(floor.watermark_bucket(), observed_bucket);
+        assert!(stored.sequence > 1);
     }
 
     #[test]
@@ -6180,6 +6464,37 @@ mod tests {
     }
 
     #[test]
+    fn watermark_requires_exact_singly_linked_regular_file() {
+        let (tmp, queue) = create_test_queue();
+        let path = tmp.path().join("control/wall-watermark");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            queue.read_wall_watermark(),
+            Err(WatermarkReadError::Corrupt(_))
+        ));
+
+        let (tmp, queue) = create_test_queue();
+        let path = tmp.path().join("control/wall-watermark");
+        std::fs::hard_link(&path, tmp.path().join("tmp/watermark-link")).unwrap();
+        assert!(matches!(
+            queue.read_wall_watermark(),
+            Err(WatermarkReadError::Corrupt(_))
+        ));
+
+        let (tmp, queue) = create_test_queue();
+        let path = tmp.path().join("control/wall-watermark");
+        let displaced = tmp.path().join("tmp/watermark-displaced");
+        std::fs::rename(&path, &displaced).unwrap();
+        std::os::unix::fs::symlink(&displaced, &path).unwrap();
+        assert!(matches!(
+            queue.read_wall_watermark(),
+            Err(WatermarkReadError::Io(_))
+        ));
+    }
+
+    #[test]
     fn watermark_open_is_not_found_table() {
         let cases: &[(std::io::ErrorKind, bool)] = &[
             (std::io::ErrorKind::NotFound, true),
@@ -6203,6 +6518,14 @@ mod tests {
             watermark_open_is_not_found(&perm),
             "NotFound must differ from other kinds"
         );
+    }
+
+    #[test]
+    fn watermark_open_flags_require_nofollow_and_cloexec() {
+        let flags = watermark_open_flags();
+        assert_eq!(flags, libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        assert_ne!(flags & libc::O_NOFOLLOW, 0);
+        assert_ne!(flags & libc::O_CLOEXEC, 0);
     }
 
     #[test]
@@ -6243,9 +6566,13 @@ mod tests {
         let wm_before = queue.read_wall_watermark().expect("watermark exists");
         let bucket = wm_before.highest_observed_bucket;
         let width = queue.format().delayed_bucket_width_ns;
-        let observed_ns = bucket * width;
+        let observed = WallFloor {
+            unix_ns: bucket * width,
+            watermark_bucket: bucket,
+            watermark_sequence: wm_before.sequence,
+        };
         let seq_before = wm_before.sequence;
-        let res = queue.advance_wall_watermark(observed_ns);
+        let res = queue.advance_wall_watermark(observed);
         assert!(
             res.is_ok(),
             "equal bucket advance should be Ok, got {res:?}"
@@ -6259,6 +6586,134 @@ mod tests {
             wm_after.highest_observed_bucket, bucket,
             "equal bucket should not change bucket"
         );
+    }
+
+    #[test]
+    fn watermark_advance_fault_matrix() {
+        for (syscall, at_count) in [
+            ("open_directory", 1),
+            ("openat", 1),
+            ("try_ofd_write_lock", 1),
+            ("openat", 2),
+            ("fstat", 1),
+            ("pread", 1),
+            ("get_random", 1),
+            ("openat", 3),
+            ("write_all", 1),
+            ("fsync", 1),
+            ("renameat", 1),
+            ("fsync_dir_fd", 1),
+        ] {
+            let (_tmp, queue) = create_test_queue();
+            let watermark = queue.read_wall_watermark().unwrap();
+            let observed_bucket = watermark.highest_observed_bucket.checked_add(1).unwrap();
+            let observed_ns = observed_bucket
+                .checked_mul(queue.format.delayed_bucket_width_ns)
+                .unwrap();
+            let observed = WallFloor {
+                unix_ns: observed_ns,
+                watermark_bucket: watermark.highest_observed_bucket,
+                watermark_sequence: watermark.sequence,
+            };
+            fs::fault::reset();
+            fs::fault::inject(syscall, at_count);
+            let result = queue.advance_wall_watermark(observed);
+            assert!(result.is_err(), "{syscall} fault #{at_count} was ignored");
+            assert_eq!(fs::fault::call_count(syscall), at_count);
+            fs::fault::reset();
+        }
+    }
+
+    #[test]
+    fn watermark_advance_rejects_missing_authority() {
+        let (tmp, queue) = create_test_queue();
+        remove_wall_watermark(&tmp);
+        assert!(matches!(
+            queue.stabilized_wall_floor(),
+            Err(Error::QueueCorrupt(_))
+        ));
+    }
+
+    #[test]
+    fn enqueue_fails_before_publication_when_wall_stabilization_fails() {
+        let (tmp, mut queue) = create_test_queue();
+        write_wall_watermark(&tmp, 0, 1);
+        fs::fault::reset();
+        fs::fault::inject("try_ofd_write_lock", 1);
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        fs::fault::reset();
+        assert!(matches!(
+            outcome,
+            EnqueueOutcome::NotCommitted(_, Error::IoFailure(_))
+        ));
+        assert!(queue.is_poisoned());
+        assert!(find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_none());
+    }
+
+    #[test]
+    fn enqueue_does_not_publish_while_wall_stabilization_is_contended() {
+        let (tmp, mut queue) = create_test_queue();
+        write_wall_watermark(&tmp, 0, 1);
+        let control_fd = fs::open_directory(queue.root_fd(), "control").unwrap();
+        let lock_fd = fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark.lock",
+            libc::O_RDWR,
+            0,
+        )
+        .unwrap();
+        assert!(fs::try_ofd_write_lock(lock_fd.as_raw_fd()).unwrap());
+
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            outcome,
+            EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy)
+        ));
+        assert!(!queue.is_poisoned());
+        assert!(find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_none());
+    }
+
+    #[test]
+    fn equal_bucket_stabilization_checks_live_writer_lock() {
+        let (tmp, mut queue) = create_test_queue();
+        let current = queue.authenticated_wall_floor().unwrap();
+        write_wall_watermark(
+            &tmp,
+            steadq_math::bucket_number(current.unix_ns(), queue.format.delayed_bucket_width_ns)
+                .unwrap(),
+            current.watermark_sequence(),
+        );
+        let control_fd = fs::open_directory(queue.root_fd(), "control").unwrap();
+        let lock_fd = fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark.lock",
+            libc::O_RDWR,
+            0,
+        )
+        .unwrap();
+        assert!(fs::try_ofd_write_lock(lock_fd.as_raw_fd()).unwrap());
+
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            outcome,
+            EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy)
+        ));
+        assert!(find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_none());
     }
 
     #[test]
@@ -6278,6 +6733,135 @@ mod tests {
             matches!(floor, Err(Error::IoFailure(_))),
             "Io watermark should make floor IoFailure, got {floor:?}"
         );
+    }
+
+    #[test]
+    fn authenticated_wall_floor_fault_matrix() {
+        for syscall in [
+            "open_directory",
+            "openat",
+            "fstat",
+            "pread",
+            "clock_realtime_ns",
+        ] {
+            let (_tmp, queue) = create_test_queue();
+            fs::fault::reset();
+            fs::fault::inject(syscall, 1);
+            let result = queue.authenticated_wall_floor();
+            assert!(
+                matches!(result, Err(Error::IoFailure(_))),
+                "{syscall} failure must fail closed, got {result:?}"
+            );
+            assert_eq!(fs::fault::call_count(syscall), 1);
+            fs::fault::reset();
+        }
+    }
+
+    #[test]
+    fn stabilized_wall_floor_lock_fault_matrix() {
+        for syscall in ["open_directory", "openat", "try_ofd_read_lock"] {
+            let (_tmp, queue) = create_test_queue();
+            fs::fault::reset();
+            fs::fault::inject(syscall, 1);
+            let result = queue.stabilized_wall_floor();
+            assert!(
+                matches!(result, Err(Error::IoFailure(_))),
+                "{syscall} failure must fail closed, got {result:?}"
+            );
+            assert_eq!(fs::fault::call_count(syscall), 1);
+            fs::fault::reset();
+        }
+    }
+
+    #[test]
+    fn wall_sensitive_mutations_fail_closed_without_watermark() {
+        let (tmp, mut queue) = create_test_queue();
+        remove_wall_watermark(&tmp);
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"data".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::NotCommitted(_, Error::QueueCorrupt(_))
+        ));
+        assert!(queue.is_poisoned());
+
+        let (tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        remove_wall_watermark(&tmp);
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::NotCommitted(Error::QueueCorrupt(_))
+        ));
+
+        for operation in ["ack", "retry_at", "retry_after", "bury", "renew"] {
+            let (tmp, mut queue) = create_test_queue();
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"data".to_vec(),
+                ..Default::default()
+            });
+            let lease = match queue.lease(0, 30_000_000_000) {
+                LeaseOutcome::Leased(lease) => lease,
+                outcome => panic!("lease failed before {operation}: {outcome:?}"),
+            };
+            remove_wall_watermark(&tmp);
+            match operation {
+                "ack" => assert!(matches!(
+                    queue.ack(&lease),
+                    AckOutcome::NotCommitted(Error::QueueCorrupt(_))
+                )),
+                "retry_at" => assert!(matches!(
+                    queue.retry_at(&lease, u64::MAX - 1),
+                    TransitionOutcome::NotCommitted(Error::QueueCorrupt(_))
+                )),
+                "retry_after" => assert!(matches!(
+                    queue.retry_after(&lease, 1_000_000_000),
+                    TransitionOutcome::NotCommitted(Error::QueueCorrupt(_))
+                )),
+                "bury" => assert!(matches!(
+                    queue.bury(&lease, DeadReason::AdministrativeBury),
+                    TransitionOutcome::NotCommitted(Error::QueueCorrupt(_))
+                )),
+                "renew" => assert!(matches!(
+                    queue.renew(&lease, 30_000_000_000),
+                    RenewOutcome::NotCommitted(Error::QueueCorrupt(_))
+                )),
+                _ => unreachable!(),
+            }
+            assert!(queue.is_poisoned(), "{operation} must poison the handle");
+        }
+    }
+
+    #[test]
+    fn wall_sensitive_operation_uses_one_snapshot() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        fs::fault::reset();
+        fs::fault::inject("clock_realtime_ns", 2);
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("lease failed: {outcome:?}"),
+        };
+        assert_eq!(fs::fault::call_count("clock_realtime_ns"), 1);
+        fs::fault::reset();
+        fs::fault::inject("clock_realtime_ns", 2);
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+        assert_eq!(fs::fault::call_count("clock_realtime_ns"), 1);
+        fs::fault::reset();
     }
 
     // ===== B-04: Lease source validation rejects corrupted handle =====
@@ -7046,7 +7630,8 @@ mod tests {
             LeaseOutcome::Leased(l) => l,
             other => panic!("lease must succeed, got {other:?}"),
         };
-        let before = queue.check_duplicate_ack_bounded(&lease);
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        let before = queue.check_duplicate_ack_bounded(&lease, wall_floor);
         assert!(!before, "no receipt yet, duplicate check must be false");
         queue.verify_lease_payload(&lease).unwrap();
         let ack = queue.ack(&lease);
@@ -7054,7 +7639,7 @@ mod tests {
             matches!(ack, AckOutcome::Acked),
             "ack must succeed, got {ack:?}"
         );
-        let after = queue.check_duplicate_ack_bounded(&lease);
+        let after = queue.check_duplicate_ack_bounded(&lease, wall_floor);
         assert!(after, "after ack, duplicate check must be true");
     }
 
@@ -7264,16 +7849,11 @@ mod tests {
             payload: b"more data".to_vec(),
             ..Default::default()
         });
-        // Watermark decode failure should cause NotCommitted or poison.
-        // Missing watermark is Ok(clock), but corrupt watermark is Err.
-        match outcome {
-            EnqueueOutcome::NotCommitted(_, _) => { /* expected */ }
-            EnqueueOutcome::Committed(_) => {
-                // Some implementations may treat corrupt watermark as missing.
-                // At minimum, the queue should still be usable.
-            }
-            _ => panic!("unexpected outcome from enqueue with corrupt watermark"),
-        }
+        assert!(matches!(
+            outcome,
+            EnqueueOutcome::NotCommitted(_, Error::QueueCorrupt(_))
+        ));
+        assert!(queue.is_poisoned());
     }
 
     // ===== P0-04: ack EEXIST authenticates receipt =====
@@ -7297,9 +7877,9 @@ mod tests {
             queue.format.shard_count,
         );
         let shard_str = shard_hex(shard);
-        let wall = queue.effective_wall_floor_ns();
+        let wall = queue.effective_wall_floor_ns_checked().unwrap();
         let bucket =
-            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap_or(0);
+            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap();
         let bucket_str = bucket_hex(bucket);
         let new_gen = lease.generation + 1;
         let receipt_common = CommonFields {
@@ -7404,29 +7984,32 @@ mod tests {
     // ===== move_to_dead actually moves exhausted objects =====
     #[test]
     fn exhausted_attempts_move_to_dead() {
-        let (_tmp, mut queue) = create_test_queue();
-        queue.enqueue(EnqueueInput {
+        let (tmp, mut queue) = create_test_queue();
+        let ticket = match queue.enqueue(EnqueueInput {
             maximum_attempts: 1,
             content_type: "x".to_string(),
             payload: b"data".to_vec(),
             ..Default::default()
-        });
-        // Lease increments attempt to 1. Retry puts it back in ready with attempt=1.
-        let lease = match queue.lease(0, 30_000_000_000) {
-            LeaseOutcome::Leased(l) => l,
-            _ => panic!("lease failed"),
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("enqueue failed: {outcome:?}"),
         };
-        let _ = queue.retry_now(&lease);
-        // Now ready has attempt=1 >= max=1. Next lease scan should move to dead.
-        let result = queue.lease(0, 30_000_000_000);
-        assert!(matches!(result, LeaseOutcome::Empty));
-        // Verify the object was moved to dead, not left in ready.
-        // Check that dead directory is non-empty.
-        let dead_root = _tmp.path().join("dead");
-        let has_dead = std::fs::read_dir(&dead_root)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-        assert!(has_dead, "exhausted object should be in dead directory");
+        let (ready_dir, ready_name) = ticket.expected_relative_path.rsplit_once('/').unwrap();
+        let parsed = steadq_names::parse_ready(ready_name).unwrap();
+        let wall_floor = queue.wall_floor_for_mutation().unwrap();
+
+        queue
+            .move_to_dead(
+                ready_dir,
+                ready_name,
+                &parsed.common,
+                DeadReason::AttemptsExhausted,
+                wall_floor,
+            )
+            .unwrap();
+
+        assert!(!tmp.path().join(&ticket.expected_relative_path).exists());
+        assert!(find_file_with_suffix(&tmp.path().join("dead"), ".sqj").is_some());
     }
 
     // ===== fsck on delayed/dead/receipt states =====
@@ -7567,7 +8150,7 @@ mod tests {
         let shard_str = shard_hex(shard);
         let wall = queue.effective_wall_floor_ns_checked().unwrap();
         let bucket =
-            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap_or(0);
+            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap();
         let bucket_str = bucket_hex(bucket);
         let new_gen = lease.generation + 1;
         let receipt_common = CommonFields {

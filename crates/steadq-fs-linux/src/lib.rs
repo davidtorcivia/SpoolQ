@@ -561,6 +561,7 @@ pub fn pwrite(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
 /// Write all bytes, retrying on partial writes. Rejects zero progress.
 /// Returns an error if write returns 0 (no progress) rather than looping forever.
 pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
+    fault_check!("write_all");
     let mut written = 0;
     while written < buf.len() {
         let rc =
@@ -683,6 +684,7 @@ pub fn create_exclusive(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<Owne
 /// Try a nonblocking exclusive OFD lock on a file.
 /// Returns Ok(true) if acquired, Ok(false) if contended.
 pub fn try_ofd_write_lock(fd: RawFd) -> io::Result<bool> {
+    fault_check!("try_ofd_write_lock");
     let mut flock: libc::flock = unsafe { std::mem::zeroed() };
     flock.l_type = libc::F_WRLCK as i16;
     flock.l_whence = libc::SEEK_SET as i16;
@@ -701,6 +703,7 @@ pub fn try_ofd_write_lock(fd: RawFd) -> io::Result<bool> {
 
 /// Try a nonblocking shared OFD lock on a file.
 pub fn try_ofd_read_lock(fd: RawFd) -> io::Result<bool> {
+    fault_check!("try_ofd_read_lock");
     let mut flock: libc::flock = unsafe { std::mem::zeroed() };
     flock.l_type = libc::F_RDLCK as i16;
     flock.l_whence = libc::SEEK_SET as i16;
@@ -1158,6 +1161,55 @@ mod tests {
         let a = random_128bit().unwrap();
         let b = random_128bit().unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn write_all_persists_every_byte() {
+        let path = unique_test_dir("write_all");
+        std::fs::create_dir(&path).unwrap();
+        let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
+        let file = create_exclusive(dir.as_raw_fd(), "data", 0o600).unwrap();
+        write_all(file.as_raw_fd(), b"complete").unwrap();
+        let mut bytes = [0u8; 8];
+        pread_exact(file.as_raw_fd(), &mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"complete");
+        drop(file);
+        drop(dir);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn ofd_write_lock_reports_acquired_and_contended() {
+        let path = unique_test_dir("write_lock");
+        std::fs::create_dir(&path).unwrap();
+        let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
+        let first = create_exclusive(dir.as_raw_fd(), "lock", 0o600).unwrap();
+        let second = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
+        assert!(try_ofd_write_lock(first.as_raw_fd()).unwrap());
+        assert!(!try_ofd_write_lock(second.as_raw_fd()).unwrap());
+        drop(second);
+        drop(first);
+        drop(dir);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn ofd_read_lock_reports_acquired_and_writer_contention() {
+        let path = unique_test_dir("read_lock");
+        std::fs::create_dir(&path).unwrap();
+        let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
+        let reader = create_exclusive(dir.as_raw_fd(), "lock", 0o600).unwrap();
+        assert!(try_ofd_read_lock(reader.as_raw_fd()).unwrap());
+        drop(reader);
+
+        let writer = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
+        let blocked_reader = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
+        assert!(try_ofd_write_lock(writer.as_raw_fd()).unwrap());
+        assert!(!try_ofd_read_lock(blocked_reader.as_raw_fd()).unwrap());
+        drop(blocked_reader);
+        drop(writer);
+        drop(dir);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

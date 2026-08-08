@@ -164,7 +164,7 @@ impl<'a> Layout<'a> {
         token: &[u8; 16],
     ) -> Result<Target, Error> {
         let bucket = steadq_math::lease_bucket(boottime_deadline_ns, self.lease_bucket_width_ns)
-            .unwrap_or(0);
+            .ok_or(Error::StateExhausted)?;
         let shard = self.shard_for(&common.job_id);
         let filename = steadq_names::make_leased_name(
             self.queue_id,
@@ -192,8 +192,8 @@ impl<'a> Layout<'a> {
         token: &[u8; 16],
         wall_ns: u64,
     ) -> Result<Target, Error> {
-        let bucket =
-            steadq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
+        let bucket = steadq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns)
+            .ok_or(Error::StateExhausted)?;
         Ok(self.receipt_in_bucket(common, token, bucket))
     }
 
@@ -218,8 +218,8 @@ impl<'a> Layout<'a> {
     }
 
     pub fn dead(&self, common: &CommonFields, reason: u16, wall_ns: u64) -> Result<Target, Error> {
-        let bucket =
-            steadq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns).unwrap_or(0);
+        let bucket = steadq_math::bucket_number(wall_ns, self.terminal_bucket_width_ns)
+            .ok_or(Error::StateExhausted)?;
         Ok(self.dead_in_bucket(common, reason, bucket))
     }
 
