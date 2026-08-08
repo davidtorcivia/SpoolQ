@@ -1714,7 +1714,11 @@ mod tests {
         );
 
         let second = reopened.recover(&budget);
-        assert_eq!(second.operations_attempted, 1, "errors: {:?}", second.errors);
+        assert_eq!(
+            second.operations_attempted, 1,
+            "errors: {:?}",
+            second.errors
+        );
         assert!(second
             .errors
             .iter()
