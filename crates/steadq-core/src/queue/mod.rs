@@ -7012,12 +7012,18 @@ mod tests {
     fn fd_leak_stress() {
         let tmp = TempDir::new().unwrap();
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
-        fn open_fd_count() -> usize {
+        fn queue_fd_count(root: &Path) -> usize {
             std::fs::read_dir("/proc/self/fd")
-                .map(|d| d.count())
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                        .filter(|target| target.starts_with(root))
+                        .count()
+                })
                 .unwrap_or(0)
         }
-        let baseline = open_fd_count();
+        let baseline = queue_fd_count(tmp.path());
         for _ in 0..200 {
             let q = Queue::open(
                 tmp.path(),
@@ -7029,12 +7035,8 @@ mod tests {
             .unwrap();
             drop(q);
         }
-        let after = open_fd_count();
-        // Allow small variance for allocator internals, but no sustained growth.
-        assert!(
-            after <= baseline + 30,
-            "FD leak: baseline={baseline}, after={after}"
-        );
+        let after = queue_fd_count(tmp.path());
+        assert_eq!(after, baseline, "queue FD leak detected");
     }
 
     // ===== T3: Negative test matrix =====
