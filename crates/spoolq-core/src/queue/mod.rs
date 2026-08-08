@@ -1,12 +1,12 @@
 // SpoolQ/1 queue initialization, open, and enqueue operations.
 
 pub mod layout;
+pub mod verified;
 
 use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use sha2::Digest;
 use spoolq_format::cbor::ExtensionHeader;
 use spoolq_format::{
     envelope_digest, payload_digest, FixedHeader, FormatRecord, WatermarkRecord,
@@ -2548,63 +2548,22 @@ impl Queue {
     }
 
     /// R4-H22/H23: Verify the payload digest on an already-open file descriptor.
-    /// Reads the header, verifies the envelope digest, then hashes the payload
-    /// and compares to the header digest. The caller must hold the fd open
-    /// across any subsequent operation to prevent TOCTOU swap.
+    /// Central verifier is the single source of truth; this wrapper preserves
+    /// the existing Error mapping for callers that have not yet adopted
+    /// VerificationError directly.
     fn verify_payload_on_fd(&self, fd: std::os::unix::io::RawFd) -> Result<(), Error> {
-        let mut header_buf = [0u8; 128];
-        fs::pread_exact(fd, &mut header_buf, 0).map_err(|e| Error::IoFailure(e.to_string()))?;
+        verified::verify_job_on_fd(fd)
+            .map(|_| ())
+            .map_err(Error::from)
+    }
 
-        let header =
-            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
-
-        let ext_len = header.extension_header_length as usize;
-        let data_offset = 128usize + ext_len;
-
-        if ext_len > 65536 {
-            return Err(Error::QueueCorrupt("extension header too large".into()));
-        }
-        // R4-H05: Always read extension (even empty) and verify envelope digest.
-        let mut ext_buf = vec![0u8; ext_len];
-        if ext_len > 0 {
-            fs::pread_exact(fd, &mut ext_buf, 128).map_err(|e| Error::IoFailure(e.to_string()))?;
-        }
-        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-            return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-        }
-
-        let file_stat = fs::fstat(fd).map_err(|e| Error::IoFailure(e.to_string()))?;
-        let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
-        if file_stat.st_size as u64 != expected_size {
-            return Err(Error::QueueCorrupt(format!(
-                "file size mismatch: expected {}, got {}",
-                expected_size, file_stat.st_size
-            )));
-        }
-
-        let mut hasher = sha2::Sha256::new();
-        let mut offset = data_offset as u64;
-        let mut remaining = header.payload_length as usize;
-        let mut buf = vec![0u8; 65536];
-
-        while remaining > 0 {
-            let to_read = remaining.min(buf.len());
-            let n = fs::pread(fd, &mut buf[..to_read], offset)
-                .map_err(|e| Error::IoFailure(e.to_string()))?;
-            if n == 0 {
-                return Err(Error::QueueCorrupt("unexpected EOF".into()));
-            }
-            hasher.update(&buf[..n]);
-            offset += n as u64;
-            remaining -= n;
-        }
-
-        let computed: [u8; 32] = hasher.finalize().into();
-        if computed != header.payload_digest {
-            return Err(Error::PayloadCorrupt);
-        }
-
-        Ok(())
+    /// Verify only the envelope and size, without hashing payload bytes.
+    /// Used by inspection paths that have not yet delivered payload.
+    fn verify_envelope_on_fd(
+        &self,
+        fd: std::os::unix::io::RawFd,
+    ) -> Result<verified::VerifiedJob, Error> {
+        verified::verify_envelope_on_fd(fd).map_err(Error::from)
     }
 
     fn quarantine_corrupt_lease(
@@ -2970,44 +2929,19 @@ impl Queue {
             )));
         }
 
-        // Read header
+        // Use central verifier for header, extension, envelope, and size.
+        // stat has already been collected for mode and nlink; verify_envelope_on_fd
+        // will re-stat the fd for size, which is fine since the fd is held open.
         let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let mut header_buf = [0u8; 128];
-        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let header = FixedHeader::decode(&header_buf)
-            .map_err(|e| Error::QueueCorrupt(format!("header decode: {e}")))?;
-
-        // Verify extension + envelope digest
-        let ext_len = header.extension_header_length as usize;
-        if ext_len > 65536 {
-            return Err(Error::QueueCorrupt("extension header too large".into()));
-        }
-        // R4-H05: Always read extension (even empty) and verify envelope digest
-        let mut ext_buf = vec![0u8; ext_len];
-        if ext_len > 0 {
-            fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
-                .map_err(|e| Error::IoFailure(e.to_string()))?;
-        }
-        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
-            return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
-        }
+        let verified = self.verify_envelope_on_fd(file_fd.as_raw_fd())?;
+        let header = verified.header;
 
         // R4-H06: Check queue-configured payload limit
         if header.payload_length > self.format.max_payload_length {
             return Err(Error::QueueCorrupt(format!(
                 "payload length {} exceeds queue limit {}",
                 header.payload_length, self.format.max_payload_length
-            )));
-        }
-
-        // Verify file size
-        let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
-        if stat.st_size as u64 != expected_size {
-            return Err(Error::QueueCorrupt(format!(
-                "{name}: size mismatch expected {} got {}",
-                expected_size, stat.st_size
             )));
         }
 
