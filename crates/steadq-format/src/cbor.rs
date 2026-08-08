@@ -413,10 +413,6 @@ impl<'a> CborParser<'a> {
                 self.pos = end;
                 Ok(CborItem::Text(s))
             }
-            4 => {
-                // array - not allowed in SteadQ metadata (only maps)
-                Err(CborError::InvalidMajorType(major))
-            }
             5 => {
                 // map
                 self.depth += 1;
@@ -455,6 +451,7 @@ impl<'a> CborParser<'a> {
                 25..=27 => Err(CborError::FloatNotAllowed),
                 _ => Err(CborError::InvalidSimpleValue(additional)),
             },
+            // Major types 4 (array), 6 (tag), and others fall through here.
             _ => Err(CborError::InvalidMajorType(major)),
         }
     }
