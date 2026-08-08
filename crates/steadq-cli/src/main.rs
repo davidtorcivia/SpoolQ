@@ -801,14 +801,14 @@ fn main() -> ExitCode {
                 max_operations: budget_ops,
                 max_duration_ms: budget_ms,
             };
+            let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             loop {
-                let mut queue = match Queue::open(&path, &OpenOptions::default()) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        eprintln!("open failed: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
                 let stats = queue.recover(&budget);
                 eprintln!(
                     "reaped:{} promoted:{} temp_deleted:{} dead:{} ops:{}{}",

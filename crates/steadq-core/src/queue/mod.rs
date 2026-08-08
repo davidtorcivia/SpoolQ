@@ -97,15 +97,74 @@ impl Default for OpenOptions {
     }
 }
 
-/// Internal queue state.
-#[allow(dead_code)]
-/// R4-RES: In-memory cursor for resumable recovery. Tracks the last
-/// Entry level cursor so persistent entries do not starve later work.
-#[derive(Clone, Debug, Default)]
+/// Last fully classified entry in a three-level recovery hierarchy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ThreeLevelCursor {
+    pub(crate) first: String,
+    pub(crate) second: String,
+    pub(crate) resume_after: String,
+}
+
+impl ThreeLevelCursor {
+    pub(crate) fn new(first: &str, second: &str, resume_after: &str) -> Self {
+        Self {
+            first: first.to_string(),
+            second: second.to_string(),
+            resume_after: resume_after.to_string(),
+        }
+    }
+
+    pub(crate) fn should_skip(&self, first: &str, second: &str, entry: &str) -> bool {
+        (first, second, entry)
+            <= (
+                self.first.as_str(),
+                self.second.as_str(),
+                self.resume_after.as_str(),
+            )
+    }
+}
+
+/// Last fully classified entry in a four-level recovery hierarchy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FourLevelCursor {
+    pub(crate) first: String,
+    pub(crate) second: String,
+    pub(crate) third: String,
+    pub(crate) resume_after: String,
+}
+
+impl FourLevelCursor {
+    pub(crate) fn new(first: &str, second: &str, third: &str, resume_after: &str) -> Self {
+        Self {
+            first: first.to_string(),
+            second: second.to_string(),
+            third: third.to_string(),
+            resume_after: resume_after.to_string(),
+        }
+    }
+
+    pub(crate) fn should_skip(&self, first: &str, second: &str, third: &str, entry: &str) -> bool {
+        (first, second, third, entry)
+            <= (
+                self.first.as_str(),
+                self.second.as_str(),
+                self.third.as_str(),
+                self.resume_after.as_str(),
+            )
+    }
+}
+
+/// Persisted progress for canonical, restartable recovery phases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryCursor {
-    pub promote_delayed: Option<(String, String, String)>,
-    pub compact_receipts: Option<(String, String, String)>,
-    pub delete_receipts: Option<(String, String, String)>,
+    pub(crate) reap_leases: Option<FourLevelCursor>,
+    pub(crate) promote_delayed: Option<ThreeLevelCursor>,
+    pub(crate) cleanup_temp: Option<ThreeLevelCursor>,
+    pub(crate) compact_receipts: Option<ThreeLevelCursor>,
+    pub(crate) delete_receipts: Option<ThreeLevelCursor>,
 }
 
 pub struct Queue {
@@ -571,7 +630,7 @@ impl Queue {
 
         // Create control lock files
         let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
-        for lock_file in ["maintenance.lock", "wall-watermark.lock"] {
+        for lock_file in ["maintenance.lock", "wall-watermark.lock", "recovery.lock"] {
             let fd =
                 fs::create_exclusive(control_fd.as_raw_fd(), lock_file, 0o600).or_else(|e| {
                     if e.kind() == io::ErrorKind::AlreadyExists {
@@ -766,6 +825,8 @@ impl Queue {
         if !locked {
             return Err(Error::MaintenanceBusy);
         }
+        let recovery_cursor =
+            crate::recovery::load_recovery_cursor(root_fd.as_raw_fd(), &format_rec.queue_id)?;
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -777,7 +838,7 @@ impl Queue {
             worker_nonce,
             options: opts.clone(),
             maint_lock_fd: Some(maint_fd),
-            recovery_cursor: RecoveryCursor::default(),
+            recovery_cursor,
         })
     }
 
@@ -4697,6 +4758,7 @@ mod tests {
         assert!(tmp.path().join("FORMAT").exists());
         assert!(tmp.path().join("control").exists());
         assert!(tmp.path().join("control/maintenance.lock").exists());
+        assert!(tmp.path().join("control/recovery.lock").exists());
         assert!(tmp.path().join("control/wall-watermark").exists());
         assert!(tmp.path().join("ready").exists());
         // Check shard dirs

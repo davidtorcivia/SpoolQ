@@ -1,14 +1,130 @@
 // SteadQ/1 cooperative recovery operations.
 
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 
 use steadq_fs_linux as fs;
 use steadq_math;
 use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
-use crate::queue::{open_relative, Queue, WallFloor};
+use crate::queue::{
+    open_relative, FourLevelCursor, Queue, RecoveryCursor, ThreeLevelCursor, WallFloor,
+};
+
+const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
+const RECOVERY_CURSOR_VERSION: u16 = 1;
+const RECOVERY_CURSOR_FILE: &str = "recovery-cursor.json";
+const RECOVERY_CURSOR_MAX_BYTES: u64 = 16 * 1024;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryCursorRecord {
+    schema: String,
+    version: u16,
+    queue_id: String,
+    cursor: RecoveryCursor,
+}
+
+fn cursor_component_is_valid(component: &str) -> bool {
+    !component.is_empty()
+        && component.len() <= 255
+        && component != "."
+        && component != ".."
+        && !component.contains('/')
+        && !component.contains('\0')
+}
+
+fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
+    let three_level_is_valid = |scan: &ThreeLevelCursor| {
+        cursor_component_is_valid(&scan.first)
+            && cursor_component_is_valid(&scan.second)
+            && cursor_component_is_valid(&scan.resume_after)
+    };
+    let four_level_is_valid = |scan: &FourLevelCursor| {
+        [&scan.first, &scan.second, &scan.third, &scan.resume_after]
+            .into_iter()
+            .all(|component| cursor_component_is_valid(component))
+    };
+
+    cursor.reap_leases.as_ref().is_none_or(four_level_is_valid)
+        && cursor
+            .promote_delayed
+            .as_ref()
+            .is_none_or(three_level_is_valid)
+        && cursor
+            .cleanup_temp
+            .as_ref()
+            .is_none_or(three_level_is_valid)
+        && cursor
+            .compact_receipts
+            .as_ref()
+            .is_none_or(three_level_is_valid)
+        && cursor
+            .delete_receipts
+            .as_ref()
+            .is_none_or(three_level_is_valid)
+}
+
+pub(crate) fn load_recovery_cursor(
+    root_fd: std::os::unix::io::RawFd,
+    queue_id: &[u8; 16],
+) -> Result<RecoveryCursor, Error> {
+    let control_fd = fs::open_directory(root_fd, "control")
+        .map_err(|error| Error::IoFailure(error.to_string()))?;
+    let cursor_fd = match fs::openat(
+        control_fd.as_raw_fd(),
+        RECOVERY_CURSOR_FILE,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            return Ok(RecoveryCursor::default());
+        }
+        Err(error) => return Err(Error::IoFailure(error.to_string())),
+    };
+    let stat =
+        fs::fstat(cursor_fd.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+        return Err(Error::QueueCorrupt(
+            "recovery cursor is not a singly linked regular file".into(),
+        ));
+    }
+    let size = u64::try_from(stat.st_size)
+        .map_err(|_| Error::QueueCorrupt("recovery cursor has negative size".into()))?;
+    if size == 0 || size > RECOVERY_CURSOR_MAX_BYTES {
+        return Err(Error::QueueCorrupt(
+            "recovery cursor size is invalid".into(),
+        ));
+    }
+    let mut bytes = vec![
+        0;
+        usize::try_from(size).map_err(|_| Error::QueueCorrupt(
+            "recovery cursor size is unsupported".into()
+        ))?
+    ];
+    fs::pread_exact(cursor_fd.as_raw_fd(), &mut bytes, 0)
+        .map_err(|error| Error::IoFailure(error.to_string()))?;
+    let record: RecoveryCursorRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| Error::QueueCorrupt(format!("recovery cursor decode: {error}")))?;
+    if record.schema != RECOVERY_CURSOR_SCHEMA || record.version != RECOVERY_CURSOR_VERSION {
+        return Err(Error::QueueCorrupt(
+            "recovery cursor schema or version is unsupported".into(),
+        ));
+    }
+    if record.queue_id != steadq_names::hex_encode(queue_id) {
+        return Err(Error::QueueCorrupt(
+            "recovery cursor belongs to another queue".into(),
+        ));
+    }
+    if !cursor_is_valid(&record.cursor) {
+        return Err(Error::QueueCorrupt(
+            "recovery cursor contains an invalid component".into(),
+        ));
+    }
+    Ok(record.cursor)
+}
 
 /// Recovery work budget.
 #[derive(Clone, Debug)]
@@ -50,9 +166,88 @@ pub struct RecoveryError {
 }
 
 impl Queue {
+    fn acquire_recovery_lock(&self) -> Result<OwnedFd, Error> {
+        let control_fd = fs::open_directory(self.root_fd(), "control")
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let lock_fd = match fs::create_exclusive(control_fd.as_raw_fd(), "recovery.lock", 0o600) {
+            Ok(fd) => {
+                fs::fsync(fd.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+                fs::fsync_dir_fd(control_fd.as_raw_fd())
+                    .map_err(|error| Error::IoFailure(error.to_string()))?;
+                fd
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => fs::openat(
+                control_fd.as_raw_fd(),
+                "recovery.lock",
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )
+            .map_err(|error| Error::IoFailure(error.to_string()))?,
+            Err(error) => return Err(Error::IoFailure(error.to_string())),
+        };
+        if !fs::try_ofd_write_lock(lock_fd.as_raw_fd())
+            .map_err(|error| Error::IoFailure(error.to_string()))?
+        {
+            return Err(Error::MaintenanceBusy);
+        }
+        Ok(lock_fd)
+    }
+
+    fn persist_recovery_cursor(&self) -> Result<(), Error> {
+        let record = RecoveryCursorRecord {
+            schema: RECOVERY_CURSOR_SCHEMA.to_string(),
+            version: RECOVERY_CURSOR_VERSION,
+            queue_id: steadq_names::hex_encode(&self.format.queue_id),
+            cursor: self.recovery_cursor.clone(),
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|error| Error::IoFailure(format!("recovery cursor encode: {error}")))?;
+        if bytes.len() as u64 > RECOVERY_CURSOR_MAX_BYTES {
+            return Err(Error::InvalidInput(
+                "recovery cursor exceeds maximum encoded size".into(),
+            ));
+        }
+        let control_fd = fs::open_directory(self.root_fd(), "control")
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let temp_name = format!(
+            ".recovery-cursor.{}.tmp",
+            steadq_names::hex_encode(
+                &fs::random_128bit().map_err(|error| Error::IoFailure(error.to_string()))?
+            )
+        );
+        let temp_fd = fs::create_exclusive(control_fd.as_raw_fd(), &temp_name, 0o600)
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        if let Err(error) = fs::write_all(temp_fd.as_raw_fd(), &bytes)
+            .and_then(|()| fs::fsync(temp_fd.as_raw_fd()))
+            .and_then(|()| {
+                fs::durable_move_replace(
+                    control_fd.as_raw_fd(),
+                    &temp_name,
+                    control_fd.as_raw_fd(),
+                    RECOVERY_CURSOR_FILE,
+                )
+            })
+        {
+            let _ = fs::unlinkat(control_fd.as_raw_fd(), &temp_name);
+            return Err(Error::IoFailure(error.to_string()));
+        }
+        Ok(())
+    }
+
     /// Run one bounded recovery pass.
     pub fn recover(&mut self, budget: &WorkBudget) -> RecoveryStats {
         let mut stats = RecoveryStats::default();
+        let _recovery_lock = match self.acquire_recovery_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                stats.errors.push(RecoveryError {
+                    operation: "recovery_lock".into(),
+                    relative_path: "control/recovery.lock".into(),
+                    error: error.to_string(),
+                });
+                return stats;
+            }
+        };
         let boottime_now = match fs::clock_boottime_ns() {
             Ok(t) => t,
             Err(e) => {
@@ -121,6 +316,14 @@ impl Queue {
                     deadline_mono,
                 );
             }
+        }
+
+        if let Err(error) = self.persist_recovery_cursor() {
+            stats.errors.push(RecoveryError {
+                operation: "recovery_cursor_persist".into(),
+                relative_path: format!("control/{RECOVERY_CURSOR_FILE}"),
+                error: error.to_string(),
+            });
         }
 
         stats
@@ -194,15 +397,21 @@ impl Queue {
             }
         };
 
-        let boot_dirs = match fs::read_dir_entries_owned(leased_fd.as_raw_fd()) {
+        let mut boot_dirs = match fs::read_dir_entries_owned(leased_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(e) => {
                 Self::record_error(stats, "read_leased_dirs", "leased", &e.to_string());
                 return;
             }
         };
+        boot_dirs.sort();
 
         for boot_dir_name in &boot_dirs {
+            if let Some(cursor) = &self.recovery_cursor.reap_leases {
+                if boot_dir_name < &cursor.first {
+                    continue;
+                }
+            }
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
@@ -218,15 +427,21 @@ impl Queue {
                 }
             };
 
-            let bucket_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
+            let mut bucket_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
                 Ok(e) => e,
                 Err(_) => {
                     stats.scan_skips += 1;
                     continue;
                 }
             };
+            bucket_dirs.sort();
 
             for bucket_name in &bucket_dirs {
+                if let Some(cursor) = &self.recovery_cursor.reap_leases {
+                    if boot_dir_name == &cursor.first && bucket_name < &cursor.second {
+                        continue;
+                    }
+                }
                 if Self::budget_exhausted(stats, budget, deadline_mono) {
                     stats.budget_exhausted = true;
                     return;
@@ -261,15 +476,24 @@ impl Queue {
                     }
                 };
 
-                let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+                let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                     Ok(e) => e,
                     Err(_) => {
                         stats.scan_skips += 1;
                         continue;
                     }
                 };
+                shard_dirs.sort();
 
                 for shard_name in &shard_dirs {
+                    if let Some(cursor) = &self.recovery_cursor.reap_leases {
+                        if boot_dir_name == &cursor.first
+                            && bucket_name == &cursor.second
+                            && shard_name < &cursor.third
+                        {
+                            continue;
+                        }
+                    }
                     let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                         Ok(fd) => fd,
                         Err(_) => {
@@ -278,19 +502,31 @@ impl Queue {
                         }
                     };
 
-                    let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                    let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                         Ok(e) => e,
                         Err(_) => {
                             stats.scan_skips += 1;
                             continue;
                         }
                     };
+                    entries.sort();
 
                     for entry in &entries {
-                        if stats.operations_attempted >= budget.max_operations {
+                        if let Some(cursor) = &self.recovery_cursor.reap_leases {
+                            if cursor.should_skip(boot_dir_name, bucket_name, shard_name, entry) {
+                                continue;
+                            }
+                        }
+                        if Self::budget_exhausted(stats, budget, deadline_mono) {
                             stats.budget_exhausted = true;
                             return;
                         }
+                        self.recovery_cursor.reap_leases = Some(FourLevelCursor::new(
+                            boot_dir_name,
+                            bucket_name,
+                            shard_name,
+                            entry,
+                        ));
 
                         if !entry.ends_with(".sqj") {
                             continue;
@@ -440,6 +676,7 @@ impl Queue {
                 }
             }
         }
+        self.recovery_cursor.reap_leases = None;
     }
 
     fn reap_to_ready(
@@ -555,16 +792,14 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.promote_delayed {
-                if bucket_name.as_str() < cursor_bucket.as_str() {
+            if let Some(cursor) = &self.recovery_cursor.promote_delayed {
+                if bucket_name.as_str() < cursor.first.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.promote_delayed =
-                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -595,18 +830,19 @@ impl Queue {
                 }
             };
 
-            let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
                 Err(_) => {
                     stats.scan_skips += 1;
                     continue;
                 }
             };
+            shard_dirs.sort();
 
             for shard_name in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
-                if let Some((cb, cs, _)) = &self.recovery_cursor.promote_delayed {
-                    if bucket_name == cb && shard_name.as_str() < cs.as_str() {
+                if let Some(cursor) = &self.recovery_cursor.promote_delayed {
+                    if bucket_name == &cursor.first && shard_name < &cursor.second {
                         continue;
                     }
                 }
@@ -623,30 +859,28 @@ impl Queue {
                     }
                 };
 
-                let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
                     Err(_) => {
                         stats.scan_skips += 1;
                         continue;
                     }
                 };
+                entries.sort();
 
                 for entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
-                    if let Some((cb, cs, ce)) = &self.recovery_cursor.promote_delayed {
-                        if bucket_name == cb
-                            && shard_name == cs.as_str()
-                            && entry.as_str() <= ce.as_str()
-                        {
+                    if let Some(cursor) = &self.recovery_cursor.promote_delayed {
+                        if cursor.should_skip(bucket_name, shard_name, entry) {
                             continue;
                         }
                     }
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
-                        self.recovery_cursor.promote_delayed =
-                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                         return;
                     }
+                    self.recovery_cursor.promote_delayed =
+                        Some(ThreeLevelCursor::new(bucket_name, shard_name, entry));
 
                     if !entry.ends_with(".sqj") {
                         continue;
@@ -745,15 +979,9 @@ impl Queue {
                                 error: "directory sync failed after promotion".into(),
                             });
                         }
-                        self.recovery_cursor.promote_delayed =
-                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                     }
                 }
             }
-
-            // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.promote_delayed =
-                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
@@ -773,12 +1001,18 @@ impl Queue {
             Err(_) => return,
         };
 
-        let boot_dirs = match fs::read_dir_entries_owned(tmp_fd.as_raw_fd()) {
+        let mut boot_dirs = match fs::read_dir_entries_owned(tmp_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
+        boot_dirs.sort();
 
         for boot_dir_name in &boot_dirs {
+            if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
+                if boot_dir_name < &cursor.first {
+                    continue;
+                }
+            }
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
@@ -794,15 +1028,21 @@ impl Queue {
                 }
             };
 
-            let shard_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
+            let mut shard_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
                 Ok(e) => e,
                 Err(_) => {
                     stats.scan_skips += 1;
                     continue;
                 }
             };
+            shard_dirs.sort();
 
             for shard_name in &shard_dirs {
+                if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
+                    if boot_dir_name == &cursor.first && shard_name < &cursor.second {
+                        continue;
+                    }
+                }
                 let shard_fd = match fs::open_directory(boot_dir_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(_) => {
@@ -811,19 +1051,27 @@ impl Queue {
                     }
                 };
 
-                let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
                     Err(_) => {
                         stats.scan_skips += 1;
                         continue;
                     }
                 };
+                entries.sort();
 
                 for entry in &entries {
+                    if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
+                        if cursor.should_skip(boot_dir_name, shard_name, entry) {
+                            continue;
+                        }
+                    }
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
+                    self.recovery_cursor.cleanup_temp =
+                        Some(ThreeLevelCursor::new(boot_dir_name, shard_name, entry));
 
                     if !entry.ends_with(".tmp") {
                         continue;
@@ -846,6 +1094,7 @@ impl Queue {
                 }
             }
         }
+        self.recovery_cursor.cleanup_temp = None;
     }
 
     // Public version of ensure_dir for recovery
@@ -876,16 +1125,14 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.compact_receipts {
-                if bucket_name.as_str() < cursor_bucket.as_str() {
+            if let Some(cursor) = &self.recovery_cursor.compact_receipts {
+                if bucket_name.as_str() < cursor.first.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.compact_receipts =
-                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -897,18 +1144,19 @@ impl Queue {
                 }
             };
 
-            let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
                 Err(_) => {
                     stats.scan_skips += 1;
                     continue;
                 }
             };
+            shard_dirs.sort();
 
             for shard_name in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
-                if let Some((cb, cs, _)) = &self.recovery_cursor.compact_receipts {
-                    if bucket_name == cb && shard_name.as_str() < cs.as_str() {
+                if let Some(cursor) = &self.recovery_cursor.compact_receipts {
+                    if bucket_name == &cursor.first && shard_name < &cursor.second {
                         continue;
                     }
                 }
@@ -920,30 +1168,28 @@ impl Queue {
                     }
                 };
 
-                let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
                     Err(_) => {
                         stats.scan_skips += 1;
                         continue;
                     }
                 };
+                entries.sort();
 
                 for entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
-                    if let Some((cb, cs, ce)) = &self.recovery_cursor.compact_receipts {
-                        if bucket_name == cb
-                            && shard_name == cs.as_str()
-                            && entry.as_str() <= ce.as_str()
-                        {
+                    if let Some(cursor) = &self.recovery_cursor.compact_receipts {
+                        if cursor.should_skip(bucket_name, shard_name, entry) {
                             continue;
                         }
                     }
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
-                        self.recovery_cursor.compact_receipts =
-                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                         return;
                     }
+                    self.recovery_cursor.compact_receipts =
+                        Some(ThreeLevelCursor::new(bucket_name, shard_name, entry));
 
                     if !entry.ends_with(".rct") {
                         continue;
@@ -1078,10 +1324,6 @@ impl Queue {
                     }
                 }
             }
-
-            // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.compact_receipts =
-                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
@@ -1113,16 +1355,14 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.delete_receipts {
-                if bucket_name.as_str() < cursor_bucket.as_str() {
+            if let Some(cursor) = &self.recovery_cursor.delete_receipts {
+                if bucket_name.as_str() < cursor.first.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.delete_receipts =
-                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -1158,18 +1398,19 @@ impl Queue {
                 }
             };
 
-            let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
                 Err(_) => {
                     stats.scan_skips += 1;
                     continue;
                 }
             };
+            shard_dirs.sort();
 
             for shard_name in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
-                if let Some((cb, cs, _)) = &self.recovery_cursor.delete_receipts {
-                    if bucket_name == cb && shard_name.as_str() < cs.as_str() {
+                if let Some(cursor) = &self.recovery_cursor.delete_receipts {
+                    if bucket_name == &cursor.first && shard_name < &cursor.second {
                         continue;
                     }
                 }
@@ -1181,21 +1422,19 @@ impl Queue {
                     }
                 };
 
-                let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
                     Err(_) => {
                         stats.scan_skips += 1;
                         continue;
                     }
                 };
+                entries.sort();
 
                 for entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
-                    if let Some((cb, cs, ce)) = &self.recovery_cursor.delete_receipts {
-                        if bucket_name == cb
-                            && shard_name == cs.as_str()
-                            && entry.as_str() <= ce.as_str()
-                        {
+                    if let Some(cursor) = &self.recovery_cursor.delete_receipts {
+                        if cursor.should_skip(bucket_name, shard_name, entry) {
                             continue;
                         }
                     }
@@ -1206,10 +1445,10 @@ impl Queue {
 
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
-                        self.recovery_cursor.delete_receipts =
-                            Some((bucket_name.clone(), shard_name.to_string(), entry.clone()));
                         return;
                     }
+                    self.recovery_cursor.delete_receipts =
+                        Some(ThreeLevelCursor::new(bucket_name, shard_name, entry));
                     stats.operations_attempted += 1;
 
                     // R4-H08: Validate the receipt filename before operating.
@@ -1313,10 +1552,6 @@ impl Queue {
                     );
                 }
             }
-
-            // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.delete_receipts =
-                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
@@ -1359,6 +1594,17 @@ mod tests {
         None
     }
 
+    fn find_files(root: &Path, extension: &str, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                find_files(&path, extension, found);
+            } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+                found.push(path);
+            }
+        }
+    }
+
     fn write_wall_watermark(tmp: &TempDir, highest_observed_bucket: u64) {
         let path = tmp.path().join("control/wall-watermark");
         let bytes = std::fs::read(&path).unwrap();
@@ -1394,6 +1640,245 @@ mod tests {
         assert!(Queue::has_recovery_budget(&stats));
         stats.budget_exhausted = true;
         assert!(!Queue::has_recovery_budget(&stats));
+    }
+
+    #[test]
+    fn scan_cursor_skips_only_canonical_processed_prefix() {
+        let cursor = ThreeLevelCursor::new("0002", "0003", "middle.rct");
+        for (bucket, shard, entry, expected) in [
+            ("0001", "ffff", "later.rct", true),
+            ("0002", "0002", "later.rct", true),
+            ("0002", "0003", "earlier.rct", true),
+            ("0002", "0003", "middle.rct", true),
+            ("0002", "0003", "z-later.rct", false),
+            ("0002", "0004", "earlier.rct", false),
+            ("0003", "0000", "earlier.rct", false),
+        ] {
+            assert_eq!(cursor.should_skip(bucket, shard, entry), expected);
+        }
+    }
+
+    #[test]
+    fn four_level_cursor_skips_only_canonical_processed_prefix() {
+        let cursor = FourLevelCursor::new("boot-b", "0002", "0003", "middle.sqj");
+        for (first, second, third, entry, expected) in [
+            ("boot-a", "ffff", "ffff", "later.sqj", true),
+            ("boot-b", "0001", "ffff", "later.sqj", true),
+            ("boot-b", "0002", "0002", "later.sqj", true),
+            ("boot-b", "0002", "0003", "middle.sqj", true),
+            ("boot-b", "0002", "0003", "z-later.sqj", false),
+            ("boot-b", "0002", "0004", "earlier.sqj", false),
+            ("boot-c", "0000", "0000", "earlier.sqj", false),
+        ] {
+            assert_eq!(cursor.should_skip(first, second, third, entry), expected);
+        }
+    }
+
+    #[test]
+    fn recovery_cursor_component_validation_table() {
+        for (component, expected) in [
+            ("0000", true),
+            ("job.rct", true),
+            ("", false),
+            (".", false),
+            ("..", false),
+            ("a/b", false),
+            ("a\0b", false),
+        ] {
+            assert_eq!(cursor_component_is_valid(component), expected);
+        }
+        assert!(!cursor_component_is_valid(&"x".repeat(256)));
+    }
+
+    #[test]
+    fn recovery_cursor_persists_exact_budget_progress_across_reopen() {
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        enqueue_and_ack(&mut queue);
+        let receipt_root = tmp.path().join("receipts");
+        let mut original_receipts = Vec::new();
+        find_files(&receipt_root, "rct", &mut original_receipts);
+        original_receipts
+            .sort_by_key(|path| path.strip_prefix(&receipt_root).unwrap().to_path_buf());
+        let first_parts = original_receipts[0]
+            .strip_prefix(&receipt_root)
+            .unwrap()
+            .components()
+            .map(|component| component.as_os_str().to_str().unwrap())
+            .collect::<Vec<_>>();
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+
+        let first = queue.recover(&budget);
+        assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
+        assert!(first.budget_exhausted);
+        assert_eq!(
+            queue.recovery_cursor.compact_receipts,
+            Some(ThreeLevelCursor::new(
+                first_parts[0],
+                first_parts[1],
+                first_parts[2]
+            ))
+        );
+        assert!(tmp.path().join("control/recovery-cursor.json").exists());
+        drop(queue);
+
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(reopened.recovery_cursor.compact_receipts.is_some());
+        let second = reopened.recover(&budget);
+        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        drop(reopened);
+
+        let mut receipts = Vec::new();
+        find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts
+            .iter()
+            .all(|path| std::fs::metadata(path).unwrap().len() == 128));
+    }
+
+    #[test]
+    fn persistent_malformed_receipt_does_not_starve_valid_receipt() {
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+        let malformed = receipt.parent().unwrap().join("000-malformed.rct");
+        std::fs::write(&malformed, b"malformed").unwrap();
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+
+        let first = queue.recover(&budget);
+        assert_eq!(first.receipts_compacted, 0);
+        assert!(first
+            .errors
+            .iter()
+            .any(|error| error.operation == "receipt_compact_invalid"));
+        assert_eq!(
+            queue
+                .recovery_cursor
+                .compact_receipts
+                .as_ref()
+                .unwrap()
+                .resume_after,
+            "000-malformed.rct"
+        );
+        drop(queue);
+
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = reopened.recover(&budget);
+
+        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        assert_eq!(std::fs::metadata(receipt).unwrap().len(), 128);
+        assert!(malformed.exists());
+    }
+
+    #[test]
+    fn busy_receipt_does_not_pin_recovery_cursor() {
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        enqueue_and_ack(&mut queue);
+        let receipt_root = tmp.path().join("receipts");
+        let mut receipts = Vec::new();
+        find_files(&receipt_root, "rct", &mut receipts);
+        receipts.sort_by_key(|path| path.strip_prefix(&receipt_root).unwrap().to_path_buf());
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&receipts[0])
+            .unwrap();
+        let held_original_len = std::fs::metadata(&receipts[0]).unwrap().len();
+        assert!(fs::try_ofd_write_lock(held.as_raw_fd()).unwrap());
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+
+        let first = queue.recover(&budget);
+        assert_eq!(first.receipts_compacted, 0);
+        drop(queue);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = reopened.recover(&budget);
+
+        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        assert_eq!(
+            std::fs::metadata(&receipts[0]).unwrap().len(),
+            held_original_len
+        );
+        assert_eq!(std::fs::metadata(&receipts[1]).unwrap().len(), 128);
+    }
+
+    #[test]
+    fn recovery_cursor_rejects_foreign_queue_identity() {
+        let (tmp, mut queue) = create_test_queue();
+        queue.recovery_cursor.compact_receipts =
+            Some(ThreeLevelCursor::new("0001", "0002", "entry.rct"));
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        let path = tmp.path().join("control/recovery-cursor.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["queue_id"] = serde_json::Value::String(steadq_names::hex_encode(&[0xff; 16]));
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let error = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("foreign cursor must reject queue open");
+        assert!(matches!(
+            error,
+            Error::QueueCorrupt(ref message)
+                if message == "recovery cursor belongs to another queue"
+        ));
+    }
+
+    #[test]
+    fn concurrent_recovery_pass_is_rejected_by_lock() {
+        let (_tmp, first) = create_test_queue();
+        let mut second = Queue::open(
+            _tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _held = first.acquire_recovery_lock().unwrap();
+
+        let stats = second.recover(&WorkBudget::default());
+
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(stats.errors[0].operation, "recovery_lock");
+        assert_eq!(stats.errors[0].error, Error::MaintenanceBusy.to_string());
     }
 
     #[test]
