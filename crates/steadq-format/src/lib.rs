@@ -625,7 +625,7 @@ mod tests {
     fn format_round_trip() {
         let rec = FormatRecord {
             queue_id: [0x42; 16],
-            created_at_unix_ns: 0,
+            created_at_unix_ns: 1_700_000_000_000_000_000,
             shard_count: 64,
             lease_bucket_width_ns: 10_000_000_000,
             delayed_bucket_width_ns: 10_000_000_000,
