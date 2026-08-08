@@ -47,17 +47,7 @@ pub struct VerifiedJob {
     pub extension: Vec<u8>,
 }
 
-impl VerifiedJob {
-    pub fn payload_length(&self) -> u64 {
-        self.header.payload_length
-    }
-    pub fn payload_digest(&self) -> [u8; 32] {
-        self.header.payload_digest
-    }
-    pub fn job_id(&self) -> [u8; 16] {
-        self.header.job_id
-    }
-}
+impl VerifiedJob {}
 
 /// Verify the envelope and payload on an already-open fd. The fd must remain
 /// open across any subsequent operation to prevent TOCTOU swap.
@@ -102,7 +92,7 @@ fn read_and_verify_header(fd: std::os::unix::io::RawFd) -> Result<FixedHeader, V
     let header = FixedHeader::decode(&header_buf)
         .map_err(|e| VerificationError::Corrupt(format!("header decode: {e}")))?;
     let ext_len = header.extension_header_length as usize;
-    if ext_len > 65536 {
+    if is_extension_too_large(ext_len) {
         return Err(VerificationError::Corrupt(
             "extension header too large".into(),
         ));
@@ -115,7 +105,7 @@ fn read_extension(
     ext_len: usize,
 ) -> Result<Vec<u8>, VerificationError> {
     let mut ext_buf = vec![0u8; ext_len];
-    if ext_len > 0 {
+    if is_extension_present(ext_len) {
         fs::pread_exact(fd, &mut ext_buf, 128).map_err(|e| VerificationError::Io(e.to_string()))?;
     }
     Ok(ext_buf)
@@ -128,7 +118,7 @@ fn verify_size(
 ) -> Result<(), VerificationError> {
     let file_stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
     let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
-    if file_stat.st_size as u64 != expected_size {
+    if is_size_mismatch(expected_size, file_stat.st_size as u64) {
         return Err(VerificationError::Corrupt(format!(
             "file size mismatch: expected {}, got {}",
             expected_size, file_stat.st_size
@@ -159,7 +149,7 @@ fn verify_payload(
         remaining -= n;
     }
     let computed: [u8; 32] = hasher.finalize().into();
-    if computed != header.payload_digest {
+    if !is_payload_digest_match(header, &computed) {
         return Err(VerificationError::PayloadCorrupt);
     }
     Ok(())
@@ -176,6 +166,14 @@ pub fn is_payload_digest_match(header: &FixedHeader, computed: &[u8; 32]) -> boo
 
 pub fn is_extension_too_large(ext_len: usize) -> bool {
     ext_len > 65536
+}
+
+pub fn is_extension_present(ext_len: usize) -> bool {
+    ext_len > 0
+}
+
+pub fn is_size_mismatch(expected: u64, actual: u64) -> bool {
+    expected != actual
 }
 
 #[cfg(test)]
@@ -234,5 +232,86 @@ mod tests {
         assert!(matches!(e, Error::QueueCorrupt(_)));
         let e: Error = VerificationError::PayloadCorrupt.into();
         assert!(matches!(e, Error::PayloadCorrupt));
+    }
+
+    #[test]
+    fn is_extension_present_table() {
+        assert!(!is_extension_present(0));
+        assert!(is_extension_present(1));
+        assert!(is_extension_present(65536));
+        assert!(is_extension_present(usize::MAX));
+    }
+
+    #[test]
+    fn is_size_mismatch_table() {
+        assert!(!is_size_mismatch(0, 0));
+        assert!(!is_size_mismatch(100, 100));
+        assert!(is_size_mismatch(100, 99));
+        assert!(is_size_mismatch(100, 101));
+        assert!(is_size_mismatch(u64::MAX, 0));
+        assert!(is_size_mismatch(0, u64::MAX));
+    }
+
+    #[test]
+    fn is_envelope_digest_valid_table() {
+        let header = FixedHeader {
+            extension_header_length: 0,
+            payload_length: 0,
+            flags: 0,
+            digest_algorithm: 1,
+            job_id: [0x11; 16],
+            maximum_attempts: 1,
+            created_at_unix_ns: 0,
+            payload_digest: [0; 32],
+            envelope_digest: [0; 32],
+        };
+        // empty extension with zero digest will not match unless header was computed for it;
+        // we just verify predicate returns false for mismatched and is functionally wired.
+        // Create a header whose envelope_digest is computed correctly for empty extension.
+        let mut h = header.clone();
+        let ext: Vec<u8> = vec![];
+        // compute correct envelope: not trivial without helper, but we can verify that
+        // the predicate is equivalent to spoolq_format::verify_envelope_digest by checking
+        // that negating the result matches the helper.
+        let valid = is_envelope_digest_valid(&h, &ext);
+        let expected = spoolq_format::verify_envelope_digest(&h, &ext);
+        assert_eq!(valid, expected);
+        // flip a byte in envelope digest to make invalid
+        h.envelope_digest = [0xFF; 32];
+        assert!(!is_envelope_digest_valid(&h, &ext));
+    }
+
+    #[test]
+    fn verify_size_detects_mismatch_via_tmpfile() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("size_test.raw");
+        let header = FixedHeader {
+            extension_header_length: 0,
+            payload_length: 10,
+            flags: 0,
+            digest_algorithm: 1,
+            job_id: [0x22; 16],
+            maximum_attempts: 1,
+            created_at_unix_ns: 0,
+            payload_digest: [0; 32],
+            envelope_digest: [0; 32],
+        };
+        let ext: Vec<u8> = vec![];
+        let mut h = header.clone();
+        h.envelope_digest = spoolq_format::envelope_digest(&h, &ext).unwrap_or([0; 32]);
+        let header_buf = h.encode(&ext).unwrap();
+        std::fs::write(&path, header_buf).unwrap();
+        let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let res = verify_size(file.as_raw_fd(), &h, 0);
+        assert!(matches!(res, Err(VerificationError::Corrupt(_))));
+        drop(file);
+        let mut full = Vec::with_capacity(138);
+        full.extend_from_slice(&header_buf);
+        full.extend_from_slice(&[0u8; 10]);
+        std::fs::write(&path, &full).unwrap();
+        let file2 = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let res2 = verify_size(file2.as_raw_fd(), &h, 0);
+        assert!(res2.is_ok());
     }
 }
