@@ -880,7 +880,30 @@ impl Queue {
     }
 
     pub(crate) fn stabilized_wall_floor(&self) -> Result<WallFloor, Error> {
+        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let lock_fd = fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark.lock",
+            libc::O_RDWR,
+            0o600,
+        )
+        .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let locked = fs::try_ofd_read_lock(lock_fd.as_raw_fd())
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        if !locked {
+            return Err(Error::MaintenanceBusy);
+        }
+
         let observed = self.authenticated_wall_floor()?;
+        let observed_bucket =
+            steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
+                .ok_or(Error::StateExhausted)?;
+        if !watermark_should_advance(observed_bucket, observed.watermark_bucket) {
+            return Ok(observed);
+        }
+
+        drop(lock_fd);
         self.advance_wall_watermark(observed)
     }
 
@@ -943,9 +966,6 @@ impl Queue {
         let observed_bucket =
             steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
                 .ok_or(Error::StateExhausted)?;
-        if !watermark_should_advance(observed_bucket, observed.watermark_bucket) {
-            return Ok(observed);
-        }
 
         let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
             .map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -6664,6 +6684,39 @@ mod tests {
     }
 
     #[test]
+    fn equal_bucket_stabilization_checks_live_writer_lock() {
+        let (tmp, mut queue) = create_test_queue();
+        let current = queue.authenticated_wall_floor().unwrap();
+        write_wall_watermark(
+            &tmp,
+            steadq_math::bucket_number(current.unix_ns(), queue.format.delayed_bucket_width_ns)
+                .unwrap(),
+            current.watermark_sequence(),
+        );
+        let control_fd = fs::open_directory(queue.root_fd(), "control").unwrap();
+        let lock_fd = fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark.lock",
+            libc::O_RDWR,
+            0,
+        )
+        .unwrap();
+        assert!(fs::try_ofd_write_lock(lock_fd.as_raw_fd()).unwrap());
+
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            outcome,
+            EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy)
+        ));
+        assert!(find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_none());
+    }
+
+    #[test]
     fn watermark_read_distinguishes_io_from_notfound() {
         steadq_fs_linux::fault::reset();
         let (_tmp, queue) = create_test_queue();
@@ -6695,6 +6748,22 @@ mod tests {
             fs::fault::reset();
             fs::fault::inject(syscall, 1);
             let result = queue.authenticated_wall_floor();
+            assert!(
+                matches!(result, Err(Error::IoFailure(_))),
+                "{syscall} failure must fail closed, got {result:?}"
+            );
+            assert_eq!(fs::fault::call_count(syscall), 1);
+            fs::fault::reset();
+        }
+    }
+
+    #[test]
+    fn stabilized_wall_floor_lock_fault_matrix() {
+        for syscall in ["open_directory", "openat", "try_ofd_read_lock"] {
+            let (_tmp, queue) = create_test_queue();
+            fs::fault::reset();
+            fs::fault::inject(syscall, 1);
+            let result = queue.stabilized_wall_floor();
             assert!(
                 matches!(result, Err(Error::IoFailure(_))),
                 "{syscall} failure must fail closed, got {result:?}"
