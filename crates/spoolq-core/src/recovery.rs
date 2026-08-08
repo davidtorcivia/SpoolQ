@@ -965,7 +965,7 @@ impl Queue {
                     {
                         continue;
                     }
-                    if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+                    if !crate::queue::verified::is_envelope_digest_valid(&header, &ext_buf) {
                         continue;
                     }
 
