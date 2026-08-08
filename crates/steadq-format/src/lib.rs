@@ -4,10 +4,10 @@ pub mod cbor;
 
 use sha2::{Digest, Sha256};
 
-pub const FORMAT_MAGIC: &[u8; 8] = b"SPQFMT1\0";
-pub const JOB_MAGIC: &[u8; 8] = b"SPQJOB1\0";
-pub const RECEIPT_MAGIC: &[u8; 8] = b"SPQRCPT\0";
-pub const WATERMARK_MAGIC: &[u8; 8] = b"SPQWMR1\0";
+pub const FORMAT_MAGIC: &[u8; 8] = b"SDQFMT1\0";
+pub const JOB_MAGIC: &[u8; 8] = b"SDQJOB1\0";
+pub const RECEIPT_MAGIC: &[u8; 8] = b"SDQRCPT\0";
+pub const WATERMARK_MAGIC: &[u8; 8] = b"SDQWMR1\0";
 
 pub const FORMAT_SIZE: usize = 160;
 pub const FIXED_HEADER_SIZE: usize = 128;
@@ -908,5 +908,57 @@ mod tests {
         };
         let ext: &[u8] = &[];
         assert!(header.encode(ext).is_err());
+    }
+
+    fn hex_to_32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn format_digest_known_value() {
+        let d = format_digest(&[0u8; 128]);
+        let expected =
+            hex_to_32("9707cc37ed7f1025a4c3b066c83051c6353c5aa3be9b6650940f03acf288961c");
+        assert_eq!(d, expected);
+    }
+
+    #[test]
+    fn envelope_digest_known_value() {
+        let header = FixedHeader {
+            extension_header_length: 0,
+            payload_length: 5,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id: [0xAB; 16],
+            maximum_attempts: 3,
+            created_at_unix_ns: 0,
+            payload_digest: payload_digest(b"hello"),
+            envelope_digest: [0; 32],
+        };
+        let ext: &[u8] = &[];
+        let d = envelope_digest(&header, ext).unwrap();
+        let expected =
+            hex_to_32("58490679fad0f92ecbea9ab1de222052f31e815331855c88bbfe5ac01503d88c");
+        assert_eq!(d, expected);
+    }
+
+    #[test]
+    fn receipt_digest_known_value() {
+        let d = receipt_digest(&[0u8; 96]);
+        let expected =
+            hex_to_32("544b0c70aa840523646a75befda7f513967631287f0ed4430993212840ae16c9");
+        assert_eq!(d, expected);
+    }
+
+    #[test]
+    fn watermark_digest_known_value() {
+        let d = watermark_digest(&[0u8; 32]);
+        let expected =
+            hex_to_32("58e096acae632c52bb6cc30d24c156eb7d45b7586475d987f13670e1193dbaca");
+        assert_eq!(d, expected);
     }
 }

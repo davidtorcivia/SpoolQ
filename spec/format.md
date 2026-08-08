@@ -4,7 +4,7 @@
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 8 | magic = `SPQFMT1\0` |
+| 0 | 8 | magic = `SDQFMT1\0` |
 | 8 | 2 | format major = 1 |
 | 10 | 2 | format minor = 0 |
 | 12 | 4 | flags = 0 |
@@ -30,7 +30,7 @@ All integers use network byte order.
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 8 | magic = `SPQJOB1\0` |
+| 0 | 8 | magic = `SDQJOB1\0` |
 | 8 | 2 | format major = 1 |
 | 10 | 2 | format minor = 0 |
 | 12 | 4 | extension_header_length |
@@ -49,7 +49,7 @@ All integers use network byte order.
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 8 | magic = `SPQRCPT\0` |
+| 0 | 8 | magic = `SDQRCPT\0` |
 | 8 | 2 | format major = 1 |
 | 10 | 2 | format minor = 0 |
 | 12 | 16 | job_id |
@@ -64,7 +64,7 @@ All integers use network byte order.
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 8 | magic = `SPQWMR1\0` |
+| 0 | 8 | magic = `SDQWMR1\0` |
 | 8 | 2 | format major = 1 |
 | 10 | 2 | format minor = 0 |
 | 12 | 4 | reserved, zero |

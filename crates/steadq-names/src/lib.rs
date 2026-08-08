@@ -1697,4 +1697,23 @@ mod tests {
         assert_eq!(parsed.reason, 0x0004);
         assert!(parsed.authenticate_tag(&qid, bucket, shard));
     }
+
+    #[test]
+    fn compute_shard_known_value() {
+        let qid = [0x42; 16];
+        let jid = [0xAB; 16];
+        // Pinned to catch mutations of the domain string or hash extraction.
+        assert_eq!(compute_shard(&qid, &jid, 64), 36);
+    }
+
+    #[test]
+    fn shard_scan_params_known_value() {
+        let qid = [0x42; 16];
+        let boot = [0u8; 16];
+        let nonce = [0u8; 16];
+        // Pinned to catch mutations of the domain string or hash extraction.
+        let (start, stride) = shard_scan_params(&qid, &boot, &nonce, 0, 64);
+        assert_eq!(start, 46);
+        assert_eq!(stride, 23);
+    }
 }

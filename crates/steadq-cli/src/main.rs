@@ -677,7 +677,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if data.len() >= 128 && &data[0..8] == b"SPQJOB1\0" {
+            if data.len() >= 128 && &data[0..8] == b"SDQJOB1\0" {
                 match steadq_format::FixedHeader::decode(&data[0..128]) {
                     Ok(header) => {
                         eprintln!("job_id: {}", steadq_names::hex_encode(&header.job_id));
@@ -718,7 +718,7 @@ fn main() -> ExitCode {
                         ExitCode::from(3)
                     }
                 }
-            } else if data.len() == 160 && &data[0..8] == b"SPQFMT1\0" {
+            } else if data.len() == 160 && &data[0..8] == b"SDQFMT1\0" {
                 match steadq_format::FormatRecord::decode(&data) {
                     Ok(fmt) => {
                         eprintln!("queue_id: {}", steadq_names::hex_encode(&fmt.queue_id));
@@ -745,7 +745,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if data.len() >= 128 && &data[0..8] == b"SPQJOB1\0" {
+            if data.len() >= 128 && &data[0..8] == b"SDQJOB1\0" {
                 match steadq_format::FixedHeader::decode(&data[0..128]) {
                     Ok(h) => {
                         println!("type: job");
@@ -768,7 +768,7 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 }
-            } else if data.len() == 160 && &data[0..8] == b"SPQFMT1\0" {
+            } else if data.len() == 160 && &data[0..8] == b"SDQFMT1\0" {
                 match steadq_format::FormatRecord::decode(&data) {
                     Ok(f) => {
                         println!("type: format");

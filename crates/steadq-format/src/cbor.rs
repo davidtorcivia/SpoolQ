@@ -880,4 +880,12 @@ mod tests {
         let raw = vec![0xA1, 0x02, 0x41, 0x01];
         assert!(ExtensionHeader::decode(&raw).is_err());
     }
+
+    #[test]
+    fn cbor_rejects_array_at_top_level() {
+        // Major type 4 (array) is not allowed in SteadQ metadata.
+        // 0x80 = empty array. Should error, not silently accept.
+        let raw = vec![0x80];
+        assert!(ExtensionHeader::decode(&raw).is_err());
+    }
 }
