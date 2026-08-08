@@ -303,13 +303,14 @@ impl Queue {
                         }
 
                         // B1: Validate object structure before recovery transition
-                        if let Err(e) = self.validate_active_object(
-                            shard_fd.as_raw_fd(),
-                            entry,
-                            "leased",
-                            shard_name,
-                            &self.format.queue_id,
-                        ) {
+                        let leased_ctx = crate::ActivePathContext::Leased {
+                            boot_id: boot_dir_name.clone(),
+                            bucket: bucket_name.clone(),
+                            shard: shard_name.to_string(),
+                        };
+                        if let Err(e) =
+                            self.validate_active_object(shard_fd.as_raw_fd(), entry, &leased_ctx)
+                        {
                             Self::record_error(
                                 stats,
                                 "reap_validate",
@@ -515,15 +516,16 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some(ref cursor) = self.recovery_cursor.promote_delayed_bucket {
-                if bucket_name.as_str() < cursor.as_str() {
+            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.promote_delayed {
+                if bucket_name.as_str() < cursor_bucket.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
+                self.recovery_cursor.promote_delayed =
+                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -559,6 +561,12 @@ impl Queue {
             };
 
             for shard_name in &shard_dirs {
+                // Entry level cursor: skip shards before cursor when bucket matches.
+                if let Some((cb, cs, _)) = &self.recovery_cursor.promote_delayed {
+                    if bucket_name == cb && shard_name.as_str() < cs.as_str() {
+                        continue;
+                    }
+                }
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(_) => {
@@ -581,8 +589,19 @@ impl Queue {
                 };
 
                 for entry in &entries {
+                    // Entry level cursor: skip entries at or before cursor when bucket and shard match.
+                    if let Some((cb, cs, ce)) = &self.recovery_cursor.promote_delayed {
+                        if bucket_name == cb
+                            && shard_name == cs.as_str()
+                            && entry.as_str() <= ce.as_str()
+                        {
+                            continue;
+                        }
+                    }
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
+                        self.recovery_cursor.promote_delayed =
+                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                         return;
                     }
 
@@ -606,13 +625,13 @@ impl Queue {
                             Ok(fd) => fd,
                             Err(_) => continue,
                         };
-                        if let Err(e) = self.validate_active_object(
-                            src_dir_fd.as_raw_fd(),
-                            entry,
-                            "delayed",
-                            shard_name,
-                            &self.format.queue_id,
-                        ) {
+                        let delayed_ctx = crate::ActivePathContext::Delayed {
+                            bucket: bucket_name.clone(),
+                            shard: shard_name.to_string(),
+                        };
+                        if let Err(e) =
+                            self.validate_active_object(src_dir_fd.as_raw_fd(), entry, &delayed_ctx)
+                        {
                             Self::record_error(
                                 stats,
                                 "promote_validate",
@@ -688,16 +707,19 @@ impl Queue {
                                 error: "directory sync failed after promotion".into(),
                             });
                         }
+                        self.recovery_cursor.promote_delayed =
+                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                     }
                 }
             }
 
             // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
+            self.recovery_cursor.promote_delayed =
+                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
-        self.recovery_cursor.promote_delayed_bucket = None;
+        self.recovery_cursor.promote_delayed = None;
     }
 
     fn cleanup_temp_files(
@@ -816,15 +838,16 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some(ref cursor) = self.recovery_cursor.compact_receipts_bucket {
-                if bucket_name.as_str() < cursor.as_str() {
+            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.compact_receipts {
+                if bucket_name.as_str() < cursor_bucket.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
+                self.recovery_cursor.compact_receipts =
+                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -845,6 +868,12 @@ impl Queue {
             };
 
             for shard_name in &shard_dirs {
+                // Entry level cursor: skip shards before cursor when bucket matches.
+                if let Some((cb, cs, _)) = &self.recovery_cursor.compact_receipts {
+                    if bucket_name == cb && shard_name.as_str() < cs.as_str() {
+                        continue;
+                    }
+                }
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(_) => {
@@ -862,8 +891,19 @@ impl Queue {
                 };
 
                 for entry in &entries {
+                    // Entry level cursor: skip entries at or before cursor when bucket and shard match.
+                    if let Some((cb, cs, ce)) = &self.recovery_cursor.compact_receipts {
+                        if bucket_name == cb
+                            && shard_name == cs.as_str()
+                            && entry.as_str() <= ce.as_str()
+                        {
+                            continue;
+                        }
+                    }
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
+                        self.recovery_cursor.compact_receipts =
+                            Some((bucket_name.clone(), shard_name.clone(), (*entry).clone()));
                         return;
                     }
 
@@ -1052,11 +1092,12 @@ impl Queue {
             }
 
             // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
+            self.recovery_cursor.compact_receipts =
+                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
-        self.recovery_cursor.compact_receipts_bucket = None;
+        self.recovery_cursor.compact_receipts = None;
     }
 
     /// Delete expired receipts based on retention policy.
@@ -1083,15 +1124,16 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some(ref cursor) = self.recovery_cursor.delete_receipts_bucket {
-                if bucket_name.as_str() < cursor.as_str() {
+            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.delete_receipts {
+                if bucket_name.as_str() < cursor_bucket.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
+                self.recovery_cursor.delete_receipts =
+                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -1136,6 +1178,12 @@ impl Queue {
             };
 
             for shard_name in &shard_dirs {
+                // Entry level cursor: skip shards before cursor when bucket matches.
+                if let Some((cb, cs, _)) = &self.recovery_cursor.delete_receipts {
+                    if bucket_name == cb && shard_name.as_str() < cs.as_str() {
+                        continue;
+                    }
+                }
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(_) => {
@@ -1153,6 +1201,15 @@ impl Queue {
                 };
 
                 for entry in &entries {
+                    // Entry level cursor: skip entries at or before cursor when bucket and shard match.
+                    if let Some((cb, cs, ce)) = &self.recovery_cursor.delete_receipts {
+                        if bucket_name == cb
+                            && shard_name == cs.as_str()
+                            && entry.as_str() <= ce.as_str()
+                        {
+                            continue;
+                        }
+                    }
                     // R4-H08: Only process receipt files.
                     if !entry.ends_with(".rct") {
                         continue;
@@ -1160,7 +1217,8 @@ impl Queue {
 
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
-                        self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
+                        self.recovery_cursor.delete_receipts =
+                            Some((bucket_name.clone(), shard_name.to_string(), entry.clone()));
                         return;
                     }
                     stats.operations_attempted += 1;
@@ -1237,11 +1295,12 @@ impl Queue {
             }
 
             // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
+            self.recovery_cursor.delete_receipts =
+                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
-        self.recovery_cursor.delete_receipts_bucket = None;
+        self.recovery_cursor.delete_receipts = None;
     }
 }
 

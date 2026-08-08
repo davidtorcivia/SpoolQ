@@ -92,12 +92,12 @@ impl Default for OpenOptions {
 /// Internal queue state.
 #[allow(dead_code)]
 /// R4-RES: In-memory cursor for resumable recovery. Tracks the last
-/// fully processed bucket per phase so the next pass resumes from there.
+/// Entry level cursor so persistent entries do not starve later work.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RecoveryCursor {
-    pub promote_delayed_bucket: Option<String>,
-    pub compact_receipts_bucket: Option<String>,
-    pub delete_receipts_bucket: Option<String>,
+    pub promote_delayed: Option<(String, String, String)>,
+    pub compact_receipts: Option<(String, String, String)>,
+    pub delete_receipts: Option<(String, String, String)>,
 }
 
 pub struct Queue {
@@ -122,6 +122,23 @@ enum ResolveObj {
     Match,
     Conflict,
     Error(Error),
+}
+
+/// Active path context for tag authentication.
+#[derive(Clone, Debug)]
+pub enum ActivePathContext {
+    Ready {
+        shard: String,
+    },
+    Leased {
+        boot_id: String,
+        bucket: String,
+        shard: String,
+    },
+    Delayed {
+        bucket: String,
+        shard: String,
+    },
 }
 
 impl Queue {
@@ -3010,30 +3027,26 @@ impl Queue {
 
     /// B1: Authenticate an active-state object structurally.
     /// Validates: file type, link count, header, envelope digest, file size,
-    /// name tag, shard placement, and header/name consistency.
+    /// name tag, shard placement, and header/name consistency with typed path context.
     /// Returns the validated header on success.
     pub(crate) fn validate_active_object(
         &self,
         dir_fd: std::os::unix::io::RawFd,
         name: &str,
-        state: &str,
-        shard_str: &str,
-        queue_id: &[u8; 16],
+        ctx: &ActivePathContext,
     ) -> Result<FixedHeader, Error> {
         // Stat with NOFOLLOW
         let stat = fs::fstatat(dir_fd, name).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         // Regular file
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(Error::QueueCorrupt(format!(
-                "{state}/{shard_str}/{name}: not a regular file"
-            )));
+            return Err(Error::QueueCorrupt(format!("{name}: not a regular file")));
         }
 
         // Link count
         if stat.st_nlink != 1 {
             return Err(Error::QueueCorrupt(format!(
-                "{state}/{shard_str}/{name}: unexpected link count {}",
+                "{name}: unexpected link count {}",
                 stat.st_nlink
             )));
         }
@@ -3074,47 +3087,117 @@ impl Queue {
         let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
         if stat.st_size as u64 != expected_size {
             return Err(Error::QueueCorrupt(format!(
-                "{state}/{shard_str}/{name}: size mismatch expected {} got {}",
+                "{name}: size mismatch expected {} got {}",
                 expected_size, stat.st_size
             )));
         }
 
-        // Parse the filename for the appropriate state and verify identity
-        let (job_id, parsed_gen, parsed_attempt, max_att, parsed_tag) = match state {
-            "ready" => {
+        // Parse and verify filename with typed path context and tag authentication.
+        let (
+            job_id,
+            _parsed_gen,
+            _parsed_attempt,
+            max_att,
+            parsed_tag,
+            expected_tag,
+            path_shard_str,
+        ) = match ctx {
+            ActivePathContext::Ready { shard } => {
                 let p = spoolq_names::parse_ready(name)
                     .map_err(|_| Error::QueueCorrupt("invalid ready filename".into()))?;
+                let base = format!(
+                    "{}.g{:016x}.a{:08x}.m{:08x}",
+                    spoolq_names::hex_encode(&p.common.job_id),
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                );
+                let ctx_str = ready_context(shard, &base);
+                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
                 (
                     p.common.job_id,
                     p.common.generation,
                     p.common.attempt,
                     p.common.maximum_attempts,
                     p.tag,
+                    expected,
+                    shard.clone(),
                 )
             }
-            "leased" => {
+            ActivePathContext::Leased {
+                boot_id,
+                bucket,
+                shard,
+            } => {
                 let p = spoolq_names::parse_leased(name)
                     .map_err(|_| Error::QueueCorrupt("invalid leased filename".into()))?;
+                let base = format!(
+                    "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
+                    spoolq_names::hex_encode(&p.common.job_id),
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                    p.boottime_deadline_ns,
+                    p.wall_deadline_ns,
+                    spoolq_names::hex_encode(&p.token),
+                );
+                let ctx_str = spoolq_names::leased_context(boot_id, bucket, shard, &base);
+                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                let expected_bucket = spoolq_math::lease_bucket(
+                    p.boottime_deadline_ns,
+                    self.format.lease_bucket_width_ns,
+                )
+                .unwrap_or(0);
+                let expected_bucket_str = spoolq_names::bucket_hex(expected_bucket);
+                if expected_bucket_str != *bucket {
+                    return Err(Error::QueueCorrupt(format!(
+                        "leased bucket mismatch: path {bucket} != expected {expected_bucket_str}"
+                    )));
+                }
                 (
                     p.common.job_id,
                     p.common.generation,
                     p.common.attempt,
                     p.common.maximum_attempts,
                     p.tag,
+                    expected,
+                    shard.clone(),
                 )
             }
-            "delayed" => {
+            ActivePathContext::Delayed { bucket, shard } => {
                 let p = spoolq_names::parse_delayed(name)
                     .map_err(|_| Error::QueueCorrupt("invalid delayed filename".into()))?;
+                let base = format!(
+                    "{}.g{:016x}.a{:08x}.m{:08x}.d{:016x}",
+                    spoolq_names::hex_encode(&p.common.job_id),
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                    p.not_before_ns,
+                );
+                let ctx_str = spoolq_names::delayed_context(bucket, shard, &base);
+                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                let expected_bucket = spoolq_math::ceiling_bucket(
+                    p.not_before_ns,
+                    self.format.delayed_bucket_width_ns,
+                )
+                .unwrap_or(0);
+                let expected_bucket_str = spoolq_names::bucket_hex(expected_bucket);
+                if expected_bucket_str != *bucket {
+                    return Err(Error::QueueCorrupt(format!(
+                        "delayed bucket mismatch: path {bucket} != expected {expected_bucket_str}"
+                    )));
+                }
                 (
                     p.common.job_id,
                     p.common.generation,
                     p.common.attempt,
                     p.common.maximum_attempts,
                     p.tag,
+                    expected,
+                    shard.clone(),
                 )
             }
-            _ => return Err(Error::InvalidInput(format!("unsupported state: {state}"))),
         };
 
         // Verify header matches filename
@@ -3129,40 +3212,14 @@ impl Queue {
             ));
         }
 
-        // R4-B01: Verify name tag by reconstructing the canonical context
-        let base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}",
-            spoolq_names::hex_encode(&job_id),
-            parsed_gen,
-            parsed_attempt,
-            max_att,
-        );
-        match state {
-            "ready" => {
-                let ctx = ready_context(shard_str, &base);
-                let expected_tag = compute_name_tag(queue_id, &ctx);
-                if expected_tag != parsed_tag {
-                    return Err(Error::QueueCorrupt("name tag mismatch".into()));
-                }
-            }
-            "leased" => {
-                // Tag context requires boot/bucket which the caller must provide.
-                // For recovery validation we skip tag verification on leased objects
-                // since the boot/bucket context comes from directory placement.
-                // R4-B02: The caller (recovery) validates placement by checking
-                // the directory path matches expected boot/bucket before calling.
-            }
-            "delayed" => {
-                // Tag context requires bucket. Recovery validates the bucket
-                // directory placement before calling this validator.
-            }
-            _ => {}
+        if parsed_tag != expected_tag {
+            return Err(Error::QueueCorrupt("name tag mismatch".into()));
         }
 
         // Verify shard placement
-        let computed_shard = compute_shard(queue_id, &job_id, self.format.shard_count);
-        let path_shard = spoolq_names::shard_from_hex(shard_str)
-            .ok_or_else(|| Error::QueueCorrupt(format!("invalid shard hex: {shard_str}")))?;
+        let computed_shard = compute_shard(&self.format.queue_id, &job_id, self.format.shard_count);
+        let path_shard = spoolq_names::shard_from_hex(&path_shard_str)
+            .ok_or_else(|| Error::QueueCorrupt(format!("invalid shard hex: {path_shard_str}")))?;
         if path_shard != computed_shard {
             return Err(Error::QueueCorrupt(format!(
                 "shard mismatch: path {path_shard} != computed {computed_shard}"
@@ -5369,6 +5426,78 @@ mod tests {
         );
         let err = res.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn validate_active_object_rejects_delayed_bucket_mismatch() {
+        let (_tmp, mut queue) = create_test_queue();
+        // Enqueue a delayed job.
+        let wall_now = spoolq_fs_linux::clock_realtime_ns().unwrap();
+        let not_before = wall_now + 5_000_000_000;
+        match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"delayed".to_vec(),
+            initial_not_before: Some(not_before),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(_) => {}
+            other => panic!("enqueue delayed must succeed, got {other:?}"),
+        }
+        // Locate the delayed file.
+        let delayed_root = _tmp.path().join("delayed");
+        let mut delayed_file: Option<(String, String, String)> = None;
+        for bucket in std::fs::read_dir(&delayed_root).unwrap().flatten() {
+            for shard in std::fs::read_dir(bucket.path()).unwrap().flatten() {
+                for entry in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".sqj") {
+                        let bucket_name = bucket.file_name().to_string_lossy().to_string();
+                        let shard_name = shard.file_name().to_string_lossy().to_string();
+                        delayed_file = Some((bucket_name, shard_name, name));
+                        break;
+                    }
+                }
+            }
+        }
+        let (bucket_name, shard_name, file_name) = delayed_file.expect("delayed file must exist");
+        // Correct context must succeed.
+        let correct_ctx = crate::ActivePathContext::Delayed {
+            bucket: bucket_name.clone(),
+            shard: shard_name.clone(),
+        };
+        let dir_fd = crate::queue::open_relative(
+            queue.root_fd().as_raw_fd(),
+            &format!("delayed/{bucket_name}/{shard_name}"),
+        )
+        .unwrap();
+        let ok = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &correct_ctx);
+        assert!(
+            ok.is_ok(),
+            "correct delayed bucket must validate, got {ok:?}"
+        );
+        // Wrong bucket must be rejected. Flip last hex digit to guarantee mismatch while keeping hex valid.
+        let mut wrong_bucket = bucket_name.clone();
+        let last = wrong_bucket.pop().unwrap();
+        let flipped = if last == '0' { '1' } else { '0' };
+        wrong_bucket.push(flipped);
+        let wrong_ctx = crate::ActivePathContext::Delayed {
+            bucket: wrong_bucket.clone(),
+            shard: shard_name.clone(),
+        };
+        let wrong_fd = crate::queue::open_relative(
+            queue.root_fd().as_raw_fd(),
+            &format!("delayed/{bucket_name}/{shard_name}"),
+        )
+        .unwrap();
+        // validate_active_object checks the filename bucket against the directory bucket.
+        // With a mismatched bucket in the context, it must return QueueCorrupt.
+        // Under the mutant that changes != to ==, this would incorrectly return Ok.
+        let wrong = queue.validate_active_object(wrong_fd.as_raw_fd(), &file_name, &wrong_ctx);
+        assert!(
+            matches!(wrong, Err(Error::QueueCorrupt(_))),
+            "wrong delayed bucket must be rejected, got {wrong:?}"
+        );
     }
 
     #[test]
