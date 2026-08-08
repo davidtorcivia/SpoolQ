@@ -515,7 +515,7 @@ impl Queue {
             }
             return;
         }
-        if !spoolq_format::verify_envelope_digest(&header, &ext_buf) {
+        if !crate::queue::verified::is_envelope_digest_valid(&header, &ext_buf) {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
                 finding_type: "envelope_digest_mismatch".into(),
