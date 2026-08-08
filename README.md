@@ -14,23 +14,22 @@ Properties: at-least-once execution, crash-safe publication and recovery, no dae
 duplicate execution, silent attempt consumption, or an unrecoverable queue
 would be materially harmful.
 
-Core protocol implemented with eleven passes of static-code audit remediations.
-Format encoding, filename parsing, deterministic CBOR, shard math, and retry
-jitter are complete with canonical parser validation. The lifecycle (init,
-open, enqueue, lease, ack, retry, bury, renew, recover) includes full source
-identity validation (device, inode, generation, token, header, envelope
-digest, name tag, shard placement), payload re-verification at ack time,
-wall watermark advancement, bounded duplicate-ack probing, error
-classification, and post-linearization outcome handling. Deep fsck verifies
-headers, envelope digests, name tags, and payload digests. Recovery uses
-per-phase bucket cursors for resumability. Streaming payload read APIs avoid
-full materialization. Thread-local syscall fault injection covers
-post-linearization OutcomeUnknown paths. The in-memory simulator models
-directory-entry durability. Quarantine admin list/inspect/export/remove are
-implemented against the on-disk layout.
+Core protocol is implemented. Format, deterministic CBOR, filename parsing,
+shard math, and retry jitter have canonical validation. The lifecycle (init,
+open, enqueue, lease, ack, retry, bury, renew, recover, inspect) enforces
+source identity (device, inode, generation, token, header, digest, name tag,
+shard), re-verifies payload at ack, advances the wall watermark, and
+classifies errors with bounded duplicate-ack probing. Recovery is resumable
+per phase, payload reads stream without full materialization, and deep fsck
+checks headers, digests, name tags, and payloads. Thread-local fault
+injection covers post-linearization `OutcomeUnknown` paths and the in-memory
+simulator covers directory-entry durability.
 
-Formal verification (TLA+/TLC model checking) and real filesystem power-loss
-testing remain future work.
+Checked with TLA+/TLC (`221185` generated, `18432` distinct, depth `19`, no
+error), a power-loss harness that crashes each transition in four windows
+(`BeforeRename`, `AfterRenameBeforeDestSync`, `AfterDestSyncBeforeSrcSync`,
+`AfterBothSync`) and asserts five recovery observations, plus mutation,
+fuzz, and concurrency tests in CI.
 
 ## Building
 
