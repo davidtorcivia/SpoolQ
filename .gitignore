@@ -17,6 +17,9 @@ SpoolQ_1_Agent_Ready_Final.md
 .DS_Store
 Thumbs.db
 
+# Plans
+.agents/
+
 # Internal scripts
 merge_pr.sh
 mutants.out/

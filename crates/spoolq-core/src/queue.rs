@@ -1654,7 +1654,7 @@ impl Queue {
                                     let _ = self.quarantine_corrupt_lease(
                                         leased_dir_fd.as_raw_fd(),
                                         &leased_name,
-                                        &format!("{leased_dir}/{leased_name}"),
+                                        leased_file.as_raw_fd(),
                                     );
                                     return LeaseOutcome::NotCommitted(Error::PayloadCorrupt);
                                 }
@@ -2691,17 +2691,25 @@ impl Queue {
         &self,
         leased_dir_fd: std::os::unix::io::RawFd,
         leased_name: &str,
-        full_path: &str,
+        held_fd: std::os::unix::io::RawFd,
     ) -> Result<(), std::io::Error> {
+        // Verify held fd still names same inode before moving by pathname.
+        let held_stat = fs::fstat(held_fd)?;
+        let name_stat = fs::fstatat(leased_dir_fd, leased_name)?;
+        if held_stat.st_dev != name_stat.st_dev || held_stat.st_ino != name_stat.st_ino {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "quarantine target changed under held fd",
+            ));
+        }
         let qid = fs::random_128bit().map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?;
         let q_name =
             spoolq_names::quarantine_filename(&qid, QuarantineReason::PayloadCorrupt as u16);
-        let _ = self.ensure_dir("quarantine");
+        self.ensure_dir("quarantine")?;
         let q_dir_fd = open_relative(self.root_fd.as_raw_fd(), "quarantine")?;
         fs::renameat2_noreplace(leased_dir_fd, leased_name, q_dir_fd.as_raw_fd(), &q_name)?;
-        let _ = fs::fsync_dir_fd(q_dir_fd.as_raw_fd());
-        let _ = fs::fsync_dir_fd(leased_dir_fd);
-        let _ = full_path;
+        fs::fsync_dir_fd(q_dir_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(leased_dir_fd)?;
         Ok(())
     }
     /// R4-PERF: Read a chunk of a leased job's payload at the given offset.
@@ -2727,7 +2735,11 @@ impl Queue {
         // P0-01: Verify payload before delivering any bytes.
         if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
-                let _ = self.quarantine_corrupt_lease(src_dir_fd.as_raw_fd(), &src_name, &src_name);
+                let _ = self.quarantine_corrupt_lease(
+                    src_dir_fd.as_raw_fd(),
+                    &src_name,
+                    file_fd.as_raw_fd(),
+                );
             }
             return Err(e);
         }
@@ -2772,7 +2784,11 @@ impl Queue {
         // P0-01: Verify payload before streaming any bytes.
         if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
-                let _ = self.quarantine_corrupt_lease(src_dir_fd.as_raw_fd(), &src_name, &src_name);
+                let _ = self.quarantine_corrupt_lease(
+                    src_dir_fd.as_raw_fd(),
+                    &src_name,
+                    file_fd.as_raw_fd(),
+                );
             }
             return Err(e);
         }
