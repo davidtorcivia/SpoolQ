@@ -22,7 +22,7 @@ CI runs the same command in the `tla` job.
 
 ## Model scope
 
-Bounded configuration: 2 jobs, 2 workers, 2 crash events, MaxAttempts=2.
+Bounded configuration: 2 jobs, 2 workers, and MaxAttempts=2. The `Crash` action is not count-bounded.
 
 ## Invariants checked
 

@@ -1,12 +1,12 @@
 # SteadQ
 
-Crash-safe filesystem queue protocol. At-least-once execution with lease-based ownership transfer via atomic rename on local Linux filesystems.
+Experimental filesystem queue protocol with lease-based ownership transfer via atomic rename on local Linux filesystems.
 
 ## Overview
 
 SteadQ is a brokerless, language-neutral filesystem queue. Jobs are immutable files with state-bearing pathnames. Ownership transfers through atomic no-overwrite rename operations.
 
-Properties: at-least-once execution, crash-safe publication and recovery, no daemon or leader or mutable index, bounded lease expiry and retry, quarantine for corrupt objects.
+The intended contract includes at-least-once execution, crash-aware publication and recovery, no daemon or leader or mutable index, bounded lease expiry and retry, and quarantine for corrupt objects. These are design targets while the hardening program is in progress, not production certification claims.
 
 ## Status
 
@@ -25,11 +25,14 @@ checks headers, digests, name tags, and payloads. Thread-local fault
 injection covers post-linearization `OutcomeUnknown` paths and the in-memory
 simulator covers directory-entry durability.
 
-Checked with TLA+/TLC (`221185` generated, `18432` distinct, depth `19`, no
-error), a power-loss harness that crashes each transition in four windows
-(`BeforeRename`, `AfterRenameBeforeDestSync`, `AfterDestSyncBeforeSrcSync`,
-`AfterBothSync`) and asserts five recovery observations, plus mutation,
-fuzz, and concurrency tests in CI.
+A bounded abstract TLA+/TLC model has checked its configured invariants for
+two jobs, two workers, and `MaxAttempts=2`; crash actions are not count-bounded.
+The in-process resolver observation harness injects transition failures and
+manufactures five namespace observations; it is not evidence of real storage
+power-loss behavior. Parser fuzz smoke tests, diff-scoped mutation tests,
+concurrency tests, and a directory-durability simulator provide additional
+evidence with the limitations recorded in
+[`docs/formal-evidence-scope.md`](docs/formal-evidence-scope.md).
 
 ## Building
 

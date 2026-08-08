@@ -1,4 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
+// Source SHA-256: 18e8cb0389bd8eee97a94b5afbb9d7ad466426c20f1665deb6a277f291d0ecb1
 
 pub struct TransitionDef {
     pub operation: &'static str,
@@ -155,7 +156,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
 pub fn is_legal_transition(source: &str, destination: &str) -> bool {
     TRANSITIONS
         .iter()
-        .any(|t| t.source == source && t.destination == destination)
+        .any(|transition| transition.source == source && transition.destination == destination)
 }
 
 #[cfg(test)]
@@ -174,17 +175,23 @@ mod tests {
         assert!(is_legal_transition("leased", "ready"));
         assert!(is_legal_transition("leased", "delayed"));
         assert!(is_legal_transition("leased", "dead"));
+        assert!(is_legal_transition("leased", "ready"));
+        assert!(is_legal_transition("leased", "dead"));
         assert!(is_legal_transition("active", "quarantine"));
     }
 
     #[test]
     fn illegal_transitions() {
-        assert!(!is_legal_transition("receipt", "ready"));
-        assert!(!is_legal_transition("dead", "ready"));
-        assert!(!is_legal_transition("quarantine", "ready"));
-        assert!(!is_legal_transition("ready", "ready"));
-        assert!(!is_legal_transition("hidden", "leased"));
-        assert!(!is_legal_transition("ready", "receipt"));
+        for (source, destination) in [
+            ("receipt", "ready"),
+            ("dead", "ready"),
+            ("quarantine", "ready"),
+            ("ready", "ready"),
+            ("hidden", "leased"),
+            ("ready", "receipt"),
+        ] {
+            assert!(!is_legal_transition(source, destination));
+        }
     }
 
     #[test]
@@ -194,18 +201,21 @@ mod tests {
 
     #[test]
     fn all_transitions_use_no_overwrite() {
-        for t in TRANSITIONS {
+        for transition in TRANSITIONS {
             assert!(
-                t.no_overwrite,
+                transition.no_overwrite,
                 "transition {} must use no-overwrite",
-                t.operation
+                transition.operation
             );
         }
     }
 
     #[test]
     fn claim_increments_attempt() {
-        let claim = TRANSITIONS.iter().find(|t| t.operation == "claim").unwrap();
+        let claim = TRANSITIONS
+            .iter()
+            .find(|transition| transition.operation == "claim")
+            .unwrap();
         assert_eq!(claim.attempt_change, AttemptChange::Increment);
         assert_eq!(claim.generation_change, GenerationChange::Increment);
         assert_eq!(claim.token_change, TokenChange::New);
@@ -215,14 +225,17 @@ mod tests {
     fn ack_does_not_change_attempt() {
         let ack = TRANSITIONS
             .iter()
-            .find(|t| t.operation == "acknowledge")
+            .find(|transition| transition.operation == "acknowledge")
             .unwrap();
         assert_eq!(ack.attempt_change, AttemptChange::Unchanged);
     }
 
     #[test]
     fn renew_preserves_token() {
-        let renew = TRANSITIONS.iter().find(|t| t.operation == "renew").unwrap();
+        let renew = TRANSITIONS
+            .iter()
+            .find(|transition| transition.operation == "renew")
+            .unwrap();
         assert_eq!(renew.token_change, TokenChange::Same);
         assert_eq!(renew.attempt_change, AttemptChange::Unchanged);
     }
