@@ -64,6 +64,13 @@ impl MoveFailure {
 /// Durable move via RENAME_NOREPLACE with phase-aware error classification.
 /// The caller provides already-opened dir fds for src and dest to avoid TOCTOU.
 /// On success both dirs are fsynced before returning.
+pub fn is_already_exists_io_kind(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::AlreadyExists
+}
+pub fn is_not_found_io_kind(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::NotFound
+}
+
 pub fn move_verified_noreplace(
     src_dir_fd: std::os::unix::io::RawFd,
     src_name: &str,
@@ -73,10 +80,10 @@ pub fn move_verified_noreplace(
 ) -> Result<(), MoveFailure> {
     let renamed = match fs::renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name) {
         Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(e) if is_already_exists_io_kind(e.kind()) => {
             return Err(MoveFailure::AlreadyExists);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if is_not_found_io_kind(e.kind()) => {
             return Err(MoveFailure::SourceMissing);
         }
         Err(e) => {
@@ -214,6 +221,26 @@ mod tests {
             source: "fsync".into(),
         });
         assert!(matches!(e, Error::IoFailure(_)));
+    }
+
+    #[test]
+    fn is_already_exists_io_kind_table() {
+        assert!(is_already_exists_io_kind(std::io::ErrorKind::AlreadyExists));
+        assert!(!is_already_exists_io_kind(std::io::ErrorKind::NotFound));
+        assert!(!is_already_exists_io_kind(
+            std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!is_already_exists_io_kind(std::io::ErrorKind::Other));
+        assert!(!is_already_exists_io_kind(std::io::ErrorKind::Interrupted));
+    }
+
+    #[test]
+    fn is_not_found_io_kind_table() {
+        assert!(is_not_found_io_kind(std::io::ErrorKind::NotFound));
+        assert!(!is_not_found_io_kind(std::io::ErrorKind::AlreadyExists));
+        assert!(!is_not_found_io_kind(std::io::ErrorKind::PermissionDenied));
+        assert!(!is_not_found_io_kind(std::io::ErrorKind::Other));
+        assert!(!is_not_found_io_kind(std::io::ErrorKind::Interrupted));
     }
 
     #[test]
