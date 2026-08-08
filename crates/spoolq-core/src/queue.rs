@@ -124,6 +124,31 @@ enum ResolveObj {
     Error(Error),
 }
 
+/// Typed wall watermark read error. Distinguishes pre-watermark (NotFound) from
+/// corruption and I/O failures so callers can decide between raw-clock fallback
+/// and hard error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatermarkReadError {
+    NotFound,
+    Truncated(String),
+    Corrupt(String),
+    Io(String),
+}
+
+/// Pure helper for watermark open error classification. Returns true only for
+/// NotFound, false for all other kinds. Extracted so match guard mutants are
+/// killable by table tests.
+fn watermark_open_is_not_found(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Pure helper for watermark advance decision. Returns true when observed
+/// bucket is strictly greater than stored bucket. Extracted so <= vs > mutants
+/// are killable.
+fn watermark_should_advance(observed_bucket: u64, stored_bucket: u64) -> bool {
+    observed_bucket > stored_bucket
+}
+
 /// Active path context for tag authentication.
 #[derive(Clone, Debug)]
 pub enum ActivePathContext {
@@ -586,32 +611,44 @@ impl Queue {
         let clock = spoolq_fs_linux::clock_realtime_ns()
             .map_err(|e| Error::IoFailure(format!("CLOCK_REALTIME: {e}")))?;
         match self.read_wall_watermark() {
-            Some(wm) => spoolq_math::effective_wall_floor(
+            Ok(wm) => spoolq_math::effective_wall_floor(
                 clock,
                 wm.highest_observed_bucket,
                 self.format.delayed_bucket_width_ns,
             )
             .ok_or_else(|| Error::QueueCorrupt("watermark computation overflow".into())),
-            None => {
-                // R2-B05: Missing watermark is a degraded condition, not silent fallback.
-                // Return raw clock but callers should be aware.
-                Ok(clock)
+            Err(WatermarkReadError::NotFound) => Ok(clock),
+            Err(WatermarkReadError::Truncated(msg)) => {
+                Err(Error::QueueCorrupt(format!("watermark truncated: {msg}")))
             }
+            Err(WatermarkReadError::Corrupt(msg)) => {
+                Err(Error::QueueCorrupt(format!("watermark corrupt: {msg}")))
+            }
+            Err(WatermarkReadError::Io(msg)) => Err(Error::IoFailure(msg)),
         }
     }
 
     /// Read the wall watermark record from control/wall-watermark.
-    fn read_wall_watermark(&self) -> Option<spoolq_format::WatermarkRecord> {
-        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control").ok()?;
+    /// Returns Ok on success, Err(NotFound) when no watermark has been written yet,
+    /// Err(Corrupt/Truncated) on digest or size mismatch, Err(Io) on I/O failure.
+    fn read_wall_watermark(&self) -> Result<spoolq_format::WatermarkRecord, WatermarkReadError> {
+        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
+            .map_err(|e| WatermarkReadError::Io(e.to_string()))?;
         let data = match fs::openat(control_fd.as_raw_fd(), "wall-watermark", libc::O_RDONLY, 0) {
             Ok(fd) => fd,
-            Err(_) => return None,
+            Err(e) => {
+                if watermark_open_is_not_found(&e) {
+                    return Err(WatermarkReadError::NotFound);
+                }
+                return Err(WatermarkReadError::Io(e.to_string()));
+            }
         };
         let mut buf = [0u8; spoolq_format::WATERMARK_SIZE];
-        if fs::pread_exact(data.as_raw_fd(), &mut buf, 0).is_err() {
-            return None;
+        if let Err(e) = fs::pread_exact(data.as_raw_fd(), &mut buf, 0) {
+            return Err(WatermarkReadError::Truncated(e.to_string()));
         }
-        spoolq_format::WatermarkRecord::decode(&buf).ok()
+        spoolq_format::WatermarkRecord::decode(&buf)
+            .map_err(|e| WatermarkReadError::Corrupt(e.to_string()))
     }
 
     /// B-05: Advance the wall watermark to max(stored, observed).
@@ -641,15 +678,21 @@ impl Queue {
                 .unwrap_or(0);
 
         let (new_bucket, new_seq) = match current {
-            Some(wm) => {
-                // R2-B05: Only advance if the observed bucket is actually higher.
-                if observed_bucket <= wm.highest_observed_bucket {
-                    return Ok(()); // No advancement needed, no rewrite.
+            Ok(wm) => {
+                if !watermark_should_advance(observed_bucket, wm.highest_observed_bucket) {
+                    return Ok(());
                 }
                 let new_seq = wm.sequence.checked_add(1).ok_or(Error::StateExhausted)?;
                 (observed_bucket, new_seq)
             }
-            None => (observed_bucket, 1),
+            Err(WatermarkReadError::NotFound) => (observed_bucket, 1),
+            Err(WatermarkReadError::Truncated(msg)) => {
+                return Err(Error::QueueCorrupt(format!("watermark truncated: {msg}")))
+            }
+            Err(WatermarkReadError::Corrupt(msg)) => {
+                return Err(Error::QueueCorrupt(format!("watermark corrupt: {msg}")))
+            }
+            Err(WatermarkReadError::Io(msg)) => return Err(Error::IoFailure(msg)),
         };
 
         let new_wm = spoolq_format::WatermarkRecord {
@@ -4863,18 +4906,204 @@ mod tests {
     #[test]
     fn wall_watermark_advances() {
         let (_tmp, mut queue) = create_test_queue();
-        let wm_before = queue.read_wall_watermark();
+        let wm_before = queue.read_wall_watermark().ok();
         queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
             content_type: "x".to_string(),
             payload: b"data".to_vec(),
             ..Default::default()
         });
-        let wm_after = queue.read_wall_watermark();
+        let wm_after = queue.read_wall_watermark().ok();
         // After enqueue, the watermark bucket should not regress
         if let (Some(before), Some(after)) = (wm_before, wm_after) {
             assert!(after.highest_observed_bucket >= before.highest_observed_bucket);
         }
+    }
+
+    #[test]
+    fn watermark_typed_read_notfound_ok_and_corrupt_is_queue_corrupt() {
+        let (tmp, mut queue) = create_test_queue();
+        let before = queue.read_wall_watermark();
+        assert!(
+            matches!(before, Err(WatermarkReadError::NotFound) | Ok(_)),
+            "initial watermark should be NotFound or Ok, got {before:?}"
+        );
+        let floor_ok = queue.effective_wall_floor_ns_checked();
+        assert!(
+            floor_ok.is_ok(),
+            "NotFound should fallback to clock, got {floor_ok:?}"
+        );
+
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let wm = queue
+            .read_wall_watermark()
+            .expect("watermark should exist after enqueue");
+        let _ = wm.highest_observed_bucket;
+
+        let wm_path = tmp.path().join("control/wall-watermark");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wm_path)
+                .unwrap();
+            f.write_all(&[0xFF; 8]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let corrupt = queue.read_wall_watermark();
+        assert!(
+            matches!(
+                corrupt,
+                Err(WatermarkReadError::Corrupt(_)) | Err(WatermarkReadError::Truncated(_))
+            ),
+            "corrupt watermark should be Corrupt or Truncated, got {corrupt:?}"
+        );
+        let floor_err = queue.effective_wall_floor_ns_checked();
+        assert!(
+            matches!(floor_err, Err(Error::QueueCorrupt(_))),
+            "corrupt watermark floor should be QueueCorrupt, got {floor_err:?}"
+        );
+        let advance_err = queue.advance_wall_watermark(u64::MAX);
+        assert!(
+            matches!(advance_err, Err(Error::QueueCorrupt(_))),
+            "advance with corrupt watermark should be QueueCorrupt, got {advance_err:?}"
+        );
+    }
+
+    #[test]
+    fn watermark_typed_read_truncated_is_queue_corrupt() {
+        let (tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"hello".to_vec(),
+            ..Default::default()
+        });
+        let wm_path = tmp.path().join("control/wall-watermark");
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wm_path)
+                .unwrap();
+            f.set_len(4).unwrap();
+            f.sync_all().unwrap();
+        }
+        let truncated = queue.read_wall_watermark();
+        assert!(
+            matches!(truncated, Err(WatermarkReadError::Truncated(_))),
+            "truncated watermark should be Truncated, got {truncated:?}"
+        );
+        let floor = queue.effective_wall_floor_ns_checked();
+        assert!(
+            matches!(floor, Err(Error::QueueCorrupt(_))),
+            "truncated floor should be QueueCorrupt, got {floor:?}"
+        );
+    }
+
+    #[test]
+    fn watermark_open_is_not_found_table() {
+        let cases: &[(std::io::ErrorKind, bool)] = &[
+            (std::io::ErrorKind::NotFound, true),
+            (std::io::ErrorKind::PermissionDenied, false),
+            (std::io::ErrorKind::AlreadyExists, false),
+            (std::io::ErrorKind::InvalidInput, false),
+            (std::io::ErrorKind::UnexpectedEof, false),
+        ];
+        for (kind, expected) in cases {
+            let err = std::io::Error::new(*kind, "test");
+            assert_eq!(
+                watermark_open_is_not_found(&err),
+                *expected,
+                "kind {kind:?} should be {expected}"
+            );
+        }
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "nf");
+        let perm = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "perm");
+        assert_ne!(
+            watermark_open_is_not_found(&not_found),
+            watermark_open_is_not_found(&perm),
+            "NotFound must differ from other kinds"
+        );
+    }
+
+    #[test]
+    fn watermark_should_advance_table() {
+        assert!(
+            !watermark_should_advance(5, 5),
+            "equal buckets should not advance"
+        );
+        assert!(
+            !watermark_should_advance(4, 5),
+            "smaller observed should not advance"
+        );
+        assert!(
+            watermark_should_advance(6, 5),
+            "greater observed should advance"
+        );
+        assert!(watermark_should_advance(1, 0), "1 > 0 should advance");
+        assert!(!watermark_should_advance(0, 0), "0 == 0 should not advance");
+        assert!(
+            !watermark_should_advance(u64::MAX - 1, u64::MAX),
+            "max-1 vs max should not advance"
+        );
+        assert!(
+            watermark_should_advance(u64::MAX, u64::MAX - 1),
+            "max vs max-1 should advance"
+        );
+    }
+
+    #[test]
+    fn watermark_advance_does_not_rewrite_on_equal_bucket() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"a".to_vec(),
+            ..Default::default()
+        });
+        let wm_before = queue.read_wall_watermark().expect("watermark exists");
+        let bucket = wm_before.highest_observed_bucket;
+        let width = queue.format().delayed_bucket_width_ns;
+        let observed_ns = bucket * width;
+        let seq_before = wm_before.sequence;
+        let res = queue.advance_wall_watermark(observed_ns);
+        assert!(
+            res.is_ok(),
+            "equal bucket advance should be Ok, got {res:?}"
+        );
+        let wm_after = queue.read_wall_watermark().expect("watermark still exists");
+        assert_eq!(
+            wm_after.sequence, seq_before,
+            "equal bucket should not bump sequence"
+        );
+        assert_eq!(
+            wm_after.highest_observed_bucket, bucket,
+            "equal bucket should not change bucket"
+        );
+    }
+
+    #[test]
+    fn watermark_read_distinguishes_io_from_notfound() {
+        spoolq_fs_linux::fault::reset();
+        let (_tmp, queue) = create_test_queue();
+        spoolq_fs_linux::fault::inject("openat", 1);
+        let result = queue.read_wall_watermark();
+        assert!(
+            matches!(result, Err(WatermarkReadError::Io(_))),
+            "injected wall-watermark openat EIO should be Io not NotFound, got {result:?}"
+        );
+        spoolq_fs_linux::fault::inject("openat", 1);
+        let floor = queue.effective_wall_floor_ns_checked();
+        spoolq_fs_linux::fault::reset();
+        assert!(
+            matches!(floor, Err(Error::IoFailure(_))),
+            "Io watermark should make floor IoFailure, got {floor:?}"
+        );
     }
 
     // ===== B-04: Lease source validation rejects corrupted handle =====
