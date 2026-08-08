@@ -2182,6 +2182,17 @@ impl Queue {
         &self,
         lease: &LeaseInfo,
     ) -> Result<Option<(OwnedFd, String)>, Error> {
+        if lease.expected_dev == 0 {
+            return Err(Error::QueueCorrupt(
+                "expected_dev is zero (forgeable handle)".into(),
+            ));
+        }
+        if lease.expected_inode == 0 {
+            return Err(Error::QueueCorrupt(
+                "expected_inode is zero (forgeable handle)".into(),
+            ));
+        }
+
         let (loc, src_name) = self.layout().parse_leased_path(&lease.exact_source_path)?;
         let (boot_id, path_shard) = match &loc {
             layout::Location::Leased { boot_id, shard, .. } => (boot_id.clone(), *shard),
