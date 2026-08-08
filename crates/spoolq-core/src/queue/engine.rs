@@ -30,7 +30,7 @@ pub enum MovePhase {
     SourceFsync,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MoveFailure {
     /// The rename did not happen. The destination still needs provisioning
     /// or the source vanished before linearizing.
@@ -241,6 +241,37 @@ mod tests {
         assert!(!is_not_found_io_kind(std::io::ErrorKind::PermissionDenied));
         assert!(!is_not_found_io_kind(std::io::ErrorKind::Other));
         assert!(!is_not_found_io_kind(std::io::ErrorKind::Interrupted));
+    }
+
+    #[test]
+    fn move_verified_noreplace_bad_fd_is_not_committed() {
+        // EBADF should map to NotCommitted, not SourceMissing, to kill the
+        // match guard mutant that replaces is_not_found_io_kind with true.
+        let dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir_in(dir.path()).unwrap();
+        let dest_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open(dest_dir.path())
+            .unwrap();
+        let bad_fd: i32 = -1;
+        let r = move_verified_noreplace(
+            bad_fd,
+            "nope.raw",
+            dest_fd.as_raw_fd(),
+            "dest.raw",
+            MoveActor::Recovery,
+        );
+        assert!(matches!(
+            &r,
+            Err(MoveFailure::NotCommitted {
+                phase: MovePhase::Rename,
+                ..
+            })
+        ));
+        assert!(r.clone().unwrap_err().is_not_committed());
+        assert!(!matches!(&r, Ok(())));
+        // Ensure it is not misclassified as SourceMissing when guard is true
+        assert!(!matches!(&r, Err(MoveFailure::SourceMissing)));
     }
 
     #[test]
