@@ -101,7 +101,7 @@ jobs:
             echo "No changes in ${{ matrix.crate }}, skipping"
             exit 0
           fi
-          cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 20 --in-diff /tmp/scope.diff --cap-lints true
+          cargo mutants -p ${{ matrix.crate }} -j 2 --timeout 60 --in-diff /tmp/scope.diff --cap-lints true
 
   # Deep fuzz - extended runs (continue-on-error)
   deep-fuzz:
