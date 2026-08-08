@@ -201,6 +201,7 @@ pub fn format_digest(header: &[u8]) -> [u8; 32] {
 
 #[derive(Clone, Debug)]
 pub struct FixedHeader {
+    pub format_minor: u16,
     pub extension_header_length: u32,
     pub payload_length: u64,
     pub flags: u32,
@@ -250,7 +251,7 @@ impl FixedHeader {
         let mut buf = [0u8; FIXED_HEADER_SIZE];
         buf[0..8].copy_from_slice(JOB_MAGIC);
         buf[8..10].copy_from_slice(&FORMAT_MAJOR.to_be_bytes());
-        buf[10..12].copy_from_slice(&FORMAT_MINOR.to_be_bytes());
+        buf[10..12].copy_from_slice(&self.format_minor.to_be_bytes());
         buf[12..16].copy_from_slice(&self.extension_header_length.to_be_bytes());
         buf[16..24].copy_from_slice(&self.payload_length.to_be_bytes());
         buf[24..28].copy_from_slice(&self.flags.to_be_bytes());
@@ -315,6 +316,7 @@ impl FixedHeader {
         }
 
         Ok(FixedHeader {
+            format_minor: minor,
             extension_header_length,
             payload_length,
             flags,
@@ -623,7 +625,7 @@ mod tests {
     fn format_round_trip() {
         let rec = FormatRecord {
             queue_id: [0x42; 16],
-            created_at_unix_ns: 1_700_000_000_000_000_000,
+            created_at_unix_ns: 0,
             shard_count: 64,
             lease_bucket_width_ns: 10_000_000_000,
             delayed_bucket_width_ns: 10_000_000_000,
@@ -689,6 +691,7 @@ mod tests {
     #[test]
     fn header_round_trip() {
         let mut header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 5,
             flags: 0,
@@ -704,8 +707,37 @@ mod tests {
         let encoded = header.encode(extension).unwrap();
         let decoded = FixedHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.job_id, header.job_id);
+        assert_eq!(decoded.format_minor, FORMAT_MINOR);
         assert_eq!(decoded.payload_length, 5);
         assert!(verify_envelope_digest(&decoded, extension));
+    }
+
+    #[test]
+    fn legacy_minor_header_preserves_envelope_digest_version() {
+        let mut header = FixedHeader {
+            format_minor: 0,
+            extension_header_length: 0,
+            payload_length: 5,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id: [0xAB; 16],
+            maximum_attempts: 3,
+            created_at_unix_ns: 0,
+            payload_digest: payload_digest(b"hello"),
+            envelope_digest: [0; 32],
+        };
+        header.envelope_digest = envelope_digest(&header, &[]).unwrap();
+        assert_eq!(
+            header.envelope_digest,
+            hex_to_32("58490679fad0f92ecbea9ab1de222052f31e815331855c88bbfe5ac01503d88c")
+        );
+
+        let encoded = header.encode(&[]).unwrap();
+        let decoded = FixedHeader::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.format_minor, 0);
+        assert!(verify_envelope_digest(&decoded, &[]));
+        assert_eq!(decoded.envelope_digest, header.envelope_digest);
     }
 
     #[test]
@@ -796,6 +828,7 @@ mod tests {
     #[test]
     fn header_truncation_fails_at_every_offset() {
         let header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 5,
             flags: 0,
@@ -871,6 +904,7 @@ mod tests {
     #[test]
     fn envelope_reader_validates_complete_file() {
         let mut header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 5,
             flags: 0,
@@ -894,6 +928,7 @@ mod tests {
     #[test]
     fn envelope_reader_rejects_trailing_bytes() {
         let mut header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 5,
             flags: 0,
@@ -916,6 +951,7 @@ mod tests {
     #[test]
     fn envelope_reader_rejects_bad_payload_digest() {
         let mut header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 5,
             flags: 0,
@@ -938,6 +974,7 @@ mod tests {
     fn fixed_header_encode_validates_extension_length() {
         // C-52: encode must reject mismatched extension_header_length
         let header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: 10, // claims 10 but ext is empty
             payload_length: 0,
             flags: 0,
@@ -971,6 +1008,7 @@ mod tests {
     #[test]
     fn envelope_digest_known_value() {
         let header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 5,
             flags: 0,

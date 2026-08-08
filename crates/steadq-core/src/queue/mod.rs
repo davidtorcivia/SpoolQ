@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use steadq_format::cbor::ExtensionHeader;
 use steadq_format::{
     envelope_digest, payload_digest, FixedHeader, FormatRecord, WatermarkRecord,
-    DIGEST_ALGORITHM_SHA256, MAX_PAYLOAD_LENGTH,
+    DIGEST_ALGORITHM_SHA256, FORMAT_MINOR, MAX_PAYLOAD_LENGTH,
 };
 use steadq_fs_linux as fs;
 use steadq_math::{self, bucket_number, ceiling_bucket, eligibility_bucket_and_ns};
@@ -1135,6 +1135,7 @@ impl Queue {
 
         // Build fixed header
         let mut header = FixedHeader {
+            format_minor: FORMAT_MINOR,
             extension_header_length: ext_bytes.len() as u32,
             payload_length: job.payload.len() as u64,
             flags: 0,

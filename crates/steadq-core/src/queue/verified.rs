@@ -424,6 +424,7 @@ mod tests {
     #[test]
     fn is_payload_digest_match_table() {
         let mut h = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 0,
             flags: 0,
@@ -488,6 +489,7 @@ mod tests {
     #[test]
     fn is_envelope_digest_valid_table() {
         let header = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 0,
             flags: 0,
@@ -519,6 +521,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("size_test.raw");
         let header = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: 10,
             flags: 0,
@@ -629,6 +632,74 @@ mod tests {
             verify(&bucket, &shard, &filename, &wrong_length),
             Err(VerificationError::Corrupt(ref message))
                 if message == "receipt is shorter than its fixed record"
+        ));
+    }
+
+    #[test]
+    fn legacy_full_receipt_remains_strictly_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_id = [0x11; 16];
+        let common = CommonFields {
+            job_id: [0x22; 16],
+            generation: 2,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let token = [0x33; 16];
+        let shard_count = 64;
+        let shard = steadq_names::shard_hex(steadq_names::compute_shard(
+            &queue_id,
+            &common.job_id,
+            shard_count,
+        ));
+        let bucket_number = 7;
+        let bucket = steadq_names::bucket_hex(bucket_number);
+        let width = 3_600_000_000_000;
+        let filename = steadq_names::make_receipt_name(&queue_id, &bucket, &shard, &common, &token);
+        let payload = b"hello";
+        let mut header = FixedHeader {
+            format_minor: 0,
+            extension_header_length: 0,
+            payload_length: payload.len() as u64,
+            flags: 0,
+            digest_algorithm: steadq_format::DIGEST_ALGORITHM_SHA256,
+            job_id: common.job_id,
+            maximum_attempts: common.maximum_attempts,
+            created_at_unix_ns: 1_700_000_000_000_000_000,
+            payload_digest: steadq_format::payload_digest(payload),
+            envelope_digest: [0; 32],
+        };
+        header.envelope_digest = steadq_format::envelope_digest(&header, &[]).unwrap();
+        let expected = ExpectedReceipt {
+            common,
+            token,
+            envelope_digest: header.envelope_digest,
+            payload_length: payload.len() as u64,
+        };
+        let mut bytes = header.encode(&[]).unwrap().to_vec();
+        bytes.extend_from_slice(payload);
+        let path = dir.path().join("legacy-full.rct");
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+
+        let verified = verify_receipt_on_fd(
+            file.as_raw_fd(),
+            ReceiptContext {
+                queue_id: &queue_id,
+                shard_count,
+                terminal_bucket_width_ns: width,
+                max_payload_length: 1024,
+                bucket: &bucket,
+                shard: &shard,
+                filename: &filename,
+            },
+            Some(&expected),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            verified.kind,
+            VerifiedReceiptKind::Full(ref job) if job.header.format_minor == 0
         ));
     }
 
@@ -753,6 +824,7 @@ mod tests {
         assert!(!compact_evidence_matches(&changed_compact, &expected));
 
         let header = FixedHeader {
+            format_minor: steadq_format::FORMAT_MINOR,
             extension_header_length: 0,
             payload_length: expected.payload_length,
             flags: 0,
