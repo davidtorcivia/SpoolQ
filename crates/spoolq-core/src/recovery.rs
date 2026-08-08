@@ -516,15 +516,16 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some(ref cursor) = self.recovery_cursor.promote_delayed_bucket {
-                if bucket_name.as_str() < cursor.as_str() {
+            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.promote_delayed {
+                if bucket_name.as_str() < cursor_bucket.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
+                self.recovery_cursor.promote_delayed =
+                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -694,11 +695,12 @@ impl Queue {
             }
 
             // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.promote_delayed_bucket = Some(bucket_name.clone());
+            self.recovery_cursor.promote_delayed =
+                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
-        self.recovery_cursor.promote_delayed_bucket = None;
+        self.recovery_cursor.promote_delayed = None;
     }
 
     fn cleanup_temp_files(
@@ -817,15 +819,16 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some(ref cursor) = self.recovery_cursor.compact_receipts_bucket {
-                if bucket_name.as_str() < cursor.as_str() {
+            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.compact_receipts {
+                if bucket_name.as_str() < cursor_bucket.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
+                self.recovery_cursor.compact_receipts =
+                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -1053,11 +1056,12 @@ impl Queue {
             }
 
             // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.compact_receipts_bucket = Some(bucket_name.clone());
+            self.recovery_cursor.compact_receipts =
+                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
-        self.recovery_cursor.compact_receipts_bucket = None;
+        self.recovery_cursor.compact_receipts = None;
     }
 
     /// Delete expired receipts based on retention policy.
@@ -1084,15 +1088,16 @@ impl Queue {
 
         for bucket_name in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
-            if let Some(ref cursor) = self.recovery_cursor.delete_receipts_bucket {
-                if bucket_name.as_str() < cursor.as_str() {
+            if let Some((ref cursor_bucket, _, _)) = self.recovery_cursor.delete_receipts {
+                if bucket_name.as_str() < cursor_bucket.as_str() {
                     continue;
                 }
             }
 
             if Self::budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
-                self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
+                self.recovery_cursor.delete_receipts =
+                    Some((bucket_name.clone(), String::new(), String::new()));
                 return;
             }
 
@@ -1161,7 +1166,8 @@ impl Queue {
 
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
-                        self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
+                        self.recovery_cursor.delete_receipts =
+                            Some((bucket_name.clone(), shard_name.to_string(), entry.clone()));
                         return;
                     }
                     stats.operations_attempted += 1;
@@ -1238,11 +1244,12 @@ impl Queue {
             }
 
             // R4-RES: Bucket fully processed, advance cursor.
-            self.recovery_cursor.delete_receipts_bucket = Some(bucket_name.clone());
+            self.recovery_cursor.delete_receipts =
+                Some((bucket_name.clone(), String::new(), String::new()));
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
-        self.recovery_cursor.delete_receipts_bucket = None;
+        self.recovery_cursor.delete_receipts = None;
     }
 }
 

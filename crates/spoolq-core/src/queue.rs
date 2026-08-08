@@ -92,12 +92,12 @@ impl Default for OpenOptions {
 /// Internal queue state.
 #[allow(dead_code)]
 /// R4-RES: In-memory cursor for resumable recovery. Tracks the last
-/// fully processed bucket per phase so the next pass resumes from there.
+/// Entry level cursor so persistent entries do not starve later work.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RecoveryCursor {
-    pub promote_delayed_bucket: Option<String>,
-    pub compact_receipts_bucket: Option<String>,
-    pub delete_receipts_bucket: Option<String>,
+    pub promote_delayed: Option<(String, String, String)>,
+    pub compact_receipts: Option<(String, String, String)>,
+    pub delete_receipts: Option<(String, String, String)>,
 }
 
 pub struct Queue {
@@ -3093,105 +3093,112 @@ impl Queue {
         }
 
         // Parse and verify filename with typed path context and tag authentication.
-        let (job_id, _parsed_gen, _parsed_attempt, max_att, parsed_tag, expected_tag, path_shard_str) =
-            match ctx {
-                ActivePathContext::Ready { shard } => {
-                    let p = spoolq_names::parse_ready(name)
-                        .map_err(|_| Error::QueueCorrupt("invalid ready filename".into()))?;
-                    let base = format!(
-                        "{}.g{:016x}.a{:08x}.m{:08x}",
-                        spoolq_names::hex_encode(&p.common.job_id),
-                        p.common.generation,
-                        p.common.attempt,
-                        p.common.maximum_attempts,
-                    );
-                    let ctx_str = ready_context(shard, &base);
-                    let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
-                    (
-                        p.common.job_id,
-                        p.common.generation,
-                        p.common.attempt,
-                        p.common.maximum_attempts,
-                        p.tag,
-                        expected,
-                        shard.clone(),
-                    )
+        let (
+            job_id,
+            _parsed_gen,
+            _parsed_attempt,
+            max_att,
+            parsed_tag,
+            expected_tag,
+            path_shard_str,
+        ) = match ctx {
+            ActivePathContext::Ready { shard } => {
+                let p = spoolq_names::parse_ready(name)
+                    .map_err(|_| Error::QueueCorrupt("invalid ready filename".into()))?;
+                let base = format!(
+                    "{}.g{:016x}.a{:08x}.m{:08x}",
+                    spoolq_names::hex_encode(&p.common.job_id),
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                );
+                let ctx_str = ready_context(shard, &base);
+                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                (
+                    p.common.job_id,
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                    p.tag,
+                    expected,
+                    shard.clone(),
+                )
+            }
+            ActivePathContext::Leased {
+                boot_id,
+                bucket,
+                shard,
+            } => {
+                let p = spoolq_names::parse_leased(name)
+                    .map_err(|_| Error::QueueCorrupt("invalid leased filename".into()))?;
+                let base = format!(
+                    "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
+                    spoolq_names::hex_encode(&p.common.job_id),
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                    p.boottime_deadline_ns,
+                    p.wall_deadline_ns,
+                    spoolq_names::hex_encode(&p.token),
+                );
+                let ctx_str = spoolq_names::leased_context(boot_id, bucket, shard, &base);
+                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                let expected_bucket = spoolq_math::lease_bucket(
+                    p.boottime_deadline_ns,
+                    self.format.lease_bucket_width_ns,
+                )
+                .unwrap_or(0);
+                let expected_bucket_str = spoolq_names::bucket_hex(expected_bucket);
+                if expected_bucket_str != *bucket {
+                    return Err(Error::QueueCorrupt(format!(
+                        "leased bucket mismatch: path {bucket} != expected {expected_bucket_str}"
+                    )));
                 }
-                ActivePathContext::Leased {
-                    boot_id,
-                    bucket,
-                    shard,
-                } => {
-                    let p = spoolq_names::parse_leased(name)
-                        .map_err(|_| Error::QueueCorrupt("invalid leased filename".into()))?;
-                    let base = format!(
-                        "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
-                        spoolq_names::hex_encode(&p.common.job_id),
-                        p.common.generation,
-                        p.common.attempt,
-                        p.common.maximum_attempts,
-                        p.boottime_deadline_ns,
-                        p.wall_deadline_ns,
-                        spoolq_names::hex_encode(&p.token),
-                    );
-                    let ctx_str = spoolq_names::leased_context(boot_id, bucket, shard, &base);
-                    let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
-                    let expected_bucket = spoolq_math::lease_bucket(
-                        p.boottime_deadline_ns,
-                        self.format.lease_bucket_width_ns,
-                    )
-                    .unwrap_or(0);
-                    let expected_bucket_str = spoolq_names::bucket_hex(expected_bucket);
-                    if expected_bucket_str != *bucket {
-                        return Err(Error::QueueCorrupt(format!(
-                            "leased bucket mismatch: path {bucket} != expected {expected_bucket_str}"
-                        )));
-                    }
-                    (
-                        p.common.job_id,
-                        p.common.generation,
-                        p.common.attempt,
-                        p.common.maximum_attempts,
-                        p.tag,
-                        expected,
-                        shard.clone(),
-                    )
+                (
+                    p.common.job_id,
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                    p.tag,
+                    expected,
+                    shard.clone(),
+                )
+            }
+            ActivePathContext::Delayed { bucket, shard } => {
+                let p = spoolq_names::parse_delayed(name)
+                    .map_err(|_| Error::QueueCorrupt("invalid delayed filename".into()))?;
+                let base = format!(
+                    "{}.g{:016x}.a{:08x}.m{:08x}.d{:016x}",
+                    spoolq_names::hex_encode(&p.common.job_id),
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                    p.not_before_ns,
+                );
+                let ctx_str = spoolq_names::delayed_context(bucket, shard, &base);
+                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                let expected_bucket = spoolq_math::ceiling_bucket(
+                    p.not_before_ns,
+                    self.format.delayed_bucket_width_ns,
+                )
+                .unwrap_or(0);
+                let expected_bucket_str = spoolq_names::bucket_hex(expected_bucket);
+                if expected_bucket_str != *bucket {
+                    return Err(Error::QueueCorrupt(format!(
+                        "delayed bucket mismatch: path {bucket} != expected {expected_bucket_str}"
+                    )));
                 }
-                ActivePathContext::Delayed { bucket, shard } => {
-                    let p = spoolq_names::parse_delayed(name)
-                        .map_err(|_| Error::QueueCorrupt("invalid delayed filename".into()))?;
-                    let base = format!(
-                        "{}.g{:016x}.a{:08x}.m{:08x}.d{:016x}",
-                        spoolq_names::hex_encode(&p.common.job_id),
-                        p.common.generation,
-                        p.common.attempt,
-                        p.common.maximum_attempts,
-                        p.not_before_ns,
-                    );
-                    let ctx_str = spoolq_names::delayed_context(bucket, shard, &base);
-                    let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
-                    let expected_bucket = spoolq_math::ceiling_bucket(
-                        p.not_before_ns,
-                        self.format.delayed_bucket_width_ns,
-                    )
-                    .unwrap_or(0);
-                    let expected_bucket_str = spoolq_names::bucket_hex(expected_bucket);
-                    if expected_bucket_str != *bucket {
-                        return Err(Error::QueueCorrupt(format!(
-                            "delayed bucket mismatch: path {bucket} != expected {expected_bucket_str}"
-                        )));
-                    }
-                    (
-                        p.common.job_id,
-                        p.common.generation,
-                        p.common.attempt,
-                        p.common.maximum_attempts,
-                        p.tag,
-                        expected,
-                        shard.clone(),
-                    )
-                }
-            };
+                (
+                    p.common.job_id,
+                    p.common.generation,
+                    p.common.attempt,
+                    p.common.maximum_attempts,
+                    p.tag,
+                    expected,
+                    shard.clone(),
+                )
+            }
+        };
 
         // Verify header matches filename
         if header.job_id != job_id {
