@@ -4,9 +4,9 @@ Status: prototype policy, not a stable compatibility promise.
 
 ## Supported build target
 
-The strict prototype build target is `x86_64-unknown-linux-gnu` on Rust 1.88.0. Other architectures and operating systems are unsupported and must not inherit strict durability or containment claims. A future target requires checked offset/size conversions and its own filesystem certification profile.
+The strict prototype build target is `x86_64-unknown-linux-gnu` on Rust 1.97.1. `steadq-core` rejects every other target at compile time. A future target requires checked offset/size conversions and its own filesystem certification profile.
 
-The current MSRV is Rust 1.88. Raising it before a stable release is allowed when documented in the changelog.
+The development toolchain and minimum supported Rust version are both Rust 1.97.1. The project tracks current stable Rust before its first stable release because the Rust project supplies bug and security fixes only for the latest release. Each toolchain update must pass the full local gate and be recorded in the changelog.
 
 ## Independent version domains
 

@@ -1,3 +1,11 @@
+#[cfg(not(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+)))]
+compile_error!("steadq-core currently supports only x86_64-unknown-linux-gnu");
+
 pub mod errors;
 pub mod quarantine;
 pub mod queue;

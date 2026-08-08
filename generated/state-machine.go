@@ -1,4 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
+// Source SHA-256: 18e8cb0389bd8eee97a94b5afbb9d7ad466426c20f1665deb6a277f291d0ecb1
 
 package steadq
 

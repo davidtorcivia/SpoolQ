@@ -3,7 +3,8 @@
 (* SteadQ/1 formal model. Models the queue state machine, crash        *)
 (* semantics, durability barriers, and recovery.                       *)
 (*                                                                      *)
-(* Bounded configuration: 2 jobs, 2 workers, 2 reapers, 2 crashes.      *)
+(* Bounded configuration: 2 jobs, 2 workers, and MaxAttempts = 2.      *)
+(* Crash remains available whenever its action predicate is enabled.    *)
 (************************************************************************)
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC

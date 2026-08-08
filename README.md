@@ -26,12 +26,13 @@ injection covers post-linearization `OutcomeUnknown` paths and the in-memory
 simulator covers directory-entry durability.
 
 A bounded abstract TLA+/TLC model has checked its configured invariants for
-two jobs, two workers, two crash events, and `MaxAttempts=2`. The in-process
-`resolver_observation_harness` injects transition failures and manufactures
-five namespace observations; it is not evidence of real storage power-loss
-behavior. Parser fuzz smoke tests, diff-scoped mutation tests, concurrency
-tests, and a directory-durability simulator provide additional evidence with
-the limitations recorded in [`docs/formal-evidence-scope.md`](docs/formal-evidence-scope.md).
+two jobs, two workers, and `MaxAttempts=2`; crash actions are not count-bounded.
+The in-process resolver observation harness injects transition failures and
+manufactures five namespace observations; it is not evidence of real storage
+power-loss behavior. Parser fuzz smoke tests, diff-scoped mutation tests,
+concurrency tests, and a directory-durability simulator provide additional
+evidence with the limitations recorded in
+[`docs/formal-evidence-scope.md`](docs/formal-evidence-scope.md).
 
 ## Building
 

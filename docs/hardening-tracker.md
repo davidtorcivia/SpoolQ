@@ -38,7 +38,7 @@ This local tracker uses the audit finding IDs as stable issue identifiers. Exter
 | SQ-P1-015 Incomplete C ABI | A-018 | Open |
 | SQ-P1-016 CLI bypasses core safety | A-017 | Open |
 | SQ-P1-017 Streaming inefficiency/ambiguity | A-011/A-016 | Open |
-| SQ-P1-018 Missing target/toolchain/version policy | A-000 | Complete for prototype target; expansion remains profile-gated |
+| SQ-P1-018 Missing target/toolchain/version policy | A-000 | Complete for x86_64-unknown-linux-gnu; other targets fail compilation and remain profile-gated |
 
 ## Freeze blockers
 
