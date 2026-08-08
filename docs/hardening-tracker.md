@@ -15,7 +15,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P0-005](https://github.com/davidtorcivia/SteadQ/issues/56) | Clock/watermark syscall fault matrix and rollback property | A-004 | Open | @davidtorcivia |
 | [SQ-P0-006](https://github.com/davidtorcivia/SteadQ/issues/57) | Corrupt payload through every ack/compaction/receipt consumer | A-005 | Open | @davidtorcivia |
 | [SQ-P0-007](https://github.com/davidtorcivia/SteadQ/issues/58) | Generated fault at every mutation phase; no flattened post-linearization result | A-008 | Open | @davidtorcivia |
-| [SQ-P0-008](https://github.com/davidtorcivia/SteadQ/issues/59) | Deliberate barrier/token/generation model mutations and checked invariant list | A-013 | Open | @davidtorcivia |
+| [SQ-P0-008](https://github.com/davidtorcivia/SteadQ/issues/59) | Deliberate barrier/token/generation model mutations and checked invariant list | A-007, A-013 | Open | @davidtorcivia |
 
 ## Priority-one findings
 
@@ -38,7 +38,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P1-015 Incomplete C ABI](https://github.com/davidtorcivia/SteadQ/issues/75) | A-018 | Open |
 | [SQ-P1-016 CLI bypasses core safety](https://github.com/davidtorcivia/SteadQ/issues/76) | A-017 | Open |
 | [SQ-P1-017 Streaming inefficiency/ambiguity](https://github.com/davidtorcivia/SteadQ/issues/77) | A-011/A-016 | Open |
-| [SQ-P1-018 Missing target/toolchain/version policy](https://github.com/davidtorcivia/SteadQ/issues/78) | A-000 | Complete in #51 for x86_64-unknown-linux-gnu; other targets fail compilation and remain profile-gated |
+| [SQ-P1-018 Missing target/toolchain/version policy](https://github.com/davidtorcivia/SteadQ/issues/78) | A-000 | Complete in #51: release/certification target is x86_64-unknown-linux-gnu; the compile guard admits its sanitizer-target cfg family; other target configurations fail compilation |
 
 ## Freeze blockers
 

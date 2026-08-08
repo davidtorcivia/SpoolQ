@@ -2,9 +2,9 @@
 
 Status: prototype policy, not a stable compatibility promise.
 
-## Supported build target
+## Supported compilation and release targets
 
-The strict prototype build target is `x86_64-unknown-linux-gnu` on Rust 1.97.1. `steadq-core` rejects every other target at compile time. A future target requires checked offset/size conversions and its own filesystem certification profile.
+The prototype release and certification target is `x86_64-unknown-linux-gnu` on Rust 1.97.1. `steadq-core` compiles only when Rust reports 64-bit `x86_64` Linux with the GNU environment. This compilation class intentionally admits Rust sanitizer targets with the same target configuration so verification can run under ASan, MSan, and TSan. Sanitizer targets are verification tools, not certified deployment targets. A future deployment target requires checked offset/size conversions and its own filesystem certification profile.
 
 The development toolchain and minimum supported Rust version are both Rust 1.97.1. The project tracks current stable Rust before its first stable release because the Rust project supplies bug and security fixes only for the latest release. Each toolchain update must pass the full local gate and be recorded in the changelog.
 
