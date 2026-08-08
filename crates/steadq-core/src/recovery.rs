@@ -8,7 +8,7 @@ use steadq_math;
 use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
-use crate::queue::{open_relative, Queue};
+use crate::queue::{open_relative, Queue, WallFloor};
 
 /// Recovery work budget.
 #[derive(Clone, Debug)]
@@ -67,16 +67,17 @@ impl Queue {
         };
         // P1-12: Use checked wall floor. If unavailable, record error and
         // skip wall-sensitive phases (delayed promotion, receipt retention).
-        let wall_now = self.effective_wall_floor_ns_checked();
-        let wall_ok = wall_now.is_ok();
-        let wall_now = wall_now.unwrap_or(0);
-        if !wall_ok {
+        let wall_floor = self.authenticated_wall_floor();
+        if let Err(error) = &wall_floor {
             stats.errors.push(RecoveryError {
                 operation: "wall_floor".into(),
                 relative_path: "/".into(),
-                error: "wall floor unavailable, skipping wall-sensitive recovery phases".into(),
+                error: format!(
+                    "wall floor unavailable, skipping wall-sensitive recovery actions: {error}"
+                ),
             });
         }
+        let wall_floor = wall_floor.ok();
         // C-31: Use CLOCK_MONOTONIC for budget enforcement
         let start_mono = match fs::clock_monotonic_ns() {
             Ok(t) => t,
@@ -94,11 +95,13 @@ impl Queue {
             start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
 
         // 1. Reap expired leases
-        self.reap_expired_leases(boottime_now, wall_now, budget, &mut stats, deadline_mono);
+        self.reap_expired_leases(boottime_now, wall_floor, budget, &mut stats, deadline_mono);
 
         // 2. Promote eligible delayed jobs (requires trusted wall floor)
-        if !stats.budget_exhausted && wall_ok {
-            self.promote_delayed(wall_now, budget, &mut stats, deadline_mono);
+        if !stats.budget_exhausted {
+            if let Some(wall_floor) = wall_floor {
+                self.promote_delayed(wall_floor, budget, &mut stats, deadline_mono);
+            }
         }
 
         // 3. Clean up old temp files
@@ -108,13 +111,16 @@ impl Queue {
         if !stats.budget_exhausted {
             self.compact_receipts(budget, &mut stats, deadline_mono);
         }
-        if !stats.budget_exhausted && wall_ok {
-            self.delete_expired_receipts(
-                self.options.receipt_retention_ns,
-                budget,
-                &mut stats,
-                deadline_mono,
-            );
+        if !stats.budget_exhausted {
+            if let Some(wall_floor) = wall_floor {
+                self.delete_expired_receipts(
+                    wall_floor,
+                    self.options.receipt_retention_ns,
+                    budget,
+                    &mut stats,
+                    deadline_mono,
+                );
+            }
         }
 
         stats
@@ -168,7 +174,7 @@ impl Queue {
     fn reap_expired_leases(
         &mut self,
         boottime_now: u64,
-        wall_now: u64,
+        wall_floor: Option<WallFloor>,
         budget: &WorkBudget,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
@@ -225,11 +231,18 @@ impl Queue {
                 // For current boot, check if bucket is expired
                 if is_current_boot {
                     if let Ok(bucket_num) = u64::from_str_radix(bucket_name, 16) {
-                        let current_bucket = steadq_math::bucket_number(
+                        let Some(current_bucket) = steadq_math::bucket_number(
                             boottime_now,
                             self.format.lease_bucket_width_ns,
-                        )
-                        .unwrap_or(0);
+                        ) else {
+                            Self::record_error(
+                                stats,
+                                "reap_bucket_check",
+                                &format!("leased/{boot_dir_name}/{bucket_name}"),
+                                "invalid lease bucket width",
+                            );
+                            return;
+                        };
                         if bucket_num > current_bucket {
                             continue; // Not yet eligible
                         }
@@ -334,12 +347,34 @@ impl Queue {
                         }
 
                         // R4-B02: Verify bucket placement matches deadline-derived bucket
-                        let expected_lease_bucket = steadq_math::lease_bucket(
+                        let Some(expected_lease_bucket) = steadq_math::lease_bucket(
                             parsed.boottime_deadline_ns,
                             self.format.lease_bucket_width_ns,
-                        )
-                        .unwrap_or(0);
-                        let actual_bucket = u64::from_str_radix(bucket_name, 16).unwrap_or(0);
+                        ) else {
+                            Self::record_error(
+                                stats,
+                                "reap_bucket_check",
+                                &format!(
+                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                ),
+                                "invalid lease bucket width",
+                            );
+                            return;
+                        };
+                        let actual_bucket = match u64::from_str_radix(bucket_name, 16) {
+                            Ok(bucket) => bucket,
+                            Err(_) => {
+                                Self::record_error(
+                                    stats,
+                                    "reap_bucket_check",
+                                    &format!(
+                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                    ),
+                                    "invalid lease bucket name",
+                                );
+                                continue;
+                            }
+                        };
                         if actual_bucket != expected_lease_bucket {
                             Self::record_error(
                                 stats,
@@ -356,6 +391,17 @@ impl Queue {
 
                         // Determine destination: ready or dead
                         if parsed.common.attempt >= parsed.common.maximum_attempts {
+                            let Some(wall_floor) = wall_floor else {
+                                Self::record_error(
+                                    stats,
+                                    "reap_to_dead",
+                                    &format!(
+                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                    ),
+                                    "authenticated wall floor unavailable",
+                                );
+                                continue;
+                            };
                             // Move to dead
                             if self
                                 .reap_to_dead(
@@ -365,7 +411,7 @@ impl Queue {
                                     entry,
                                     &parsed.common,
                                     DeadReason::AttemptsExhausted,
-                                    wall_now,
+                                    wall_floor,
                                 )
                                 .is_ok()
                             {
@@ -439,11 +485,14 @@ impl Queue {
         leased_name: &str,
         common: &steadq_names::CommonFields,
         reason: DeadReason,
-        wall_now: u64,
+        wall_floor: WallFloor,
     ) -> io::Result<()> {
         let src_dir = format!("leased/{boot_dir}/{bucket}/{shard}");
         let terminal_bucket =
-            steadq_math::bucket_number(wall_now, self.format.terminal_bucket_width_ns).unwrap_or(0);
+            steadq_math::bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "terminal bucket overflow")
+                })?;
         let bucket_str = bucket_hex(terminal_bucket);
         let dest_dir = format!("dead/{bucket_str}/{shard}");
 
@@ -483,7 +532,7 @@ impl Queue {
 
     fn promote_delayed(
         &mut self,
-        wall_now: u64,
+        wall_floor: WallFloor,
         budget: &WorkBudget,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
@@ -521,9 +570,13 @@ impl Queue {
             };
 
             // Read effective wall floor
-            let current_wall_bucket =
-                steadq_math::bucket_number(wall_now, self.format.delayed_bucket_width_ns)
-                    .unwrap_or(0);
+            let current_wall_bucket = match steadq_math::bucket_number(
+                wall_floor.unix_ns(),
+                self.format.delayed_bucket_width_ns,
+            ) {
+                Some(bucket) => bucket,
+                None => return,
+            };
 
             // Only promote buckets at or below the current wall bucket
             if bucket_num > current_wall_bucket {
@@ -931,7 +984,10 @@ impl Queue {
                     }
 
                     let mut header_buf = [0u8; 128];
-                    if fs::pread(receipt_fd.as_raw_fd(), &mut header_buf, 0).unwrap_or(0) != 128 {
+                    if !matches!(
+                        fs::pread(receipt_fd.as_raw_fd(), &mut header_buf, 0),
+                        Ok(128)
+                    ) {
                         continue;
                     }
 
@@ -994,10 +1050,15 @@ impl Queue {
                     }
 
                     // Compute bucket start time
-                    let bucket_num = u64::from_str_radix(bucket_name, 16).unwrap_or(0);
-                    let bucket_start = bucket_num
-                        .checked_mul(self.format.terminal_bucket_width_ns)
-                        .unwrap_or(0);
+                    let bucket_num = match u64::from_str_radix(bucket_name, 16) {
+                        Ok(bucket) => bucket,
+                        Err(_) => continue,
+                    };
+                    let bucket_start =
+                        match bucket_num.checked_mul(self.format.terminal_bucket_width_ns) {
+                            Some(bucket_start) => bucket_start,
+                            None => continue,
+                        };
 
                     // Build compact receipt
                     let compact = steadq_format::CompactReceipt {
@@ -1064,15 +1125,16 @@ impl Queue {
     }
 
     /// Delete expired receipts based on retention policy.
-    pub fn delete_expired_receipts(
+    fn delete_expired_receipts(
         &mut self,
+        wall_floor: WallFloor,
         retention_ns: u64,
         budget: &WorkBudget,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
         let root_fd = self.root_fd();
-        let wall_floor = self.effective_wall_floor_ns();
+        let wall_floor = wall_floor.unix_ns();
 
         let receipts_fd = match fs::open_directory(root_fd, "receipts") {
             Ok(fd) => fd,
@@ -1342,8 +1404,75 @@ mod tests {
             "dummy",
             &common,
             crate::errors::DeadReason::AttemptsExhausted,
-            0,
+            queue.authenticated_wall_floor().unwrap(),
         );
         assert!(res.is_err(), "generation overflow must be Err, got {res:?}");
+    }
+
+    #[test]
+    fn recovery_skips_wall_sensitive_actions_without_watermark() {
+        let (tmp, mut queue) = create_test_queue();
+        let not_before = queue.authenticated_wall_floor().unwrap().unix_ns() + 60_000_000_000;
+        let ticket = match queue.enqueue(crate::queue::EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            initial_not_before: Some(not_before),
+            payload: b"delayed".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("enqueue failed: {outcome:?}"),
+        };
+        std::fs::remove_file(tmp.path().join("control/wall-watermark")).unwrap();
+
+        let stats = queue.recover(&WorkBudget::default());
+        assert_eq!(stats.delayed_promoted, 0);
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "wall_floor"));
+        assert!(tmp.path().join(ticket.expected_relative_path).exists());
+    }
+
+    #[test]
+    fn recovery_uses_one_wall_snapshot() {
+        let (_tmp, mut queue) = create_test_queue();
+        fs::fault::reset();
+        fs::fault::inject("clock_realtime_ns", 2);
+        let stats = queue.recover(&WorkBudget::default());
+        assert!(!stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "wall_floor"));
+        assert_eq!(fs::fault::call_count("clock_realtime_ns"), 1);
+        fs::fault::reset();
+    }
+
+    #[test]
+    fn recovery_does_not_invent_terminal_bucket_without_wall_floor() {
+        let (tmp, mut queue) = create_test_queue();
+        assert!(matches!(
+            queue.enqueue(crate::queue::EnqueueInput {
+                maximum_attempts: 1,
+                content_type: "x".into(),
+                payload: b"terminal".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        let lease = match queue.lease(0, 1_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("lease failed: {outcome:?}"),
+        };
+        let mut stats = RecoveryStats::default();
+        queue.reap_expired_leases(u64::MAX, None, &WorkBudget::default(), &mut stats, u64::MAX);
+
+        assert_eq!(stats.leases_to_dead, 0);
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "reap_to_dead"));
+        assert!(tmp.path().join(&lease.exact_source_path).exists());
+        assert!(!tmp.path().join("dead/0000000000000000").exists());
     }
 }

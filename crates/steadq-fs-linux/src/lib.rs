@@ -561,6 +561,7 @@ pub fn pwrite(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
 /// Write all bytes, retrying on partial writes. Rejects zero progress.
 /// Returns an error if write returns 0 (no progress) rather than looping forever.
 pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
+    fault_check!("write_all");
     let mut written = 0;
     while written < buf.len() {
         let rc =
@@ -683,6 +684,7 @@ pub fn create_exclusive(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<Owne
 /// Try a nonblocking exclusive OFD lock on a file.
 /// Returns Ok(true) if acquired, Ok(false) if contended.
 pub fn try_ofd_write_lock(fd: RawFd) -> io::Result<bool> {
+    fault_check!("try_ofd_write_lock");
     let mut flock: libc::flock = unsafe { std::mem::zeroed() };
     flock.l_type = libc::F_WRLCK as i16;
     flock.l_whence = libc::SEEK_SET as i16;
