@@ -1255,9 +1255,9 @@ mod tests {
         let base = unique_test_dir("openat2_symlink");
         std::fs::create_dir_all(base.join("root")).unwrap();
         std::fs::create_dir_all(base.join("outside/secret")).unwrap();
-        symlink(base.join("outside"), base.join("root/link")).unwrap();
         let root = std::fs::File::open(base.join("root")).unwrap();
         let path = ValidatedRelativePath::new("link/secret").unwrap();
+        symlink(base.join("outside"), base.join("root/link")).unwrap();
         assert!(open_directory_beneath(root.as_raw_fd(), path).is_err());
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1278,6 +1278,23 @@ mod tests {
 
         assert_eq!(RESOLVER_RESOLVE_FLAGS, 0x0e);
         assert_eq!(resolver_open_flags(), libc::O_DIRECTORY | libc::O_CLOEXEC);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn open_directory_beneath_does_not_fallback_on_enosys() {
+        let base = unique_test_dir("openat2_enosys");
+        std::fs::create_dir_all(base.join("root/a")).unwrap();
+        let root = std::fs::File::open(base.join("root")).unwrap();
+        let path = ValidatedRelativePath::new("a").unwrap();
+
+        fault::reset();
+        fault::inject_errno("openat2_beneath", 1, libc::ENOSYS);
+        let error = open_directory_beneath(root.as_raw_fd(), path).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSYS));
+        assert_eq!(fault::call_count("openat2_beneath"), 1);
+        assert_eq!(fault::call_count("open_directory"), 0);
+        fault::reset();
         std::fs::remove_dir_all(base).unwrap();
     }
 

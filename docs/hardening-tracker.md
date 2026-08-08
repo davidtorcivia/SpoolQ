@@ -8,7 +8,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 
 | Finding | Reproducer/evidence plan | Dependency | Status | Owner |
 | --- | --- | --- | --- | --- |
-| [SQ-P0-001](https://github.com/davidtorcivia/SteadQ/issues/52) | Malicious ticket component corpus plus syscall trace proving no out-of-root open | A-001 | Open | @davidtorcivia |
+| [SQ-P0-001](https://github.com/davidtorcivia/SteadQ/issues/52) | Malicious ticket component corpus plus syscall trace proving no out-of-root open | A-001/A-002 | Partial in [#80](https://github.com/davidtorcivia/SteadQ/pull/80): root escape is blocked; authority-bearing paths remain until A-002 recomputes locations from identity | @davidtorcivia |
 | [SQ-P0-002](https://github.com/davidtorcivia/SteadQ/issues/53) | Mutate operation and every identity field for each ticket/resolver row | A-002 | Open | @davidtorcivia |
 | [SQ-P0-003](https://github.com/davidtorcivia/SteadQ/issues/54) | Source/destination/both/neither/conflict and second-crash matrix | A-003, A-009 | Open | @davidtorcivia |
 | [SQ-P0-004](https://github.com/davidtorcivia/SteadQ/issues/55) | Random readdir order, every budget boundary, faults, and reopen property | A-006 | Open | @davidtorcivia |

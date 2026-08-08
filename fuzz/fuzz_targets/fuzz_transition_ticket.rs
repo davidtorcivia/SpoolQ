@@ -22,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
     else {
         return;
     };
+    let destination_path = destination_path.strip_suffix('\n').unwrap_or(destination_path);
 
     let ticket = TransitionTicket {
         job_id: [0; 16],
