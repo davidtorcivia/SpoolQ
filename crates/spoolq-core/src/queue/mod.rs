@@ -1,5 +1,7 @@
 // SpoolQ/1 queue initialization, open, and enqueue operations.
 
+pub mod layout;
+
 use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -581,6 +583,18 @@ impl Queue {
     fn poison(&mut self) {
         self.poisoned = true;
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn layout(&self) -> layout::Layout<'_> {
+        layout::Layout::new(
+            &self.format.queue_id,
+            self.format.shard_count,
+            self.format.lease_bucket_width_ns,
+            self.format.delayed_bucket_width_ns,
+            self.format.terminal_bucket_width_ns,
+            &self.boot_id,
+        )
+    }
     /// Compute the effective wall floor: max(CLOCK_REALTIME, stored watermark bucket * width)
     /// Wall floor for mutating operations. P0-01: Returns Err and poisons
     /// on failure so callers abort before computing destination paths.
@@ -843,10 +857,6 @@ impl Queue {
         };
         header.envelope_digest = env_dig;
 
-        // Compute shard
-        let shard = compute_shard(&self.format.queue_id, &job_id, self.format.shard_count);
-        let shard_str = shard_hex(shard);
-
         // Determine initial state: ready or delayed
         let now_wall = match self.wall_floor_for_mutation() {
             Ok(v) => v,
@@ -862,7 +872,7 @@ impl Queue {
                 )
             }
         };
-        let (initial_state, eligibility_bucket) = match job.initial_not_before {
+        let (initial_state, _) = match job.initial_not_before {
             Some(nb) if nb > now_wall => {
                 let (eb, _) =
                     match eligibility_bucket_and_ns(nb, self.format.delayed_bucket_width_ns) {
@@ -895,22 +905,17 @@ impl Queue {
 
         let (dest_dir_relative, filename, expected_path) = match initial_state {
             InitialState::Ready => {
-                let fname =
-                    spoolq_names::make_ready_name(&self.format.queue_id, &shard_str, &common);
-                let path = format!("ready/{shard_str}/{fname}");
-                (format!("ready/{shard_str}"), fname, path)
+                let target = self.layout().ready(&common);
+                let path = target.relative_path();
+                (target.directory(), target.filename, path)
             }
             InitialState::Delayed => {
-                let bucket_str = bucket_hex(eligibility_bucket);
-                let fname = spoolq_names::make_delayed_name(
-                    &self.format.queue_id,
-                    &bucket_str,
-                    &shard_str,
-                    &common,
-                    nb_to_u64(job.initial_not_before),
-                );
-                let path = format!("delayed/{bucket_str}/{shard_str}/{fname}");
-                (format!("delayed/{bucket_str}/{shard_str}"), fname, path)
+                let target = self
+                    .layout()
+                    .delayed(&common, nb_to_u64(job.initial_not_before))
+                    .unwrap();
+                let path = target.relative_path();
+                (target.directory(), target.filename, path)
             }
         };
 
