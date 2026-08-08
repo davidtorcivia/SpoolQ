@@ -450,13 +450,7 @@ impl Queue {
             }
         }
         let format_rec = FormatRecord::decode(&format_bytes).map_err(|e| match e {
-            steadq_format::FormatError::BadMagic | steadq_format::FormatError::WrongSize { .. } => {
-                Error::QueueCorrupt(format!("FORMAT decode: {e}"))
-            }
             steadq_format::FormatError::UnsupportedVersion(_, _) => Error::UnsupportedFormat,
-            steadq_format::FormatError::DigestMismatch => {
-                Error::QueueCorrupt("FORMAT digest mismatch".into())
-            }
             _ => Error::QueueCorrupt(format!("FORMAT decode: {e}")),
         })?;
 
@@ -4990,6 +4984,39 @@ mod tests {
                 "FORMAT should be mode 0400, got {mode:o}"
             );
         }
+    }
+
+    #[test]
+    fn open_rejects_unsupported_format_version() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+
+        // Overwrite FORMAT major version byte (offset 8) to trigger
+        // UnsupportedVersion -> Error::UnsupportedFormat.
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let fmt_path = tmp.path().join("FORMAT");
+        std::fs::set_permissions(&fmt_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fmt_path)
+            .unwrap();
+        f.seek(SeekFrom::Start(8)).unwrap();
+        f.write_all(&[0xFF, 0xFF]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let result = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::UnsupportedFormat)),
+            "expected Err(UnsupportedFormat)"
+        );
     }
 
     // T-03: Real concurrent producers AND consumers
