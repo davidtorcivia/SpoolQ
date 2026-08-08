@@ -7,6 +7,46 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
+const MAX_COMPONENT_BYTES: usize = 255;
+const MAX_RELATIVE_PATH_BYTES: usize = 4095;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVER_RESOLVE_FLAGS: u64 = RESOLVE_NO_MAGICLINKS + RESOLVE_NO_SYMLINKS + RESOLVE_BENEATH;
+
+fn resolver_open_flags() -> i32 {
+    libc::O_DIRECTORY
+        .checked_add(libc::O_CLOEXEC)
+        .expect("Linux open flags fit i32")
+}
+
+/// A relative path whose components are safe to resolve beneath a directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedRelativePath<'a> {
+    path: &'a str,
+}
+
+impl<'a> ValidatedRelativePath<'a> {
+    pub fn new(path: &'a str) -> io::Result<Self> {
+        validate_relative_path(path)
+    }
+
+    pub fn as_str(self) -> &'a str {
+        self.path
+    }
+
+    pub fn components(self) -> impl Iterator<Item = &'a str> {
+        self.path.split('/')
+    }
+}
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
 // ---------- Fault injection (always compiled; idle until armed) ----------
 //
 // Tests arm faults via fault::inject / inject_errno. Idle threads take a
@@ -167,6 +207,36 @@ pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open a directory path while the kernel enforces confinement beneath `root_fd`.
+pub fn open_directory_beneath(
+    root_fd: RawFd,
+    relative: ValidatedRelativePath<'_>,
+) -> io::Result<OwnedFd> {
+    fault_check!("openat2_beneath");
+    let path = cstr_from_name(relative.as_str())?;
+    let how = OpenHow {
+        flags: resolver_open_flags() as u64,
+        mode: 0,
+        resolve: RESOLVER_RESOLVE_FLAGS,
+    };
+    // SAFETY: `path` is NUL-terminated, `how` has the kernel open_how layout,
+    // and both pointers remain valid for the duration of the syscall.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root_fd,
+            path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        ) as libc::c_int
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a nonnegative openat2 result is a newly owned file descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -975,7 +1045,7 @@ pub fn is_absolute_path(s: &str) -> bool {
 }
 
 /// Validate a relative path component for safety:
-/// rejects absolute paths, '..', empty components, and NUL.
+/// rejects slashes, dot components, empty components, NUL, and noncanonical bytes.
 pub fn validate_path_component(comp: &str) -> io::Result<()> {
     if comp.is_empty() {
         return Err(io::Error::new(
@@ -989,10 +1059,10 @@ pub fn validate_path_component(comp: &str) -> io::Result<()> {
             "path component is '.' or '..'",
         ));
     }
-    if comp.starts_with('/') {
+    if comp.contains('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "absolute path component in relative path",
+            "slash in path component",
         ));
     }
     if comp.contains('\0') {
@@ -1001,11 +1071,23 @@ pub fn validate_path_component(comp: &str) -> io::Result<()> {
             "NUL byte in path component",
         ));
     }
+    if !comp.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path component contains noncanonical ASCII",
+        ));
+    }
+    if comp.len() > MAX_COMPONENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path component exceeds 255 bytes",
+        ));
+    }
     Ok(())
 }
 
 /// Validate a relative path for safety: rejects absolute paths, '.' and '..'.
-pub fn validate_relative_path(path: &str) -> io::Result<Vec<&str>> {
+pub fn validate_relative_path(path: &str) -> io::Result<ValidatedRelativePath<'_>> {
     if path.starts_with('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1015,8 +1097,13 @@ pub fn validate_relative_path(path: &str) -> io::Result<Vec<&str>> {
     if path.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path"));
     }
-    let components: Vec<&str> = path.split('/').collect();
-    for comp in &components {
+    if path.len() > MAX_RELATIVE_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "relative path exceeds 4095 bytes",
+        ));
+    }
+    for comp in path.split('/') {
         if comp.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1025,12 +1112,22 @@ pub fn validate_relative_path(path: &str) -> io::Result<Vec<&str>> {
         }
         validate_path_component(comp)?;
     }
-    Ok(components)
+    Ok(ValidatedRelativePath { path })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "steadq_{label}_{}_{}",
+            std::process::id(),
+            sequence
+        ))
+    }
 
     #[test]
     fn boot_id_available() {
@@ -1100,20 +1197,88 @@ mod tests {
         assert!(validate_path_component(".").is_err());
         assert!(validate_path_component("").is_err());
         assert!(validate_path_component("/abs").is_err());
+        assert!(validate_path_component("a/b").is_err());
+        assert!(validate_path_component("non-ascii-\u{00e9}").is_err());
+        assert!(validate_path_component("with space").is_err());
+        assert!(validate_path_component("with\ttab").is_err());
+        assert!(validate_path_component("with\nnewline").is_err());
+        assert!(validate_path_component(&"a".repeat(256)).is_err());
+        assert!(validate_path_component(&"a".repeat(255)).is_ok());
         assert!(validate_path_component("ok").is_ok());
     }
 
     #[test]
     fn validate_relative_path_rejects_absolute_and_empty() {
+        let path_with_len = |length: usize| {
+            assert_eq!(length % 2, 1);
+            "a/".repeat(length / 2) + "a"
+        };
         assert!(validate_relative_path("/etc/passwd").is_err());
         assert!(validate_relative_path("").is_err());
         assert!(validate_relative_path("a//b").is_err());
-        assert!(validate_relative_path("a/b/c").is_ok());
-        assert_eq!(validate_relative_path("a/b").unwrap(), vec!["a", "b"]);
+        assert!(validate_relative_path("a/b/").is_err());
+        assert!(validate_relative_path("a/./b").is_err());
+        assert!(validate_relative_path("a/../b").is_err());
+        assert!(validate_relative_path("a/b\0c").is_err());
+        assert!(validate_relative_path(&path_with_len(4095)).is_ok());
+        assert!(validate_relative_path(&path_with_len(4097)).is_err());
+        assert_eq!(validate_relative_path("a/b").unwrap().as_str(), "a/b");
         assert_eq!(
-            validate_relative_path("a/b/c").unwrap(),
+            validate_relative_path("a/b/c")
+                .unwrap()
+                .components()
+                .collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
+    }
+
+    #[test]
+    fn open_directory_beneath_opens_nested_directory() {
+        let base = unique_test_dir("openat2_nested");
+        std::fs::create_dir_all(base.join("root/a/b")).unwrap();
+        let root = std::fs::File::open(base.join("root")).unwrap();
+        let path = ValidatedRelativePath::new("a/b").unwrap();
+        let opened = open_directory_beneath(root.as_raw_fd(), path).unwrap();
+        let stat = fstat(opened.as_raw_fd()).unwrap();
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        // SAFETY: `opened` owns a valid descriptor for the duration of the call.
+        let descriptor_flags = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(descriptor_flags, -1);
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn open_directory_beneath_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base = unique_test_dir("openat2_symlink");
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        std::fs::create_dir_all(base.join("outside/secret")).unwrap();
+        symlink(base.join("outside"), base.join("root/link")).unwrap();
+        let root = std::fs::File::open(base.join("root")).unwrap();
+        let path = ValidatedRelativePath::new("link/secret").unwrap();
+        assert!(open_directory_beneath(root.as_raw_fd(), path).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn open_directory_beneath_enforces_kernel_beneath_and_directory_flags() {
+        let base = unique_test_dir("openat2_policy");
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        std::fs::write(base.join("root/file"), b"not a directory").unwrap();
+        let root = std::fs::File::open(base.join("root")).unwrap();
+
+        let forged_escape = ValidatedRelativePath { path: "../outside" };
+        assert!(open_directory_beneath(root.as_raw_fd(), forged_escape).is_err());
+
+        let file = ValidatedRelativePath::new("file").unwrap();
+        assert!(open_directory_beneath(root.as_raw_fd(), file).is_err());
+
+        assert_eq!(RESOLVER_RESOLVE_FLAGS, 0x0e);
+        assert_eq!(resolver_open_flags(), libc::O_DIRECTORY | libc::O_CLOEXEC);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

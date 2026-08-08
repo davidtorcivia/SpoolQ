@@ -124,6 +124,30 @@ enum ResolveObj {
     Error(Error),
 }
 
+struct ResolvePath<'a> {
+    directory: fs::ValidatedRelativePath<'a>,
+    name: &'a str,
+    parts: Vec<&'a str>,
+}
+
+impl<'a> ResolvePath<'a> {
+    fn new(path: &'a str) -> Result<Self, Error> {
+        let relative = fs::ValidatedRelativePath::new(path)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        let (directory, name) = relative
+            .as_str()
+            .rsplit_once('/')
+            .ok_or_else(|| Error::InvalidInput("ticket path has no parent directory".into()))?;
+        let directory = fs::ValidatedRelativePath::new(directory)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        Ok(Self {
+            directory,
+            name,
+            parts: relative.components().collect(),
+        })
+    }
+}
+
 /// Typed wall watermark read error. Distinguishes pre-watermark (NotFound) from
 /// corruption and I/O failures so callers can decide between raw-clock fallback
 /// and hard error.
@@ -3192,15 +3216,26 @@ impl Queue {
     }
 
     pub fn resolve(&self, ticket: &TransitionTicket, stabilize: bool) -> ResolutionOutcome {
-        let src_result = self.resolve_check_object(&ticket.source_relative_path, ticket);
-        let dest_result =
-            self.resolve_check_object(&ticket.attempted_destination_relative_path, ticket);
+        if let Err(error) = ticket.validate_paths() {
+            return ResolutionOutcome::ResolutionFailed(error);
+        }
+        let source_path = match ResolvePath::new(&ticket.source_relative_path) {
+            Ok(path) => path,
+            Err(error) => return ResolutionOutcome::ResolutionFailed(error),
+        };
+        let destination_path = match ResolvePath::new(&ticket.attempted_destination_relative_path) {
+            Ok(path) => path,
+            Err(error) => return ResolutionOutcome::ResolutionFailed(error),
+        };
+
+        let src_result = self.resolve_check_object(&source_path, ticket);
+        let dest_result = self.resolve_check_object(&destination_path, ticket);
 
         match (src_result, dest_result) {
             // Source exists but destination doesn't
             (ResolveObj::Match, ResolveObj::Absent) => {
                 if stabilize {
-                    if let Err(e) = self.stabilize_path(&ticket.source_relative_path) {
+                    if let Err(e) = self.stabilize_path(&source_path) {
                         return ResolutionOutcome::ResolutionFailed(e);
                     }
                     ResolutionOutcome::SourceStabilized
@@ -3211,8 +3246,7 @@ impl Queue {
             // Destination exists but source doesn't
             (ResolveObj::Absent, ResolveObj::Match) => {
                 if stabilize {
-                    if let Err(e) = self.stabilize_path(&ticket.attempted_destination_relative_path)
-                    {
+                    if let Err(e) = self.stabilize_path(&destination_path) {
                         return ResolutionOutcome::ResolutionFailed(e);
                     }
                     ResolutionOutcome::DestinationStabilized
@@ -3233,15 +3267,15 @@ impl Queue {
         }
     }
 
-    fn resolve_check_object(&self, path: &str, ticket: &TransitionTicket) -> ResolveObj {
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() < 3 {
-            return ResolveObj::Absent;
-        }
-        let name = parts.last().unwrap();
-        let dir = parts[..parts.len() - 1].join("/");
+    fn resolve_check_object(
+        &self,
+        path: &ResolvePath<'_>,
+        ticket: &TransitionTicket,
+    ) -> ResolveObj {
+        let parts = &path.parts;
+        let name = path.name;
 
-        let dir_fd = match open_relative(self.root_fd.as_raw_fd(), &dir) {
+        let dir_fd = match fs::open_directory_beneath(self.root_fd.as_raw_fd(), path.directory) {
             Ok(fd) => fd,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return ResolveObj::Absent,
             Err(e) => return ResolveObj::Error(Error::IoFailure(e.to_string())),
@@ -3457,16 +3491,10 @@ impl Queue {
         ResolveObj::Match
     }
 
-    fn stabilize_path(&self, path: &str) -> Result<(), Error> {
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() < 2 {
-            return Ok(());
-        }
-        let name = parts.last().unwrap();
-        let dir = parts[..parts.len() - 1].join("/");
-        let dir_fd = open_relative(self.root_fd.as_raw_fd(), &dir)
+    fn stabilize_path(&self, path: &ResolvePath<'_>) -> Result<(), Error> {
+        let dir_fd = fs::open_directory_beneath(self.root_fd.as_raw_fd(), path.directory)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let file_fd = fs::openat(dir_fd.as_raw_fd(), name, libc::O_RDONLY, 0)
+        let file_fd = fs::openat(dir_fd.as_raw_fd(), path.name, libc::O_NOFOLLOW, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::fsync(file_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::fsync_dir_fd(dir_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -3476,23 +3504,15 @@ impl Queue {
 
 /// Open a relative path from a directory fd.
 pub(crate) fn open_relative(root_fd: RawFd, relative: &str) -> io::Result<OwnedFd> {
-    let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
-    let mut current_fd = root_fd;
-    let mut opened = Vec::new();
-    for comp in &components {
-        let fd = fs::open_directory(current_fd, comp)?;
-        current_fd = fd.as_raw_fd();
-        opened.push(fd);
+    let relative = fs::ValidatedRelativePath::new(relative)?;
+    let mut current = None::<OwnedFd>;
+    for component in relative.components() {
+        let parent_fd = current
+            .as_ref()
+            .map_or(root_fd, std::os::fd::AsRawFd::as_raw_fd);
+        current = Some(fs::open_directory(parent_fd, component)?);
     }
-    // Return the last opened fd, forgetting the intermediates
-    match opened.into_iter().last() {
-        Some(fd) => Ok(fd),
-        None => {
-            // Re-open root
-            let root_path = format!("/proc/self/fd/{root_fd}");
-            fs::open_dir_absolute(std::path::Path::new(&root_path))
-        }
-    }
+    current.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty relative path"))
 }
 
 /// Input for an enqueue operation.
@@ -3572,6 +3592,44 @@ mod tests {
         )
         .unwrap();
         (tmp, queue)
+    }
+
+    fn absent_leased_path() -> String {
+        let boot = "00000000-0000-0000-0000-000000000000";
+        let bucket = "0000000000000000";
+        let shard = "0000";
+        let common = CommonFields {
+            job_id: [0; 16],
+            generation: 0,
+            attempt: 1,
+            maximum_attempts: 1,
+        };
+        let name =
+            steadq_names::make_leased_name(&[0; 16], boot, bucket, shard, &common, 1, 1, &[0; 16]);
+        format!("leased/{boot}/{bucket}/{shard}/{name}")
+    }
+
+    fn absent_ready_path() -> String {
+        let shard = "0000";
+        let common = CommonFields {
+            job_id: [0; 16],
+            generation: 0,
+            attempt: 0,
+            maximum_attempts: 1,
+        };
+        let name = steadq_names::make_ready_name(&[0; 16], shard, &common);
+        format!("ready/{shard}/{name}")
+    }
+
+    #[test]
+    fn open_relative_rejects_escape_before_opening_a_component() {
+        let (_tmp, queue) = create_test_queue();
+        fs::fault::reset();
+        fs::fault::inject("open_directory", 1);
+        let result = open_relative(queue.root_fd().as_raw_fd(), "ready/../../outside");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::fault::call_count("open_directory"), 0);
+        fs::fault::reset();
     }
 
     #[test]
@@ -4612,9 +4670,9 @@ mod tests {
             source_state: "ready".into(),
             source_generation: 0,
             source_attempt: 0,
-            source_relative_path: "ready/0000/nonexistent.sqj".into(),
+            source_relative_path: absent_ready_path(),
             attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            attempted_destination_relative_path: absent_leased_path(),
             lease_token: Some([0u8; 16]),
             envelope_digest: et.envelope_digest,
         };
@@ -4645,12 +4703,51 @@ mod tests {
             source_attempt: parsed.common.attempt,
             source_relative_path: et.expected_relative_path.clone(),
             attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            attempted_destination_relative_path: absent_leased_path(),
             lease_token: Some([0u8; 16]),
             envelope_digest: et.envelope_digest,
         };
         let outcome = queue.resolve(&ticket, false);
         assert!(matches!(outcome, ResolutionOutcome::SourceObserved));
+    }
+
+    #[test]
+    fn resolve_stabilization_reports_file_sync_failure() {
+        let (_tmp, mut queue) = create_test_queue();
+        let et = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            _ => panic!("enqueue failed"),
+        };
+        let parsed =
+            steadq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
+                .unwrap();
+        let ticket = TransitionTicket {
+            job_id: et.job_id,
+            source_state: "ready".into(),
+            source_generation: parsed.common.generation,
+            source_attempt: parsed.common.attempt,
+            source_relative_path: et.expected_relative_path,
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: absent_leased_path(),
+            lease_token: Some([0u8; 16]),
+            envelope_digest: et.envelope_digest,
+        };
+
+        fs::fault::reset();
+        fs::fault::inject("fsync", 1);
+        let outcome = queue.resolve(&ticket, true);
+        assert!(matches!(
+            outcome,
+            ResolutionOutcome::ResolutionFailed(Error::IoFailure(_))
+        ));
+        assert_eq!(fs::fault::call_count("fsync"), 1);
+        assert_eq!(fs::fault::call_count("fsync_dir_fd"), 0);
+        fs::fault::reset();
     }
 
     #[test]
@@ -4675,13 +4772,73 @@ mod tests {
             source_attempt: 0,
             source_relative_path: et.expected_relative_path.clone(),
             attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            attempted_destination_relative_path: absent_leased_path(),
             lease_token: Some([0u8; 16]),
             envelope_digest: [0; 32],
         };
         let outcome = queue.resolve(&ticket, false);
         // File exists but belongs to different job -> Conflict
         assert!(matches!(outcome, ResolutionOutcome::ConflictingObject));
+    }
+
+    #[test]
+    fn resolve_rejects_both_invalid_ticket_paths_before_filesystem_calls() {
+        let (_tmp, queue) = create_test_queue();
+        let base_ticket = TransitionTicket {
+            job_id: [1; 16],
+            source_state: "ready".into(),
+            source_generation: 0,
+            source_attempt: 0,
+            source_relative_path: absent_ready_path(),
+            attempted_destination_state: "leased".into(),
+            attempted_destination_relative_path: absent_leased_path(),
+            lease_token: Some([2; 16]),
+            envelope_digest: [3; 32],
+        };
+        let invalid_paths = vec![
+            "".to_string(),
+            "/absolute".to_string(),
+            "../outside.sqj".to_string(),
+            "ready/0000/../../outside.sqj".to_string(),
+            "ready//nonexistent.sqj".to_string(),
+            "ready/0000/nonexistent.sqj/".to_string(),
+            "ready/0000/extra/nonexistent.sqj".to_string(),
+            "unknown/0000/nonexistent.sqj".to_string(),
+            "ready/0000/nonexistent\0.sqj".to_string(),
+            format!("ready/0000/{}.sqj", "a".repeat(256)),
+        ];
+
+        for invalid_path in invalid_paths {
+            for invalid_source in [true, false] {
+                let mut ticket = base_ticket.clone();
+                if invalid_source {
+                    ticket.source_relative_path = invalid_path.clone();
+                } else {
+                    ticket.attempted_destination_relative_path = invalid_path.clone();
+                }
+
+                fs::fault::reset();
+                for syscall in ["openat2_beneath", "open_directory", "fstatat", "openat"] {
+                    fs::fault::inject(syscall, 1);
+                }
+                let outcome = queue.resolve(&ticket, false);
+                assert!(
+                    matches!(
+                        outcome,
+                        ResolutionOutcome::ResolutionFailed(Error::InvalidInput(_))
+                    ),
+                    "invalid path {invalid_path:?} produced {outcome:?}"
+                );
+                for syscall in ["openat2_beneath", "open_directory", "fstatat", "openat"] {
+                    assert_eq!(
+                        fs::fault::call_count(syscall),
+                        0,
+                        "invalid path {invalid_path:?} reached {syscall}"
+                    );
+                }
+            }
+        }
+        fs::fault::reset();
     }
 
     // ===== B-05: Wall watermark advances after enqueue =====
@@ -6242,7 +6399,7 @@ mod tests {
             source_attempt: 0,
             source_relative_path: format!("ready/{wrong_shard}/{}", parts[2]),
             attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: "leased/x/x/0000/nonexistent.sqj".into(),
+            attempted_destination_relative_path: absent_leased_path(),
             lease_token: Some([0u8; 16]),
             envelope_digest: et.envelope_digest,
         };
