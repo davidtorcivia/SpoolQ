@@ -57,8 +57,7 @@
         "maximum_attempts",
         "lease_token",
         "envelope_digest",
-        "payload_length",
-        "payload_digest"
+        "payload_length"
       ],
       "properties": {
         "job_id": { "$ref": "#/$defs/hex16" },
@@ -67,8 +66,7 @@
         "maximum_attempts": { "$ref": "#/$defs/u32" },
         "lease_token": { "$ref": "#/$defs/hex16" },
         "envelope_digest": { "$ref": "#/$defs/hex32" },
-        "payload_length": { "$ref": "#/$defs/u64" },
-        "payload_digest": { "$ref": "#/$defs/hex32" }
+        "payload_length": { "$ref": "#/$defs/u64" }
       }
     },
     "readySource": {

@@ -1421,7 +1421,7 @@ impl Queue {
                     }
                     Err(error) => return LeaseOutcome::NotCommitted(error),
                 };
-                let claim_ticket = match self.claim_transition_ticket(
+                let mut claim_ticket = match self.claim_transition_ticket(
                     &parsed.common,
                     lease_token,
                     claim_source.evidence.clone(),
@@ -1469,6 +1469,34 @@ impl Queue {
                                     }
                                 }
                             }
+                            Err(_) => {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket.with_phase(TransitionPhase::Linearized),
+                                );
+                            }
+                        };
+                        let refreshed_evidence = match Self::read_claim_ticket_evidence(
+                            claim_source.file_fd.as_raw_fd(),
+                            &parsed.common.job_id,
+                            parsed.common.maximum_attempts,
+                        ) {
+                            Ok(evidence) => evidence,
+                            Err(_) => {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket.with_phase(TransitionPhase::Linearized),
+                                );
+                            }
+                        };
+                        claim_ticket = match self.claim_transition_ticket(
+                            &parsed.common,
+                            lease_token,
+                            refreshed_evidence,
+                            boottime_deadline,
+                            wall_deadline,
+                        ) {
+                            Ok(ticket) => ticket,
                             Err(_) => {
                                 self.poison();
                                 return LeaseOutcome::OutcomeUnknown(
@@ -2353,6 +2381,16 @@ impl Queue {
                 "envelope digest does not match handle".into(),
             ));
         }
+        if header.payload_length != lease.payload_length {
+            return Err(Error::QueueCorrupt(
+                "payload length does not match handle".into(),
+            ));
+        }
+        if header.payload_digest != lease.payload_digest {
+            return Err(Error::QueueCorrupt(
+                "payload digest does not match handle".into(),
+            ));
+        }
 
         // R2-H03: Extension read failure is a real error, not a silent pass.
         let ext_len = header.extension_header_length as usize;
@@ -2481,11 +2519,7 @@ impl Queue {
                 lease.attempt,
                 lease.maximum_attempts,
                 lease.token,
-                TicketEvidence::new(
-                    lease.envelope_digest,
-                    lease.payload_length,
-                    lease.payload_digest,
-                ),
+                TicketEvidence::new(lease.envelope_digest, lease.payload_length),
             ),
             TicketSource::Leased {
                 boot_id: lease.boot_id.clone(),
@@ -2540,7 +2574,25 @@ impl Queue {
                 "ready source is not a singly-linked regular file".into(),
             ));
         }
-        let verified = verified::verify_envelope_on_fd(file.as_raw_fd()).map_err(Error::from)?;
+        let evidence = Self::read_claim_ticket_evidence(
+            file.as_raw_fd(),
+            expected_job_id,
+            expected_maximum_attempts,
+        )?;
+        Ok(ClaimSourceWitness {
+            file_fd: file,
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+            evidence,
+        })
+    }
+
+    fn read_claim_ticket_evidence(
+        file_fd: RawFd,
+        expected_job_id: &[u8; 16],
+        expected_maximum_attempts: u32,
+    ) -> Result<TicketEvidence, Error> {
+        let verified = verified::verify_envelope_on_fd(file_fd).map_err(Error::from)?;
         let header = verified.header;
         if &header.job_id != expected_job_id {
             return Err(Error::QueueCorrupt("header job_id mismatch".into()));
@@ -2550,16 +2602,10 @@ impl Queue {
                 "header maximum_attempts mismatch".into(),
             ));
         }
-        Ok(ClaimSourceWitness {
-            file_fd: file,
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
-            evidence: TicketEvidence::new(
-                header.envelope_digest,
-                header.payload_length,
-                header.payload_digest,
-            ),
-        })
+        Ok(TicketEvidence::new(
+            header.envelope_digest,
+            header.payload_length,
+        ))
     }
 
     /// Move a ready object to dead (for exhausted attempts cleanup).
@@ -3430,8 +3476,12 @@ impl Queue {
 
         // R4-B07: Read the 128-byte header buffer.
         let mut header_buf = [0u8; 128];
-        if fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0).is_err() {
-            return ResolveObj::Conflict;
+        if let Err(error) = fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0) {
+            return if error.kind() == io::ErrorKind::UnexpectedEof {
+                ResolveObj::Conflict
+            } else {
+                ResolveObj::Error(Error::IoFailure(error.to_string()))
+            };
         }
 
         // Check for compact receipt magic first (128 bytes).
@@ -3479,11 +3529,17 @@ impl Queue {
             }
         }
 
-        // Decode the full job header.
-        let header = match FixedHeader::decode(&header_buf) {
-            Ok(h) => h,
-            Err(_) => return ResolveObj::Conflict,
+        let verified = match verified::verify_job_on_fd(file_fd.as_raw_fd()) {
+            Ok(verified) => verified,
+            Err(verified::VerificationError::Io(error)) => {
+                return ResolveObj::Error(Error::IoFailure(error));
+            }
+            Err(
+                verified::VerificationError::Corrupt(_)
+                | verified::VerificationError::PayloadCorrupt,
+            ) => return ResolveObj::Conflict,
         };
+        let header = verified.header;
 
         // R4-B07: Verify header job_id matches the ticket.
         if header.job_id != ticket.job_id() {
@@ -3496,12 +3552,7 @@ impl Queue {
         if header.envelope_digest != ticket.envelope_digest() {
             return ResolveObj::Conflict;
         }
-        if header.payload_length != ticket.payload_length()
-            || header.payload_digest != ticket.payload_digest()
-        {
-            return ResolveObj::Conflict;
-        }
-        if verified::verify_job_on_fd(file_fd.as_raw_fd()).is_err() {
+        if header.payload_length != ticket.payload_length() {
             return ResolveObj::Conflict;
         }
 
@@ -3793,7 +3844,7 @@ mod tests {
             .claim_transition_ticket(
                 &common,
                 lease_token,
-                TicketEvidence::new(envelope_digest, 4, payload_digest(b"data")),
+                TicketEvidence::new(envelope_digest, 4),
                 1,
                 1,
             )
@@ -3951,6 +4002,34 @@ mod tests {
         assert!(!is_singly_linked_regular(libc::S_IFREG | 0o400, 2));
         assert!(!is_singly_linked_regular(libc::S_IFDIR | 0o500, 1));
         assert!(!is_singly_linked_regular(libc::S_IFLNK | 0o400, 1));
+    }
+
+    #[test]
+    fn claim_source_evidence_detects_in_place_header_change() {
+        let (tmp, mut queue) = create_test_queue();
+        let enqueue = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".to_string(),
+            payload: b"in-place".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("expected committed enqueue, got {outcome:?}"),
+        };
+        let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
+        let directory_fd = open_relative(queue.root_fd().as_raw_fd(), directory).unwrap();
+        let witness =
+            Queue::open_claim_source(directory_fd.as_raw_fd(), name, &enqueue.job_id, 3).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join(enqueue.expected_relative_path))
+            .unwrap();
+        file.write_at(&[0xff], 0).unwrap();
+
+        assert!(matches!(
+            Queue::read_claim_ticket_evidence(witness.file_fd.as_raw_fd(), &enqueue.job_id, 3,),
+            Err(Error::QueueCorrupt(_))
+        ));
     }
 
     #[test]
@@ -5205,14 +5284,7 @@ mod tests {
             [0xff; 16],
             TransitionOperation::Claim,
             TransitionPhase::Linearized,
-            TicketIdentity::new(
-                [1; 16],
-                0,
-                0,
-                3,
-                [2; 16],
-                TicketEvidence::new([3; 32], 4, [5; 32]),
-            ),
+            TicketIdentity::new([1; 16], 0, 0, 3, [2; 16], TicketEvidence::new([3; 32], 4)),
             TicketSource::Ready {},
             TicketDestination::Leased {
                 boot_id: queue.boot_id.clone(),
@@ -5266,7 +5338,7 @@ mod tests {
                 1,
                 3,
                 lease_token,
-                TicketEvidence::new(envelope_digest, 4, [10; 32]),
+                TicketEvidence::new(envelope_digest, 4),
             ),
             TicketSource::Leased {
                 boot_id: queue.boot_id.clone(),
@@ -5412,16 +5484,14 @@ mod tests {
             receipt_queue.resolve(&wrong_payload_length, false),
             ResolutionOutcome::ConflictingObject
         ));
-        ticket_json["source_identity"]["payload_length"] =
-            serde_json::json!(receipt_ticket.payload_length());
-        ticket_json["source_identity"]["payload_digest"] =
-            serde_json::json!(steadq_names::hex_encode(&[0xff; 32]));
-        let wrong_payload_digest =
-            TransitionTicket::from_json(&serde_json::to_vec(&ticket_json).unwrap()).unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_at("pread", 3);
         assert!(matches!(
-            receipt_queue.resolve(&wrong_payload_digest, false),
-            ResolutionOutcome::ConflictingObject
+            receipt_queue.resolve(&receipt_ticket, false),
+            ResolutionOutcome::ResolutionFailed(Error::IoFailure(_))
         ));
+        fs::fault::reset();
 
         std::fs::OpenOptions::new()
             .write(true)
@@ -5661,15 +5731,23 @@ mod tests {
     }
 
     #[test]
-    fn source_location_fields_are_authenticated_before_every_lease_transition() {
+    fn source_identity_fields_are_authenticated_before_every_lease_transition() {
         for operation in ["ack", "retry", "bury", "renew"] {
-            for field in ["boot_id", "boottime_deadline", "wall_deadline"] {
+            for field in [
+                "boot_id",
+                "boottime_deadline",
+                "wall_deadline",
+                "payload_length",
+                "payload_digest",
+            ] {
                 let (_tmp, mut queue) = create_test_queue();
                 let mut lease = enqueue_and_lease(&mut queue);
                 match field {
                     "boot_id" => lease.boot_id = "00000000-0000-0000-0000-000000000000".into(),
                     "boottime_deadline" => lease.expires_boottime_ns ^= 1,
                     "wall_deadline" => lease.expires_wall_ns ^= 1,
+                    "payload_length" => lease.payload_length ^= 1,
+                    "payload_digest" => lease.payload_digest[0] ^= 0xff,
                     _ => unreachable!(),
                 }
 
