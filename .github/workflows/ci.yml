@@ -35,7 +35,7 @@ jobs:
               echo "steadq-core accepted unsupported target $target"
               exit 1
             fi
-            grep -F "steadq-core currently supports only x86_64-unknown-linux-gnu" "/tmp/steadq-target-error-$target"
+            grep -F "steadq-core supports only 64-bit x86_64 Linux targets with the GNU environment" "/tmp/steadq-target-error-$target"
           done
       - name: Build (debug)
         run: cargo build --all
