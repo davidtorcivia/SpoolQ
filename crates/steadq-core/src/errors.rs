@@ -13,6 +13,8 @@ pub enum Error {
     IdentityCollision,
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("invalid transition ticket: {0}")]
+    InvalidTicket(String),
     #[error("unsupported filesystem")]
     UnsupportedFilesystem,
     #[error("unsupported format")]
@@ -124,9 +126,9 @@ pub enum TransitionPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TicketSource {
-    Ready,
+    Ready {},
     Leased {
         boot_id: String,
         boottime_deadline_ns: u64,
@@ -135,9 +137,9 @@ pub enum TicketSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TicketDestination {
-    Ready,
+    Ready {},
     Leased {
         boot_id: String,
         boottime_deadline_ns: u64,
@@ -227,21 +229,21 @@ impl TransitionTicket {
 
     pub fn from_json(data: &[u8]) -> Result<Self, Error> {
         let wire: TransitionTicketWire = serde_json::from_slice(data)
-            .map_err(|error| Error::InvalidInput(format!("invalid ticket JSON: {error}")))?;
+            .map_err(|error| Error::InvalidTicket(format!("invalid JSON: {error}")))?;
         if wire.schema != TRANSITION_TICKET_SCHEMA {
-            return Err(Error::InvalidInput("invalid ticket schema".into()));
+            return Err(Error::InvalidTicket("invalid schema".into()));
         }
         if wire.version != TRANSITION_TICKET_VERSION {
-            return Err(Error::InvalidInput("unsupported ticket version".into()));
+            return Err(Error::InvalidTicket("unsupported version".into()));
         }
         let queue_id = steadq_names::hex_decode_16(&wire.queue_id)
-            .ok_or_else(|| Error::InvalidInput("invalid ticket queue_id".into()))?;
+            .ok_or_else(|| Error::InvalidTicket("invalid queue_id".into()))?;
         let job_id = steadq_names::hex_decode_16(&wire.source_identity.job_id)
-            .ok_or_else(|| Error::InvalidInput("invalid ticket job_id".into()))?;
+            .ok_or_else(|| Error::InvalidTicket("invalid job_id".into()))?;
         let lease_token = steadq_names::hex_decode_16(&wire.source_identity.lease_token)
-            .ok_or_else(|| Error::InvalidInput("invalid ticket lease_token".into()))?;
+            .ok_or_else(|| Error::InvalidTicket("invalid lease_token".into()))?;
         let envelope_digest = steadq_names::hex_decode_32(&wire.source_identity.envelope_digest)
-            .ok_or_else(|| Error::InvalidInput("invalid ticket envelope_digest".into()))?;
+            .ok_or_else(|| Error::InvalidTicket("invalid envelope_digest".into()))?;
         Self::new(
             queue_id,
             wire.operation,
@@ -276,7 +278,7 @@ impl TransitionTicket {
             destination_derivation: self.destination.clone(),
         };
         serde_json::to_vec_pretty(&wire)
-            .map_err(|error| Error::InvalidInput(format!("ticket serialization failed: {error}")))
+            .map_err(|error| Error::InvalidTicket(format!("serialization failed: {error}")))
     }
 
     pub fn operation(&self) -> TransitionOperation {
@@ -342,11 +344,11 @@ impl TransitionTicket {
         let generation = self
             .source_generation
             .checked_add(1)
-            .ok_or(Error::StateExhausted)?;
+            .ok_or_else(|| Error::InvalidTicket("source generation cannot increment".into()))?;
         let attempt = if self.operation == TransitionOperation::Claim {
             self.source_attempt
                 .checked_add(1)
-                .ok_or(Error::StateExhausted)?
+                .ok_or_else(|| Error::InvalidTicket("source attempt cannot increment".into()))?
         } else {
             self.source_attempt
         };
@@ -361,7 +363,7 @@ impl TransitionTicket {
     pub(crate) fn validate_for_queue(&self, queue_id: &[u8; 16]) -> Result<(), Error> {
         self.validate()?;
         if &self.queue_id != queue_id {
-            return Err(Error::InvalidInput(
+            return Err(Error::InvalidTicket(
                 "ticket belongs to another queue".into(),
             ));
         }
@@ -370,20 +372,22 @@ impl TransitionTicket {
 
     fn validate(&self) -> Result<(), Error> {
         if self.maximum_attempts == 0 {
-            return Err(Error::InvalidInput(
+            return Err(Error::InvalidTicket(
                 "ticket maximum_attempts must be nonzero".into(),
             ));
         }
         if self.source_attempt > self.maximum_attempts {
-            return Err(Error::InvalidInput(
+            return Err(Error::InvalidTicket(
                 "ticket attempt exceeds maximum_attempts".into(),
             ));
         }
         self.destination_common()?;
         let legal = match (&self.operation, &self.source, &self.destination) {
-            (TransitionOperation::Claim, TicketSource::Ready, TicketDestination::Leased { .. }) => {
-                self.source_attempt < self.maximum_attempts
-            }
+            (
+                TransitionOperation::Claim,
+                TicketSource::Ready {},
+                TicketDestination::Leased { .. },
+            ) => self.source_attempt < self.maximum_attempts,
             (
                 TransitionOperation::Renew,
                 TicketSource::Leased { .. },
@@ -397,7 +401,7 @@ impl TransitionTicket {
             | (
                 TransitionOperation::RetryNow,
                 TicketSource::Leased { .. },
-                TicketDestination::Ready,
+                TicketDestination::Ready {},
             )
             | (
                 TransitionOperation::RetryLater,
@@ -412,7 +416,7 @@ impl TransitionTicket {
             _ => false,
         };
         if !legal {
-            return Err(Error::InvalidInput(
+            return Err(Error::InvalidTicket(
                 "operation does not permit the ticket source and destination".into(),
             ));
         }
@@ -421,7 +425,7 @@ impl TransitionTicket {
             .flatten()
         {
             if steadq_names::boot_id_bytes(boot_id).is_none() {
-                return Err(Error::InvalidInput(
+                return Err(Error::InvalidTicket(
                     "ticket boot_id is not canonical".into(),
                 ));
             }
@@ -431,7 +435,7 @@ impl TransitionTicket {
 
     fn source_boot_id(&self) -> Option<&str> {
         match &self.source {
-            TicketSource::Ready => None,
+            TicketSource::Ready {} => None,
             TicketSource::Leased { boot_id, .. } => Some(boot_id),
         }
     }
@@ -614,7 +618,7 @@ mod tests {
             3,
             [2; 16],
             [3; 32],
-            TicketSource::Ready,
+            TicketSource::Ready {},
             TicketDestination::Leased {
                 boot_id: "00000000-0000-0000-0000-000000000000".into(),
                 boottime_deadline_ns: 1,
@@ -646,6 +650,13 @@ mod tests {
         assert!(TransitionTicket::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
 
         value.as_object_mut().unwrap().remove("unexpected");
+        value["source"]["relative_path"] = serde_json::json!("../../outside");
+        assert!(TransitionTicket::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+
+        value["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("relative_path");
         value["schema"] = serde_json::json!("another-schema");
         assert!(TransitionTicket::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
 
@@ -670,7 +681,7 @@ mod tests {
 
         ticket = valid_transition_ticket();
         ticket.source_generation = u64::MAX;
-        assert!(matches!(ticket.validate(), Err(Error::StateExhausted)));
+        assert!(matches!(ticket.validate(), Err(Error::InvalidTicket(_))));
 
         ticket = valid_transition_ticket();
         ticket.source = TicketSource::Leased {
@@ -680,5 +691,101 @@ mod tests {
         };
         ticket.operation = TransitionOperation::Renew;
         assert!(ticket.validate().is_err());
+    }
+
+    #[test]
+    fn transition_ticket_operation_matrix() {
+        let boot_id = "00000000-0000-0000-0000-000000000000".to_string();
+        let leased_source = || TicketSource::Leased {
+            boot_id: boot_id.clone(),
+            boottime_deadline_ns: 10,
+            wall_deadline_ns: 20,
+        };
+        let cases = [
+            (
+                TransitionOperation::Claim,
+                TicketSource::Ready {},
+                TicketDestination::Leased {
+                    boot_id: boot_id.clone(),
+                    boottime_deadline_ns: 30,
+                    wall_deadline_ns: 40,
+                },
+            ),
+            (
+                TransitionOperation::Renew,
+                leased_source(),
+                TicketDestination::Leased {
+                    boot_id: boot_id.clone(),
+                    boottime_deadline_ns: 30,
+                    wall_deadline_ns: 40,
+                },
+            ),
+            (
+                TransitionOperation::Acknowledge,
+                leased_source(),
+                TicketDestination::Receipt { terminal_bucket: 5 },
+            ),
+            (
+                TransitionOperation::RetryNow,
+                leased_source(),
+                TicketDestination::Ready {},
+            ),
+            (
+                TransitionOperation::RetryLater,
+                leased_source(),
+                TicketDestination::Delayed { not_before_ns: 50 },
+            ),
+            (
+                TransitionOperation::Bury,
+                leased_source(),
+                TicketDestination::Dead {
+                    terminal_bucket: 5,
+                    reason: 3,
+                },
+            ),
+        ];
+
+        for (operation, source, destination) in cases {
+            assert!(TransitionTicket::new(
+                [1; 16],
+                operation,
+                TransitionPhase::Linearized,
+                [2; 16],
+                7,
+                1,
+                3,
+                [3; 16],
+                [4; 32],
+                source,
+                destination,
+            )
+            .is_ok());
+        }
+
+        let invalid_destinations = [
+            TicketDestination::Ready {},
+            TicketDestination::Delayed { not_before_ns: 50 },
+            TicketDestination::Receipt { terminal_bucket: 5 },
+            TicketDestination::Dead {
+                terminal_bucket: 5,
+                reason: 3,
+            },
+        ];
+        for destination in invalid_destinations {
+            assert!(TransitionTicket::new(
+                [1; 16],
+                TransitionOperation::Renew,
+                TransitionPhase::Linearized,
+                [2; 16],
+                7,
+                1,
+                3,
+                [3; 16],
+                [4; 32],
+                leased_source(),
+                destination,
+            )
+            .is_err());
+        }
     }
 }

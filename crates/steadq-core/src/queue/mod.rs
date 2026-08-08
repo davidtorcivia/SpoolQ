@@ -1962,7 +1962,7 @@ impl Queue {
                     target.directory(),
                     target.filename,
                     TransitionOperation::RetryNow,
-                    TicketDestination::Ready,
+                    TicketDestination::Ready {},
                 )
             }
         };
@@ -2432,7 +2432,7 @@ impl Queue {
             source.maximum_attempts,
             lease_token,
             envelope_digest,
-            TicketSource::Ready,
+            TicketSource::Ready {},
             TicketDestination::Leased {
                 boot_id: self.boot_id.clone(),
                 boottime_deadline_ns,
@@ -3204,9 +3204,14 @@ impl Queue {
             Ok(path) => path,
             Err(error) => return ResolutionOutcome::ResolutionFailed(error),
         };
+        let source_common = ticket.source_common();
+        let destination_common = match ticket.destination_common() {
+            Ok(common) => common,
+            Err(error) => return ResolutionOutcome::ResolutionFailed(error),
+        };
 
-        let src_result = self.resolve_check_object(&source_path, ticket);
-        let dest_result = self.resolve_check_object(&destination_path, ticket);
+        let src_result = self.resolve_check_object(&source_path, ticket, &source_common);
+        let dest_result = self.resolve_check_object(&destination_path, ticket, &destination_common);
 
         match (src_result, dest_result) {
             // Source exists but destination doesn't
@@ -3255,7 +3260,7 @@ impl Queue {
         let destination_common = ticket.destination_common()?;
         let layout = self.layout();
         let source = match ticket.source() {
-            TicketSource::Ready => layout.ready(&source_common),
+            TicketSource::Ready {} => layout.ready(&source_common),
             TicketSource::Leased {
                 boot_id,
                 boottime_deadline_ns,
@@ -3269,7 +3274,7 @@ impl Queue {
             )?,
         };
         let destination = match ticket.destination() {
-            TicketDestination::Ready => layout.ready(&destination_common),
+            TicketDestination::Ready {} => layout.ready(&destination_common),
             TicketDestination::Leased {
                 boot_id,
                 boottime_deadline_ns,
@@ -3301,6 +3306,7 @@ impl Queue {
         &self,
         path: &ResolvePath<'_>,
         ticket: &TransitionTicket,
+        expected_common: &CommonFields,
     ) -> ResolveObj {
         let parts = &path.parts;
         let name = path.name;
@@ -3350,6 +3356,20 @@ impl Queue {
                     if cr.lease_token != ticket.lease_token() {
                         return ResolveObj::Conflict;
                     }
+                    if cr.final_attempt != expected_common.attempt {
+                        return ResolveObj::Conflict;
+                    }
+                    let expected_bucket_start = match parts
+                        .get(1)
+                        .and_then(|value| steadq_names::bucket_from_hex(value))
+                        .and_then(|bucket| bucket.checked_mul(self.format.terminal_bucket_width_ns))
+                    {
+                        Some(value) => value,
+                        None => return ResolveObj::Conflict,
+                    };
+                    if cr.receipt_bucket_start_unix_ns != expected_bucket_start {
+                        return ResolveObj::Conflict;
+                    }
                     return ResolveObj::Match(ResolvedObject {
                         directory_fd: dir_fd,
                         directory_device: directory_stat.st_dev as u64,
@@ -3372,6 +3392,9 @@ impl Queue {
 
         // R4-B07: Verify header job_id matches the ticket.
         if header.job_id != ticket.job_id() {
+            return ResolveObj::Conflict;
+        }
+        if header.maximum_attempts != expected_common.maximum_attempts {
             return ResolveObj::Conflict;
         }
 
@@ -3406,7 +3429,7 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id() {
+                if &p.common != expected_common {
                     return ResolveObj::Conflict;
                 }
                 let shard_hex = parts[1];
@@ -3426,7 +3449,7 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id() {
+                if &p.common != expected_common {
                     return ResolveObj::Conflict;
                 }
                 if p.token != ticket.lease_token() {
@@ -3451,7 +3474,7 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id() {
+                if &p.common != expected_common {
                     return ResolveObj::Conflict;
                 }
                 let bucket = parts[1];
@@ -3472,7 +3495,7 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id() {
+                if &p.common != expected_common {
                     return ResolveObj::Conflict;
                 }
                 let bucket = parts[1];
@@ -3493,7 +3516,7 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id() {
+                if &p.common != expected_common {
                     return ResolveObj::Conflict;
                 }
                 if p.token != ticket.lease_token() {
@@ -4865,10 +4888,11 @@ mod tests {
         );
         let (source_relative_path, _) = queue.transition_ticket_paths(&ticket).unwrap();
         let source_path = ResolvePath::new(&source_relative_path).unwrap();
-        let object = match queue.resolve_check_object(&source_path, &ticket) {
-            ResolveObj::Match(object) => object,
-            _ => panic!("source object did not authenticate"),
-        };
+        let object =
+            match queue.resolve_check_object(&source_path, &ticket, &ticket.source_common()) {
+                ResolveObj::Match(object) => object,
+                _ => panic!("source object did not authenticate"),
+            };
 
         let source = tmp.path().join(&source_relative_path);
         let displaced = tmp.path().join("tmp/displaced.sqj");
@@ -4920,10 +4944,11 @@ mod tests {
         );
         let (source_relative_path, _) = queue.transition_ticket_paths(&ticket).unwrap();
         let source_path = ResolvePath::new(&source_relative_path).unwrap();
-        let object = match queue.resolve_check_object(&source_path, &ticket) {
-            ResolveObj::Match(object) => object,
-            _ => panic!("source object did not authenticate"),
-        };
+        let object =
+            match queue.resolve_check_object(&source_path, &ticket, &ticket.source_common()) {
+                ResolveObj::Match(object) => object,
+                _ => panic!("source object did not authenticate"),
+            };
 
         let parent = tmp.path().join(source_path.directory.as_str());
         let displaced = tmp.path().join("tmp/displaced-shard");
@@ -4976,7 +5001,7 @@ mod tests {
             3,
             [2; 16],
             [3; 32],
-            TicketSource::Ready,
+            TicketSource::Ready {},
             TicketDestination::Leased {
                 boot_id: queue.boot_id.clone(),
                 boottime_deadline_ns: 1,
@@ -4998,7 +5023,7 @@ mod tests {
         let outcome = queue.resolve(&ticket, false);
         assert!(matches!(
             outcome,
-            ResolutionOutcome::ResolutionFailed(Error::InvalidInput(_))
+            ResolutionOutcome::ResolutionFailed(Error::InvalidTicket(_))
         ));
         for syscall in [
             "openat2_beneath",
@@ -5010,6 +5035,65 @@ mod tests {
             assert_eq!(fs::fault::call_count(syscall), 0);
         }
         fs::fault::reset();
+    }
+
+    #[test]
+    fn resolve_compact_receipt_requires_ticket_attempt_and_bucket() {
+        let (tmp, queue) = create_test_queue();
+        let job_id = [7; 16];
+        let lease_token = [8; 16];
+        let envelope_digest = [9; 32];
+        let terminal_bucket = 2;
+        let ticket = TransitionTicket::new(
+            queue.format.queue_id,
+            TransitionOperation::Acknowledge,
+            TransitionPhase::SourceDirectoryDurable,
+            job_id,
+            4,
+            1,
+            3,
+            lease_token,
+            envelope_digest,
+            TicketSource::Leased {
+                boot_id: queue.boot_id.clone(),
+                boottime_deadline_ns: 1,
+                wall_deadline_ns: 2,
+            },
+            TicketDestination::Receipt { terminal_bucket },
+        )
+        .unwrap();
+        let (_, destination) = queue.transition_ticket_paths(&ticket).unwrap();
+        let destination_path = tmp.path().join(&destination);
+        std::fs::create_dir_all(destination_path.parent().unwrap()).unwrap();
+        let mut receipt = steadq_format::CompactReceipt {
+            job_id,
+            envelope_digest,
+            final_attempt: 1,
+            lease_token,
+            receipt_bucket_start_unix_ns: terminal_bucket
+                * queue.format.terminal_bucket_width_ns,
+            original_payload_length: 4,
+        };
+        std::fs::write(&destination_path, receipt.encode()).unwrap();
+        assert!(matches!(
+            queue.resolve(&ticket, false),
+            ResolutionOutcome::DestinationObserved
+        ));
+
+        receipt.final_attempt = 2;
+        std::fs::write(&destination_path, receipt.encode()).unwrap();
+        assert!(matches!(
+            queue.resolve(&ticket, false),
+            ResolutionOutcome::ConflictingObject
+        ));
+
+        receipt.final_attempt = 1;
+        receipt.receipt_bucket_start_unix_ns += 1;
+        std::fs::write(&destination_path, receipt.encode()).unwrap();
+        assert!(matches!(
+            queue.resolve(&ticket, false),
+            ResolutionOutcome::ConflictingObject
+        ));
     }
 
     // ===== B-05: Wall watermark advances after enqueue =====
