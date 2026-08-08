@@ -1645,6 +1645,38 @@ impl Queue {
                             String::new()
                         };
 
+                        // P0-01: Verify payload digest on held fd before delivery.
+                        // Deterministic PayloadCorrupt is quarantined, not delivered.
+                        // Indeterminate I/O poisons and yields OutcomeUnknown.
+                        if let Err(e) = self.verify_payload_on_fd(leased_file.as_raw_fd()) {
+                            match e {
+                                Error::PayloadCorrupt => {
+                                    let _ = self.quarantine_corrupt_lease(
+                                        leased_dir_fd.as_raw_fd(),
+                                        &leased_name,
+                                        leased_file.as_raw_fd(),
+                                    );
+                                    return LeaseOutcome::NotCommitted(Error::PayloadCorrupt);
+                                }
+                                _ => {
+                                    self.poison();
+                                    return LeaseOutcome::OutcomeUnknown(TransitionTicket {
+                                        job_id: parsed.common.job_id,
+                                        source_state: "ready".into(),
+                                        source_generation: parsed.common.generation,
+                                        source_attempt: parsed.common.attempt,
+                                        source_relative_path: format!("{ready_dir}/{entry}"),
+                                        attempted_destination_state: "leased".into(),
+                                        attempted_destination_relative_path: format!(
+                                            "{leased_dir}/{leased_name}"
+                                        ),
+                                        lease_token: Some(lease_token),
+                                        envelope_digest: header.envelope_digest,
+                                    });
+                                }
+                            }
+                        }
+
                         let lease_info = LeaseInfo {
                             job_id: parsed.common.job_id,
                             envelope_digest: header.envelope_digest,
@@ -2638,6 +2670,32 @@ impl Queue {
 
         Ok(())
     }
+
+    fn quarantine_corrupt_lease(
+        &self,
+        leased_dir_fd: std::os::unix::io::RawFd,
+        leased_name: &str,
+        held_fd: std::os::unix::io::RawFd,
+    ) -> Result<(), std::io::Error> {
+        // Verify held fd still names same inode before moving by pathname.
+        let held_stat = fs::fstat(held_fd)?;
+        let name_stat = fs::fstatat(leased_dir_fd, leased_name)?;
+        if held_stat.st_dev != name_stat.st_dev || held_stat.st_ino != name_stat.st_ino {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "quarantine target changed under held fd",
+            ));
+        }
+        let qid = fs::random_128bit().map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?;
+        let q_name =
+            spoolq_names::quarantine_filename(&qid, QuarantineReason::PayloadCorrupt as u16);
+        self.ensure_dir("quarantine")?;
+        let q_dir_fd = open_relative(self.root_fd.as_raw_fd(), "quarantine")?;
+        fs::renameat2_noreplace(leased_dir_fd, leased_name, q_dir_fd.as_raw_fd(), &q_name)?;
+        fs::fsync_dir_fd(q_dir_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(leased_dir_fd)?;
+        Ok(())
+    }
     /// R4-PERF: Read a chunk of a leased job's payload at the given offset.
     /// Returns the number of bytes read (0 at EOF).
     /// Validates source identity before reading (B-04).
@@ -2658,6 +2716,17 @@ impl Queue {
             0,
         )
         .map_err(|e| Error::IoFailure(e.to_string()))?;
+        // P0-01: Verify payload before delivering any bytes.
+        if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
+            if matches!(e, Error::PayloadCorrupt) {
+                let _ = self.quarantine_corrupt_lease(
+                    src_dir_fd.as_raw_fd(),
+                    &src_name,
+                    file_fd.as_raw_fd(),
+                );
+            }
+            return Err(e);
+        }
         let mut header_buf = [0u8; 128];
         fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -2696,6 +2765,17 @@ impl Queue {
             0,
         )
         .map_err(|e| Error::IoFailure(e.to_string()))?;
+        // P0-01: Verify payload before streaming any bytes.
+        if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
+            if matches!(e, Error::PayloadCorrupt) {
+                let _ = self.quarantine_corrupt_lease(
+                    src_dir_fd.as_raw_fd(),
+                    &src_name,
+                    file_fd.as_raw_fd(),
+                );
+            }
+            return Err(e);
+        }
 
         let mut header_buf = [0u8; 128];
         fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
@@ -5116,6 +5196,179 @@ mod tests {
             result,
             Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))
         ));
+    }
+
+    #[test]
+    fn p0_01_lease_rejects_corrupt_payload_before_delivery() {
+        for pos in ["first", "middle", "last"] {
+            let (_tmp, mut queue) = create_test_queue();
+            let payload = b"payload for P0-01 before-delivery corrupt test 12345".to_vec();
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: payload.clone(),
+                ..Default::default()
+            });
+            // Find ready file and corrupt one byte before lease.
+            // Helper to scan ready shards under root/ready/*/*.sqj
+            let find_one_ready = |root: &std::path::Path| -> Option<std::path::PathBuf> {
+                let ready_root = root.join("ready");
+                for shard in std::fs::read_dir(&ready_root).ok()?.flatten() {
+                    for f in std::fs::read_dir(shard.path()).ok()?.flatten() {
+                        let p = f.path();
+                        if p.extension().map(|e| e == "sqj").unwrap_or(false) {
+                            return Some(p);
+                        }
+                    }
+                }
+                None
+            };
+            let ready_path = find_one_ready(_tmp.path()).expect("ready file should exist");
+            let mut data = std::fs::read(&ready_path).unwrap();
+            let header_len = 128usize;
+            let ext_len = {
+                let mut hb = [0u8; 128];
+                hb.copy_from_slice(&data[0..128]);
+                let h = FixedHeader::decode(&hb).unwrap();
+                h.extension_header_length as usize
+            };
+            let payload_start = header_len + ext_len;
+            let idx = match pos {
+                "first" => payload_start,
+                "middle" => payload_start + payload.len() / 2,
+                "last" => payload_start + payload.len() - 1,
+                _ => unreachable!(),
+            };
+            data[idx] ^= 0xFF;
+            std::fs::write(&ready_path, data).unwrap();
+            let outcome = queue.lease(0, 30_000_000_000);
+            match outcome {
+                LeaseOutcome::NotCommitted(Error::PayloadCorrupt) => {}
+                other => panic!("pos {pos} expected PayloadCorrupt, got {other:?}"),
+            }
+            // Object should be quarantined, not still ready.
+            let remaining = find_one_ready(_tmp.path());
+            assert!(
+                remaining.is_none(),
+                "corrupt object should not remain in ready after lease attempt, found {remaining:?}"
+            );
+            let q = queue.list_quarantine();
+            assert!(
+                q.iter()
+                    .any(|e| e.reason == QuarantineReason::PayloadCorrupt as u16),
+                "quarantine should contain PayloadCorrupt for pos {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn p0_01_stream_zero_and_boundary_payloads_verify() {
+        for len in [0usize, 4096, 65535, 65536, 65537] {
+            let (_tmp, mut queue) = create_test_queue();
+            let payload = vec![0xAB; len];
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: payload.clone(),
+                ..Default::default()
+            });
+            let lease = match queue.lease(0, 30_000_000_000) {
+                LeaseOutcome::Leased(l) => l,
+                other => panic!("len {len} lease failed: {other:?}"),
+            };
+            // Streaming must succeed for valid payload, even at boundaries.
+            let mut out = Vec::new();
+            queue
+                .stream_lease_payload(&lease, 8192, |chunk| {
+                    out.extend_from_slice(chunk);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(out.len(), len);
+            assert_eq!(out, payload);
+            // Chunk read also.
+            let mut buf = vec![0u8; len.max(1)];
+            let n = queue.read_lease_payload_chunk(&lease, &mut buf, 0).unwrap();
+            assert_eq!(n, len);
+        }
+    }
+
+    #[test]
+    fn p0_01_read_stream_reject_corrupt_after_lease() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"stream after lease corrupt".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            other => panic!("lease failed: {other:?}"),
+        };
+        // Corrupt leased file after successful lease but before read.
+        let src_path = _tmp.path().join(&lease.exact_source_path);
+        let mut data = std::fs::read(&src_path).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 0x01;
+        std::fs::write(&src_path, data).unwrap();
+        // Chunk read must not deliver corrupt bytes.
+        let mut buf = vec![0u8; 64];
+        let r = queue.read_lease_payload_chunk(&lease, &mut buf, 0);
+        assert!(matches!(
+            r,
+            Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))
+        ));
+        // Stream must also fail.
+        let sr = queue.stream_lease_payload(&lease, 4096, |_| Ok(()));
+        assert!(matches!(
+            sr,
+            Err(Error::PayloadCorrupt) | Err(Error::QueueCorrupt(_))
+        ));
+    }
+
+    #[test]
+    fn quarantine_held_fd_must_match_name() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"a".to_vec(),
+            ..Default::default()
+        });
+        let lease_a = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            other => panic!("lease a failed: {other:?}"),
+        };
+        // Hold fd for a dummy file in same leased dir but different inode. Dev same, ino differs.
+        let dir_path = lease_a
+            .exact_source_path
+            .rsplit_once('/')
+            .map(|(d, _)| d)
+            .unwrap();
+        let dir_fd = crate::queue::open_relative(queue.root_fd().as_raw_fd(), dir_path).unwrap();
+        // Create dummy file in same dir
+        let dummy_fd = spoolq_fs_linux::openat(
+            dir_fd.as_raw_fd(),
+            "dummy.sqj",
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        let name_a = lease_a
+            .exact_source_path
+            .rsplit_once('/')
+            .map(|(_, n)| n)
+            .unwrap();
+        // Same device, different inode should fail with NotFound.
+        let res = queue.quarantine_corrupt_lease(dir_fd.as_raw_fd(), name_a, dummy_fd.as_raw_fd());
+        let _ = dummy_fd;
+        assert!(
+            res.is_err(),
+            "quarantine with mismatched held fd should fail, got ok"
+        );
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
