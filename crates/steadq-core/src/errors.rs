@@ -158,6 +158,57 @@ pub enum TicketDestination {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketEvidence {
+    pub(crate) envelope_digest: [u8; 32],
+    pub(crate) payload_length: u64,
+    pub(crate) payload_digest: [u8; 32],
+}
+
+impl TicketEvidence {
+    pub(crate) fn new(
+        envelope_digest: [u8; 32],
+        payload_length: u64,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            envelope_digest,
+            payload_length,
+            payload_digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketIdentity {
+    job_id: [u8; 16],
+    generation: u64,
+    attempt: u32,
+    maximum_attempts: u32,
+    lease_token: [u8; 16],
+    evidence: TicketEvidence,
+}
+
+impl TicketIdentity {
+    pub(crate) fn new(
+        job_id: [u8; 16],
+        generation: u64,
+        attempt: u32,
+        maximum_attempts: u32,
+        lease_token: [u8; 16],
+        evidence: TicketEvidence,
+    ) -> Self {
+        Self {
+            job_id,
+            generation,
+            attempt,
+            maximum_attempts,
+            lease_token,
+            evidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionTicket {
     queue_id: [u8; 16],
     operation: TransitionOperation,
@@ -168,6 +219,8 @@ pub struct TransitionTicket {
     maximum_attempts: u32,
     lease_token: [u8; 16],
     envelope_digest: [u8; 32],
+    payload_length: u64,
+    payload_digest: [u8; 32],
     source: TicketSource,
     destination: TicketDestination,
 }
@@ -194,6 +247,8 @@ struct TicketIdentityWire {
     maximum_attempts: u32,
     lease_token: String,
     envelope_digest: String,
+    payload_length: u64,
+    payload_digest: String,
 }
 
 impl TransitionTicket {
@@ -201,12 +256,7 @@ impl TransitionTicket {
         queue_id: [u8; 16],
         operation: TransitionOperation,
         phase: TransitionPhase,
-        job_id: [u8; 16],
-        source_generation: u64,
-        source_attempt: u32,
-        maximum_attempts: u32,
-        lease_token: [u8; 16],
-        envelope_digest: [u8; 32],
+        identity: TicketIdentity,
         source: TicketSource,
         destination: TicketDestination,
     ) -> Result<Self, Error> {
@@ -214,12 +264,14 @@ impl TransitionTicket {
             queue_id,
             operation,
             phase,
-            job_id,
-            source_generation,
-            source_attempt,
-            maximum_attempts,
-            lease_token,
-            envelope_digest,
+            job_id: identity.job_id,
+            source_generation: identity.generation,
+            source_attempt: identity.attempt,
+            maximum_attempts: identity.maximum_attempts,
+            lease_token: identity.lease_token,
+            envelope_digest: identity.evidence.envelope_digest,
+            payload_length: identity.evidence.payload_length,
+            payload_digest: identity.evidence.payload_digest,
             source,
             destination,
         };
@@ -244,16 +296,24 @@ impl TransitionTicket {
             .ok_or_else(|| Error::InvalidTicket("invalid lease_token".into()))?;
         let envelope_digest = steadq_names::hex_decode_32(&wire.source_identity.envelope_digest)
             .ok_or_else(|| Error::InvalidTicket("invalid envelope_digest".into()))?;
+        let payload_digest = steadq_names::hex_decode_32(&wire.source_identity.payload_digest)
+            .ok_or_else(|| Error::InvalidTicket("invalid payload_digest".into()))?;
         Self::new(
             queue_id,
             wire.operation,
             wire.phase,
-            job_id,
-            wire.source_identity.generation,
-            wire.source_identity.attempt,
-            wire.source_identity.maximum_attempts,
-            lease_token,
-            envelope_digest,
+            TicketIdentity::new(
+                job_id,
+                wire.source_identity.generation,
+                wire.source_identity.attempt,
+                wire.source_identity.maximum_attempts,
+                lease_token,
+                TicketEvidence::new(
+                    envelope_digest,
+                    wire.source_identity.payload_length,
+                    payload_digest,
+                ),
+            ),
             wire.source,
             wire.destination_derivation,
         )
@@ -273,6 +333,8 @@ impl TransitionTicket {
                 maximum_attempts: self.maximum_attempts,
                 lease_token: steadq_names::hex_encode(&self.lease_token),
                 envelope_digest: steadq_names::hex_encode(&self.envelope_digest),
+                payload_length: self.payload_length,
+                payload_digest: steadq_names::hex_encode(&self.payload_digest),
             },
             source: self.source.clone(),
             destination_derivation: self.destination.clone(),
@@ -315,6 +377,14 @@ impl TransitionTicket {
 
     pub fn envelope_digest(&self) -> [u8; 32] {
         self.envelope_digest
+    }
+
+    pub fn payload_length(&self) -> u64 {
+        self.payload_length
+    }
+
+    pub fn payload_digest(&self) -> [u8; 32] {
+        self.payload_digest
     }
 
     pub fn source(&self) -> &TicketSource {
@@ -612,12 +682,14 @@ mod tests {
             [5; 16],
             TransitionOperation::Claim,
             TransitionPhase::Linearized,
-            [6; 16],
-            7,
-            2,
-            4,
-            [8; 16],
-            [9; 32],
+            TicketIdentity::new(
+                [6; 16],
+                7,
+                2,
+                4,
+                [8; 16],
+                TicketEvidence::new([9; 32], 12, [10; 32]),
+            ),
             TicketSource::Ready {},
             TicketDestination::Leased {
                 boot_id: "00000000-0000-0000-0000-000000000000".into(),
@@ -653,6 +725,8 @@ mod tests {
         assert_eq!(ticket.maximum_attempts(), 4);
         assert_eq!(ticket.lease_token(), [8; 16]);
         assert_eq!(ticket.envelope_digest(), [9; 32]);
+        assert_eq!(ticket.payload_length(), 12);
+        assert_eq!(ticket.payload_digest(), [10; 32]);
         assert!(matches!(ticket.source(), TicketSource::Ready {}));
         assert!(matches!(
             ticket.destination(),
@@ -781,12 +855,14 @@ mod tests {
                 [1; 16],
                 operation,
                 TransitionPhase::Linearized,
-                [2; 16],
-                7,
-                1,
-                3,
-                [3; 16],
-                [4; 32],
+                TicketIdentity::new(
+                    [2; 16],
+                    7,
+                    1,
+                    3,
+                    [3; 16],
+                    TicketEvidence::new([4; 32], 5, [6; 32]),
+                ),
                 source,
                 destination,
             )
@@ -807,12 +883,14 @@ mod tests {
                 [1; 16],
                 TransitionOperation::Renew,
                 TransitionPhase::Linearized,
-                [2; 16],
-                7,
-                1,
-                3,
-                [3; 16],
-                [4; 32],
+                TicketIdentity::new(
+                    [2; 16],
+                    7,
+                    1,
+                    3,
+                    [3; 16],
+                    TicketEvidence::new([4; 32], 5, [6; 32]),
+                ),
                 leased_source(),
                 destination,
             )
