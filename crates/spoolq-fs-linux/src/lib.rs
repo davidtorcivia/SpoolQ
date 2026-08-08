@@ -1104,6 +1104,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_relative_path_rejects_absolute_and_empty() {
+        assert!(validate_relative_path("/etc/passwd").is_err());
+        assert!(validate_relative_path("").is_err());
+        assert!(validate_relative_path("a//b").is_err());
+        assert!(validate_relative_path("a/b/c").is_ok());
+        assert_eq!(validate_relative_path("a/b").unwrap(), vec!["a", "b"]);
+        assert_eq!(
+            validate_relative_path("a/b/c").unwrap(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
     fn read_dir_for_each_visits_all_entries() {
         let tmp = std::env::temp_dir();
         let dir_name = format!("spoolq_rdfe_test_{}", std::process::id());
