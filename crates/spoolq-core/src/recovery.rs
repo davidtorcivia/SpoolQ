@@ -5,7 +5,7 @@ use std::os::unix::io::AsRawFd;
 
 use spoolq_fs_linux as fs;
 use spoolq_math;
-use spoolq_names::{self, bucket_hex, compute_name_tag, ready_context};
+use spoolq_names::{self, bucket_hex};
 
 use crate::errors::*;
 use crate::queue::{open_relative, Queue};
@@ -414,16 +414,7 @@ impl Queue {
             maximum_attempts: common.maximum_attempts,
         };
 
-        let base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}",
-            spoolq_names::hex_encode(&ready_common.job_id),
-            new_gen,
-            ready_common.attempt,
-            ready_common.maximum_attempts,
-        );
-        let ctx = ready_context(shard, &base);
-        let tag = compute_name_tag(&self.format.queue_id, &ctx);
-        let ready_name = spoolq_names::ready_filename(&ready_common, &tag);
+        let ready_name = spoolq_names::make_ready_name(&self.format.queue_id, shard, &ready_common);
 
         let src_fd = open_relative(self.root_fd(), &src_dir)?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir)?;
@@ -467,18 +458,13 @@ impl Queue {
             maximum_attempts: common.maximum_attempts,
         };
 
-        let base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}.x{:04x}",
-            spoolq_names::hex_encode(&dead_common.job_id),
-            new_gen,
-            dead_common.attempt,
-            dead_common.maximum_attempts,
+        let dead_name = spoolq_names::make_dead_name(
+            &self.format.queue_id,
+            &bucket_str,
+            shard,
+            &dead_common,
             reason as u16,
         );
-        let ctx =
-            spoolq_names::terminal_context(spoolq_names::State::Dead, &bucket_str, shard, &base);
-        let tag = compute_name_tag(&self.format.queue_id, &ctx);
-        let dead_name = spoolq_names::dead_filename(&dead_common, reason as u16, &tag);
 
         let _ = self.ensure_dir_pub(&dest_dir);
         let src_fd = open_relative(self.root_fd(), &src_dir)?;
@@ -665,16 +651,11 @@ impl Queue {
                         maximum_attempts: parsed.common.maximum_attempts,
                     };
 
-                    let base = format!(
-                        "{}.g{:016x}.a{:08x}.m{:08x}",
-                        spoolq_names::hex_encode(&ready_common.job_id),
-                        new_gen,
-                        ready_common.attempt,
-                        ready_common.maximum_attempts,
+                    let ready_name = spoolq_names::make_ready_name(
+                        &self.format.queue_id,
+                        shard_name,
+                        &ready_common,
                     );
-                    let ctx = ready_context(shard_name, &base);
-                    let tag = compute_name_tag(&self.format.queue_id, &ctx);
-                    let ready_name = spoolq_names::ready_filename(&ready_common, &tag);
 
                     let src_fd = match open_relative(self.root_fd(), &src_dir) {
                         Ok(fd) => fd,
@@ -994,25 +975,7 @@ impl Queue {
                         continue;
                     }
 
-                    // R4-H11: Verify name tag for the receipt context.
-                    let job_hex = spoolq_names::hex_encode(&parsed.common.job_id);
-                    let token_hex = spoolq_names::hex_encode(&parsed.token);
-                    let base = format!(
-                        "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
-                        job_hex,
-                        parsed.common.generation,
-                        parsed.common.attempt,
-                        parsed.common.maximum_attempts,
-                        token_hex,
-                    );
-                    let tag_ctx = spoolq_names::terminal_context(
-                        spoolq_names::State::Receipt,
-                        bucket_name,
-                        shard_name,
-                        &base,
-                    );
-                    let expected_tag = compute_name_tag(&self.format.queue_id, &tag_ctx);
-                    if expected_tag != parsed.tag {
+                    if !parsed.authenticate_tag(&self.format.queue_id, bucket_name, shard_name) {
                         continue;
                     }
 
