@@ -5033,12 +5033,24 @@ mod tests {
                 for _ in 0..jobs_per_producer {
                     let payload =
                         format!("payload-{}", steadq_fs_linux::random_128bit().unwrap()[0]);
-                    queue.enqueue(EnqueueInput {
+                    let input = EnqueueInput {
                         maximum_attempts: 3,
                         content_type: "text/plain".to_string(),
                         payload: payload.into_bytes(),
                         ..Default::default()
-                    });
+                    };
+                    let mut attempts = 0;
+                    loop {
+                        attempts += 1;
+                        assert!(attempts <= 1_000, "enqueue remained contended");
+                        match queue.enqueue(input.clone()) {
+                            EnqueueOutcome::Committed(_) => break,
+                            EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy) => {
+                                std::thread::yield_now();
+                            }
+                            outcome => panic!("concurrent enqueue failed: {outcome:?}"),
+                        }
+                    }
                 }
             });
             producer_handles.push(handle);
@@ -5076,8 +5088,11 @@ mod tests {
                     match queue.lease(0, 30_000_000_000) {
                         LeaseOutcome::Leased(lease) => {
                             lc.fetch_add(1, Ordering::SeqCst);
-                            if queue.ack(&lease) == AckOutcome::Acked {
-                                ac.fetch_add(1, Ordering::SeqCst);
+                            match queue.ack(&lease) {
+                                AckOutcome::Acked => {
+                                    ac.fetch_add(1, Ordering::SeqCst);
+                                }
+                                outcome => panic!("concurrent ack failed: {outcome:?}"),
                             }
                         }
                         LeaseOutcome::Empty => {
