@@ -303,13 +303,14 @@ impl Queue {
                         }
 
                         // B1: Validate object structure before recovery transition
-                        if let Err(e) = self.validate_active_object(
-                            shard_fd.as_raw_fd(),
-                            entry,
-                            "leased",
-                            shard_name,
-                            &self.format.queue_id,
-                        ) {
+                        let leased_ctx = crate::ActivePathContext::Leased {
+                            boot_id: boot_dir_name.clone(),
+                            bucket: bucket_name.clone(),
+                            shard: shard_name.to_string(),
+                        };
+                        if let Err(e) =
+                            self.validate_active_object(shard_fd.as_raw_fd(), entry, &leased_ctx)
+                        {
                             Self::record_error(
                                 stats,
                                 "reap_validate",
@@ -606,13 +607,13 @@ impl Queue {
                             Ok(fd) => fd,
                             Err(_) => continue,
                         };
-                        if let Err(e) = self.validate_active_object(
-                            src_dir_fd.as_raw_fd(),
-                            entry,
-                            "delayed",
-                            shard_name,
-                            &self.format.queue_id,
-                        ) {
+                        let delayed_ctx = crate::ActivePathContext::Delayed {
+                            bucket: bucket_name.clone(),
+                            shard: shard_name.to_string(),
+                        };
+                        if let Err(e) =
+                            self.validate_active_object(src_dir_fd.as_raw_fd(), entry, &delayed_ctx)
+                        {
                             Self::record_error(
                                 stats,
                                 "promote_validate",
