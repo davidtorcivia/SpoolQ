@@ -140,6 +140,31 @@ struct ClaimSourceWitness {
     evidence: TicketEvidence,
 }
 
+struct LeasedSourceWitness {
+    directory_fd: OwnedFd,
+    name: String,
+    file_fd: OwnedFd,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug)]
+enum WitnessedRenameOutcome {
+    Linearized,
+    LinearizedIdentityUnknown,
+    SourceGone,
+    SourceChanged,
+    Collision,
+    Failed(Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WitnessPathObservation {
+    Match,
+    Gone,
+    Mismatch,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimSourceIdentity {
     Match,
@@ -165,6 +190,24 @@ fn classify_claim_source_identity(
 
 fn is_singly_linked_regular(mode: libc::mode_t, link_count: libc::nlink_t) -> bool {
     mode & libc::S_IFMT == libc::S_IFREG && link_count == 1
+}
+
+fn stat_matches_witness(stat: &libc::stat, device: u64, inode: u64) -> bool {
+    is_singly_linked_regular(stat.st_mode, stat.st_nlink)
+        && identity_matches(stat.st_dev, stat.st_ino, device, inode)
+}
+
+fn classify_renamed_destination(
+    stat: Option<&libc::stat>,
+    device: u64,
+    inode: u64,
+) -> WitnessedRenameOutcome {
+    match stat {
+        Some(stat) if stat_matches_witness(stat, device, inode) => {
+            WitnessedRenameOutcome::Linearized
+        }
+        Some(_) | None => WitnessedRenameOutcome::LinearizedIdentityUnknown,
+    }
 }
 
 fn resolver_file_open_flags() -> i32 {
@@ -1779,8 +1822,8 @@ impl Queue {
         };
 
         // B-04: Validate the current lease source before acknowledging
-        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease) {
-            Ok(Some(pair)) => pair,
+        let source = match self.open_and_validate_current_lease(lease) {
+            Ok(Some(source)) => source,
             Ok(None) => {
                 // R2-H01: Source is gone. Before returning LeaseLost,
                 // check if this was a duplicate ack by probing receipts.
@@ -1796,67 +1839,20 @@ impl Queue {
             Err(e) => return AckOutcome::NotCommitted(e),
         };
 
-        // P0-05: Hold the verified fd open across rename to prove the
-        // destination is the same object we verified, not a pathname swap.
-        struct VerifiedFd {
-            _fd: OwnedFd,
-            dev: u64,
-            ino: u64,
-        }
-        let verified: Option<VerifiedFd> = if verify_payload {
-            let file_fd = match fs::openat(
-                src_dir_fd.as_raw_fd(),
-                &src_name,
-                libc::O_RDONLY | libc::O_NOFOLLOW,
-                0,
-            ) {
-                Ok(f) => f,
-                Err(e) => {
-                    self.poison();
-                    return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
-                }
-            };
-            if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
+        if verify_payload {
+            if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
                 self.poison();
                 return AckOutcome::NotCommitted(e);
             }
-            match fs::fstat(file_fd.as_raw_fd()) {
-                Ok(st) => Some(VerifiedFd {
-                    _fd: file_fd,
-                    dev: st.st_dev,
-                    ino: st.st_ino,
-                }),
-                Err(e) => {
-                    self.poison();
-                    return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
-                }
-            }
-        } else {
-            None
-        };
+        }
 
         // Rename leased -> receipt with NOREPLACE
-        match fs::renameat2_noreplace(
-            src_dir_fd.as_raw_fd(),
-            &src_name,
+        match Self::rename_leased_witness_noreplace(
+            &source,
             receipt_dir_fd.as_raw_fd(),
             &receipt_name,
         ) {
-            Ok(()) => {
-                // P0-05: Verify the renamed file is the exact object we verified
-                // by comparing both dev and ino from the held-open fd.
-                if let Some(ref vf) = verified {
-                    match fs::fstatat(receipt_dir_fd.as_raw_fd(), &receipt_name) {
-                        Ok(dest_stat)
-                            if dest_stat.st_dev == vf.dev && dest_stat.st_ino == vf.ino => {}
-                        _ => {
-                            self.poison();
-                            return AckOutcome::OutcomeUnknown(
-                                transition_ticket.with_phase(TransitionPhase::Linearized),
-                            );
-                        }
-                    }
-                }
+            WitnessedRenameOutcome::Linearized => {
                 // Sync both directories
                 if fs::fsync_dir_fd(receipt_dir_fd.as_raw_fd()).is_err() {
                     self.poison();
@@ -1864,7 +1860,7 @@ impl Queue {
                         transition_ticket.with_phase(TransitionPhase::Linearized),
                     );
                 }
-                if fs::fsync_dir_fd(src_dir_fd.as_raw_fd()).is_err() {
+                if fs::fsync_dir_fd(source.directory_fd.as_raw_fd()).is_err() {
                     self.poison();
                     return AckOutcome::OutcomeUnknown(
                         transition_ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
@@ -1872,8 +1868,13 @@ impl Queue {
                 }
                 AckOutcome::Acked
             }
-
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            WitnessedRenameOutcome::LinearizedIdentityUnknown => {
+                self.poison();
+                AckOutcome::OutcomeUnknown(
+                    transition_ticket.with_phase(TransitionPhase::Linearized),
+                )
+            }
+            WitnessedRenameOutcome::Collision => {
                 // P0-04: Authenticate the existing receipt instead of blindly
                 // reporting AlreadyAcked. A conflicting object at the
                 // deterministic path must not be treated as idempotent success.
@@ -1892,7 +1893,7 @@ impl Queue {
                     ))
                 }
             }
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            WitnessedRenameOutcome::SourceGone => {
                 // C-22: On source absence, do a bounded receipt probe.
                 // Construct the finite set of exact retained receipt paths
                 // and check them directly (C-23: bounded, not full scan).
@@ -1902,8 +1903,13 @@ impl Queue {
                     AckOutcome::LeaseLost
                 }
             }
-            // C-24/B-12: Preserve I/O, permission, resource, and corruption categories
-            Err(e) => AckOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+            WitnessedRenameOutcome::SourceChanged => {
+                self.poison();
+                AckOutcome::NotCommitted(Error::QueueCorrupt(
+                    "leased source identity changed before acknowledgment".into(),
+                ))
+            }
+            WitnessedRenameOutcome::Failed(error) => AckOutcome::NotCommitted(error),
         }
     }
 
@@ -2190,11 +2196,11 @@ impl Queue {
         path == computed
     }
 
-    /// Returns the opened source directory fd and source filename on success.
+    /// Returns a retained source descriptor and exact path identity on success.
     fn open_and_validate_current_lease(
         &self,
         lease: &LeaseInfo,
-    ) -> Result<Option<(OwnedFd, String)>, Error> {
+    ) -> Result<Option<LeasedSourceWitness>, Error> {
         if Self::is_expected_dev_zero(lease.expected_dev) {
             return Err(Error::QueueCorrupt(
                 "expected_dev is zero (forgeable handle)".into(),
@@ -2273,39 +2279,9 @@ impl Queue {
             Err(e) => return Err(Error::IoFailure(e.to_string())),
         };
 
-        // Verify regular file type
-        if src_stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(Error::QueueCorrupt("source is not a regular file".into()));
-        }
-
-        // R4-H02: Always verify device/inode. Zero values are rejected, not
-        // treated as wildcards.
-        if lease.expected_dev == 0 {
+        if !is_singly_linked_regular(src_stat.st_mode, src_stat.st_nlink) {
             return Err(Error::QueueCorrupt(
-                "expected_dev is zero (forgeable handle)".into(),
-            ));
-        }
-        if lease.expected_inode == 0 {
-            return Err(Error::QueueCorrupt(
-                "expected_inode is zero (forgeable handle)".into(),
-            ));
-        }
-        if lease.expected_dev != src_stat.st_dev as u64 {
-            return Err(Error::QueueCorrupt(format!(
-                "device mismatch: expected {}, got {}",
-                lease.expected_dev, src_stat.st_dev
-            )));
-        }
-        if lease.expected_inode != src_stat.st_ino as u64 {
-            return Err(Error::QueueCorrupt(format!(
-                "inode mismatch: expected {}, got {}",
-                lease.expected_inode, src_stat.st_ino
-            )));
-        }
-
-        if src_stat.st_nlink != 1 {
-            return Err(Error::QueueCorrupt(
-                "source has unexpected hard links".into(),
+                "source is not a singly-linked regular file".into(),
             ));
         }
 
@@ -2353,8 +2329,29 @@ impl Queue {
             return Err(Error::QueueCorrupt("source name tag mismatch".into()));
         }
 
-        let file_fd = fs::openat(src_dir_fd.as_raw_fd(), &src_name, libc::O_RDONLY, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let file_fd = fs::openat(
+            src_dir_fd.as_raw_fd(),
+            &src_name,
+            resolver_file_open_flags(),
+            0,
+        )
+        .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let opened_stat =
+            fs::fstat(file_fd.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+        if !stat_matches_witness(&opened_stat, lease.expected_dev, lease.expected_inode) {
+            return Err(Error::QueueCorrupt(
+                "opened source identity does not match lease handle".into(),
+            ));
+        }
+        if !stat_matches_witness(
+            &src_stat,
+            opened_stat.st_dev as u64,
+            opened_stat.st_ino as u64,
+        ) {
+            return Err(Error::QueueCorrupt(
+                "source path changed while opening lease".into(),
+            ));
+        }
         let mut header_buf = [0u8; 128];
         fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -2409,14 +2406,69 @@ impl Queue {
 
         // R2-B02: Verify exact file size (no trailing data)
         let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
-        if src_stat.st_size as u64 != expected_size {
+        if opened_stat.st_size as u64 != expected_size {
             return Err(Error::QueueCorrupt(format!(
                 "source file size mismatch: expected {}, got {}",
-                expected_size, src_stat.st_size
+                expected_size, opened_stat.st_size
             )));
         }
 
-        Ok(Some((src_dir_fd, src_name)))
+        Ok(Some(LeasedSourceWitness {
+            directory_fd: src_dir_fd,
+            name: src_name,
+            file_fd,
+            device: opened_stat.st_dev as u64,
+            inode: opened_stat.st_ino as u64,
+        }))
+    }
+
+    fn observe_leased_source_path(
+        source: &LeasedSourceWitness,
+    ) -> Result<WitnessPathObservation, Error> {
+        match fs::fstatat(source.directory_fd.as_raw_fd(), &source.name) {
+            Ok(stat) if stat_matches_witness(&stat, source.device, source.inode) => {
+                Ok(WitnessPathObservation::Match)
+            }
+            Ok(_) => Ok(WitnessPathObservation::Mismatch),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                Ok(WitnessPathObservation::Gone)
+            }
+            Err(error) => Err(Error::IoFailure(error.to_string())),
+        }
+    }
+
+    fn rename_leased_witness_noreplace(
+        source: &LeasedSourceWitness,
+        destination_directory_fd: RawFd,
+        destination_name: &str,
+    ) -> WitnessedRenameOutcome {
+        match Self::observe_leased_source_path(source) {
+            Ok(WitnessPathObservation::Match) => {}
+            Ok(WitnessPathObservation::Gone) => return WitnessedRenameOutcome::SourceGone,
+            Ok(WitnessPathObservation::Mismatch) => {
+                return WitnessedRenameOutcome::SourceChanged;
+            }
+            Err(error) => return WitnessedRenameOutcome::Failed(error),
+        }
+
+        match fs::renameat2_noreplace(
+            source.directory_fd.as_raw_fd(),
+            &source.name,
+            destination_directory_fd,
+            destination_name,
+        ) {
+            Ok(()) => {
+                let destination_stat = fs::fstatat(destination_directory_fd, destination_name).ok();
+                classify_renamed_destination(destination_stat.as_ref(), source.device, source.inode)
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                WitnessedRenameOutcome::SourceGone
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                WitnessedRenameOutcome::Collision
+            }
+            Err(error) => WitnessedRenameOutcome::Failed(Error::IoFailure(error.to_string())),
+        }
     }
 
     /// Internal: move a leased object to a new state directory.
@@ -2437,8 +2489,8 @@ impl Queue {
         };
 
         // B-04: Validate the current lease source before transitioning
-        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease) {
-            Ok(Some(pair)) => pair,
+        let source = match self.open_and_validate_current_lease(lease) {
+            Ok(Some(source)) => source,
             Ok(None) => return TransitionOutcome::LeaseLost,
             Err(Error::QueueCorrupt(e)) => {
                 self.poison();
@@ -2447,15 +2499,10 @@ impl Queue {
             Err(e) => return TransitionOutcome::NotCommitted(e),
         };
 
-        match fs::renameat2_noreplace(
-            src_dir_fd.as_raw_fd(),
-            &src_name,
-            dest_dir_fd.as_raw_fd(),
-            dest_name,
-        ) {
-            Ok(()) => {
+        match Self::rename_leased_witness_noreplace(&source, dest_dir_fd.as_raw_fd(), dest_name) {
+            WitnessedRenameOutcome::Linearized => {
                 // Check if source and destination are the same directory
-                let src_stat = fs::fstat(src_dir_fd.as_raw_fd()).ok();
+                let src_stat = fs::fstat(source.directory_fd.as_raw_fd()).ok();
                 let dest_stat = fs::fstat(dest_dir_fd.as_raw_fd()).ok();
                 let src_same = match (src_stat, dest_stat) {
                     (Some(s), Some(d)) => s.st_dev == d.st_dev && s.st_ino == d.st_ino,
@@ -2475,7 +2522,7 @@ impl Queue {
                             ticket.with_phase(TransitionPhase::Linearized),
                         );
                     }
-                    if fs::fsync_dir_fd(src_dir_fd.as_raw_fd()).is_err() {
+                    if fs::fsync_dir_fd(source.directory_fd.as_raw_fd()).is_err() {
                         self.poison();
                         return TransitionOutcome::OutcomeUnknown(
                             ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
@@ -2484,11 +2531,21 @@ impl Queue {
                 }
                 TransitionOutcome::Committed
             }
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => TransitionOutcome::LeaseLost,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            WitnessedRenameOutcome::LinearizedIdentityUnknown => {
+                self.poison();
+                TransitionOutcome::OutcomeUnknown(ticket.with_phase(TransitionPhase::Linearized))
+            }
+            WitnessedRenameOutcome::SourceGone => TransitionOutcome::LeaseLost,
+            WitnessedRenameOutcome::SourceChanged => {
+                self.poison();
+                TransitionOutcome::NotCommitted(Error::QueueCorrupt(
+                    "leased source identity changed before transition".into(),
+                ))
+            }
+            WitnessedRenameOutcome::Collision => {
                 TransitionOutcome::NotCommitted(Error::QueueCorrupt("destination exists".into()))
             }
-            Err(e) => TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string())),
+            WitnessedRenameOutcome::Failed(error) => TransitionOutcome::NotCommitted(error),
         }
     }
 
@@ -2661,22 +2718,11 @@ impl Queue {
     /// then hashes the payload and compares to the header digest.
     /// Returns Ok(()) on success, Err(PayloadCorrupt) if the digest does not match.
     pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<(), Error> {
-        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
-            Some(pair) => pair,
+        let source = match self.open_and_validate_current_lease(lease)? {
+            Some(source) => source,
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
-        self.verify_payload_at_path(src_dir_fd.as_raw_fd(), &src_name)
-    }
-
-    /// R4-H22/H23: Verify the payload digest of a file at the given path.
-    fn verify_payload_at_path(
-        &self,
-        dir_fd: std::os::unix::io::RawFd,
-        name: &str,
-    ) -> Result<(), Error> {
-        let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        self.verify_payload_on_fd(file_fd.as_raw_fd())
+        self.verify_payload_on_fd(source.file_fd.as_raw_fd())
     }
 
     /// R4-H22/H23: Verify the payload digest on an already-open file descriptor.
@@ -2732,30 +2778,23 @@ impl Queue {
         buf: &mut [u8],
         offset: u64,
     ) -> Result<usize, Error> {
-        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
-            Some(pair) => pair,
+        let source = match self.open_and_validate_current_lease(lease)? {
+            Some(source) => source,
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
-        let file_fd = fs::openat(
-            src_dir_fd.as_raw_fd(),
-            &src_name,
-            libc::O_RDONLY | libc::O_NOFOLLOW,
-            0,
-        )
-        .map_err(|e| Error::IoFailure(e.to_string()))?;
         // P0-01: Verify payload before delivering any bytes.
-        if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
+        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 let _ = self.quarantine_corrupt_lease(
-                    src_dir_fd.as_raw_fd(),
-                    &src_name,
-                    file_fd.as_raw_fd(),
+                    source.directory_fd.as_raw_fd(),
+                    &source.name,
+                    source.file_fd.as_raw_fd(),
                 );
             }
             return Err(e);
         }
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+        fs::pread_exact(source.file_fd.as_raw_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
@@ -2767,7 +2806,7 @@ impl Queue {
         }
         let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
         let abs_offset = payload_start + offset;
-        let n = fs::pread(file_fd.as_raw_fd(), &mut buf[..to_read], abs_offset)
+        let n = fs::pread(source.file_fd.as_raw_fd(), &mut buf[..to_read], abs_offset)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         Ok(n)
     }
@@ -2781,31 +2820,24 @@ impl Queue {
         chunk_size: usize,
         mut f: F,
     ) -> Result<(), Error> {
-        let (src_dir_fd, src_name) = match self.open_and_validate_current_lease(lease)? {
-            Some(pair) => pair,
+        let source = match self.open_and_validate_current_lease(lease)? {
+            Some(source) => source,
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
-        let file_fd = fs::openat(
-            src_dir_fd.as_raw_fd(),
-            &src_name,
-            libc::O_RDONLY | libc::O_NOFOLLOW,
-            0,
-        )
-        .map_err(|e| Error::IoFailure(e.to_string()))?;
         // P0-01: Verify payload before streaming any bytes.
-        if let Err(e) = self.verify_payload_on_fd(file_fd.as_raw_fd()) {
+        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 let _ = self.quarantine_corrupt_lease(
-                    src_dir_fd.as_raw_fd(),
-                    &src_name,
-                    file_fd.as_raw_fd(),
+                    source.directory_fd.as_raw_fd(),
+                    &source.name,
+                    source.file_fd.as_raw_fd(),
                 );
             }
             return Err(e);
         }
 
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+        fs::pread_exact(source.file_fd.as_raw_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
@@ -2820,7 +2852,7 @@ impl Queue {
         while offset < payload_len {
             let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
             let n = fs::pread(
-                file_fd.as_raw_fd(),
+                source.file_fd.as_raw_fd(),
                 &mut buf[..to_read],
                 payload_start + offset,
             )
@@ -3440,6 +3472,29 @@ impl Queue {
         Ok((source.relative_path(), destination.relative_path()))
     }
 
+    fn resolve_receipt_path_matches(
+        &self,
+        parts: &[&str],
+        name: &str,
+        ticket: &TransitionTicket,
+        expected_common: &CommonFields,
+    ) -> bool {
+        if parts.len() != 4 || parts[0] != "receipts" {
+            return false;
+        }
+        let parsed = match steadq_names::parse_receipt(name) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
+        if &parsed.common != expected_common || parsed.token != ticket.lease_token() {
+            return false;
+        }
+        let bucket = parts[1];
+        let shard = parts[2];
+        parsed.authenticate_tag(&self.format.queue_id, bucket, shard)
+            && self.verify_shard_placement(shard, &ticket.job_id())
+    }
+
     fn resolve_check_object(
         &self,
         path: &ResolvePath<'_>,
@@ -3470,7 +3525,7 @@ impl Queue {
             Err(error) => return ResolveObj::Error(Error::IoFailure(error.to_string())),
         };
 
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        if !is_singly_linked_regular(stat.st_mode, stat.st_nlink) {
             return ResolveObj::Conflict;
         }
 
@@ -3484,10 +3539,17 @@ impl Queue {
             };
         }
 
-        // Check for compact receipt magic first (128 bytes).
+        let state = parts[0];
+
+        // Compact receipts are valid only as authenticated receipt destinations.
         if stat.st_size as usize == steadq_format::COMPACT_RECEIPT_SIZE
             && &header_buf[0..8] == steadq_format::RECEIPT_MAGIC
         {
+            if ticket.operation() != TransitionOperation::Acknowledge
+                || !self.resolve_receipt_path_matches(parts, name, ticket, expected_common)
+            {
+                return ResolveObj::Conflict;
+            }
             match steadq_format::CompactReceipt::decode(&header_buf) {
                 Ok(cr) if cr.job_id == ticket.job_id() => {
                     // R4-B07: Verify compact receipt fields against the ticket.
@@ -3559,7 +3621,6 @@ impl Queue {
         // R4-B07: Parse the filename using the state-appropriate parser and
         // verify identity fields against the ticket. The state is derived from
         // the path prefix, not trusted from the ticket.
-        let state = parts[0];
         match state {
             "ready" => {
                 // ready/<shard>/<file> = 3 parts
@@ -3649,26 +3710,9 @@ impl Queue {
                 }
             }
             "receipts" => {
-                // receipts/<bucket>/<shard>/<file> = 4 parts
-                if parts.len() != 4 {
-                    return ResolveObj::Conflict;
-                }
-                let p = match steadq_names::parse_receipt(name) {
-                    Ok(p) => p,
-                    Err(_) => return ResolveObj::Conflict,
-                };
-                if &p.common != expected_common {
-                    return ResolveObj::Conflict;
-                }
-                if p.token != ticket.lease_token() {
-                    return ResolveObj::Conflict;
-                }
-                let bucket = parts[1];
-                let shard_hex = parts[2];
-                if !p.authenticate_tag(&self.format.queue_id, bucket, shard_hex) {
-                    return ResolveObj::Conflict;
-                }
-                if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
+                if ticket.operation() != TransitionOperation::Acknowledge
+                    || !self.resolve_receipt_path_matches(parts, name, ticket, expected_common)
+                {
                     return ResolveObj::Conflict;
                 }
             }
@@ -3867,6 +3911,76 @@ mod tests {
         }
     }
 
+    fn add_hard_link(tmp: &tempfile::TempDir, relative_path: &str, label: &str) {
+        std::fs::hard_link(
+            tmp.path().join(relative_path),
+            tmp.path().join(format!("tmp/{label}.link")),
+        )
+        .unwrap();
+    }
+
+    fn resolver_ticket_case(operation: &str) -> (tempfile::TempDir, Queue, TransitionTicket) {
+        let (tmp, mut queue) = create_test_queue();
+        if operation == "claim" {
+            let enqueue = match queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"data".to_vec(),
+                ..Default::default()
+            }) {
+                EnqueueOutcome::Committed(ticket) => ticket,
+                outcome => panic!("expected enqueue, got {outcome:?}"),
+            };
+            let parsed = steadq_names::parse_ready(
+                enqueue.expected_relative_path.rsplit('/').next().unwrap(),
+            )
+            .unwrap();
+            let ticket = queue
+                .claim_transition_ticket(
+                    &parsed.common,
+                    [8; 16],
+                    TicketEvidence::new(enqueue.envelope_digest, 4),
+                    1,
+                    1,
+                )
+                .unwrap();
+            return (tmp, queue, ticket);
+        }
+
+        let lease = enqueue_and_lease(&mut queue);
+        let (operation, destination) = match operation {
+            "acknowledge" => (
+                TransitionOperation::Acknowledge,
+                TicketDestination::Receipt { terminal_bucket: 1 },
+            ),
+            "retry_now" => (TransitionOperation::RetryNow, TicketDestination::Ready {}),
+            "retry_later" => (
+                TransitionOperation::RetryLater,
+                TicketDestination::Delayed { not_before_ns: 1 },
+            ),
+            "bury" => (
+                TransitionOperation::Bury,
+                TicketDestination::Dead {
+                    terminal_bucket: 1,
+                    reason: DeadReason::AdministrativeBury as u16,
+                },
+            ),
+            "renew" => (
+                TransitionOperation::Renew,
+                TicketDestination::Leased {
+                    boot_id: lease.boot_id.clone(),
+                    boottime_deadline_ns: lease.expires_boottime_ns + 1,
+                    wall_deadline_ns: lease.expires_wall_ns + 1,
+                },
+            ),
+            _ => unreachable!(),
+        };
+        let ticket = queue
+            .transition_ticket_for_lease(&lease, operation, destination)
+            .unwrap();
+        (tmp, queue, ticket)
+    }
+
     #[test]
     fn resolver_error_is_not_found_table() {
         for (errno, expected) in [
@@ -3994,6 +4108,173 @@ mod tests {
             classify_claim_source_identity(&original, &witness),
             ClaimSourceIdentity::Match
         );
+    }
+
+    #[test]
+    fn leased_source_witness_rejects_replacement_after_validation() {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        let source = queue
+            .open_and_validate_current_lease(&lease)
+            .unwrap()
+            .unwrap();
+        let source_path = tmp.path().join(&lease.exact_source_path);
+        let displaced = tmp.path().join("tmp/displaced-leased.sqj");
+        std::fs::rename(&source_path, &displaced).unwrap();
+        std::fs::copy(&displaced, &source_path).unwrap();
+
+        assert_eq!(
+            Queue::observe_leased_source_path(&source).unwrap(),
+            WitnessPathObservation::Mismatch
+        );
+        let ready = queue.layout().ready(&CommonFields {
+            job_id: lease.job_id,
+            generation: lease.generation + 1,
+            attempt: lease.attempt,
+            maximum_attempts: lease.maximum_attempts,
+        });
+        let destination_directory = open_relative(queue.root_fd(), &ready.directory()).unwrap();
+        assert!(matches!(
+            Queue::rename_leased_witness_noreplace(
+                &source,
+                destination_directory.as_raw_fd(),
+                &ready.filename,
+            ),
+            WitnessedRenameOutcome::SourceChanged
+        ));
+        assert!(!tmp.path().join(ready.relative_path()).exists());
+    }
+
+    #[test]
+    fn leased_source_witness_rejects_symlink_after_validation() {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        let source = queue
+            .open_and_validate_current_lease(&lease)
+            .unwrap()
+            .unwrap();
+        let source_path = tmp.path().join(&lease.exact_source_path);
+        let displaced = tmp.path().join("tmp/displaced-leased-symlink.sqj");
+        std::fs::rename(&source_path, &displaced).unwrap();
+        std::os::unix::fs::symlink(&displaced, &source_path).unwrap();
+
+        assert_eq!(
+            Queue::observe_leased_source_path(&source).unwrap(),
+            WitnessPathObservation::Mismatch
+        );
+    }
+
+    #[test]
+    fn leased_source_witness_classifies_absence_and_io() {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        let source = queue
+            .open_and_validate_current_lease(&lease)
+            .unwrap()
+            .unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject("fstatat", 1);
+        assert!(matches!(
+            Queue::observe_leased_source_path(&source),
+            Err(Error::IoFailure(_))
+        ));
+        fs::fault::reset();
+
+        std::fs::remove_file(tmp.path().join(&lease.exact_source_path)).unwrap();
+        assert_eq!(
+            Queue::observe_leased_source_path(&source).unwrap(),
+            WitnessPathObservation::Gone
+        );
+    }
+
+    #[test]
+    fn renamed_destination_requires_exact_witness_identity() {
+        let (_tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        let source = queue
+            .open_and_validate_current_lease(&lease)
+            .unwrap()
+            .unwrap();
+        let mut stat = fs::fstat(source.file_fd.as_raw_fd()).unwrap();
+        assert!(matches!(
+            classify_renamed_destination(Some(&stat), source.device, source.inode),
+            WitnessedRenameOutcome::Linearized
+        ));
+        stat.st_ino ^= 1;
+        assert!(matches!(
+            classify_renamed_destination(Some(&stat), source.device, source.inode),
+            WitnessedRenameOutcome::LinearizedIdentityUnknown
+        ));
+        assert!(matches!(
+            classify_renamed_destination(None, source.device, source.inode),
+            WitnessedRenameOutcome::LinearizedIdentityUnknown
+        ));
+    }
+
+    #[test]
+    fn witnessed_rename_preserves_failure_categories() {
+        for (errno, expected) in [
+            (libc::ENOENT, "gone"),
+            (libc::EEXIST, "collision"),
+            (libc::EIO, "failed"),
+        ] {
+            let (_tmp, mut queue) = create_test_queue();
+            let lease = enqueue_and_lease(&mut queue);
+            let source = queue
+                .open_and_validate_current_lease(&lease)
+                .unwrap()
+                .unwrap();
+            let ready = queue.layout().ready(&CommonFields {
+                job_id: lease.job_id,
+                generation: lease.generation + 1,
+                attempt: lease.attempt,
+                maximum_attempts: lease.maximum_attempts,
+            });
+            let destination_directory = open_relative(queue.root_fd(), &ready.directory()).unwrap();
+            fs::fault::reset();
+            fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+            let outcome = Queue::rename_leased_witness_noreplace(
+                &source,
+                destination_directory.as_raw_fd(),
+                &ready.filename,
+            );
+            match expected {
+                "gone" => assert!(matches!(outcome, WitnessedRenameOutcome::SourceGone)),
+                "collision" => assert!(matches!(outcome, WitnessedRenameOutcome::Collision)),
+                "failed" => assert!(matches!(outcome, WitnessedRenameOutcome::Failed(_))),
+                _ => unreachable!(),
+            }
+            fs::fault::reset();
+        }
+    }
+
+    #[test]
+    fn witnessed_rename_reports_post_linearization_identity_error() {
+        let (_tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        let source = queue
+            .open_and_validate_current_lease(&lease)
+            .unwrap()
+            .unwrap();
+        let ready = queue.layout().ready(&CommonFields {
+            job_id: lease.job_id,
+            generation: lease.generation + 1,
+            attempt: lease.attempt,
+            maximum_attempts: lease.maximum_attempts,
+        });
+        let destination_directory = open_relative(queue.root_fd(), &ready.directory()).unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno("fstatat", 2, libc::EIO);
+        assert!(matches!(
+            Queue::rename_leased_witness_noreplace(
+                &source,
+                destination_directory.as_raw_fd(),
+                &ready.filename,
+            ),
+            WitnessedRenameOutcome::LinearizedIdentityUnknown
+        ));
+        fs::fault::reset();
     }
 
     #[test]
@@ -4240,7 +4521,11 @@ mod tests {
             RenewOutcome::Renewed(l) => l,
             other => panic!("renew failed: {other:?}"),
         };
+        assert_eq!(renewed.generation, lease.generation + 1);
         assert!(renewed.expires_boottime_ns > lease.expires_boottime_ns);
+        assert!(renewed.expires_wall_ns > lease.expires_wall_ns);
+        assert_ne!(renewed.exact_source_path, lease.exact_source_path);
+        assert!(_tmp.path().join(&renewed.exact_source_path).exists());
         assert_eq!(renewed.attempt, lease.attempt);
         assert_eq!(renewed.token, lease.token);
     }
@@ -5395,6 +5680,114 @@ mod tests {
             queue.resolve(&ticket, false),
             ResolutionOutcome::ConflictingObject
         ));
+    }
+
+    #[test]
+    fn receipt_path_authentication_rejects_each_mismatch() {
+        let (_tmp, queue, ticket) = resolver_ticket_case("acknowledge");
+        let (_, destination) = queue.transition_ticket_paths(&ticket).unwrap();
+        let parts = destination.split('/').collect::<Vec<_>>();
+        let name = parts[3];
+        let expected_common = ticket.destination_common().unwrap();
+        assert!(queue.resolve_receipt_path_matches(&parts, name, &ticket, &expected_common,));
+
+        assert!(!queue.resolve_receipt_path_matches(&parts[..3], name, &ticket, &expected_common,));
+        let wrong_state = ["ready", parts[1], parts[2], parts[3]];
+        assert!(!queue.resolve_receipt_path_matches(&wrong_state, name, &ticket, &expected_common,));
+
+        let mut wrong_common = expected_common.clone();
+        wrong_common.generation += 1;
+        assert!(!queue.resolve_receipt_path_matches(&parts, name, &ticket, &wrong_common,));
+        let mut wrong_token_json: serde_json::Value =
+            serde_json::from_slice(&ticket.to_json().unwrap()).unwrap();
+        wrong_token_json["source_identity"]["lease_token"] =
+            serde_json::json!(steadq_names::hex_encode(&[0xff; 16]));
+        let wrong_token =
+            TransitionTicket::from_json(&serde_json::to_vec(&wrong_token_json).unwrap()).unwrap();
+        assert!(!queue.resolve_receipt_path_matches(&parts, name, &wrong_token, &expected_common,));
+
+        let mut wrong_tag = name.as_bytes().to_vec();
+        let tag_index = wrong_tag.len() - 5;
+        wrong_tag[tag_index] = if wrong_tag[tag_index] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
+        let wrong_tag = String::from_utf8(wrong_tag).unwrap();
+        assert!(!queue.resolve_receipt_path_matches(&parts, &wrong_tag, &ticket, &expected_common,));
+
+        let actual_shard = steadq_names::shard_from_hex(parts[2]).unwrap();
+        let wrong_shard = (actual_shard + 1) % queue.format.shard_count;
+        let wrong_shard = shard_hex(wrong_shard);
+        let wrong_shard_name = steadq_names::make_receipt_name(
+            &queue.format.queue_id,
+            parts[1],
+            &wrong_shard,
+            &expected_common,
+            &ticket.lease_token(),
+        );
+        let wrong_shard_parts = ["receipts", parts[1], &wrong_shard, &wrong_shard_name];
+        assert!(!queue.resolve_receipt_path_matches(
+            &wrong_shard_parts,
+            &wrong_shard_name,
+            &ticket,
+            &expected_common,
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_compact_receipt_at_ready_source() {
+        let (tmp, queue) = create_test_queue();
+        let job_id = [7; 16];
+        let lease_token = [8; 16];
+        let envelope_digest = [9; 32];
+        let ticket = test_claim_ticket(&queue, job_id, 0, 0, 3, lease_token, envelope_digest);
+        let (source, _) = queue.transition_ticket_paths(&ticket).unwrap();
+        let receipt = steadq_format::CompactReceipt {
+            job_id,
+            envelope_digest,
+            final_attempt: 0,
+            lease_token,
+            receipt_bucket_start_unix_ns: 0,
+            original_payload_length: 4,
+        };
+        std::fs::write(tmp.path().join(source), receipt.encode()).unwrap();
+
+        assert!(matches!(
+            queue.resolve(&ticket, false),
+            ResolutionOutcome::ConflictingObject
+        ));
+    }
+
+    #[test]
+    fn resolver_rejects_hard_links_for_every_operation_side() {
+        for operation in [
+            "claim",
+            "acknowledge",
+            "retry_now",
+            "retry_later",
+            "bury",
+            "renew",
+        ] {
+            let (tmp, queue, ticket) = resolver_ticket_case(operation);
+            let (source, _) = queue.transition_ticket_paths(&ticket).unwrap();
+            add_hard_link(&tmp, &source, &format!("{operation}-source"));
+            assert!(matches!(
+                queue.resolve(&ticket, false),
+                ResolutionOutcome::ConflictingObject
+            ));
+
+            let (tmp, queue, ticket) = resolver_ticket_case(operation);
+            let (source, destination) = queue.transition_ticket_paths(&ticket).unwrap();
+            let destination_path = tmp.path().join(&destination);
+            std::fs::create_dir_all(destination_path.parent().unwrap()).unwrap();
+            std::fs::rename(tmp.path().join(source), &destination_path).unwrap();
+            add_hard_link(&tmp, &destination, &format!("{operation}-destination"));
+            assert!(matches!(
+                queue.resolve(&ticket, false),
+                ResolutionOutcome::ConflictingObject
+            ));
+        }
     }
 
     #[test]
