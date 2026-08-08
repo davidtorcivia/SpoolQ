@@ -235,3 +235,73 @@ impl<'a> Layout<'a> {
         Ok((loc, filename))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_layout() -> Layout<'static> {
+        static QID: [u8; 16] = [0x42; 16];
+        static BOOT: &str = "12345678-1234-1234-1234-123456789abc";
+        Layout::new(
+            &QID,
+            64,
+            10_000_000_000,
+            10_000_000_000,
+            3_600_000_000_000,
+            BOOT,
+        )
+    }
+
+    #[test]
+    fn parse_leased_path_valid() {
+        let layout = test_layout();
+        let path = "leased/12345678-1234-1234-1234-123456789abc/000000000000000a/0001/file.sqj";
+        let (loc, name) = layout.parse_leased_path(path).expect("valid must parse");
+        match loc {
+            Location::Leased {
+                boot_id,
+                bucket,
+                shard,
+            } => {
+                assert_eq!(boot_id, "12345678-1234-1234-1234-123456789abc");
+                assert_eq!(bucket, 0xa);
+                assert_eq!(shard, 1);
+            }
+            _ => panic!("expected Leased"),
+        }
+        assert_eq!(name, "file.sqj");
+    }
+
+    #[test]
+    fn parse_leased_path_rejects_wrong_length() {
+        let layout = test_layout();
+        let short = "leased/12345678-1234-1234-1234-123456789abc/000000000000000a/0001";
+        assert!(layout.parse_leased_path(short).is_err());
+        let long =
+            "leased/12345678-1234-1234-1234-123456789abc/000000000000000a/0001/file.sqj/extra";
+        assert!(layout.parse_leased_path(long).is_err());
+    }
+
+    #[test]
+    fn parse_leased_path_rejects_wrong_prefix() {
+        let layout = test_layout();
+        let wrong = "ready/12345678-1234-1234-1234-123456789abc/000000000000000a/0001/file.sqj";
+        assert!(layout.parse_leased_path(wrong).is_err());
+    }
+
+    #[test]
+    fn parse_leased_path_rejects_short_but_correct_prefix() {
+        let layout = test_layout();
+        let short_correct_prefix = "leased/12345678-1234-1234-1234-123456789abc/000000000000000a";
+        assert!(layout.parse_leased_path(short_correct_prefix).is_err());
+    }
+
+    #[test]
+    fn parse_leased_path_rejects_shard_out_of_range() {
+        let layout = test_layout();
+        let bad_shard =
+            "leased/12345678-1234-1234-1234-123456789abc/000000000000000a/ffff/file.sqj";
+        assert!(layout.parse_leased_path(bad_shard).is_err());
+    }
+}
