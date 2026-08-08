@@ -4,6 +4,9 @@ pub mod queue;
 pub mod recovery;
 pub mod state_machine;
 
+#[cfg(test)]
+pub mod power_loss_harness;
+
 pub use errors::*;
 pub use quarantine::{
     CorruptionFinding, FindingSeverity, FsckDepth, FsckMode, FsckOptions, FsckReport,
