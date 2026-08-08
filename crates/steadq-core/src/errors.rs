@@ -609,20 +609,20 @@ mod tests {
 
     fn valid_transition_ticket() -> TransitionTicket {
         TransitionTicket::new(
-            [0; 16],
+            [5; 16],
             TransitionOperation::Claim,
             TransitionPhase::Linearized,
-            [1; 16],
-            0,
-            0,
+            [6; 16],
+            7,
+            1,
             3,
-            [2; 16],
-            [3; 32],
+            [8; 16],
+            [9; 32],
             TicketSource::Ready {},
             TicketDestination::Leased {
                 boot_id: "00000000-0000-0000-0000-000000000000".into(),
-                boottime_deadline_ns: 1,
-                wall_deadline_ns: 2,
+                boottime_deadline_ns: 10,
+                wall_deadline_ns: 11,
             },
         )
         .unwrap()
@@ -639,6 +639,29 @@ mod tests {
         assert_eq!(value["version"], TRANSITION_TICKET_VERSION);
         assert!(value.get("source_relative_path").is_none());
         assert!(value.get("attempted_destination_relative_path").is_none());
+    }
+
+    #[test]
+    fn transition_ticket_accessors_preserve_identity() {
+        let ticket = valid_transition_ticket();
+        assert_eq!(ticket.queue_id(), [5; 16]);
+        assert_eq!(ticket.operation(), TransitionOperation::Claim);
+        assert_eq!(ticket.phase(), TransitionPhase::Linearized);
+        assert_eq!(ticket.job_id(), [6; 16]);
+        assert_eq!(ticket.source_generation(), 7);
+        assert_eq!(ticket.source_attempt(), 1);
+        assert_eq!(ticket.maximum_attempts(), 3);
+        assert_eq!(ticket.lease_token(), [8; 16]);
+        assert_eq!(ticket.envelope_digest(), [9; 32]);
+        assert!(matches!(ticket.source(), TicketSource::Ready {}));
+        assert!(matches!(
+            ticket.destination(),
+            TicketDestination::Leased {
+                boottime_deadline_ns: 10,
+                wall_deadline_ns: 11,
+                ..
+            }
+        ));
     }
 
     #[test]
