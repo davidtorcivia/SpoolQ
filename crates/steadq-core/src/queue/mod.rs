@@ -5070,8 +5070,7 @@ mod tests {
             envelope_digest,
             final_attempt: 1,
             lease_token,
-            receipt_bucket_start_unix_ns: terminal_bucket
-                * queue.format.terminal_bucket_width_ns,
+            receipt_bucket_start_unix_ns: terminal_bucket * queue.format.terminal_bucket_width_ns,
             original_payload_length: 4,
         };
         std::fs::write(&destination_path, receipt.encode()).unwrap();
