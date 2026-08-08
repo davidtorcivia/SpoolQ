@@ -1,4 +1,4 @@
-# steadq
+# SteadQ
 
 Crash-safe filesystem queue protocol. At-least-once execution with lease-based ownership transfer via atomic rename on local Linux filesystems.
 
