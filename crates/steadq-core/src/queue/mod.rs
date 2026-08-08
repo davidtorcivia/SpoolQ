@@ -1374,6 +1374,29 @@ impl Queue {
                     }
                 };
 
+                let ticket_envelope_digest = match Self::read_ticket_envelope_digest(
+                    shard_fd.as_raw_fd(),
+                    entry,
+                    &parsed.common.job_id,
+                    parsed.common.maximum_attempts,
+                ) {
+                    Ok(digest) => digest,
+                    Err(_) => {
+                        scan_had_error = true;
+                        continue;
+                    }
+                };
+                let claim_ticket = match self.claim_transition_ticket(
+                    &parsed.common,
+                    lease_token,
+                    ticket_envelope_digest,
+                    boottime_deadline,
+                    wall_deadline,
+                ) {
+                    Ok(ticket) => ticket,
+                    Err(error) => return LeaseOutcome::NotCommitted(error),
+                };
+
                 // Rename ready -> leased with NOREPLACE
                 match fs::renameat2_noreplace(
                     shard_fd.as_raw_fd(),
@@ -1387,35 +1410,16 @@ impl Queue {
                         if !same_dir {
                             if fs::fsync_dir_fd(leased_dir_fd.as_raw_fd()).is_err() {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: [0; 32],
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket.with_phase(TransitionPhase::Linearized),
+                                );
                             }
                             if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_err() {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: [0; 32],
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::DestinationDirectoryDurable),
+                                );
                             }
                         }
 
@@ -1429,38 +1433,19 @@ impl Queue {
                                 // The rename succeeded but we cannot stat the result.
                                 // This is OutcomeUnknown - the job is leased but we cannot verify.
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: [0; 32],
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                         };
 
                         // Verify link count is exactly 1 (rejects external hard links)
                         if leased_stat.st_nlink != 1 {
                             self.poison();
-                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                job_id: parsed.common.job_id,
-                                source_state: "ready".into(),
-                                source_generation: parsed.common.generation,
-                                source_attempt: parsed.common.attempt,
-                                source_relative_path: format!("{ready_dir}/{entry}"),
-                                attempted_destination_state: "leased".into(),
-                                attempted_destination_relative_path: format!(
-                                    "{leased_dir}/{leased_name}"
-                                ),
-                                lease_token: Some(lease_token),
-                                envelope_digest: [0; 32],
-                            });
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
                         }
 
                         // Read and validate the fixed header
@@ -1474,76 +1459,38 @@ impl Queue {
                             Ok(f) => f,
                             Err(_) => {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: [0; 32],
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                         };
 
                         let mut header_buf = [0u8; 128];
                         if fs::pread_exact(leased_file.as_raw_fd(), &mut header_buf, 0).is_err() {
                             self.poison();
-                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                job_id: parsed.common.job_id,
-                                source_state: "ready".into(),
-                                source_generation: parsed.common.generation,
-                                source_attempt: parsed.common.attempt,
-                                source_relative_path: format!("{ready_dir}/{entry}"),
-                                attempted_destination_state: "leased".into(),
-                                attempted_destination_relative_path: format!(
-                                    "{leased_dir}/{leased_name}"
-                                ),
-                                lease_token: Some(lease_token),
-                                envelope_digest: [0; 32],
-                            });
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
                         }
 
                         let header = match FixedHeader::decode(&header_buf) {
                             Ok(h) => h,
                             Err(_) => {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: [0; 32],
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                         };
 
                         // Verify job_id matches
                         if header.job_id != parsed.common.job_id {
                             self.poison();
-                            return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                job_id: parsed.common.job_id,
-                                source_state: "ready".into(),
-                                source_generation: parsed.common.generation,
-                                source_attempt: parsed.common.attempt,
-                                source_relative_path: format!("{ready_dir}/{entry}"),
-                                attempted_destination_state: "leased".into(),
-                                attempted_destination_relative_path: format!(
-                                    "{leased_dir}/{leased_name}"
-                                ),
-                                lease_token: Some(lease_token),
-                                envelope_digest: [0; 32],
-                            });
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
                         }
 
                         // R4-B05: Full structural validation of the claimed object before return.
@@ -1552,19 +1499,10 @@ impl Queue {
                             let ext_len_h = header.extension_header_length as usize;
                             if ext_len_h > 65536 {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: header.envelope_digest,
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                             let mut ext_buf_claim = vec![0u8; ext_len_h];
                             if ext_len_h > 0
@@ -1572,88 +1510,43 @@ impl Queue {
                                     .is_err()
                             {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: header.envelope_digest,
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                             if !steadq_format::verify_envelope_digest(&header, &ext_buf_claim) {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: header.envelope_digest,
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                             // Verify exact file size
                             let expected_claim_size =
                                 (128 + ext_len_h + header.payload_length as usize) as u64;
                             if leased_stat.st_size as u64 != expected_claim_size {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: header.envelope_digest,
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                             // Verify payload limit
                             if header.payload_length > self.format.max_payload_length {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: header.envelope_digest,
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                             // Verify header max_attempts matches filename
                             if header.maximum_attempts != parsed.common.maximum_attempts {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: header.envelope_digest,
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                         }
 
@@ -1662,19 +1555,10 @@ impl Queue {
                         let content_type = if header.extension_header_length > 0 {
                             if header.extension_header_length > 65536 {
                                 self.poison();
-                                return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                    job_id: parsed.common.job_id,
-                                    source_state: "ready".into(),
-                                    source_generation: parsed.common.generation,
-                                    source_attempt: parsed.common.attempt,
-                                    source_relative_path: format!("{ready_dir}/{entry}"),
-                                    attempted_destination_state: "leased".into(),
-                                    attempted_destination_relative_path: format!(
-                                        "{leased_dir}/{leased_name}"
-                                    ),
-                                    lease_token: Some(lease_token),
-                                    envelope_digest: header.envelope_digest,
-                                });
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                );
                             }
                             let mut ext_buf = vec![0u8; header.extension_header_length as usize];
                             match fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf, 128) {
@@ -1684,40 +1568,19 @@ impl Queue {
                                         Err(_) => {
                                             self.poison();
                                             return LeaseOutcome::OutcomeUnknown(
-                                                TransitionTicket {
-                                                    job_id: parsed.common.job_id,
-                                                    source_state: "ready".into(),
-                                                    source_generation: parsed.common.generation,
-                                                    source_attempt: parsed.common.attempt,
-                                                    source_relative_path: format!(
-                                                        "{ready_dir}/{entry}"
-                                                    ),
-                                                    attempted_destination_state: "leased".into(),
-                                                    attempted_destination_relative_path: format!(
-                                                        "{leased_dir}/{leased_name}"
-                                                    ),
-                                                    lease_token: Some(lease_token),
-                                                    envelope_digest: header.envelope_digest,
-                                                },
+                                                claim_ticket.with_phase(
+                                                    TransitionPhase::SourceDirectoryDurable,
+                                                ),
                                             );
                                         }
                                     }
                                 }
                                 Err(_) => {
                                     self.poison();
-                                    return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                        job_id: parsed.common.job_id,
-                                        source_state: "ready".into(),
-                                        source_generation: parsed.common.generation,
-                                        source_attempt: parsed.common.attempt,
-                                        source_relative_path: format!("{ready_dir}/{entry}"),
-                                        attempted_destination_state: "leased".into(),
-                                        attempted_destination_relative_path: format!(
-                                            "{leased_dir}/{leased_name}"
-                                        ),
-                                        lease_token: Some(lease_token),
-                                        envelope_digest: header.envelope_digest,
-                                    });
+                                    return LeaseOutcome::OutcomeUnknown(
+                                        claim_ticket
+                                            .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                    );
                                 }
                             }
                         } else {
@@ -1739,19 +1602,10 @@ impl Queue {
                                 }
                                 _ => {
                                     self.poison();
-                                    return LeaseOutcome::OutcomeUnknown(TransitionTicket {
-                                        job_id: parsed.common.job_id,
-                                        source_state: "ready".into(),
-                                        source_generation: parsed.common.generation,
-                                        source_attempt: parsed.common.attempt,
-                                        source_relative_path: format!("{ready_dir}/{entry}"),
-                                        attempted_destination_state: "leased".into(),
-                                        attempted_destination_relative_path: format!(
-                                            "{leased_dir}/{leased_name}"
-                                        ),
-                                        lease_token: Some(lease_token),
-                                        envelope_digest: header.envelope_digest,
-                                    });
+                                    return LeaseOutcome::OutcomeUnknown(
+                                        claim_ticket
+                                            .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                    );
                                 }
                             }
                         }
@@ -1827,12 +1681,23 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let target = self
-            .layout()
-            .receipt(&receipt_common, &lease.token, wall_now)
-            .unwrap();
+        let terminal_bucket = match bucket_number(wall_now, self.format.terminal_bucket_width_ns) {
+            Some(bucket) => bucket,
+            None => return AckOutcome::NotCommitted(Error::StateExhausted),
+        };
+        let target =
+            self.layout()
+                .receipt_in_bucket(&receipt_common, &lease.token, terminal_bucket);
         let receipt_dir = target.directory();
         let receipt_name = target.filename;
+        let transition_ticket = match self.transition_ticket_for_lease(
+            lease,
+            TransitionOperation::Acknowledge,
+            TicketDestination::Receipt { terminal_bucket },
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => return AckOutcome::NotCommitted(error),
+        };
         if let Err(e) = self.ensure_dir(&receipt_dir) {
             return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
         }
@@ -1915,54 +1780,24 @@ impl Queue {
                             if dest_stat.st_dev == vf.dev && dest_stat.st_ino == vf.ino => {}
                         _ => {
                             self.poison();
-                            return AckOutcome::OutcomeUnknown(TransitionTicket {
-                                job_id: lease.job_id,
-                                source_state: "leased".into(),
-                                source_generation: lease.generation,
-                                source_attempt: lease.attempt,
-                                source_relative_path: lease.exact_source_path.clone(),
-                                attempted_destination_state: "receipts".into(),
-                                attempted_destination_relative_path: format!(
-                                    "{receipt_dir}/{receipt_name}"
-                                ),
-                                lease_token: Some(lease.token),
-                                envelope_digest: lease.envelope_digest,
-                            });
+                            return AckOutcome::OutcomeUnknown(
+                                transition_ticket.with_phase(TransitionPhase::Linearized),
+                            );
                         }
                     }
                 }
                 // Sync both directories
                 if fs::fsync_dir_fd(receipt_dir_fd.as_raw_fd()).is_err() {
                     self.poison();
-                    return AckOutcome::OutcomeUnknown(TransitionTicket {
-                        job_id: lease.job_id,
-                        source_state: "leased".into(),
-                        source_generation: lease.generation,
-                        source_attempt: lease.attempt,
-                        source_relative_path: lease.exact_source_path.clone(),
-                        attempted_destination_state: "receipts".into(),
-                        attempted_destination_relative_path: format!(
-                            "{receipt_dir}/{receipt_name}"
-                        ),
-                        lease_token: Some(lease.token),
-                        envelope_digest: lease.envelope_digest,
-                    });
+                    return AckOutcome::OutcomeUnknown(
+                        transition_ticket.with_phase(TransitionPhase::Linearized),
+                    );
                 }
                 if fs::fsync_dir_fd(src_dir_fd.as_raw_fd()).is_err() {
                     self.poison();
-                    return AckOutcome::OutcomeUnknown(TransitionTicket {
-                        job_id: lease.job_id,
-                        source_state: "leased".into(),
-                        source_generation: lease.generation,
-                        source_attempt: lease.attempt,
-                        source_relative_path: lease.exact_source_path.clone(),
-                        attempted_destination_state: "receipts".into(),
-                        attempted_destination_relative_path: format!(
-                            "{receipt_dir}/{receipt_name}"
-                        ),
-                        lease_token: Some(lease.token),
-                        envelope_digest: lease.envelope_digest,
-                    });
+                    return AckOutcome::OutcomeUnknown(
+                        transition_ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
+                    );
                 }
                 AckOutcome::Acked
             }
@@ -2099,7 +1934,7 @@ impl Queue {
             None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
         };
 
-        let (dest_dir, dest_name) = match delayed_ns {
+        let (dest_dir, dest_name, operation, destination) = match delayed_ns {
             Some(nb) => {
                 let common = CommonFields {
                     job_id: lease.job_id,
@@ -2108,7 +1943,12 @@ impl Queue {
                     maximum_attempts: lease.maximum_attempts,
                 };
                 let target = self.layout().delayed(&common, nb).unwrap();
-                (target.directory(), target.filename)
+                (
+                    target.directory(),
+                    target.filename,
+                    TransitionOperation::RetryLater,
+                    TicketDestination::Delayed { not_before_ns: nb },
+                )
             }
             None => {
                 let common = CommonFields {
@@ -2118,11 +1958,20 @@ impl Queue {
                     maximum_attempts: lease.maximum_attempts,
                 };
                 let target = self.layout().ready(&common);
-                (target.directory(), target.filename)
+                (
+                    target.directory(),
+                    target.filename,
+                    TransitionOperation::RetryNow,
+                    TicketDestination::Ready,
+                )
             }
         };
 
-        self.move_leased(lease, &dest_dir, &dest_name)
+        let ticket = match self.transition_ticket_for_lease(lease, operation, destination) {
+            Ok(ticket) => ticket,
+            Err(error) => return TransitionOutcome::NotCommitted(error),
+        };
+        self.move_leased(lease, &dest_dir, &dest_name, &ticket)
     }
 
     /// Bury a lease (move to dead).
@@ -2152,14 +2001,28 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
+        let terminal_bucket = match bucket_number(wall_now, self.format.terminal_bucket_width_ns) {
+            Some(bucket) => bucket,
+            None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
+        };
         let target = self
             .layout()
-            .dead(&common, reason as u16, wall_now)
-            .unwrap();
+            .dead_in_bucket(&common, reason as u16, terminal_bucket);
         let dest_dir = target.directory();
         let fname = target.filename;
+        let ticket = match self.transition_ticket_for_lease(
+            lease,
+            TransitionOperation::Bury,
+            TicketDestination::Dead {
+                terminal_bucket,
+                reason: reason as u16,
+            },
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => return TransitionOutcome::NotCommitted(error),
+        };
 
-        self.move_leased(lease, &dest_dir, &fname)
+        self.move_leased(lease, &dest_dir, &fname, &ticket)
     }
 
     /// Renew a lease with a new deadline.
@@ -2215,7 +2078,20 @@ impl Queue {
         let dest_dir = target.directory();
         let fname = target.filename;
 
-        match self.move_leased_renew(lease, &dest_dir, &fname) {
+        let ticket = match self.transition_ticket_for_lease(
+            lease,
+            TransitionOperation::Renew,
+            TicketDestination::Leased {
+                boot_id: self.boot_id.clone(),
+                boottime_deadline_ns: new_boottime_dl,
+                wall_deadline_ns: new_wall_dl,
+            },
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => return RenewOutcome::NotCommitted(error),
+        };
+
+        match self.move_leased_renew(lease, &dest_dir, &fname, &ticket) {
             TransitionOutcome::Committed => RenewOutcome::Renewed(LeaseInfo {
                 generation: new_gen,
                 expires_boottime_ns: new_boottime_dl,
@@ -2435,6 +2311,7 @@ impl Queue {
         lease: &LeaseInfo,
         dest_dir: &str,
         dest_name: &str,
+        ticket: &TransitionTicket,
     ) -> TransitionOutcome {
         if let Err(e) = self.ensure_dir(dest_dir) {
             return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string()));
@@ -2474,20 +2351,20 @@ impl Queue {
                     if fs::fsync_dir_fd(dest_dir_fd.as_raw_fd()).is_err() {
                         self.poison();
                         return TransitionOutcome::OutcomeUnknown(
-                            self.transition_ticket(lease, dest_dir, dest_name),
+                            ticket.with_phase(TransitionPhase::Linearized),
                         );
                     }
                 } else {
                     if fs::fsync_dir_fd(dest_dir_fd.as_raw_fd()).is_err() {
                         self.poison();
                         return TransitionOutcome::OutcomeUnknown(
-                            self.transition_ticket(lease, dest_dir, dest_name),
+                            ticket.with_phase(TransitionPhase::Linearized),
                         );
                     }
                     if fs::fsync_dir_fd(src_dir_fd.as_raw_fd()).is_err() {
                         self.poison();
                         return TransitionOutcome::OutcomeUnknown(
-                            self.transition_ticket(lease, dest_dir, dest_name),
+                            ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
                         );
                     }
                 }
@@ -2507,27 +2384,90 @@ impl Queue {
         lease: &LeaseInfo,
         dest_dir: &str,
         dest_name: &str,
+        ticket: &TransitionTicket,
     ) -> TransitionOutcome {
-        self.move_leased(lease, dest_dir, dest_name)
+        self.move_leased(lease, dest_dir, dest_name, ticket)
     }
 
-    fn transition_ticket(
+    fn transition_ticket_for_lease(
         &self,
         lease: &LeaseInfo,
-        dest_dir: &str,
-        dest_name: &str,
-    ) -> TransitionTicket {
-        TransitionTicket {
-            job_id: lease.job_id,
-            source_state: "leased".into(),
-            source_generation: lease.generation,
-            source_attempt: lease.attempt,
-            source_relative_path: lease.exact_source_path.clone(),
-            attempted_destination_state: dest_dir.split('/').next().unwrap_or("").into(),
-            attempted_destination_relative_path: format!("{dest_dir}/{dest_name}"),
-            lease_token: Some(lease.token),
-            envelope_digest: lease.envelope_digest,
+        operation: TransitionOperation,
+        destination: TicketDestination,
+    ) -> Result<TransitionTicket, Error> {
+        TransitionTicket::new(
+            self.format.queue_id,
+            operation,
+            TransitionPhase::Linearized,
+            lease.job_id,
+            lease.generation,
+            lease.attempt,
+            lease.maximum_attempts,
+            lease.token,
+            lease.envelope_digest,
+            TicketSource::Leased {
+                boot_id: lease.boot_id.clone(),
+                boottime_deadline_ns: lease.expires_boottime_ns,
+                wall_deadline_ns: lease.expires_wall_ns,
+            },
+            destination,
+        )
+    }
+
+    fn claim_transition_ticket(
+        &self,
+        source: &CommonFields,
+        lease_token: [u8; 16],
+        envelope_digest: [u8; 32],
+        boottime_deadline_ns: u64,
+        wall_deadline_ns: u64,
+    ) -> Result<TransitionTicket, Error> {
+        TransitionTicket::new(
+            self.format.queue_id,
+            TransitionOperation::Claim,
+            TransitionPhase::Linearized,
+            source.job_id,
+            source.generation,
+            source.attempt,
+            source.maximum_attempts,
+            lease_token,
+            envelope_digest,
+            TicketSource::Ready,
+            TicketDestination::Leased {
+                boot_id: self.boot_id.clone(),
+                boottime_deadline_ns,
+                wall_deadline_ns,
+            },
+        )
+    }
+
+    fn read_ticket_envelope_digest(
+        directory_fd: RawFd,
+        name: &str,
+        expected_job_id: &[u8; 16],
+        expected_maximum_attempts: u32,
+    ) -> Result<[u8; 32], Error> {
+        let file = fs::openat(
+            directory_fd,
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+        .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let mut header_bytes = [0u8; 128];
+        fs::pread_exact(file.as_raw_fd(), &mut header_bytes, 0)
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let header = FixedHeader::decode(&header_bytes)
+            .map_err(|error| Error::QueueCorrupt(format!("header decode: {error}")))?;
+        if &header.job_id != expected_job_id {
+            return Err(Error::QueueCorrupt("header job_id mismatch".into()));
         }
+        if header.maximum_attempts != expected_maximum_attempts {
+            return Err(Error::QueueCorrupt(
+                "header maximum_attempts mismatch".into(),
+            ));
+        }
+        Ok(header.envelope_digest)
     }
 
     /// Move a ready object to dead (for exhausted attempts cleanup).
@@ -3251,14 +3191,16 @@ impl Queue {
     }
 
     pub fn resolve(&self, ticket: &TransitionTicket, stabilize: bool) -> ResolutionOutcome {
-        if let Err(error) = ticket.validate_paths() {
-            return ResolutionOutcome::ResolutionFailed(error);
-        }
-        let source_path = match ResolvePath::new(&ticket.source_relative_path) {
+        let (source_relative_path, destination_relative_path) =
+            match self.transition_ticket_paths(ticket) {
+                Ok(paths) => paths,
+                Err(error) => return ResolutionOutcome::ResolutionFailed(error),
+            };
+        let source_path = match ResolvePath::new(&source_relative_path) {
             Ok(path) => path,
             Err(error) => return ResolutionOutcome::ResolutionFailed(error),
         };
-        let destination_path = match ResolvePath::new(&ticket.attempted_destination_relative_path) {
+        let destination_path = match ResolvePath::new(&destination_relative_path) {
             Ok(path) => path,
             Err(error) => return ResolutionOutcome::ResolutionFailed(error),
         };
@@ -3302,6 +3244,57 @@ impl Queue {
                 ResolutionOutcome::ResolutionFailed(e)
             }
         }
+    }
+
+    pub fn transition_ticket_paths(
+        &self,
+        ticket: &TransitionTicket,
+    ) -> Result<(String, String), Error> {
+        ticket.validate_for_queue(&self.format.queue_id)?;
+        let source_common = ticket.source_common();
+        let destination_common = ticket.destination_common()?;
+        let layout = self.layout();
+        let source = match ticket.source() {
+            TicketSource::Ready => layout.ready(&source_common),
+            TicketSource::Leased {
+                boot_id,
+                boottime_deadline_ns,
+                wall_deadline_ns,
+            } => layout.leased_for_boot(
+                &source_common,
+                boot_id,
+                *boottime_deadline_ns,
+                *wall_deadline_ns,
+                &ticket.lease_token(),
+            )?,
+        };
+        let destination = match ticket.destination() {
+            TicketDestination::Ready => layout.ready(&destination_common),
+            TicketDestination::Leased {
+                boot_id,
+                boottime_deadline_ns,
+                wall_deadline_ns,
+            } => layout.leased_for_boot(
+                &destination_common,
+                boot_id,
+                *boottime_deadline_ns,
+                *wall_deadline_ns,
+                &ticket.lease_token(),
+            )?,
+            TicketDestination::Delayed { not_before_ns } => {
+                layout.delayed(&destination_common, *not_before_ns)?
+            }
+            TicketDestination::Receipt { terminal_bucket } => layout.receipt_in_bucket(
+                &destination_common,
+                &ticket.lease_token(),
+                *terminal_bucket,
+            ),
+            TicketDestination::Dead {
+                terminal_bucket,
+                reason,
+            } => layout.dead_in_bucket(&destination_common, *reason, *terminal_bucket),
+        };
+        Ok((source.relative_path(), destination.relative_path()))
     }
 
     fn resolve_check_object(
@@ -3348,19 +3341,14 @@ impl Queue {
             && &header_buf[0..8] == steadq_format::RECEIPT_MAGIC
         {
             match steadq_format::CompactReceipt::decode(&header_buf) {
-                Ok(cr) if cr.job_id == ticket.job_id => {
+                Ok(cr) if cr.job_id == ticket.job_id() => {
                     // R4-B07: Verify compact receipt fields against the ticket.
                     // The envelope digest must match when known (non-zero).
-                    if ticket.envelope_digest != [0u8; 32]
-                        && cr.envelope_digest != ticket.envelope_digest
-                    {
+                    if cr.envelope_digest != ticket.envelope_digest() {
                         return ResolveObj::Conflict;
                     }
-                    // Verify lease token if present in the ticket.
-                    if let Some(tkt) = ticket.lease_token {
-                        if cr.lease_token != tkt {
-                            return ResolveObj::Conflict;
-                        }
+                    if cr.lease_token != ticket.lease_token() {
+                        return ResolveObj::Conflict;
                     }
                     return ResolveObj::Match(ResolvedObject {
                         directory_fd: dir_fd,
@@ -3383,12 +3371,11 @@ impl Queue {
         };
 
         // R4-B07: Verify header job_id matches the ticket.
-        if header.job_id != ticket.job_id {
+        if header.job_id != ticket.job_id() {
             return ResolveObj::Conflict;
         }
 
-        // R4-B07: Verify envelope digest when the ticket carries a known value.
-        if ticket.envelope_digest != [0u8; 32] && header.envelope_digest != ticket.envelope_digest {
+        if header.envelope_digest != ticket.envelope_digest() {
             return ResolveObj::Conflict;
         }
 
@@ -3409,8 +3396,6 @@ impl Queue {
         // verify identity fields against the ticket. The state is derived from
         // the path prefix, not trusted from the ticket.
         let state = parts[0];
-        let known_digest = ticket.envelope_digest != [0u8; 32];
-
         match state {
             "ready" => {
                 // ready/<shard>/<file> = 3 parts
@@ -3421,14 +3406,14 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id {
+                if p.common.job_id != ticket.job_id() {
                     return ResolveObj::Conflict;
                 }
                 let shard_hex = parts[1];
                 if !p.authenticate_tag(&self.format.queue_id, shard_hex) {
                     return ResolveObj::Conflict;
                 }
-                if !self.verify_shard_placement(shard_hex, &ticket.job_id) {
+                if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
                     return ResolveObj::Conflict;
                 }
             }
@@ -3441,13 +3426,11 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id {
+                if p.common.job_id != ticket.job_id() {
                     return ResolveObj::Conflict;
                 }
-                if let Some(tkt) = ticket.lease_token {
-                    if p.token != tkt {
-                        return ResolveObj::Conflict;
-                    }
+                if p.token != ticket.lease_token() {
+                    return ResolveObj::Conflict;
                 }
                 let boot = parts[1];
                 let bucket = parts[2];
@@ -3455,7 +3438,7 @@ impl Queue {
                 if !p.authenticate_tag(&self.format.queue_id, boot, bucket, shard_hex) {
                     return ResolveObj::Conflict;
                 }
-                if !self.verify_shard_placement(shard_hex, &ticket.job_id) {
+                if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
                     return ResolveObj::Conflict;
                 }
             }
@@ -3468,7 +3451,7 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id {
+                if p.common.job_id != ticket.job_id() {
                     return ResolveObj::Conflict;
                 }
                 let bucket = parts[1];
@@ -3476,7 +3459,7 @@ impl Queue {
                 if !p.authenticate_tag(&self.format.queue_id, bucket, shard_hex) {
                     return ResolveObj::Conflict;
                 }
-                if !self.verify_shard_placement(shard_hex, &ticket.job_id) {
+                if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
                     return ResolveObj::Conflict;
                 }
             }
@@ -3489,7 +3472,7 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id {
+                if p.common.job_id != ticket.job_id() {
                     return ResolveObj::Conflict;
                 }
                 let bucket = parts[1];
@@ -3497,7 +3480,7 @@ impl Queue {
                 if !p.authenticate_tag(&self.format.queue_id, bucket, shard_hex) {
                     return ResolveObj::Conflict;
                 }
-                if !self.verify_shard_placement(shard_hex, &ticket.job_id) {
+                if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
                     return ResolveObj::Conflict;
                 }
             }
@@ -3510,27 +3493,24 @@ impl Queue {
                     Ok(p) => p,
                     Err(_) => return ResolveObj::Conflict,
                 };
-                if p.common.job_id != ticket.job_id {
+                if p.common.job_id != ticket.job_id() {
                     return ResolveObj::Conflict;
                 }
-                if let Some(tkt) = ticket.lease_token {
-                    if p.token != tkt {
-                        return ResolveObj::Conflict;
-                    }
+                if p.token != ticket.lease_token() {
+                    return ResolveObj::Conflict;
                 }
                 let bucket = parts[1];
                 let shard_hex = parts[2];
                 if !p.authenticate_tag(&self.format.queue_id, bucket, shard_hex) {
                     return ResolveObj::Conflict;
                 }
-                if !self.verify_shard_placement(shard_hex, &ticket.job_id) {
+                if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
                     return ResolveObj::Conflict;
                 }
             }
             _ => return ResolveObj::Conflict,
         }
 
-        let _ = known_digest;
         ResolveObj::Match(ResolvedObject {
             directory_fd: dir_fd,
             directory_device: directory_stat.st_dev as u64,
@@ -3680,31 +3660,24 @@ mod tests {
         (tmp, queue)
     }
 
-    fn absent_leased_path() -> String {
-        let boot = "00000000-0000-0000-0000-000000000000";
-        let bucket = "0000000000000000";
-        let shard = "0000";
+    fn test_claim_ticket(
+        queue: &Queue,
+        job_id: [u8; 16],
+        generation: u64,
+        attempt: u32,
+        maximum_attempts: u32,
+        lease_token: [u8; 16],
+        envelope_digest: [u8; 32],
+    ) -> TransitionTicket {
         let common = CommonFields {
-            job_id: [0; 16],
-            generation: 0,
-            attempt: 1,
-            maximum_attempts: 1,
+            job_id,
+            generation,
+            attempt,
+            maximum_attempts,
         };
-        let name =
-            steadq_names::make_leased_name(&[0; 16], boot, bucket, shard, &common, 1, 1, &[0; 16]);
-        format!("leased/{boot}/{bucket}/{shard}/{name}")
-    }
-
-    fn absent_ready_path() -> String {
-        let shard = "0000";
-        let common = CommonFields {
-            job_id: [0; 16],
-            generation: 0,
-            attempt: 0,
-            maximum_attempts: 1,
-        };
-        let name = steadq_names::make_ready_name(&[0; 16], shard, &common);
-        format!("ready/{shard}/{name}")
+        queue
+            .claim_transition_ticket(&common, lease_token, envelope_digest, 1, 1)
+            .unwrap()
     }
 
     #[test]
@@ -4778,20 +4751,20 @@ mod tests {
             EnqueueOutcome::Committed(t) => t,
             _ => panic!("enqueue failed"),
         };
-        // Simulate a ticket for a ready->leased transition that was interrupted
-        let ticket = TransitionTicket {
-            job_id: et.job_id,
-            source_state: "ready".into(),
-            source_generation: 0,
-            source_attempt: 0,
-            source_relative_path: absent_ready_path(),
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([0u8; 16]),
-            envelope_digest: et.envelope_digest,
-        };
+        let parsed =
+            steadq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
+                .unwrap();
+        let ticket = test_claim_ticket(
+            &queue,
+            et.job_id,
+            parsed.common.generation,
+            parsed.common.attempt,
+            parsed.common.maximum_attempts,
+            [0; 16],
+            et.envelope_digest,
+        );
         let outcome = queue.resolve(&ticket, false);
-        assert!(matches!(outcome, ResolutionOutcome::NeitherObserved));
+        assert!(matches!(outcome, ResolutionOutcome::SourceObserved));
     }
 
     #[test]
@@ -4810,17 +4783,15 @@ mod tests {
         let parsed =
             steadq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
                 .unwrap();
-        let ticket = TransitionTicket {
-            job_id: et.job_id,
-            source_state: "ready".into(),
-            source_generation: parsed.common.generation,
-            source_attempt: parsed.common.attempt,
-            source_relative_path: et.expected_relative_path.clone(),
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([0u8; 16]),
-            envelope_digest: et.envelope_digest,
-        };
+        let ticket = test_claim_ticket(
+            &queue,
+            et.job_id,
+            parsed.common.generation,
+            parsed.common.attempt,
+            parsed.common.maximum_attempts,
+            [0; 16],
+            et.envelope_digest,
+        );
         let outcome = queue.resolve(&ticket, false);
         assert!(matches!(outcome, ResolutionOutcome::SourceObserved));
     }
@@ -4840,17 +4811,15 @@ mod tests {
         let parsed =
             steadq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
                 .unwrap();
-        let ticket = TransitionTicket {
-            job_id: et.job_id,
-            source_state: "ready".into(),
-            source_generation: parsed.common.generation,
-            source_attempt: parsed.common.attempt,
-            source_relative_path: et.expected_relative_path,
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([0u8; 16]),
-            envelope_digest: et.envelope_digest,
-        };
+        let ticket = test_claim_ticket(
+            &queue,
+            et.job_id,
+            parsed.common.generation,
+            parsed.common.attempt,
+            parsed.common.maximum_attempts,
+            [0; 16],
+            et.envelope_digest,
+        );
 
         fs::fault::reset();
         fs::fault::inject("fsync", 1);
@@ -4885,24 +4854,23 @@ mod tests {
         let parsed =
             steadq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
                 .unwrap();
-        let ticket = TransitionTicket {
-            job_id: et.job_id,
-            source_state: "ready".into(),
-            source_generation: parsed.common.generation,
-            source_attempt: parsed.common.attempt,
-            source_relative_path: et.expected_relative_path,
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([0u8; 16]),
-            envelope_digest: et.envelope_digest,
-        };
-        let source_path = ResolvePath::new(&ticket.source_relative_path).unwrap();
+        let ticket = test_claim_ticket(
+            &queue,
+            et.job_id,
+            parsed.common.generation,
+            parsed.common.attempt,
+            parsed.common.maximum_attempts,
+            [0; 16],
+            et.envelope_digest,
+        );
+        let (source_relative_path, _) = queue.transition_ticket_paths(&ticket).unwrap();
+        let source_path = ResolvePath::new(&source_relative_path).unwrap();
         let object = match queue.resolve_check_object(&source_path, &ticket) {
             ResolveObj::Match(object) => object,
             _ => panic!("source object did not authenticate"),
         };
 
-        let source = tmp.path().join(&ticket.source_relative_path);
+        let source = tmp.path().join(&source_relative_path);
         let displaced = tmp.path().join("tmp/displaced.sqj");
         std::fs::rename(&source, displaced).unwrap();
         assert!(!queue.stabilize_object(&source_path, &object).unwrap());
@@ -4941,18 +4909,17 @@ mod tests {
         let parsed =
             steadq_names::parse_ready(et.expected_relative_path.rsplit('/').next().unwrap())
                 .unwrap();
-        let ticket = TransitionTicket {
-            job_id: et.job_id,
-            source_state: "ready".into(),
-            source_generation: parsed.common.generation,
-            source_attempt: parsed.common.attempt,
-            source_relative_path: et.expected_relative_path,
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([0u8; 16]),
-            envelope_digest: et.envelope_digest,
-        };
-        let source_path = ResolvePath::new(&ticket.source_relative_path).unwrap();
+        let ticket = test_claim_ticket(
+            &queue,
+            et.job_id,
+            parsed.common.generation,
+            parsed.common.attempt,
+            parsed.common.maximum_attempts,
+            [0; 16],
+            et.envelope_digest,
+        );
+        let (source_relative_path, _) = queue.transition_ticket_paths(&ticket).unwrap();
+        let source_path = ResolvePath::new(&source_relative_path).unwrap();
         let object = match queue.resolve_check_object(&source_path, &ticket) {
             ResolveObj::Match(object) => object,
             _ => panic!("source object did not authenticate"),
@@ -4977,7 +4944,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_wrong_job_id() {
+    fn resolve_recomputes_paths_after_job_id_change() {
         let (_tmp, mut queue) = create_test_queue();
         let et = match queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
@@ -4991,90 +4958,56 @@ mod tests {
         // Use a different job_id - the file exists but belongs to a different job.
         let mut wrong_id = et.job_id;
         wrong_id[0] ^= 0xFF;
-        let ticket = TransitionTicket {
-            job_id: wrong_id,
-            source_state: "ready".into(),
-            source_generation: 0,
-            source_attempt: 0,
-            source_relative_path: et.expected_relative_path.clone(),
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([0u8; 16]),
-            envelope_digest: [0; 32],
-        };
+        let ticket = test_claim_ticket(&queue, wrong_id, 0, 0, 3, [0; 16], et.envelope_digest);
         let outcome = queue.resolve(&ticket, false);
-        // File exists but belongs to different job -> Conflict
-        assert!(matches!(outcome, ResolutionOutcome::ConflictingObject));
+        assert!(matches!(outcome, ResolutionOutcome::NeitherObserved));
     }
 
     #[test]
-    fn resolve_rejects_both_invalid_ticket_paths_before_filesystem_calls() {
+    fn resolve_rejects_foreign_queue_ticket_before_filesystem_calls() {
         let (_tmp, queue) = create_test_queue();
-        let base_ticket = TransitionTicket {
-            job_id: [1; 16],
-            source_state: "ready".into(),
-            source_generation: 0,
-            source_attempt: 0,
-            source_relative_path: absent_ready_path(),
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([2; 16]),
-            envelope_digest: [3; 32],
-        };
-        let invalid_paths = vec![
-            "".to_string(),
-            "/absolute".to_string(),
-            "../outside.sqj".to_string(),
-            "ready/0000/../../outside.sqj".to_string(),
-            "ready//nonexistent.sqj".to_string(),
-            "ready/0000/nonexistent.sqj/".to_string(),
-            "ready/0000/extra/nonexistent.sqj".to_string(),
-            "unknown/0000/nonexistent.sqj".to_string(),
-            "ready/0000/nonexistent\0.sqj".to_string(),
-            format!("ready/0000/{}.sqj", "a".repeat(256)),
-        ];
+        let ticket = TransitionTicket::new(
+            [0xff; 16],
+            TransitionOperation::Claim,
+            TransitionPhase::Linearized,
+            [1; 16],
+            0,
+            0,
+            3,
+            [2; 16],
+            [3; 32],
+            TicketSource::Ready,
+            TicketDestination::Leased {
+                boot_id: queue.boot_id.clone(),
+                boottime_deadline_ns: 1,
+                wall_deadline_ns: 1,
+            },
+        )
+        .unwrap();
 
-        for invalid_path in invalid_paths {
-            for invalid_source in [true, false] {
-                let mut ticket = base_ticket.clone();
-                if invalid_source {
-                    ticket.source_relative_path = invalid_path.clone();
-                } else {
-                    ticket.attempted_destination_relative_path = invalid_path.clone();
-                }
-
-                fs::fault::reset();
-                for syscall in [
-                    "openat2_beneath",
-                    "open_directory",
-                    "fstatat",
-                    "fstat",
-                    "openat",
-                ] {
-                    fs::fault::inject(syscall, 1);
-                }
-                let outcome = queue.resolve(&ticket, false);
-                assert!(
-                    matches!(
-                        outcome,
-                        ResolutionOutcome::ResolutionFailed(Error::InvalidInput(_))
-                    ),
-                    "invalid path {invalid_path:?} produced {outcome:?}"
-                );
-                for syscall in [
-                    "openat2_beneath",
-                    "open_directory",
-                    "fstatat",
-                    "fstat",
-                    "openat",
-                ] {
-                    assert_eq!(
-                        fs::fault::call_count(syscall),
-                        0,
-                        "invalid path {invalid_path:?} reached {syscall}"
-                    );
-                }
-            }
+        fs::fault::reset();
+        for syscall in [
+            "openat2_beneath",
+            "open_directory",
+            "fstatat",
+            "fstat",
+            "openat",
+        ] {
+            fs::fault::inject(syscall, 1);
+        }
+        let outcome = queue.resolve(&ticket, false);
+        assert!(matches!(
+            outcome,
+            ResolutionOutcome::ResolutionFailed(Error::InvalidInput(_))
+        ));
+        for syscall in [
+            "openat2_beneath",
+            "open_directory",
+            "fstatat",
+            "fstat",
+            "openat",
+        ] {
+            assert_eq!(fs::fault::call_count(syscall), 0);
         }
         fs::fault::reset();
     }
@@ -6607,9 +6540,8 @@ mod tests {
         assert_eq!(&collected, payload);
     }
 
-    // ===== verify_shard_placement rejects wrong shard =====
     #[test]
-    fn resolve_rejects_wrong_shard_in_path() {
+    fn resolve_does_not_follow_object_relocated_to_wrong_shard() {
         let (_tmp, mut queue) = create_test_queue();
         let et = match queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
@@ -6629,22 +6561,11 @@ mod tests {
         std::fs::create_dir_all(&wrong_dir).unwrap();
         let wrong_path = wrong_dir.join(parts[2]);
         std::fs::rename(&actual_full, &wrong_path).unwrap();
-        // Resolve with the wrong-shard path should return Conflict.
-        let ticket = TransitionTicket {
-            job_id: et.job_id,
-            source_state: "ready".into(),
-            source_generation: 0,
-            source_attempt: 0,
-            source_relative_path: format!("ready/{wrong_shard}/{}", parts[2]),
-            attempted_destination_state: "leased".into(),
-            attempted_destination_relative_path: absent_leased_path(),
-            lease_token: Some([0u8; 16]),
-            envelope_digest: et.envelope_digest,
-        };
+        let ticket = test_claim_ticket(&queue, et.job_id, 0, 0, 3, [0; 16], et.envelope_digest);
         let outcome = queue.resolve(&ticket, false);
         assert!(
-            matches!(outcome, ResolutionOutcome::ConflictingObject),
-            "wrong shard should be Conflict, got {outcome:?}"
+            matches!(outcome, ResolutionOutcome::NeitherObserved),
+            "resolver should only inspect the derived shard, got {outcome:?}"
         );
     }
 
