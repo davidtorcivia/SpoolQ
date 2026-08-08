@@ -208,11 +208,19 @@ impl<'a> Layout<'a> {
         })
     }
 
+    fn is_valid_leased_path_parts(len: usize, first: &str) -> bool {
+        len == 5 && first == "leased"
+    }
+
+    fn is_shard_in_range(shard: u32, count: u32) -> bool {
+        shard < count
+    }
+
     /// Parse a leased relative path into typed location and filename.
     /// Validates leased/<boot>/<bucket>/<shard>/<name> with canonical hex.
     pub fn parse_leased_path(&self, relative: &str) -> Result<(Location, String), Error> {
         let parts: Vec<&str> = relative.split('/').collect();
-        if parts.len() != 5 || parts[0] != "leased" {
+        if !Self::is_valid_leased_path_parts(parts.len(), parts[0]) {
             return Err(Error::QueueCorrupt("invalid leased path".into()));
         }
         let boot_id = parts[1];
@@ -223,7 +231,7 @@ impl<'a> Layout<'a> {
             .ok_or_else(|| Error::QueueCorrupt("invalid bucket hex".into()))?;
         let shard = spoolq_names::shard_from_hex(parts[3])
             .ok_or_else(|| Error::QueueCorrupt("invalid shard hex".into()))?;
-        if shard >= self.shard_count {
+        if !Self::is_shard_in_range(shard, self.shard_count) {
             return Err(Error::QueueCorrupt("shard out of range".into()));
         }
         let filename = parts[4].to_string();
@@ -303,5 +311,26 @@ mod tests {
         let bad_shard =
             "leased/12345678-1234-1234-1234-123456789abc/000000000000000a/ffff/file.sqj";
         assert!(layout.parse_leased_path(bad_shard).is_err());
+    }
+
+    #[test]
+    fn is_valid_leased_path_parts_table() {
+        assert!(Layout::is_valid_leased_path_parts(5, "leased"));
+        assert!(!Layout::is_valid_leased_path_parts(4, "leased"));
+        assert!(!Layout::is_valid_leased_path_parts(5, "ready"));
+        assert!(!Layout::is_valid_leased_path_parts(6, "leased"));
+        assert!(!Layout::is_valid_leased_path_parts(5, "Leased"));
+        assert!(!Layout::is_valid_leased_path_parts(0, ""));
+    }
+
+    #[test]
+    fn is_shard_in_range_table() {
+        assert!(Layout::is_shard_in_range(0, 64));
+        assert!(Layout::is_shard_in_range(63, 64));
+        assert!(!Layout::is_shard_in_range(64, 64));
+        assert!(!Layout::is_shard_in_range(100, 64));
+        assert!(Layout::is_shard_in_range(0, 1));
+        assert!(!Layout::is_shard_in_range(1, 1));
+        assert!(!Layout::is_shard_in_range(u32::MAX, 64));
     }
 }

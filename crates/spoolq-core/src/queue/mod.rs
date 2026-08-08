@@ -2177,17 +2177,29 @@ impl Queue {
 
     /// B-04: Open and validate the current leased source object.
     /// Validates the source path, filename, header, and identity against the handle.
+    fn is_expected_dev_zero(dev: u64) -> bool {
+        dev == 0
+    }
+
+    fn is_expected_inode_zero(ino: u64) -> bool {
+        ino == 0
+    }
+
+    fn shard_matches(path: u32, computed: u32) -> bool {
+        path == computed
+    }
+
     /// Returns the opened source directory fd and source filename on success.
     fn open_and_validate_current_lease(
         &self,
         lease: &LeaseInfo,
     ) -> Result<Option<(OwnedFd, String)>, Error> {
-        if lease.expected_dev == 0 {
+        if Self::is_expected_dev_zero(lease.expected_dev) {
             return Err(Error::QueueCorrupt(
                 "expected_dev is zero (forgeable handle)".into(),
             ));
         }
-        if lease.expected_inode == 0 {
+        if Self::is_expected_inode_zero(lease.expected_inode) {
             return Err(Error::QueueCorrupt(
                 "expected_inode is zero (forgeable handle)".into(),
             ));
@@ -2211,7 +2223,7 @@ impl Queue {
             &lease.job_id,
             self.format.shard_count,
         );
-        if path_shard != computed_shard {
+        if !Self::shard_matches(path_shard, computed_shard) {
             return Err(Error::QueueCorrupt(format!(
                 "source shard {path_shard} does not match queue-derived shard {computed_shard}"
             )));
@@ -4060,7 +4072,16 @@ mod tests {
                 )
                 .unwrap();
                 let mut queue = queue;
+                let mut attempts = 0;
                 loop {
+                    attempts += 1;
+                    if attempts > total_jobs * 4 + 100 {
+                        panic!(
+                            "concurrent test hung: attempts {attempts} exceeded bound, leased {} acked {}",
+                            lc.load(Ordering::SeqCst),
+                            ac.load(Ordering::SeqCst)
+                        );
+                    }
                     match queue.lease(0, 30_000_000_000) {
                         LeaseOutcome::Leased(lease) => {
                             lc.fetch_add(1, Ordering::SeqCst);
@@ -6442,5 +6463,29 @@ mod tests {
             ),
             "expected clock fault to fail enqueue, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn is_expected_dev_zero_table() {
+        assert!(Queue::is_expected_dev_zero(0));
+        assert!(!Queue::is_expected_dev_zero(1));
+        assert!(!Queue::is_expected_dev_zero(u64::MAX));
+        assert!(!Queue::is_expected_dev_zero(42));
+    }
+
+    #[test]
+    fn is_expected_inode_zero_table() {
+        assert!(Queue::is_expected_inode_zero(0));
+        assert!(!Queue::is_expected_inode_zero(1));
+        assert!(!Queue::is_expected_inode_zero(u64::MAX));
+    }
+
+    #[test]
+    fn shard_matches_table() {
+        assert!(Queue::shard_matches(5, 5));
+        assert!(!Queue::shard_matches(5, 6));
+        assert!(!Queue::shard_matches(6, 5));
+        assert!(!Queue::shard_matches(0, 1));
+        assert!(Queue::shard_matches(u32::MAX, u32::MAX));
     }
 }
