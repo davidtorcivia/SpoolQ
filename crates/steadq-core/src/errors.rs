@@ -614,8 +614,8 @@ mod tests {
             TransitionPhase::Linearized,
             [6; 16],
             7,
-            1,
-            3,
+            2,
+            4,
             [8; 16],
             [9; 32],
             TicketSource::Ready {},
@@ -649,8 +649,8 @@ mod tests {
         assert_eq!(ticket.phase(), TransitionPhase::Linearized);
         assert_eq!(ticket.job_id(), [6; 16]);
         assert_eq!(ticket.source_generation(), 7);
-        assert_eq!(ticket.source_attempt(), 1);
-        assert_eq!(ticket.maximum_attempts(), 3);
+        assert_eq!(ticket.source_attempt(), 2);
+        assert_eq!(ticket.maximum_attempts(), 4);
         assert_eq!(ticket.lease_token(), [8; 16]);
         assert_eq!(ticket.envelope_digest(), [9; 32]);
         assert!(matches!(ticket.source(), TicketSource::Ready {}));
@@ -713,6 +713,14 @@ mod tests {
             wall_deadline_ns: 2,
         };
         ticket.operation = TransitionOperation::Renew;
+        assert!(ticket.validate().is_err());
+
+        ticket = valid_transition_ticket();
+        ticket.destination = TicketDestination::Leased {
+            boot_id: "not-a-boot-id".into(),
+            boottime_deadline_ns: 1,
+            wall_deadline_ns: 2,
+        };
         assert!(ticket.validate().is_err());
     }
 

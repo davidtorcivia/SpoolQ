@@ -2447,13 +2447,8 @@ impl Queue {
         expected_job_id: &[u8; 16],
         expected_maximum_attempts: u32,
     ) -> Result<[u8; 32], Error> {
-        let file = fs::openat(
-            directory_fd,
-            name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            0,
-        )
-        .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let file = fs::openat(directory_fd, name, resolver_file_open_flags(), 0)
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
         let mut header_bytes = [0u8; 128];
         fs::pread_exact(file.as_raw_fd(), &mut header_bytes, 0)
             .map_err(|error| Error::IoFailure(error.to_string()))?;
@@ -3765,6 +3760,39 @@ mod tests {
             }
             _ => panic!("expected committed, got {outcome:?}"),
         }
+    }
+
+    #[test]
+    fn ticket_envelope_digest_authenticates_ready_header() {
+        let (_tmp, mut queue) = create_test_queue();
+        let enqueue = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".to_string(),
+            payload: b"ticket evidence".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("expected committed enqueue, got {outcome:?}"),
+        };
+        let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
+        let directory_fd = open_relative(queue.root_fd().as_raw_fd(), directory).unwrap();
+
+        assert_eq!(
+            Queue::read_ticket_envelope_digest(directory_fd.as_raw_fd(), name, &enqueue.job_id, 3,)
+                .unwrap(),
+            enqueue.envelope_digest
+        );
+
+        let mut wrong_job_id = enqueue.job_id;
+        wrong_job_id[0] ^= 0xff;
+        assert!(matches!(
+            Queue::read_ticket_envelope_digest(directory_fd.as_raw_fd(), name, &wrong_job_id, 3,),
+            Err(Error::QueueCorrupt(_))
+        ));
+        assert!(matches!(
+            Queue::read_ticket_envelope_digest(directory_fd.as_raw_fd(), name, &enqueue.job_id, 4,),
+            Err(Error::QueueCorrupt(_))
+        ));
     }
 
     #[test]
