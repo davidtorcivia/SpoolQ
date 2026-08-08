@@ -5,7 +5,6 @@ No stable or certified release may proceed until the tracked hardening findings 
 Minimum gates:
 
 - Zero unresolved P0 findings.
-- ADR-0033 accepted and reconciled.
 - Closed protocol IR and complete traceability matrix.
 - All authoritative mutations use the phase-aware executor.
 - All release-critical CI lanes are gating and reproducible.
