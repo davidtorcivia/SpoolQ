@@ -168,6 +168,9 @@ impl FormatRecord {
         if !(60_000_000_000..=86_400_000_000_000).contains(&terminal_bucket_width_ns) {
             return Err(FormatError::InvalidBucketWidth);
         }
+        if !terminal_bucket_width_ns.is_multiple_of(delayed_bucket_width_ns) {
+            return Err(FormatError::InvalidBucketWidth);
+        }
 
         if max_payload_length > MAX_PAYLOAD_LENGTH {
             return Err(FormatError::PayloadLimitExceeded);
@@ -663,6 +666,23 @@ mod tests {
         // The digest is computed over bytes including shard_count=3,
         // so decode will pass digest check but fail shard validation.
         assert!(FormatRecord::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn format_rejects_misaligned_wall_bucket_widths() {
+        let rec = FormatRecord {
+            queue_id: [1; 16],
+            created_at_unix_ns: 0,
+            shard_count: 64,
+            lease_bucket_width_ns: 10_000_000_000,
+            delayed_bucket_width_ns: 7_000_000_000,
+            terminal_bucket_width_ns: 3_600_000_000_000,
+            max_payload_length: MAX_PAYLOAD_LENGTH,
+        };
+        assert!(matches!(
+            FormatRecord::decode(&rec.encode()),
+            Err(FormatError::InvalidBucketWidth)
+        ));
     }
 
     #[test]
