@@ -12,10 +12,7 @@ use spoolq_format::{
 };
 use spoolq_fs_linux as fs;
 use spoolq_math::{self, bucket_number, ceiling_bucket, eligibility_bucket_and_ns};
-use spoolq_names::{
-    self, bucket_hex, compute_name_tag, compute_shard, delayed_context, delayed_filename,
-    ready_context, ready_filename, shard_hex, temp_filename, CommonFields,
-};
+use spoolq_names::{self, bucket_hex, compute_shard, shard_hex, temp_filename, CommonFields};
 
 use crate::errors::*;
 
@@ -898,32 +895,20 @@ impl Queue {
 
         let (dest_dir_relative, filename, expected_path) = match initial_state {
             InitialState::Ready => {
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}",
-                    spoolq_names::hex_encode(&job_id),
-                    0u64,
-                    0u32,
-                    job.maximum_attempts
-                );
-                let ctx = ready_context(&shard_str, &base);
-                let tag = compute_name_tag(&self.format.queue_id, &ctx);
-                let fname = ready_filename(&common, &tag);
+                let fname =
+                    spoolq_names::make_ready_name(&self.format.queue_id, &shard_str, &common);
                 let path = format!("ready/{shard_str}/{fname}");
                 (format!("ready/{shard_str}"), fname, path)
             }
             InitialState::Delayed => {
                 let bucket_str = bucket_hex(eligibility_bucket);
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}.d{:016x}",
-                    spoolq_names::hex_encode(&job_id),
-                    0u64,
-                    0u32,
-                    job.maximum_attempts,
-                    nb_to_u64(job.initial_not_before)
+                let fname = spoolq_names::make_delayed_name(
+                    &self.format.queue_id,
+                    &bucket_str,
+                    &shard_str,
+                    &common,
+                    nb_to_u64(job.initial_not_before),
                 );
-                let ctx = delayed_context(&bucket_str, &shard_str, &base);
-                let tag = compute_name_tag(&self.format.queue_id, &ctx);
-                let fname = delayed_filename(&common, nb_to_u64(job.initial_not_before), &tag);
                 let path = format!("delayed/{bucket_str}/{shard_str}/{fname}");
                 (format!("delayed/{bucket_str}/{shard_str}"), fname, path)
             }
@@ -1223,17 +1208,7 @@ impl Queue {
                     Err(_) => continue,
                 };
 
-                // Verify name tag
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}",
-                    spoolq_names::hex_encode(&parsed.common.job_id),
-                    parsed.common.generation,
-                    parsed.common.attempt,
-                    parsed.common.maximum_attempts,
-                );
-                let ctx = ready_context(&shard_str, &base);
-                let expected_tag = compute_name_tag(&self.format.queue_id, &ctx);
-                if expected_tag != parsed.tag {
+                if !parsed.authenticate_tag(&self.format.queue_id, &shard_str) {
                     continue;
                 }
 
@@ -1311,30 +1286,15 @@ impl Queue {
                     maximum_attempts: parsed.common.maximum_attempts,
                 };
 
-                // Build leased filename
-                let leased_base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
-                    spoolq_names::hex_encode(&leased_common.job_id),
-                    leased_common.generation,
-                    leased_common.attempt,
-                    leased_common.maximum_attempts,
-                    boottime_deadline,
-                    wall_deadline,
-                    spoolq_names::hex_encode(&lease_token),
-                );
-                let leased_ctx = spoolq_names::leased_context(
+                let leased_name = spoolq_names::make_leased_name(
+                    &self.format.queue_id,
                     &self.boot_id,
                     &bucket_str,
                     &shard_str,
-                    &leased_base,
-                );
-                let leased_tag = compute_name_tag(&self.format.queue_id, &leased_ctx);
-                let leased_name = spoolq_names::leased_filename(
                     &leased_common,
                     boottime_deadline,
                     wall_deadline,
                     &lease_token,
-                    &leased_tag,
                 );
 
                 // Ensure lease directory exists
@@ -1819,24 +1779,13 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        // Build receipt filename
-        let receipt_base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
-            spoolq_names::hex_encode(&receipt_common.job_id),
-            receipt_common.generation,
-            receipt_common.attempt,
-            receipt_common.maximum_attempts,
-            spoolq_names::hex_encode(&lease.token),
-        );
-        let receipt_ctx = spoolq_names::terminal_context(
-            spoolq_names::State::Receipt,
+        let receipt_name = spoolq_names::make_receipt_name(
+            &self.format.queue_id,
             &bucket_str,
             &shard_str,
-            &receipt_base,
+            &receipt_common,
+            &lease.token,
         );
-        let receipt_tag = compute_name_tag(&self.format.queue_id, &receipt_ctx);
-        let receipt_name =
-            spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
 
         let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
         if let Err(e) = self.ensure_dir(&receipt_dir) {
@@ -2131,17 +2080,13 @@ impl Queue {
                     attempt: lease.attempt,
                     maximum_attempts: lease.maximum_attempts,
                 };
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}.d{:016x}",
-                    spoolq_names::hex_encode(&lease.job_id),
-                    new_gen,
-                    lease.attempt,
-                    lease.maximum_attempts,
+                let fname = spoolq_names::make_delayed_name(
+                    &self.format.queue_id,
+                    &bucket_str,
+                    &shard_str,
+                    &common,
                     nb,
                 );
-                let ctx = spoolq_names::delayed_context(&bucket_str, &shard_str, &base);
-                let tag = compute_name_tag(&self.format.queue_id, &ctx);
-                let fname = spoolq_names::delayed_filename(&common, nb, &tag);
                 let dir = format!("delayed/{bucket_str}/{shard_str}");
                 (dir, fname)
             }
@@ -2152,16 +2097,8 @@ impl Queue {
                     attempt: lease.attempt,
                     maximum_attempts: lease.maximum_attempts,
                 };
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}",
-                    spoolq_names::hex_encode(&lease.job_id),
-                    new_gen,
-                    lease.attempt,
-                    lease.maximum_attempts,
-                );
-                let ctx = ready_context(&shard_str, &base);
-                let tag = compute_name_tag(&self.format.queue_id, &ctx);
-                let fname = ready_filename(&common, &tag);
+                let fname =
+                    spoolq_names::make_ready_name(&self.format.queue_id, &shard_str, &common);
                 (format!("ready/{shard_str}"), fname)
             }
         };
@@ -2205,22 +2142,13 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}.x{:04x}",
-            spoolq_names::hex_encode(&lease.job_id),
-            new_gen,
-            lease.attempt,
-            lease.maximum_attempts,
-            reason as u16,
-        );
-        let ctx = spoolq_names::terminal_context(
-            spoolq_names::State::Dead,
+        let fname = spoolq_names::make_dead_name(
+            &self.format.queue_id,
             &bucket_str,
             &shard_str,
-            &base,
+            &common,
+            reason as u16,
         );
-        let tag = compute_name_tag(&self.format.queue_id, &ctx);
-        let fname = spoolq_names::dead_filename(&common, reason as u16, &tag);
         let dest_dir = format!("dead/{bucket_str}/{shard_str}");
 
         self.move_leased(lease, &dest_dir, &fname)
@@ -2283,24 +2211,15 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
-            spoolq_names::hex_encode(&lease.job_id),
-            new_gen,
-            lease.attempt,
-            lease.maximum_attempts,
-            new_boottime_dl,
-            new_wall_dl,
-            spoolq_names::hex_encode(&lease.token),
-        );
-        let ctx = spoolq_names::leased_context(&self.boot_id, &bucket_str, &shard_str, &base);
-        let tag = compute_name_tag(&self.format.queue_id, &ctx);
-        let fname = spoolq_names::leased_filename(
+        let fname = spoolq_names::make_leased_name(
+            &self.format.queue_id,
+            &self.boot_id,
+            &bucket_str,
+            &shard_str,
             &common,
             new_boottime_dl,
             new_wall_dl,
             &lease.token,
-            &tag,
         );
         let dest_dir = format!("leased/{}/{}/{}", self.boot_id, bucket_str, shard_str);
 
@@ -2616,22 +2535,13 @@ impl Queue {
             maximum_attempts: common.maximum_attempts,
         };
 
-        let base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}.x{:04x}",
-            spoolq_names::hex_encode(&dead_common.job_id),
-            new_gen,
-            dead_common.attempt,
-            dead_common.maximum_attempts,
-            reason as u16,
-        );
-        let ctx = spoolq_names::terminal_context(
-            spoolq_names::State::Dead,
+        let dead_name = spoolq_names::make_dead_name(
+            &self.format.queue_id,
             &bucket_str,
             shard_str,
-            &base,
+            &dead_common,
+            reason as u16,
         );
-        let tag = compute_name_tag(&self.format.queue_id, &ctx);
-        let dead_name = spoolq_names::dead_filename(&dead_common, reason as u16, &tag);
         let dead_dir = format!("dead/{bucket_str}/{shard_str}");
 
         let _ = self.ensure_dir(&dead_dir);
@@ -3148,22 +3058,16 @@ impl Queue {
             ActivePathContext::Ready { shard } => {
                 let p = spoolq_names::parse_ready(name)
                     .map_err(|_| Error::QueueCorrupt("invalid ready filename".into()))?;
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}",
-                    spoolq_names::hex_encode(&p.common.job_id),
-                    p.common.generation,
-                    p.common.attempt,
-                    p.common.maximum_attempts,
-                );
-                let ctx_str = ready_context(shard, &base);
-                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                if !p.authenticate_tag(&self.format.queue_id, shard) {
+                    return Err(Error::QueueCorrupt("name tag mismatch".into()));
+                }
                 (
                     p.common.job_id,
                     p.common.generation,
                     p.common.attempt,
                     p.common.maximum_attempts,
                     p.tag,
-                    expected,
+                    p.tag,
                     shard.clone(),
                 )
             }
@@ -3174,18 +3078,9 @@ impl Queue {
             } => {
                 let p = spoolq_names::parse_leased(name)
                     .map_err(|_| Error::QueueCorrupt("invalid leased filename".into()))?;
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}.b{:016x}.w{:016x}.t{}",
-                    spoolq_names::hex_encode(&p.common.job_id),
-                    p.common.generation,
-                    p.common.attempt,
-                    p.common.maximum_attempts,
-                    p.boottime_deadline_ns,
-                    p.wall_deadline_ns,
-                    spoolq_names::hex_encode(&p.token),
-                );
-                let ctx_str = spoolq_names::leased_context(boot_id, bucket, shard, &base);
-                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                if !p.authenticate_tag(&self.format.queue_id, boot_id, bucket, shard) {
+                    return Err(Error::QueueCorrupt("name tag mismatch".into()));
+                }
                 let expected_bucket = spoolq_math::lease_bucket(
                     p.boottime_deadline_ns,
                     self.format.lease_bucket_width_ns,
@@ -3203,23 +3098,16 @@ impl Queue {
                     p.common.attempt,
                     p.common.maximum_attempts,
                     p.tag,
-                    expected,
+                    p.tag,
                     shard.clone(),
                 )
             }
             ActivePathContext::Delayed { bucket, shard } => {
                 let p = spoolq_names::parse_delayed(name)
                     .map_err(|_| Error::QueueCorrupt("invalid delayed filename".into()))?;
-                let base = format!(
-                    "{}.g{:016x}.a{:08x}.m{:08x}.d{:016x}",
-                    spoolq_names::hex_encode(&p.common.job_id),
-                    p.common.generation,
-                    p.common.attempt,
-                    p.common.maximum_attempts,
-                    p.not_before_ns,
-                );
-                let ctx_str = spoolq_names::delayed_context(bucket, shard, &base);
-                let expected = compute_name_tag(&self.format.queue_id, &ctx_str);
+                if !p.authenticate_tag(&self.format.queue_id, bucket, shard) {
+                    return Err(Error::QueueCorrupt("name tag mismatch".into()));
+                }
                 let expected_bucket = spoolq_math::ceiling_bucket(
                     p.not_before_ns,
                     self.format.delayed_bucket_width_ns,
@@ -3237,7 +3125,7 @@ impl Queue {
                     p.common.attempt,
                     p.common.maximum_attempts,
                     p.tag,
-                    expected,
+                    p.tag,
                     shard.clone(),
                 )
             }
@@ -3354,23 +3242,13 @@ impl Queue {
         };
         for bucket_num in min_bucket..=now_bucket {
             let bucket_str = bucket_hex(bucket_num);
-            let receipt_base = format!(
-                "{}.g{:016x}.a{:08x}.m{:08x}.t{}",
-                spoolq_names::hex_encode(&receipt_common.job_id),
-                receipt_common.generation,
-                receipt_common.attempt,
-                receipt_common.maximum_attempts,
-                spoolq_names::hex_encode(&lease.token),
-            );
-            let receipt_ctx = spoolq_names::terminal_context(
-                spoolq_names::State::Receipt,
+            let receipt_name = spoolq_names::make_receipt_name(
+                &self.format.queue_id,
                 &bucket_str,
                 &shard_str,
-                &receipt_base,
+                &receipt_common,
+                &lease.token,
             );
-            let receipt_tag = compute_name_tag(&self.format.queue_id, &receipt_ctx);
-            let receipt_name =
-                spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
             let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
             if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &receipt_dir) {
                 // R4-B08: Authenticate the receipt, not just check existence
@@ -5730,6 +5608,76 @@ mod tests {
     }
 
     #[test]
+    fn validate_active_object_rejects_tag_mismatch() {
+        let (_tmp, mut queue) = create_test_queue();
+        match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"tag-test".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(_) => {}
+            other => panic!("enqueue must succeed, got {other:?}"),
+        }
+        let ready_root = _tmp.path().join("ready");
+        let mut found: Option<(String, String)> = None;
+        for shard in std::fs::read_dir(&ready_root).unwrap().flatten() {
+            for entry in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                let n = entry.file_name().to_string_lossy().to_string();
+                if n.ends_with(".sqj") {
+                    found = Some((shard.file_name().to_string_lossy().to_string(), n));
+                    break;
+                }
+            }
+        }
+        let (shard_name, file_name) = found.expect("ready file");
+        let correct_ctx = crate::ActivePathContext::Ready {
+            shard: shard_name.clone(),
+        };
+        let dir_fd = crate::queue::open_relative(
+            queue.root_fd().as_raw_fd(),
+            &format!("ready/{shard_name}"),
+        )
+        .unwrap();
+        let ok = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &correct_ctx);
+        assert!(ok.is_ok(), "correct tag must validate, got {ok:?}");
+        let wrong_ctx = crate::ActivePathContext::Ready {
+            shard: "ffff".to_string(),
+        };
+        let bad = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &wrong_ctx);
+        assert!(
+            matches!(bad, Err(Error::QueueCorrupt(_))),
+            "wrong shard must cause tag mismatch, got {bad:?}"
+        );
+    }
+
+    #[test]
+    fn check_duplicate_ack_bounded_is_false_when_no_receipt() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = b"dup-ack-test";
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            other => panic!("lease must succeed, got {other:?}"),
+        };
+        let before = queue.check_duplicate_ack_bounded(&lease);
+        assert!(!before, "no receipt yet, duplicate check must be false");
+        queue.verify_lease_payload(&lease).unwrap();
+        let ack = queue.ack(&lease);
+        assert!(
+            matches!(ack, AckOutcome::Acked),
+            "ack must succeed, got {ack:?}"
+        );
+        let after = queue.check_duplicate_ack_bounded(&lease);
+        assert!(after, "after ack, duplicate check must be true");
+    }
+
+    #[test]
     fn full_lifecycle_with_verify() {
         let (_tmp, mut queue) = create_test_queue();
         let payload = b"lifecycle test payload data";
@@ -5993,7 +5941,7 @@ mod tests {
             &shard_str,
             &receipt_base,
         );
-        let receipt_tag = compute_name_tag(&queue.format.queue_id, &receipt_ctx);
+        let receipt_tag = spoolq_names::compute_name_tag(&queue.format.queue_id, &receipt_ctx);
         let receipt_name =
             spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
         // Pre-plant a non-receipt file at the exact destination.
@@ -6261,7 +6209,7 @@ mod tests {
             &shard_str,
             &receipt_base,
         );
-        let receipt_tag = compute_name_tag(&queue.format.queue_id, &receipt_ctx);
+        let receipt_tag = spoolq_names::compute_name_tag(&queue.format.queue_id, &receipt_ctx);
         let receipt_name =
             spoolq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
         let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");

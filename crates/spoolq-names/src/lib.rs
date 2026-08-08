@@ -444,6 +444,80 @@ pub fn quarantine_filename(quarantine_id: &[u8; 16], reason: u16) -> String {
     format!("q{}.x{}.raw", hex_encode(quarantine_id), hex_u16(reason))
 }
 
+// ---------- High-level canonical builders ----------
+// PR1: Single source for writer side. Callers supply semantic fields only;
+// canonical text, context, and tag are derived here. Core production code
+// should use these instead of composing ready_context etc. directly.
+
+pub fn make_ready_name(queue_id: &[u8; 16], shard_hex: &str, common: &CommonFields) -> String {
+    let base = common.base_name();
+    let ctx = ready_context(shard_hex, &base);
+    let tag = compute_name_tag(queue_id, &ctx);
+    ready_filename(common, &tag)
+}
+
+pub fn make_delayed_name(
+    queue_id: &[u8; 16],
+    bucket_hex: &str,
+    shard_hex: &str,
+    common: &CommonFields,
+    not_before_ns: u64,
+) -> String {
+    let base = format!("{}.d{}", common.base_name(), hex_u64(not_before_ns));
+    let ctx = delayed_context(bucket_hex, shard_hex, &base);
+    let tag = compute_name_tag(queue_id, &ctx);
+    delayed_filename(common, not_before_ns, &tag)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_leased_name(
+    queue_id: &[u8; 16],
+    boot_id: &str,
+    bucket_hex: &str,
+    shard_hex: &str,
+    common: &CommonFields,
+    boottime_deadline_ns: u64,
+    wall_deadline_ns: u64,
+    token: &[u8; 16],
+) -> String {
+    let base = format!(
+        "{}.b{}.w{}.t{}",
+        common.base_name(),
+        hex_u64(boottime_deadline_ns),
+        hex_u64(wall_deadline_ns),
+        hex_encode(token),
+    );
+    let ctx = leased_context(boot_id, bucket_hex, shard_hex, &base);
+    let tag = compute_name_tag(queue_id, &ctx);
+    leased_filename(common, boottime_deadline_ns, wall_deadline_ns, token, &tag)
+}
+
+pub fn make_receipt_name(
+    queue_id: &[u8; 16],
+    bucket_hex: &str,
+    shard_hex: &str,
+    common: &CommonFields,
+    token: &[u8; 16],
+) -> String {
+    let base = format!("{}.t{}", common.base_name(), hex_encode(token));
+    let ctx = terminal_context(State::Receipt, bucket_hex, shard_hex, &base);
+    let tag = compute_name_tag(queue_id, &ctx);
+    receipt_filename(common, token, &tag)
+}
+
+pub fn make_dead_name(
+    queue_id: &[u8; 16],
+    bucket_hex: &str,
+    shard_hex: &str,
+    common: &CommonFields,
+    reason: u16,
+) -> String {
+    let base = format!("{}.x{}", common.base_name(), hex_u16(reason));
+    let ctx = terminal_context(State::Dead, bucket_hex, shard_hex, &base);
+    let tag = compute_name_tag(queue_id, &ctx);
+    dead_filename(common, reason, &tag)
+}
+
 // ---------- Canonical context for name tag ----------
 
 /// Build the canonical context string used for name tag computation.
@@ -1544,5 +1618,83 @@ mod tests {
         assert!(ctx.starts_with("receipts/-/bucket1/01ab/"));
         assert!(ctx.contains(".t"));
         assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn make_ready_name_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let shard = "01ab";
+        let name = make_ready_name(&qid, shard, &common);
+        let parsed = parse_ready(&name).expect("make_ready_name should be parseable");
+        assert_eq!(parsed.common, common);
+        assert!(parsed.authenticate_tag(&qid, shard));
+    }
+
+    #[test]
+    fn make_delayed_name_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000005";
+        let shard = "02cd";
+        let not_before = 1_700_000_000_000_000_000u64;
+        let name = make_delayed_name(&qid, bucket, shard, &common, not_before);
+        let parsed = parse_delayed(&name).expect("make_delayed_name parse");
+        assert_eq!(parsed.common, common);
+        assert_eq!(parsed.not_before_ns, not_before);
+        assert!(parsed.authenticate_tag(&qid, bucket, shard));
+    }
+
+    #[test]
+    fn make_leased_name_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let boot = "12345678-1234-1234-1234-123456789abc";
+        let bucket = "000000000000000a";
+        let shard = "03ef";
+        let token = [0xAB; 16];
+        let name = make_leased_name(
+            &qid,
+            boot,
+            bucket,
+            shard,
+            &common,
+            3_000_000_000,
+            4_000_000_000,
+            &token,
+        );
+        let parsed = parse_leased(&name).expect("make_leased_name parse");
+        assert_eq!(parsed.common, common);
+        assert_eq!(parsed.boottime_deadline_ns, 3_000_000_000);
+        assert_eq!(parsed.wall_deadline_ns, 4_000_000_000);
+        assert_eq!(parsed.token, token);
+        assert!(parsed.authenticate_tag(&qid, boot, bucket, shard));
+    }
+
+    #[test]
+    fn make_receipt_name_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000007";
+        let shard = "04aa";
+        let token = [0xCD; 16];
+        let name = make_receipt_name(&qid, bucket, shard, &common, &token);
+        let parsed = parse_receipt(&name).expect("make_receipt_name parse");
+        assert_eq!(parsed.common, common);
+        assert_eq!(parsed.token, token);
+        assert!(parsed.authenticate_tag(&qid, bucket, shard));
+    }
+
+    #[test]
+    fn make_dead_name_round_trip() {
+        let qid = test_queue_id();
+        let common = make_common();
+        let bucket = "0000000000000009";
+        let shard = "05bb";
+        let name = make_dead_name(&qid, bucket, shard, &common, 0x0004);
+        let parsed = parse_dead(&name).expect("make_dead_name parse");
+        assert_eq!(parsed.common, common);
+        assert_eq!(parsed.reason, 0x0004);
+        assert!(parsed.authenticate_tag(&qid, bucket, shard));
     }
 }
