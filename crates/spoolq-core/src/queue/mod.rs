@@ -1,5 +1,6 @@
 // SpoolQ/1 queue initialization, open, and enqueue operations.
 
+pub mod engine;
 pub mod layout;
 pub mod verified;
 
