@@ -299,7 +299,21 @@ impl PowerLossHarness {
     pub fn crash(&mut self, window: CrashWindow) {
         drop(self.queue.take());
         match window {
-            CrashWindow::BeforeRename => {}
+            CrashWindow::BeforeRename => {
+                // Rename never happened: source remains, dest never created
+                if let Some(dest) = self.last_rename_dest.clone() {
+                    let dest_path = self.tmp.path().join(&dest);
+                    let _ = std::fs::remove_file(&dest_path);
+                }
+                if let Some(src) = self.last_rename_src.clone() {
+                    let src_path = self.tmp.path().join(&src);
+                    if !src_path.exists() {
+                        if let Some(bytes) = self.saved_source_bytes.clone() {
+                            let _ = std::fs::write(&src_path, bytes);
+                        }
+                    }
+                }
+            }
             CrashWindow::AfterRenameBeforeDestSync => {
                 // Dest not durable, so remove dest. Source should be restored if it was removed.
                 if let Some(dest) = self.last_rename_dest.clone() {

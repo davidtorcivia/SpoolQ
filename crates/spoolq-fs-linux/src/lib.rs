@@ -1004,10 +1004,25 @@ pub fn validate_path_component(comp: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Validate a relative path for safety: split into components and validate each.
+/// Validate a relative path for safety: rejects absolute paths, '.' and '..'.
 pub fn validate_relative_path(path: &str) -> io::Result<Vec<&str>> {
-    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if path.starts_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "absolute path not allowed",
+        ));
+    }
+    if path.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path"));
+    }
+    let components: Vec<&str> = path.split('/').collect();
     for comp in &components {
+        if comp.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty path component in relative path",
+            ));
+        }
         validate_path_component(comp)?;
     }
     Ok(components)

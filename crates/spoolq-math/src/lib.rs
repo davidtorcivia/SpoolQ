@@ -31,7 +31,11 @@ pub fn ceiling_bucket(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
     }
     let q = timestamp_ns / bucket_width_ns;
     let r = timestamp_ns % bucket_width_ns;
-    Some(if r != 0 { q + 1 } else { q })
+    if r != 0 {
+        checked_add_u64(q, 1)
+    } else {
+        Some(q)
+    }
 }
 
 /// Rounded-up eligibility bucket for delayed scheduling.

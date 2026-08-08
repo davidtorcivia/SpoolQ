@@ -1475,15 +1475,28 @@ fn load_handle(
             )
         })?;
 
-    // P1-21: Verify queue binding.
-    if let Some(ref hqid) = handle.queue_id {
-        if let Some(handle_qid) = spoolq_names::hex_decode_16(hqid) {
-            if handle_qid != *queue_id {
+    // P1-21: Verify queue binding. Queue id must be present and must match.
+    match handle.queue_id.as_ref() {
+        Some(hqid) => match spoolq_names::hex_decode_16(hqid) {
+            Some(handle_qid) if handle_qid == *queue_id => {}
+            Some(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "handle file queue_id does not match target queue",
                 ));
             }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "handle file queue_id is not 32 lowercase hex chars",
+                ));
+            }
+        },
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "handle file missing queue_id binding",
+            ));
         }
     }
 
