@@ -3017,8 +3017,19 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_queue() -> (TempDir, Queue) {
+        create_test_queue_with_shards(CreateOptions::default().shard_count)
+    }
+
+    fn create_test_queue_with_shards(shard_count: u32) -> (TempDir, Queue) {
         let tmp = TempDir::new().unwrap();
-        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        Queue::init(
+            tmp.path(),
+            &CreateOptions {
+                shard_count,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let queue = Queue::open(
             tmp.path(),
             &OpenOptions {
@@ -3028,6 +3039,83 @@ mod tests {
         )
         .unwrap();
         (tmp, queue)
+    }
+
+    fn enqueue_for_shard(
+        queue: &mut Queue,
+        tmp: &TempDir,
+        target_shard: u32,
+        initial_not_before: Option<u64>,
+        payload: &[u8],
+    ) -> EnqueueTicket {
+        for _ in 0..128 {
+            let ticket = match queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                initial_not_before,
+                payload: payload.to_vec(),
+                ..Default::default()
+            }) {
+                EnqueueOutcome::Committed(ticket) => ticket,
+                outcome => panic!("enqueue failed: {outcome:?}"),
+            };
+            let shard = ticket
+                .expected_relative_path
+                .rsplit('/')
+                .nth(1)
+                .and_then(steadq_names::shard_from_hex)
+                .unwrap();
+            if shard == target_shard {
+                return ticket;
+            }
+            std::fs::remove_file(tmp.path().join(&ticket.expected_relative_path)).unwrap();
+        }
+        panic!("failed to enqueue a job in shard {target_shard}");
+    }
+
+    fn ack_for_shard(queue: &mut Queue, tmp: &TempDir, target_shard: u32, payload: &[u8]) {
+        enqueue_for_shard(queue, tmp, target_shard, None, payload);
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("lease failed: {outcome:?}"),
+        };
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
+    }
+
+    fn hierarchical_receipts(tmp: &TempDir, queue: &mut Queue) -> Vec<PathBuf> {
+        for (shard, payload) in [(0, b"low-a"), (0, b"low-b"), (1, b"low-c")] {
+            ack_for_shard(queue, tmp, shard, payload);
+        }
+        let mut low_receipts = Vec::new();
+        find_files(&tmp.path().join("receipts"), "rct", &mut low_receipts);
+        let low_terminal_bucket = low_receipts[0]
+            .strip_prefix(tmp.path().join("receipts"))
+            .unwrap()
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_str()
+            .and_then(steadq_names::bucket_from_hex)
+            .unwrap();
+        let delayed_buckets_per_terminal = queue
+            .format
+            .terminal_bucket_width_ns
+            .checked_div(queue.format.delayed_bucket_width_ns)
+            .unwrap();
+        let high_floor_bucket = low_terminal_bucket
+            .checked_add(2)
+            .and_then(|bucket| bucket.checked_mul(delayed_buckets_per_terminal))
+            .unwrap();
+        write_wall_watermark(tmp, high_floor_bucket);
+        for (shard, payload) in [(0, b"high-a"), (1, b"high-b")] {
+            ack_for_shard(queue, tmp, shard, payload);
+        }
+
+        let mut receipts = Vec::new();
+        find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
+        receipts.sort();
+        receipts
     }
 
     fn find_file(root: &Path, extension: &str) -> Option<PathBuf> {
@@ -3115,7 +3203,8 @@ mod tests {
         queue.retry_one_hierarchy_directory(phase, retry, phase_root_fd, scan, stats, deadline_mono)
     }
 
-    const RECOVERY_READ_PERMUTATIONS: [(usize, bool); 3] = [(1, false), (0, true), (2, true)];
+    const RECOVERY_READ_PERMUTATIONS: [(usize, bool); 5] =
+        [(1, false), (0, true), (2, true), (3, false), (4, true)];
 
     fn open_with_readdir_permutation(tmp: &TempDir, options: &OpenOptions, pass: usize) -> Queue {
         let queue = Queue::open(tmp.path(), options).unwrap();
@@ -3146,6 +3235,43 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    fn hierarchy_components(root: &Path, paths: &[PathBuf]) -> Vec<Vec<String>> {
+        paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|component| component.as_os_str().to_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_three_level_fixture(root: &Path, paths: &[PathBuf]) {
+        let parts = hierarchy_components(root, paths);
+        assert_eq!(parts.len(), RECOVERY_READ_PERMUTATIONS.len());
+        assert_eq!(parts[0][..2], parts[1][..2]);
+        assert_ne!(parts[0][2], parts[1][2]);
+        assert_eq!(parts[1][0], parts[2][0]);
+        assert_ne!(parts[1][1], parts[2][1]);
+        assert_ne!(parts[2][0], parts[3][0]);
+        assert_eq!(parts[3][0], parts[4][0]);
+        assert_ne!(parts[3][1], parts[4][1]);
+    }
+
+    fn assert_four_level_fixture(root: &Path, paths: &[PathBuf]) {
+        let parts = hierarchy_components(root, paths);
+        assert_eq!(parts.len(), RECOVERY_READ_PERMUTATIONS.len());
+        assert_eq!(parts[0][..3], parts[1][..3]);
+        assert_ne!(parts[0][3], parts[1][3]);
+        assert_eq!(parts[1][..2], parts[2][..2]);
+        assert_ne!(parts[1][2], parts[2][2]);
+        assert_eq!(parts[2][0], parts[3][0]);
+        assert_ne!(parts[2][1], parts[3][1]);
+        assert_ne!(parts[3][0], parts[4][0]);
     }
 
     fn valid_cursor_record(queue: &Queue) -> RecoveryCursorRecord {
@@ -3588,26 +3714,24 @@ mod tests {
 
     #[test]
     fn readdir_permutations_preserve_reap_budget_boundaries() {
-        let (tmp, mut queue) = create_test_queue();
-        for payload in [b"reap-a", b"reap-b", b"reap-c"] {
-            assert!(matches!(
-                queue.enqueue(EnqueueInput {
-                    maximum_attempts: 3,
-                    content_type: "x".into(),
-                    payload: payload.to_vec(),
-                    ..Default::default()
-                }),
-                EnqueueOutcome::Committed(_)
-            ));
-            assert!(matches!(
-                queue.lease(0, 30_000_000_000),
-                LeaseOutcome::Leased(_)
-            ));
+        let (tmp, mut queue) = create_test_queue_with_shards(2);
+        let first_boot = "00000000-0000-0000-0000-000000000001";
+        let second_boot = "00000000-0000-0000-0000-000000000002";
+        for (boot, duration, shard, payload) in [
+            (first_boot, 30_000_000_000, 0, b"reap-a" as &[u8]),
+            (first_boot, 30_000_000_000, 0, b"reap-b" as &[u8]),
+            (first_boot, 30_000_000_000, 1, b"reap-c" as &[u8]),
+            (first_boot, 130_000_000_000, 0, b"reap-d" as &[u8]),
+            (second_boot, 30_000_000_000, 0, b"reap-e" as &[u8]),
+        ] {
+            queue.boot_id = boot.into();
+            enqueue_for_shard(&mut queue, &tmp, shard, None, payload);
+            assert!(matches!(queue.lease(0, duration), LeaseOutcome::Leased(_)));
         }
         let mut leased = Vec::new();
         find_files(&tmp.path().join("leased"), "sqj", &mut leased);
         leased.sort();
-        assert_eq!(leased.len(), RECOVERY_READ_PERMUTATIONS.len());
+        assert_four_level_fixture(&tmp.path().join("leased"), &leased);
         drop(queue);
 
         let options = OpenOptions {
@@ -3650,38 +3774,43 @@ mod tests {
 
     #[test]
     fn readdir_permutations_preserve_promotion_budget_boundaries() {
-        let (tmp, mut queue) = create_test_queue();
-        let not_before = queue
+        let (tmp, mut queue) = create_test_queue_with_shards(2);
+        let low_not_before = queue
             .authenticated_wall_floor()
             .unwrap()
             .unix_ns()
             .checked_add(queue.format.delayed_bucket_width_ns * 4)
             .unwrap();
-        for payload in [b"promote-a", b"promote-b", b"promote-c"] {
-            assert!(matches!(
-                queue.enqueue(EnqueueInput {
-                    maximum_attempts: 3,
-                    content_type: "x".into(),
-                    initial_not_before: Some(not_before),
-                    payload: payload.to_vec(),
-                    ..Default::default()
-                }),
-                EnqueueOutcome::Committed(_)
-            ));
+        let high_not_before = low_not_before
+            .checked_add(queue.format.delayed_bucket_width_ns * 4)
+            .unwrap();
+        for (not_before, shard, payload) in [
+            (low_not_before, 0, b"promote-a" as &[u8]),
+            (low_not_before, 0, b"promote-b" as &[u8]),
+            (low_not_before, 1, b"promote-c" as &[u8]),
+            (high_not_before, 0, b"promote-d" as &[u8]),
+            (high_not_before, 1, b"promote-e" as &[u8]),
+        ] {
+            enqueue_for_shard(&mut queue, &tmp, shard, Some(not_before), payload);
         }
         let mut delayed = Vec::new();
         find_files(&tmp.path().join("delayed"), "sqj", &mut delayed);
         delayed.sort();
-        assert_eq!(delayed.len(), RECOVERY_READ_PERMUTATIONS.len());
-        let delayed_bucket = delayed[0]
-            .strip_prefix(tmp.path().join("delayed"))
-            .unwrap()
-            .components()
-            .next()
-            .unwrap()
-            .as_os_str()
-            .to_str()
-            .and_then(steadq_names::bucket_from_hex)
+        assert_three_level_fixture(&tmp.path().join("delayed"), &delayed);
+        let delayed_bucket = delayed
+            .iter()
+            .map(|path| {
+                path.strip_prefix(tmp.path().join("delayed"))
+                    .unwrap()
+                    .components()
+                    .next()
+                    .unwrap()
+                    .as_os_str()
+                    .to_str()
+                    .and_then(steadq_names::bucket_from_hex)
+                    .unwrap()
+            })
+            .max()
             .unwrap();
         write_wall_watermark(&tmp, delayed_bucket);
         drop(queue);
@@ -3745,19 +3874,28 @@ mod tests {
 
     #[test]
     fn readdir_permutations_preserve_temp_cleanup_budget_boundaries() {
-        let (tmp, queue) = create_test_queue();
-        let old_boot = "00000000-0000-0000-0000-000000000000";
-        assert_ne!(queue.boot_id, old_boot);
-        let shard = tmp.path().join(format!("tmp/{old_boot}/0000"));
-        std::fs::create_dir_all(&shard).unwrap();
+        let (tmp, queue) = create_test_queue_with_shards(2);
+        let first_boot = "00000000-0000-0000-0000-000000000001";
+        let second_boot = "00000000-0000-0000-0000-000000000002";
+        assert_ne!(queue.boot_id, first_boot);
+        assert_ne!(queue.boot_id, second_boot);
         let mut temp_paths = Vec::new();
-        for suffix in 0..RECOVERY_READ_PERMUTATIONS.len() {
+        for (boot, shard, suffix) in [
+            (first_boot, "0000", 0),
+            (first_boot, "0000", 1),
+            (first_boot, "0001", 2),
+            (second_boot, "0000", 3),
+            (second_boot, "0001", 4),
+        ] {
+            let directory = tmp.path().join(format!("tmp/{boot}/{shard}"));
+            std::fs::create_dir_all(&directory).unwrap();
             let filename = steadq_names::temp_filename(0, &[suffix as u8; 16]);
-            let path = shard.join(filename);
+            let path = directory.join(filename);
             std::fs::write(&path, b"temp").unwrap();
             temp_paths.push(path);
         }
         temp_paths.sort();
+        assert_three_level_fixture(&tmp.path().join("tmp"), &temp_paths);
         drop(queue);
 
         let options = OpenOptions {
@@ -3817,14 +3955,9 @@ mod tests {
 
     #[test]
     fn readdir_permutations_preserve_compaction_budget_boundaries() {
-        let (tmp, mut queue) = create_test_queue();
-        for _ in 0..RECOVERY_READ_PERMUTATIONS.len() {
-            enqueue_and_ack(&mut queue);
-        }
-        let mut receipts = Vec::new();
-        find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
-        receipts.sort();
-        assert_eq!(receipts.len(), RECOVERY_READ_PERMUTATIONS.len());
+        let (tmp, mut queue) = create_test_queue_with_shards(2);
+        let receipts = hierarchical_receipts(&tmp, &mut queue);
+        assert_three_level_fixture(&tmp.path().join("receipts"), &receipts);
         drop(queue);
 
         let options = OpenOptions {
@@ -3885,23 +4018,23 @@ mod tests {
 
     #[test]
     fn readdir_permutations_preserve_deletion_budget_boundaries() {
-        let (tmp, mut queue) = create_test_queue();
-        for _ in 0..RECOVERY_READ_PERMUTATIONS.len() {
-            enqueue_and_ack(&mut queue);
-        }
-        let mut receipts = Vec::new();
-        find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
-        receipts.sort();
-        assert_eq!(receipts.len(), RECOVERY_READ_PERMUTATIONS.len());
-        let terminal_bucket = receipts[0]
-            .strip_prefix(tmp.path().join("receipts"))
-            .unwrap()
-            .components()
-            .next()
-            .unwrap()
-            .as_os_str()
-            .to_str()
-            .and_then(steadq_names::bucket_from_hex)
+        let (tmp, mut queue) = create_test_queue_with_shards(2);
+        let receipts = hierarchical_receipts(&tmp, &mut queue);
+        assert_three_level_fixture(&tmp.path().join("receipts"), &receipts);
+        let terminal_bucket = receipts
+            .iter()
+            .map(|path| {
+                path.strip_prefix(tmp.path().join("receipts"))
+                    .unwrap()
+                    .components()
+                    .next()
+                    .unwrap()
+                    .as_os_str()
+                    .to_str()
+                    .and_then(steadq_names::bucket_from_hex)
+                    .unwrap()
+            })
+            .max()
             .unwrap();
         let delayed_buckets_per_terminal = queue
             .format
