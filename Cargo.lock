@@ -701,6 +701,7 @@ name = "steadq-fs-linux"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tempfile",
 ]
 
 [[package]]

@@ -1556,14 +1556,26 @@ mod tests {
         }
     }
 
-    fn unique_test_dir(label: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "steadq_{label}_{}_{}",
-            std::process::id(),
-            sequence
-        ))
+    fn test_dir(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("steadq_{label}_"))
+            .tempdir()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_directories_are_exclusive_and_owned() {
+        let first = test_dir("isolation");
+        let first_path = first.path().to_path_buf();
+        let second = test_dir("isolation");
+        let second_path = second.path().to_path_buf();
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.is_dir());
+        assert!(second_path.is_dir());
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.is_dir());
     }
 
     #[test]
@@ -1599,9 +1611,8 @@ mod tests {
 
     #[test]
     fn write_all_persists_every_byte() {
-        let path = unique_test_dir("write_all");
-        std::fs::create_dir(&path).unwrap();
-        let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
+        let directory = test_dir("write_all");
+        let dir: OwnedFd = std::fs::File::open(directory.path()).unwrap().into();
         let file = create_exclusive(dir.as_fd(), "data", 0o600).unwrap();
         write_all(file.as_fd(), b"complete").unwrap();
         let mut bytes = [0u8; 8];
@@ -1609,14 +1620,12 @@ mod tests {
         assert_eq!(&bytes, b"complete");
         drop(file);
         drop(dir);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn ofd_write_lock_reports_acquired_and_contended() {
-        let path = unique_test_dir("write_lock");
-        std::fs::create_dir(&path).unwrap();
-        let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
+        let directory = test_dir("write_lock");
+        let dir: OwnedFd = std::fs::File::open(directory.path()).unwrap().into();
         let first = create_exclusive(dir.as_fd(), "lock", 0o600).unwrap();
         let second = openat(dir.as_fd(), "lock", libc::O_RDWR, 0).unwrap();
         assert!(try_ofd_write_lock(first.as_fd()).unwrap());
@@ -1624,14 +1633,12 @@ mod tests {
         drop(second);
         drop(first);
         drop(dir);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn ofd_read_lock_reports_acquired_and_writer_contention() {
-        let path = unique_test_dir("read_lock");
-        std::fs::create_dir(&path).unwrap();
-        let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
+        let directory = test_dir("read_lock");
+        let dir: OwnedFd = std::fs::File::open(directory.path()).unwrap().into();
         let reader = create_exclusive(dir.as_fd(), "lock", 0o600).unwrap();
         assert!(try_ofd_read_lock(reader.as_fd()).unwrap());
         drop(reader);
@@ -1643,7 +1650,6 @@ mod tests {
         drop(blocked_reader);
         drop(writer);
         drop(dir);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -1720,9 +1726,9 @@ mod tests {
 
     #[test]
     fn open_directory_beneath_opens_nested_directory() {
-        let base = unique_test_dir("openat2_nested");
-        std::fs::create_dir_all(base.join("root/a/b")).unwrap();
-        let root = std::fs::File::open(base.join("root")).unwrap();
+        let base = test_dir("openat2_nested");
+        std::fs::create_dir_all(base.path().join("root/a/b")).unwrap();
+        let root = std::fs::File::open(base.path().join("root")).unwrap();
         let path = ValidatedRelativePath::new("a/b").unwrap();
         let opened = open_directory_beneath(root.as_fd(), path).unwrap();
         let stat = fstat(opened.as_fd()).unwrap();
@@ -1731,30 +1737,28 @@ mod tests {
         let descriptor_flags = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(descriptor_flags, -1);
         assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
     fn open_directory_beneath_rejects_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let base = unique_test_dir("openat2_symlink");
-        std::fs::create_dir_all(base.join("root")).unwrap();
-        std::fs::create_dir_all(base.join("outside/secret")).unwrap();
-        let root = std::fs::File::open(base.join("root")).unwrap();
+        let base = test_dir("openat2_symlink");
+        std::fs::create_dir_all(base.path().join("root")).unwrap();
+        std::fs::create_dir_all(base.path().join("outside/secret")).unwrap();
+        let root = std::fs::File::open(base.path().join("root")).unwrap();
         let path = ValidatedRelativePath::new("link/secret").unwrap();
-        symlink(base.join("outside"), base.join("root/link")).unwrap();
+        symlink(base.path().join("outside"), base.path().join("root/link")).unwrap();
         assert!(open_directory_beneath(root.as_fd(), path).is_err());
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
     fn open_directory_beneath_enforces_kernel_beneath_and_directory_flags() {
-        let base = unique_test_dir("openat2_policy");
-        std::fs::create_dir_all(base.join("root")).unwrap();
-        std::fs::create_dir_all(base.join("outside")).unwrap();
-        std::fs::write(base.join("root/file"), b"not a directory").unwrap();
-        let root = std::fs::File::open(base.join("root")).unwrap();
+        let base = test_dir("openat2_policy");
+        std::fs::create_dir_all(base.path().join("root")).unwrap();
+        std::fs::create_dir_all(base.path().join("outside")).unwrap();
+        std::fs::write(base.path().join("root/file"), b"not a directory").unwrap();
+        let root = std::fs::File::open(base.path().join("root")).unwrap();
 
         let forged_escape = ValidatedRelativePath { path: "../outside" };
         assert!(open_directory_beneath(root.as_fd(), forged_escape).is_err());
@@ -1764,14 +1768,13 @@ mod tests {
 
         assert_eq!(RESOLVER_RESOLVE_FLAGS, 0x0e);
         assert_eq!(resolver_open_flags(), libc::O_DIRECTORY | libc::O_CLOEXEC);
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
     fn open_directory_beneath_does_not_fallback_on_enosys() {
-        let base = unique_test_dir("openat2_enosys");
-        std::fs::create_dir_all(base.join("root/a")).unwrap();
-        let root = std::fs::File::open(base.join("root")).unwrap();
+        let base = test_dir("openat2_enosys");
+        std::fs::create_dir_all(base.path().join("root/a")).unwrap();
+        let root = std::fs::File::open(base.path().join("root")).unwrap();
         let path = ValidatedRelativePath::new("a").unwrap();
 
         fault::reset();
@@ -1781,19 +1784,16 @@ mod tests {
         assert_eq!(fault::call_count("openat2_beneath"), 1);
         assert_eq!(fault::call_count("open_directory"), 0);
         fault::reset();
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
     fn read_dir_for_each_visits_all_entries() {
-        let tmp = std::env::temp_dir();
-        let dir_name = format!("steadq_rdfe_test_{}", std::process::id());
-        let dir_path = tmp.join(&dir_name);
-        std::fs::create_dir_all(&dir_path).unwrap();
+        let directory = test_dir("read-dir-for-each");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("a.txt"), b"x").unwrap();
         std::fs::write(dir_path.join("b.txt"), b"y").unwrap();
 
-        let fd = std::fs::File::open(&dir_path).unwrap();
+        let fd = std::fs::File::open(dir_path).unwrap();
         let mut names = Vec::new();
         let count = read_dir_for_each(fd.as_fd(), |name| {
             names.push(name.as_bytes().to_vec());
@@ -1803,21 +1803,17 @@ mod tests {
         assert_eq!(count, 2);
         assert!(names.contains(&b"a.txt".to_vec()));
         assert!(names.contains(&b"b.txt".to_vec()));
-
-        std::fs::remove_dir_all(&dir_path).ok();
     }
 
     #[test]
     fn read_dir_for_each_stops_early() {
-        let tmp = std::env::temp_dir();
-        let dir_name = format!("steadq_rdfe_stop_{}", std::process::id());
-        let dir_path = tmp.join(&dir_name);
-        std::fs::create_dir_all(&dir_path).unwrap();
+        let directory = test_dir("read-dir-for-each-stop");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("a.txt"), b"x").unwrap();
         std::fs::write(dir_path.join("b.txt"), b"y").unwrap();
         std::fs::write(dir_path.join("c.txt"), b"z").unwrap();
 
-        let fd = std::fs::File::open(&dir_path).unwrap();
+        let fd = std::fs::File::open(dir_path).unwrap();
         let mut count_seen = 0;
         let _count = read_dir_for_each(fd.as_fd(), |_| {
             count_seen += 1;
@@ -1832,16 +1828,14 @@ mod tests {
         assert_eq!(entries[0].as_bytes(), b"a.txt");
         assert_eq!(entries[1].as_bytes(), b"b.txt");
         assert_eq!(entries[2].as_bytes(), b"c.txt");
-
-        std::fs::remove_dir_all(&dir_path).ok();
     }
 
     #[test]
     fn directory_stream_closes_consumed_descriptor_on_success_and_failure() {
-        let dir_path = unique_test_dir("directory-stream-ownership");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory_owner = test_dir("directory-stream-ownership");
+        let dir_path = directory_owner.path();
 
-        let directory: OwnedFd = std::fs::File::open(&dir_path).unwrap().into();
+        let directory: OwnedFd = std::fs::File::open(dir_path).unwrap().into();
         let directory_fd = directory.as_raw_fd();
         let directory_stat = fstat(directory.as_fd()).unwrap();
         let stream = DirectoryStream::open(directory).unwrap();
@@ -1859,21 +1853,18 @@ mod tests {
         };
         assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
         assert_fd_released(file_fd, file_stat.st_dev, file_stat.st_ino);
-
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn borrowed_enumeration_failure_keeps_caller_descriptor_open() {
-        let path = unique_test_dir("borrowed-enumeration-failure");
+        let directory = test_dir("borrowed-enumeration-failure");
+        let path = directory.path().join("plain-file");
         std::fs::write(&path, b"data").unwrap();
         let file = std::fs::File::open(&path).unwrap();
 
         let error = read_dir_entries(file.as_fd()).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
         assert_eq!(fstat(file.as_fd()).unwrap().st_size, 4);
-
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1881,14 +1872,14 @@ mod tests {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
-        let dir_path = unique_test_dir("raw-directory-names");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("raw-directory-names");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("plain"), b"plain").unwrap();
         let first = OsStr::from_bytes(b"bad-\x80");
         let second = OsStr::from_bytes(b"bad-\x81");
         std::fs::write(dir_path.join(first), b"a").unwrap();
         std::fs::write(dir_path.join(second), b"b").unwrap();
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
 
         let mut entries = read_dir_entries_bounded(dir.as_fd(), 3, 510).unwrap();
         entries.sort();
@@ -1906,7 +1897,7 @@ mod tests {
         assert_eq!(owned[0].as_bytes(), b"bad-\x80");
         assert_eq!(owned[1].as_bytes(), b"bad-\x81");
 
-        let callback_dir = std::fs::File::open(&dir_path).unwrap();
+        let callback_dir = std::fs::File::open(dir_path).unwrap();
         let mut visited = Vec::new();
         read_dir_for_each(callback_dir.as_fd(), |entry| {
             visited.push(entry.as_bytes().to_vec());
@@ -1916,7 +1907,6 @@ mod tests {
         visited.sort();
         assert_eq!(visited[0], b"bad-\x80");
         assert_eq!(visited[1], b"bad-\x81");
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
@@ -1928,12 +1918,12 @@ mod tests {
 
     #[test]
     fn bounded_directory_read_applies_thread_local_permutation() {
-        let dir_path = unique_test_dir("permuted-directory-read");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("permuted-directory-read");
+        let dir_path = directory.path();
         for name in ["a", "b", "c", "d"] {
             std::fs::write(dir_path.join(name), name.as_bytes()).unwrap();
         }
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
         fault::reset();
         let baseline = read_dir_entries_bounded(dir.as_fd(), 4, usize::MAX).unwrap();
 
@@ -1954,16 +1944,15 @@ mod tests {
             read_dir_entries_bounded(dir.as_fd(), 4, usize::MAX).unwrap(),
             baseline
         );
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn bounded_directory_read_rejects_entry_and_byte_overflow() {
-        let dir_path = unique_test_dir("bounded-directory-read");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("bounded-directory-read");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("a"), b"a").unwrap();
         std::fs::write(dir_path.join("bb"), b"b").unwrap();
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
 
         let entry_error = read_dir_entries_bounded(dir.as_fd(), 1, usize::MAX).unwrap_err();
         assert_eq!(entry_error.kind(), io::ErrorKind::FileTooLarge);
@@ -1973,16 +1962,15 @@ mod tests {
         exact_entries.sort();
         assert_eq!(exact_entries[0].as_bytes(), b"a");
         assert_eq!(exact_entries[1].as_bytes(), b"bb");
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn owned_directory_read_returns_exact_name_bytes() {
-        let dir_path = unique_test_dir("owned-directory-read");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("owned-directory-read");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("alpha"), b"a").unwrap();
         std::fs::write(dir_path.join("beta"), b"b").unwrap();
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
 
         let mut first = read_dir_entries(dir.as_fd()).unwrap();
         let mut second = read_dir_entries(dir.as_fd()).unwrap();
@@ -1991,15 +1979,14 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first[0].as_bytes(), b"alpha");
         assert_eq!(first[1].as_bytes(), b"beta");
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn bounded_directory_read_stops_at_cooperative_deadline() {
-        let dir_path = unique_test_dir("bounded-directory-deadline");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("bounded-directory-deadline");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("alpha"), b"a").unwrap();
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
         let mut checks = 0;
 
         let error = read_dir_entries_bounded_until_with_progress(
@@ -2022,15 +2009,14 @@ mod tests {
         ));
         assert_eq!(checks, 1);
         assert_eq!(read_dir_entries(dir.as_fd()).unwrap().len(), 1);
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn cancellable_directory_api_preserves_error_shape() {
-        let dir_path = unique_test_dir("bounded-directory-legacy-result");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("bounded-directory-legacy-result");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("alpha"), b"a").unwrap();
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
 
         let entries =
             read_dir_entries_bounded_until(dir.as_fd(), usize::MAX, usize::MAX, || Ok(false))
@@ -2042,17 +2028,16 @@ mod tests {
             read_dir_entries_bounded_until(dir.as_fd(), usize::MAX, usize::MAX, || Ok(true))
                 .unwrap_err();
         assert!(matches!(error, DirectoryEnumerationError::Cancelled));
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn cancelled_directory_read_reports_partial_progress() {
-        let dir_path = unique_test_dir("bounded-directory-partial-progress");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("bounded-directory-partial-progress");
+        let dir_path = directory.path();
         for index in 0..32 {
             std::fs::write(dir_path.join(format!("entry-{index:02}")), b"x").unwrap();
         }
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
         let mut checks = 0;
 
         let error = read_dir_entries_bounded_until_with_progress(
@@ -2074,14 +2059,13 @@ mod tests {
         assert!(progress.entries_read > 0);
         assert!(progress.entries_read < 10);
         assert_eq!(progress.name_bytes_read, progress.entries_read * 8);
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn bounded_directory_read_distinguishes_cancellation_check_failure() {
-        let dir_path = unique_test_dir("bounded-directory-check-failure");
-        std::fs::create_dir(&dir_path).unwrap();
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let directory = test_dir("bounded-directory-check-failure");
+        let dir_path = directory.path();
+        let dir = std::fs::File::open(dir_path).unwrap();
 
         let error = read_dir_entries_bounded_until_with_progress(
             dir.as_fd(),
@@ -2101,7 +2085,6 @@ mod tests {
                 },
             } if error.raw_os_error() == Some(libc::ETIMEDOUT)
         ));
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
@@ -2159,11 +2142,11 @@ mod tests {
 
     #[test]
     fn bounded_directory_read_reports_the_overflow_sentinel() {
-        let dir_path = unique_test_dir("bounded-directory-progress");
-        std::fs::create_dir(&dir_path).unwrap();
+        let directory = test_dir("bounded-directory-progress");
+        let dir_path = directory.path();
         std::fs::write(dir_path.join("a"), b"a").unwrap();
         std::fs::write(dir_path.join("bb"), b"b").unwrap();
-        let dir = std::fs::File::open(&dir_path).unwrap();
+        let dir = std::fs::File::open(dir_path).unwrap();
 
         let error =
             read_dir_entries_bounded_until_with_progress(dir.as_fd(), 1, usize::MAX, || Ok(false))
@@ -2179,7 +2162,6 @@ mod tests {
                 },
             } if error.kind() == io::ErrorKind::FileTooLarge
         ));
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
@@ -2198,8 +2180,8 @@ mod tests {
     #[test]
     fn borrowed_file_operations_preserve_the_owner() {
         fault::reset();
-        let dir_path = tempfile_dir("borrowed-file-owner");
-        let dir = open_dir_absolute(&dir_path).unwrap();
+        let directory = test_dir("borrowed-file-owner");
+        let dir = open_dir_absolute(directory.path()).unwrap();
         let file = create_exclusive(dir.as_fd(), "data", 0o600).unwrap();
         fchmod(file.as_fd(), 0o700).unwrap();
         assert_eq!(fstat(file.as_fd()).unwrap().st_mode & 0o777, 0o700);
@@ -2227,14 +2209,13 @@ mod tests {
         fault::reset();
         drop(file);
         drop(dir);
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn borrowed_directory_operations_preserve_the_owner() {
         fault::reset();
-        let dir_path = tempfile_dir("borrowed-directory-owner");
-        let directory = open_dir_absolute(&dir_path).unwrap();
+        let directory_owner = test_dir("borrowed-directory-owner");
+        let directory = open_dir_absolute(directory_owner.path()).unwrap();
 
         mkdirat(directory.as_fd(), "child", 0o700).unwrap();
         let child = open_directory(directory.as_fd(), "child").unwrap();
@@ -2278,14 +2259,13 @@ mod tests {
         fault::reset();
         drop(child);
         drop(directory);
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn empty_write_is_a_noop_without_consuming_a_fault() {
         fault::reset();
-        let dir_path = tempfile_dir("empty-write");
-        let dir = open_dir_absolute(&dir_path).unwrap();
+        let directory = test_dir("empty-write");
+        let dir = open_dir_absolute(directory.path()).unwrap();
         let file = create_exclusive(dir.as_fd(), "data", 0o600).unwrap();
         fault::inject_errno("write_all", 1, libc::EIO);
 
@@ -2298,37 +2278,34 @@ mod tests {
         fault::reset();
         drop(file);
         drop(dir);
-        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
     fn fault_inject_nth_call() {
         fault::reset();
         fault::inject("renameat2_noreplace", 2);
-        let dir = tempfile_dir("nth");
-        let fd = open_dir_absolute(&dir).unwrap();
-        std::fs::write(dir.join("src1"), b"1").unwrap();
-        std::fs::write(dir.join("src2"), b"2").unwrap();
+        let dir = test_dir("nth");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        std::fs::write(dir.path().join("src1"), b"1").unwrap();
+        std::fs::write(dir.path().join("src2"), b"2").unwrap();
         let r1 = renameat2_noreplace(fd.as_fd(), "src1", fd.as_fd(), "dst1");
         assert!(r1.is_ok(), "first call should succeed: {r1:?}");
         let r2 = renameat2_noreplace(fd.as_fd(), "src2", fd.as_fd(), "dst2");
         assert!(r2.is_err(), "second call should fault: {r2:?}");
         assert_eq!(r2.unwrap_err().raw_os_error(), Some(libc::EIO));
         fault::reset();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn fault_inject_errno_enotdir() {
         fault::reset();
         fault::inject_errno("fstatat", 1, libc::ENOTDIR);
-        let dir = tempfile_dir("enotdir");
-        let fd = open_dir_absolute(&dir).unwrap();
-        std::fs::write(dir.join("f"), b"x").unwrap();
+        let dir = test_dir("enotdir");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
         let err = fstatat(fd.as_fd(), "f").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
         fault::reset();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2364,74 +2341,54 @@ mod tests {
     fn fault_idle_has_no_effect() {
         fault::reset();
         assert_eq!(fault::call_count("fsync"), 0);
-        let dir = tempfile_dir("idle");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("idle");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         fsync(fd.as_fd()).unwrap();
         // Idle threads do not count checks when no faults are armed.
         assert_eq!(fault::call_count("fsync"), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn tempfile_dir(tag: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "steadq-fs-fault-{}-{}-{}",
-            std::process::id(),
-            tag,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
     }
 
     #[test]
     fn mkdirat_and_unlinkat_dir_round_trip() {
-        let dir = tempfile_dir("mkdir");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("mkdir");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         mkdirat(fd.as_fd(), "child", 0o700).unwrap();
         // Open proves the directory was created (Ok(()) no-op mutant fails here).
         let child = open_directory(fd.as_fd(), "child").unwrap();
         drop(child);
         unlinkat_dir(fd.as_fd(), "child").unwrap();
         assert!(open_directory(fd.as_fd(), "child").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn unlinkat_removes_file() {
-        let dir = tempfile_dir("unlink");
-        let fd = open_dir_absolute(&dir).unwrap();
-        std::fs::write(dir.join("f"), b"x").unwrap();
+        let dir = test_dir("unlink");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
         fstatat(fd.as_fd(), "f").unwrap();
         unlinkat(fd.as_fd(), "f").unwrap();
         assert!(fstatat(fd.as_fd(), "f").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn renameat_moves_file() {
-        let dir = tempfile_dir("renameat");
-        let fd = open_dir_absolute(&dir).unwrap();
-        std::fs::write(dir.join("a"), b"z").unwrap();
+        let dir = test_dir("renameat");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a"), b"z").unwrap();
         renameat(fd.as_fd(), "a", fd.as_fd(), "b").unwrap();
         assert!(fstatat(fd.as_fd(), "a").is_err());
         assert!(fstatat(fd.as_fd(), "b").is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn fsync_dir_and_fd_succeed() {
-        let dir = tempfile_dir("fsyncdir");
-        let fd = open_dir_absolute(&dir).unwrap();
-        std::fs::write(dir.join("x"), b"1").unwrap();
+        let dir = test_dir("fsyncdir");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        std::fs::write(dir.path().join("x"), b"1").unwrap();
         fsync_dir_fd(fd.as_fd()).unwrap();
         // Nested child dir
         mkdirat(fd.as_fd(), "nested", 0o700).unwrap();
         fsync_dir(fd.as_fd(), "nested").unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2439,8 +2396,8 @@ mod tests {
         // Whole-function Ok(()) mutants skip fault_check and would pass a bare
         // success test. Arming a fault requires the real function body.
         fault::reset();
-        let dir = tempfile_dir("fsyncdir-fault");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("fsyncdir-fault");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         fault::inject("fsync_dir_fd", 1);
         let err = fsync_dir_fd(fd.as_fd()).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
@@ -2454,16 +2411,15 @@ mod tests {
         let err = fsync_dir(fd.as_fd(), "nested").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         fault::reset();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn fsync_dir_fd_records_ordered_directory_identities() {
         fault::reset();
-        let first_dir = tempfile_dir("fsyncdir-record-first");
-        let second_dir = tempfile_dir("fsyncdir-record-second");
-        let first_fd = open_dir_absolute(&first_dir).unwrap();
-        let second_fd = open_dir_absolute(&second_dir).unwrap();
+        let first_dir = test_dir("fsyncdir-record-first");
+        let second_dir = test_dir("fsyncdir-record-second");
+        let first_fd = open_dir_absolute(first_dir.path()).unwrap();
+        let second_fd = open_dir_absolute(second_dir.path()).unwrap();
         let first_stat = fstat(first_fd.as_fd()).unwrap();
         let second_stat = fstat(second_fd.as_fd()).unwrap();
         let expected = [
@@ -2482,8 +2438,6 @@ mod tests {
 
         fault::reset();
         assert!(fault::fd_identities("fsync_dir_fd").is_empty());
-        let _ = std::fs::remove_dir_all(&first_dir);
-        let _ = std::fs::remove_dir_all(&second_dir);
     }
 
     #[test]
@@ -2503,8 +2457,8 @@ mod tests {
 
     #[test]
     fn pwrite_pread_round_trip() {
-        let dir = tempfile_dir("pwrite");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("pwrite");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         let file = openat(
             fd.as_fd(),
             "blob",
@@ -2520,52 +2474,46 @@ mod tests {
         let r = pread(file.as_fd(), &mut buf, 0).unwrap();
         assert_eq!(r, data.len());
         assert_eq!(&buf, data);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn durable_move_noreplace_moves_and_syncs() {
-        let dir = tempfile_dir("dmnr");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("dmnr");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         mkdirat(fd.as_fd(), "src", 0o700).unwrap();
         mkdirat(fd.as_fd(), "dst", 0o700).unwrap();
         let src = open_directory(fd.as_fd(), "src").unwrap();
         let dst = open_directory(fd.as_fd(), "dst").unwrap();
-        std::fs::write(dir.join("src/f"), b"payload").unwrap();
+        std::fs::write(dir.path().join("src/f"), b"payload").unwrap();
         durable_move_noreplace(src.as_fd(), "f", dst.as_fd(), "f").unwrap();
         assert!(fstatat(src.as_fd(), "f").is_err());
         assert!(fstatat(dst.as_fd(), "f").is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn durable_move_replace_overwrites() {
-        let dir = tempfile_dir("dmr");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("dmr");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         mkdirat(fd.as_fd(), "src", 0o700).unwrap();
         mkdirat(fd.as_fd(), "dst", 0o700).unwrap();
         let src = open_directory(fd.as_fd(), "src").unwrap();
         let dst = open_directory(fd.as_fd(), "dst").unwrap();
-        std::fs::write(dir.join("src/f"), b"new").unwrap();
-        std::fs::write(dir.join("dst/f"), b"old").unwrap();
+        std::fs::write(dir.path().join("src/f"), b"new").unwrap();
+        std::fs::write(dir.path().join("dst/f"), b"old").unwrap();
         durable_move_replace(src.as_fd(), "f", dst.as_fd(), "f").unwrap();
         assert!(fstatat(src.as_fd(), "f").is_err());
         let st = fstatat(dst.as_fd(), "f").unwrap();
         assert_eq!(st.st_size as usize, 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn linkat_tmpfile_publication_paths() {
-        let dir = tempfile_dir("tmpfile");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("tmpfile");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         // O_TMPFILE may be unsupported on some filesystems; skip if so.
         let tmp = match open_tmpfile(fd.as_fd()) {
             Ok(t) => t,
-            Err(_) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return;
-            }
+            Err(_) => return,
         };
         write_all(tmp.as_fd(), b"tmp").unwrap();
         // Prefer empty_path; fall back to proc path.
@@ -2573,7 +2521,6 @@ mod tests {
             .or_else(|_| linkat_proc_self_fd(tmp.as_fd(), fd.as_fd(), "pub1"));
         assert!(linked.is_ok(), "tmpfile link failed: {linked:?}");
         assert!(fstatat(fd.as_fd(), "pub1").is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2581,14 +2528,11 @@ mod tests {
         // empty_path may succeed first in the publication test and leave
         // linkat_proc_self_fd unexercised. Arm a fault so the real body runs.
         fault::reset();
-        let dir = tempfile_dir("linkat-proc-fault");
-        let fd = open_dir_absolute(&dir).unwrap();
+        let dir = test_dir("linkat-proc-fault");
+        let fd = open_dir_absolute(dir.path()).unwrap();
         let tmp = match open_tmpfile(fd.as_fd()) {
             Ok(t) => t,
-            Err(_) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return;
-            }
+            Err(_) => return,
         };
         fault::inject("linkat_proc_self_fd", 1);
         let err = linkat_proc_self_fd(tmp.as_fd(), fd.as_fd(), "pub-fault").unwrap_err();
@@ -2597,6 +2541,5 @@ mod tests {
         // Real publication via proc path when empty_path is not used.
         linkat_proc_self_fd(tmp.as_fd(), fd.as_fd(), "pub-proc").unwrap();
         assert!(fstatat(fd.as_fd(), "pub-proc").is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
