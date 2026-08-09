@@ -7,16 +7,14 @@
 (* Crash remains available whenever its action predicate is enabled.    *)
 (************************************************************************)
 
-EXTENDS Naturals, Sequences, FiniteSets, TLC
-
-(* State values *)
-CONSTANTS Hidden, Ready, Leased, Delayed, Dead, Receipt, Quarantine, Nil
+EXTENDS Naturals, Sequences, FiniteSets, TLC, SteadQProtocol
 
 (* Model parameters *)
 CONSTANTS 
     Jobs,            (* set of job ids *)
     Workers,         (* set of worker ids *)
-    MaxAttempts      (* maximum attempts per job *)
+    MaxAttempts,     (* maximum attempts per job *)
+    Nil
 
 VARIABLES
     state,           (* [job -> State] *)
@@ -31,7 +29,8 @@ VARIABLES
 Vars == <<state, generation, attempt, fileSynced, destSynced, srcSynced, poisoned, token>>
 
 TypeInvariant ==
-    /\ state \in [Jobs -> {Hidden, Ready, Leased, Delayed, Dead, Receipt, Quarantine}]
+    /\ state \in [Jobs -> {StateHidden, StateReady, StateLeased, StateDelayed,
+                            StateDead, StateReceipt, StateQuarantine}]
     /\ generation \in [Jobs -> Nat]
     /\ attempt \in [Jobs -> 0..MaxAttempts]
     /\ fileSynced \in [Jobs -> BOOLEAN]
@@ -42,7 +41,7 @@ TypeInvariant ==
 
 (* Initial state: all jobs hidden, not synced *)
 Init ==
-    /\ state = [j \in Jobs |-> Hidden]
+    /\ state = [j \in Jobs |-> StateHidden]
     /\ generation = [j \in Jobs |-> 0]
     /\ attempt = [j \in Jobs |-> 0]
     /\ fileSynced = [j \in Jobs |-> FALSE]
@@ -55,8 +54,8 @@ Init ==
 
 (* Enqueue: hidden -> ready, file content is durable before publish *)
 Enqueue(j) ==
-    /\ state[j] = Hidden
-    /\ state' = [state EXCEPT ![j] = Ready]
+    /\ state[j] = StateHidden
+    /\ state' = [state EXCEPT ![j] = StateReady]
     /\ generation' = generation
     /\ attempt' = attempt
     /\ fileSynced' = [fileSynced EXCEPT ![j] = TRUE]
@@ -67,7 +66,7 @@ Enqueue(j) ==
 
 (* File sync: make file content durable *)
 FileSync(j) ==
-    /\ state[j] \in {Ready, Leased, Delayed, Dead, Receipt}
+    /\ state[j] \in {StateReady, StateLeased, StateDelayed, StateDead, StateReceipt}
     /\ fileSynced' = [fileSynced EXCEPT ![j] = TRUE]
     /\ UNCHANGED <<state, generation, attempt, destSynced, srcSynced, poisoned, token>>
 
@@ -85,9 +84,9 @@ SrcDirSync(j) ==
 Claim(w, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
-    /\ state[j] = Ready
+    /\ state[j] = StateReady
     /\ attempt[j] < MaxAttempts
-    /\ state' = [state EXCEPT ![j] = Leased]
+    /\ state' = [state EXCEPT ![j] = StateLeased]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ attempt' = [attempt EXCEPT ![j] = attempt[j] + 1]
     /\ fileSynced' = [fileSynced EXCEPT ![j] = TRUE]
@@ -100,9 +99,9 @@ Claim(w, j) ==
 Ack(w, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
-    /\ state[j] = Leased
+    /\ state[j] = StateLeased
     /\ token[j] = w
-    /\ state' = [state EXCEPT ![j] = Receipt]
+    /\ state' = [state EXCEPT ![j] = StateReceipt]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
@@ -113,9 +112,9 @@ Ack(w, j) ==
 RetryNow(w, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
-    /\ state[j] = Leased
+    /\ state[j] = StateLeased
     /\ token[j] = w
-    /\ state' = [state EXCEPT ![j] = Ready]
+    /\ state' = [state EXCEPT ![j] = StateReady]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
@@ -126,9 +125,9 @@ RetryNow(w, j) ==
 Bury(w, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
-    /\ state[j] = Leased
+    /\ state[j] = StateLeased
     /\ token[j] = w
-    /\ state' = [state EXCEPT ![j] = Dead]
+    /\ state' = [state EXCEPT ![j] = StateDead]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
@@ -137,10 +136,10 @@ Bury(w, j) ==
 
 (* Reap expired: leased -> ready or dead *)
 ReapExpired(j) ==
-    /\ state[j] = Leased
+    /\ state[j] = StateLeased
     /\ IF attempt[j] >= MaxAttempts
-       THEN /\ state' = [state EXCEPT ![j] = Dead]
-       ELSE /\ state' = [state EXCEPT ![j] = Ready]
+       THEN /\ state' = [state EXCEPT ![j] = StateDead]
+       ELSE /\ state' = [state EXCEPT ![j] = StateReady]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
@@ -155,20 +154,21 @@ PoisonHandle(h) ==
 (* Crash: reset volatile sync states, preserve file durability, clear stale lease token if claim never completed *)
 Crash ==
     /\ fileSynced' = [j \in Jobs |->
-         IF state[j] \in {Receipt, Dead, Quarantine} THEN TRUE ELSE fileSynced[j]]
+         IF state[j] \in {StateReceipt, StateDead, StateQuarantine}
+         THEN TRUE ELSE fileSynced[j]]
     /\ destSynced' = [j \in Jobs |-> FALSE]
     /\ srcSynced' = [j \in Jobs |-> FALSE]
     /\ poisoned' = {}
     /\ state' = [j \in Jobs |->
-         IF state[j] = Leased /\ fileSynced[j]
-         THEN Leased
-         ELSE IF state[j] = Leased /\ ~fileSynced[j]
-         THEN Ready
-         ELSE IF state[j] = Ready /\ ~destSynced[j] /\ ~fileSynced[j]
-         THEN Hidden
+         IF state[j] = StateLeased /\ fileSynced[j]
+         THEN StateLeased
+         ELSE IF state[j] = StateLeased /\ ~fileSynced[j]
+         THEN StateReady
+         ELSE IF state[j] = StateReady /\ ~destSynced[j] /\ ~fileSynced[j]
+         THEN StateHidden
          ELSE state[j]]
     /\ token' = [j \in Jobs |->
-         IF state[j] = Leased /\ ~fileSynced[j]
+         IF state[j] = StateLeased /\ ~fileSynced[j]
          THEN Nil
          ELSE token[j]]
     /\ UNCHANGED <<generation, attempt>>
@@ -194,25 +194,26 @@ Spec == Init /\ [][Next]_Vars
 (* I1: No visible active object has an incomplete envelope *)
 I1 ==
     \A j \in Jobs :
-        state[j] \in {Ready, Leased, Delayed, Dead, Receipt} => fileSynced[j]
+        state[j] \in {StateReady, StateLeased, StateDelayed, StateDead, StateReceipt}
+        => fileSynced[j]
 
 (* I2: At most one lease token per job (simplified: token is unique per job) *)
 I2 ==
     \A j \in Jobs :
-        state[j] = Leased => token[j] # Nil
+        state[j] = StateLeased => token[j] # Nil
 
 (* I3: Every committed enqueue remains represented after crash *)
 I3 ==
     \A j \in Jobs :
-        /\ state[j] = Ready
+        /\ state[j] = StateReady
         /\ fileSynced[j]
         /\ destSynced[j]
-        => state[j] # Hidden
+        => state[j] # StateHidden
 
 (* I4: A lost token cannot transition (modeled by token nil check) *)
 I4 ==
     \A j \in Jobs :
-        state[j] = Leased => token[j] # Nil
+        state[j] = StateLeased => token[j] # Nil
 
 (* I9: Committed leases never exceed maximum_attempts *)
 I9 ==
@@ -222,12 +223,12 @@ I9 ==
 (* I5: Receipt is terminal *)
 I5 ==
     \A j \in Jobs :
-        state[j] = Receipt => \A w \in Workers : ~ENABLED Ack(w, j)
+        state[j] = StateReceipt => \A w \in Workers : ~ENABLED Ack(w, j)
 
 (* I11: Delivered job attempt matches header (modeled as attempt consistency) *)
 I11 ==
     \A j \in Jobs :
-        state[j] = Leased => attempt[j] >= 1
+        state[j] = StateLeased => attempt[j] >= 1
 
 (* Combined invariant for model checking *)
 Inv == /\ TypeInvariant

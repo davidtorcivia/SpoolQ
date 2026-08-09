@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 pub(super) const GENERATED_RUST: &str = "generated/state-machine.rs";
 pub(super) const GENERATED_GO: &str = "generated/state-machine.go";
 pub(super) const GENERATED_MARKDOWN: &str = "generated/state-machine.md";
+pub(super) const GENERATED_TLA: &str = "model/SteadQProtocol.tla";
 pub(super) const CORE_RUST: &str = "crates/steadq-core/src/state_machine.rs";
 
 pub(crate) fn check_generated(root: &Path) -> Result<(), String> {
@@ -41,6 +42,7 @@ pub(super) fn generated_outputs(
         (CORE_RUST, rust),
         (GENERATED_GO, render_go(spec, digest)),
         (GENERATED_MARKDOWN, render_markdown(spec, digest)),
+        (GENERATED_TLA, render_tla(spec, digest)),
     ]
 }
 
@@ -560,6 +562,243 @@ Protocol IR: `{}`, version `{}`.\n\n\
         .expect("writing to String cannot fail");
     }
     output
+}
+
+pub(super) fn render_tla(spec: &StateMachineSpec, digest: &str) -> String {
+    let mut output = format!(
+        "-------------------------- MODULE SteadQProtocol --------------------------\n\
+(* Auto-generated from spec/state-machine.json. Do not edit by hand. *)\n\
+(* Source SHA-256: {digest} *)\n\n\
+ProtocolIRIdentity == {}\n\
+ProtocolIRVersion == {}\n\n",
+        tla_string(&spec.protocol),
+        spec.version,
+    );
+
+    write_tla_enum(
+        &mut output,
+        "ProtocolOperations",
+        "Operation",
+        &Operation::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolStates",
+        "State",
+        &State::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolObjectKinds",
+        "ObjectKind",
+        &ObjectKind::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolGenerationChanges",
+        "GenerationChange",
+        &GenerationChange::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolAttemptChanges",
+        "AttemptChange",
+        &AttemptChange::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolTokenChanges",
+        "TokenChange",
+        &TokenChange::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolReasonClasses",
+        "ReasonClass",
+        &ReasonClass::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    output.push_str("NoReasonClass == \"none\"\n\n");
+    write_tla_enum(
+        &mut output,
+        "ProtocolClockRequirements",
+        "ClockRequirement",
+        &ClockRequirement::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolSyncSteps",
+        "SyncStep",
+        &SyncStep::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolLinearizationPrimitives",
+        "Linearization",
+        &LinearizationPrimitive::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolFailureOutcomes",
+        "FailureOutcome",
+        &FailureOutcome::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolResolverProbeTopologies",
+        "ResolverProbeTopology",
+        &ResolverProbeTopology::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolTransitionQualifications",
+        "TransitionQualification",
+        &TransitionQualification::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolMutationClasses",
+        "MutationClass",
+        &MutationClass::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolExceptionNames",
+        "Exception",
+        &ExceptionName::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolReentryNames",
+        "Reentry",
+        &ReentryName::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+
+    output.push_str("ProtocolTransitions == <<\n");
+    for (index, transition) in spec.transitions.iter().enumerate() {
+        let required_syncs = transition
+            .required_syncs
+            .iter()
+            .map(|sync| format!("SyncStep{}", sync.rust_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason_class = match &transition.reason_class {
+            Nullable::Value(reason) => format!("ReasonClass{}", reason.rust_name()),
+            Nullable::Null => "NoReasonClass".into(),
+        };
+        writeln!(
+            output,
+            "    [operation |-> Operation{},\n     source |-> State{},\n     sourceObjectKind |-> ObjectKind{},\n     destination |-> State{},\n     destinationObjectKind |-> ObjectKind{},\n     generationChange |-> GenerationChange{},\n     attemptChange |-> AttemptChange{},\n     tokenChange |-> TokenChange{},\n     reasonClass |-> {},\n     clockRequirement |-> ClockRequirement{},\n     requiredSyncs |-> <<{}>>,\n     linearization |-> Linearization{},\n     beforeLinearizationFailure |-> FailureOutcome{},\n     afterLinearizationFailure |-> FailureOutcome{},\n     resolverProbeTopology |-> ResolverProbeTopology{},\n     qualification |-> TransitionQualification{}]{}",
+            transition.operation.rust_name(),
+            transition.source.rust_name(),
+            transition.source_object_kind.rust_name(),
+            transition.destination.rust_name(),
+            transition.destination_object_kind.rust_name(),
+            transition.generation_change.rust_name(),
+            transition.attempt_change.rust_name(),
+            transition.token_change.rust_name(),
+            reason_class,
+            transition.clock_requirement.rust_name(),
+            required_syncs,
+            transition.linearization.rust_name(),
+            transition.before_linearization_failure.rust_name(),
+            transition.after_linearization_failure.rust_name(),
+            transition.resolver_probe_topology.rust_name(),
+            transition.qualification.rust_name(),
+            if index + 1 == spec.transitions.len() {
+                ""
+            } else {
+                ","
+            },
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str(
+        ">>\n\n(* descriptionUtf8Hex stores exact UTF-8 bytes as lowercase hex. *)\n\
+ProtocolExceptions == <<\n",
+    );
+    for (index, exception) in spec.exceptions.iter().enumerate() {
+        let required_syncs = exception
+            .required_syncs
+            .iter()
+            .map(|sync| format!("SyncStep{}", sync.rust_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            output,
+            "    [name |-> Exception{},\n     descriptionUtf8Hex |-> {},\n     sourceObjectKind |-> ObjectKind{},\n     destinationObjectKind |-> ObjectKind{},\n     clockRequirement |-> ClockRequirement{},\n     mutationClass |-> MutationClass{},\n     linearization |-> Linearization{},\n     requiredSyncs |-> <<{}>>,\n     beforeLinearizationFailure |-> FailureOutcome{},\n     afterLinearizationFailure |-> FailureOutcome{}]{}",
+            exception.name.rust_name(),
+            tla_string(&utf8_hex(&exception.description)),
+            exception.source_object_kind.rust_name(),
+            exception.destination_object_kind.rust_name(),
+            exception.clock_requirement.rust_name(),
+            exception.mutation_class.rust_name(),
+            exception.linearization.rust_name(),
+            required_syncs,
+            exception.before_linearization_failure.rust_name(),
+            exception.after_linearization_failure.rust_name(),
+            if index + 1 == spec.exceptions.len() {
+                ""
+            } else {
+                ","
+            },
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str(">>\n\nProtocolReentry == <<\n");
+    for (index, reentry) in spec.reentry.iter().enumerate() {
+        writeln!(
+            output,
+            "    [name |-> Reentry{},\n     source |-> State{},\n     descriptionUtf8Hex |-> {},\n     createsNewIdentity |-> {}]{}",
+            reentry.name.rust_name(),
+            reentry.source.rust_name(),
+            tla_string(&utf8_hex(&reentry.description)),
+            if reentry.creates_new_identity {
+                "TRUE"
+            } else {
+                "FALSE"
+            },
+            if index + 1 == spec.reentry.len() {
+                ""
+            } else {
+                ","
+            },
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str(
+        ">>\n\n=============================================================================\n",
+    );
+    output
+}
+
+fn write_tla_enum(
+    output: &mut String,
+    set_name: &str,
+    value_prefix: &str,
+    variants: &[(&str, &str)],
+) {
+    for (variant, value) in variants {
+        writeln!(output, "{value_prefix}{variant} == {}", tla_string(value))
+            .expect("writing to String cannot fail");
+    }
+    let members = variants
+        .iter()
+        .map(|(variant, _)| format!("{value_prefix}{variant}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(output, "{set_name} == {{{members}}}\n").expect("writing to String cannot fail");
+}
+
+fn utf8_hex(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn tla_string(value: &str) -> String {
+    json_string(value)
 }
 
 fn rust_literal(value: &str) -> String {
