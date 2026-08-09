@@ -746,6 +746,46 @@ impl std::fmt::Debug for DirEntryName {
     }
 }
 
+#[derive(Debug)]
+pub enum DirectoryEnumerationError {
+    Cancelled,
+    CancellationCheck(io::Error),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for DirectoryEnumerationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(formatter, "directory enumeration cancelled"),
+            Self::CancellationCheck(error) => {
+                write!(formatter, "directory cancellation check failed: {error}")
+            }
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DirectoryEnumerationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cancelled => None,
+            Self::CancellationCheck(error) | Self::Io(error) => Some(error),
+        }
+    }
+}
+
+impl DirectoryEnumerationError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Cancelled => io::Error::new(
+                io::ErrorKind::Interrupted,
+                "directory enumeration cancelled unexpectedly",
+            ),
+            Self::CancellationCheck(error) | Self::Io(error) => error,
+        }
+    }
+}
+
 /// Read directory entries without losing non-UTF-8 names.
 /// Consumes the fd via fdopendir and rejects directories exceeding either
 /// bound before retaining an unbounded collection.
@@ -754,9 +794,9 @@ fn read_dir_entry_names_impl<F>(
     max_entries: usize,
     max_name_bytes: usize,
     mut should_stop: F,
-) -> io::Result<Vec<DirEntryName>>
+) -> Result<Vec<DirEntryName>, DirectoryEnumerationError>
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> io::Result<bool>,
 {
     let mut entries = Vec::new();
     let mut name_bytes_read = 0usize;
@@ -765,16 +805,20 @@ where
         let error = io::Error::last_os_error();
         // fdopendir did not take ownership when it returned a null pointer.
         unsafe { libc::close(dir_fd) };
-        return Err(error);
+        return Err(DirectoryEnumerationError::Io(error));
     }
 
     loop {
-        if should_stop() {
-            unsafe { libc::closedir(dir) };
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "directory enumeration exceeded its deadline",
-            ));
+        match should_stop() {
+            Ok(true) => {
+                unsafe { libc::closedir(dir) };
+                return Err(DirectoryEnumerationError::Cancelled);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                unsafe { libc::closedir(dir) };
+                return Err(DirectoryEnumerationError::CancellationCheck(error));
+            }
         }
         // B5: Set errno to 0 before readdir to distinguish EOF from error.
         unsafe { *libc::__errno_location() = 0 };
@@ -784,7 +828,9 @@ where
             let errno = unsafe { *libc::__errno_location() };
             if errno != 0 {
                 unsafe { libc::closedir(dir) };
-                return Err(io::Error::from_raw_os_error(errno));
+                return Err(DirectoryEnumerationError::Io(io::Error::from_raw_os_error(
+                    errno,
+                )));
             }
             break;
         }
@@ -796,17 +842,17 @@ where
         if name_bytes != b"." && name_bytes != b".." {
             let Some(next_name_bytes) = name_bytes_read.checked_add(name_bytes.len()) else {
                 unsafe { libc::closedir(dir) };
-                return Err(io::Error::new(
+                return Err(DirectoryEnumerationError::Io(io::Error::new(
                     io::ErrorKind::FileTooLarge,
                     "directory entry byte count overflow",
-                ));
+                )));
             };
             if entries.len() >= max_entries || next_name_bytes > max_name_bytes {
                 unsafe { libc::closedir(dir) };
-                return Err(io::Error::new(
+                return Err(DirectoryEnumerationError::Io(io::Error::new(
                     io::ErrorKind::FileTooLarge,
                     "directory exceeds configured recovery scan bound",
-                ));
+                )));
             }
             name_bytes_read = next_name_bytes;
             entries.push(DirEntryName(name_bytes.to_vec()));
@@ -821,12 +867,14 @@ where
 /// Read directory entries as strings for legacy callers.
 /// Consumes the fd via fdopendir.
 fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
-    read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX, || false).map(|entries| {
-        entries
-            .into_iter()
-            .map(|entry| String::from_utf8_lossy(entry.as_bytes()).into_owned())
-            .collect()
-    })
+    read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX, || Ok(false))
+        .map_err(DirectoryEnumerationError::into_io_error)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| String::from_utf8_lossy(entry.as_bytes()).into_owned())
+                .collect()
+        })
 }
 
 /// R4-PERF: Iterate directory entries with a callback, avoiding full
@@ -910,7 +958,8 @@ pub fn read_dir_entry_names_bounded_owned(
     max_entries: usize,
     max_name_bytes: usize,
 ) -> io::Result<Vec<DirEntryName>> {
-    read_dir_entry_names_bounded_owned_until(dir_fd, max_entries, max_name_bytes, || false)
+    read_dir_entry_names_bounded_owned_until(dir_fd, max_entries, max_name_bytes, || Ok(false))
+        .map_err(DirectoryEnumerationError::into_io_error)
 }
 
 /// Read bounded byte-preserving directory entries with cooperative cancellation.
@@ -919,11 +968,11 @@ pub fn read_dir_entry_names_bounded_owned_until<F>(
     max_entries: usize,
     max_name_bytes: usize,
     should_stop: F,
-) -> io::Result<Vec<DirEntryName>>
+) -> Result<Vec<DirEntryName>, DirectoryEnumerationError>
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> io::Result<bool>,
 {
-    let reopened = open_directory(dir_fd, ".")?;
+    let reopened = open_directory(dir_fd, ".").map_err(DirectoryEnumerationError::Io)?;
     read_dir_entry_names_impl(
         reopened.into_raw_fd(),
         max_entries,
@@ -1572,14 +1621,68 @@ mod tests {
             usize::MAX,
             || {
                 checks += 1;
-                checks == 1
+                Ok(checks == 1)
             },
         )
         .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(error, DirectoryEnumerationError::Cancelled));
         assert_eq!(checks, 1);
         std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn bounded_directory_read_distinguishes_cancellation_check_failure() {
+        let dir_path = unique_test_dir("bounded-directory-check-failure");
+        std::fs::create_dir(&dir_path).unwrap();
+        let dir = std::fs::File::open(&dir_path).unwrap();
+
+        let error = read_dir_entry_names_bounded_owned_until(
+            dir.as_raw_fd(),
+            usize::MAX,
+            usize::MAX,
+            || Err(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DirectoryEnumerationError::CancellationCheck(ref source)
+                if source.raw_os_error() == Some(libc::ETIMEDOUT)
+        ));
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn directory_enumeration_error_preserves_category_and_source() {
+        use std::error::Error as _;
+
+        let cancelled = DirectoryEnumerationError::Cancelled;
+        assert_eq!(cancelled.to_string(), "directory enumeration cancelled");
+        assert!(cancelled.source().is_none());
+
+        let check = DirectoryEnumerationError::CancellationCheck(io::Error::from_raw_os_error(
+            libc::ETIMEDOUT,
+        ));
+        assert!(check
+            .to_string()
+            .starts_with("directory cancellation check failed:"));
+        assert_eq!(
+            check
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .and_then(io::Error::raw_os_error),
+            Some(libc::ETIMEDOUT)
+        );
+
+        let io_error = DirectoryEnumerationError::Io(io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(
+            io_error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .and_then(io::Error::raw_os_error),
+            Some(libc::EIO)
+        );
     }
 
     #[test]

@@ -43,13 +43,27 @@ fn cursor_component_is_valid(component: &[u8]) -> bool {
 fn read_recovery_directory(
     dir_fd: std::os::unix::io::RawFd,
     deadline_mono: u64,
-) -> io::Result<Vec<fs::DirEntryName>> {
+) -> Result<Vec<fs::DirEntryName>, RecoveryDirectoryError> {
     fs::read_dir_entry_names_bounded_owned_until(
         dir_fd,
         MAX_RECOVERY_DIRECTORY_ENTRIES,
         MAX_RECOVERY_DIRECTORY_NAME_BYTES,
         || Queue::budget_time_exceeded(deadline_mono),
     )
+    .map_err(|error| match error {
+        fs::DirectoryEnumerationError::Cancelled => RecoveryDirectoryError::BudgetExhausted,
+        fs::DirectoryEnumerationError::CancellationCheck(error) => {
+            RecoveryDirectoryError::Clock(error)
+        }
+        fs::DirectoryEnumerationError::Io(error) => RecoveryDirectoryError::Io(error),
+    })
+}
+
+#[derive(Debug)]
+enum RecoveryDirectoryError {
+    BudgetExhausted,
+    Clock(io::Error),
+    Io(io::Error),
 }
 
 fn raw_name_for_error(name: &fs::DirEntryName) -> String {
@@ -350,7 +364,8 @@ impl Queue {
             if !Self::has_recovery_budget(&stats) {
                 break;
             }
-            match self.recovery_cursor.phase {
+            let phase = self.recovery_cursor.phase;
+            let next_phase = match phase {
                 RecoveryPhase::ReapLeases => {
                     self.reap_expired_leases(
                         boottime_now,
@@ -359,29 +374,21 @@ impl Queue {
                         &mut stats,
                         deadline_mono,
                     );
-                    if Self::has_recovery_budget(&stats) {
-                        self.recovery_cursor.phase = RecoveryPhase::PromoteDelayed;
-                    }
+                    RecoveryPhase::PromoteDelayed
                 }
                 RecoveryPhase::PromoteDelayed => {
                     if let Some(wall_floor) = wall_floor {
                         self.promote_delayed(wall_floor, budget, &mut stats, deadline_mono);
                     }
-                    if Self::has_recovery_budget(&stats) {
-                        self.recovery_cursor.phase = RecoveryPhase::CleanupTemp;
-                    }
+                    RecoveryPhase::CleanupTemp
                 }
                 RecoveryPhase::CleanupTemp => {
                     self.cleanup_temp_files(boottime_now, budget, &mut stats, deadline_mono);
-                    if Self::has_recovery_budget(&stats) {
-                        self.recovery_cursor.phase = RecoveryPhase::CompactReceipts;
-                    }
+                    RecoveryPhase::CompactReceipts
                 }
                 RecoveryPhase::CompactReceipts => {
                     self.compact_receipts(budget, &mut stats, deadline_mono);
-                    if Self::has_recovery_budget(&stats) {
-                        self.recovery_cursor.phase = RecoveryPhase::DeleteReceipts;
-                    }
+                    RecoveryPhase::DeleteReceipts
                 }
                 RecoveryPhase::DeleteReceipts => {
                     if let Some(wall_floor) = wall_floor {
@@ -393,11 +400,17 @@ impl Queue {
                             deadline_mono,
                         );
                     }
-                    if Self::has_recovery_budget(&stats) {
-                        self.recovery_cursor.phase = RecoveryPhase::ReapLeases;
-                    }
-                    break;
+                    RecoveryPhase::ReapLeases
                 }
+            };
+            if Self::budget_exhausted(&mut stats, budget, deadline_mono) {
+                stats.budget_exhausted = true;
+            }
+            if Self::has_recovery_budget(&stats) {
+                self.recovery_cursor.phase = next_phase;
+            }
+            if phase == RecoveryPhase::DeleteReceipts {
+                break;
             }
         }
 
@@ -432,19 +445,31 @@ impl Queue {
     }
 
     /// R2-H05: Check if the monotonic deadline has been exceeded.
-    fn budget_time_exceeded(deadline_mono: u64) -> bool {
-        match fs::clock_monotonic_ns() {
-            Ok(now) => now >= deadline_mono,
-            Err(_) => true,
-        }
+    fn budget_time_exceeded(deadline_mono: u64) -> io::Result<bool> {
+        fs::clock_monotonic_ns().map(|now| now >= deadline_mono)
     }
 
     /// Check if either operations or time budget is exhausted.
-    fn budget_exhausted(stats: &RecoveryStats, budget: &WorkBudget, deadline_mono: u64) -> bool {
+    fn budget_exhausted(
+        stats: &mut RecoveryStats,
+        budget: &WorkBudget,
+        deadline_mono: u64,
+    ) -> bool {
         if stats.operations_attempted >= budget.max_operations {
             return true;
         }
-        Self::budget_time_exceeded(deadline_mono)
+        match Self::budget_time_exceeded(deadline_mono) {
+            Ok(exceeded) => exceeded,
+            Err(error) => {
+                Self::block_phase(
+                    stats,
+                    "clock_monotonic",
+                    "/",
+                    &format!("recovery budget clock unavailable: {error}"),
+                );
+                true
+            }
+        }
     }
 
     fn has_recovery_budget(stats: &RecoveryStats) -> bool {
@@ -470,12 +495,19 @@ impl Queue {
         stats: &mut RecoveryStats,
         op: &str,
         path: &str,
-        error: &io::Error,
+        error: &RecoveryDirectoryError,
     ) {
-        if error.kind() == io::ErrorKind::TimedOut {
-            stats.budget_exhausted = true;
-        } else {
-            Self::block_phase(stats, op, path, &error.to_string());
+        match error {
+            RecoveryDirectoryError::BudgetExhausted => stats.budget_exhausted = true,
+            RecoveryDirectoryError::Clock(error) => Self::block_phase(
+                stats,
+                "clock_monotonic",
+                path,
+                &format!("directory budget clock unavailable during {op}: {error}"),
+            ),
+            RecoveryDirectoryError::Io(error) => {
+                Self::block_phase(stats, op, path, &error.to_string());
+            }
         }
     }
 
@@ -2235,23 +2267,28 @@ mod tests {
     #[test]
     fn recovery_budget_predicates_cover_operation_time_and_clock_failure() {
         fs::fault::reset();
-        assert!(Queue::budget_time_exceeded(0));
-        assert!(!Queue::budget_time_exceeded(u64::MAX));
+        assert!(Queue::budget_time_exceeded(0).unwrap());
+        assert!(!Queue::budget_time_exceeded(u64::MAX).unwrap());
 
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: u64::MAX,
         };
         let mut stats = RecoveryStats::default();
-        assert!(!Queue::budget_exhausted(&stats, &budget, u64::MAX));
+        assert!(!Queue::budget_exhausted(&mut stats, &budget, u64::MAX));
         stats.operations_attempted = 1;
-        assert!(Queue::budget_exhausted(&stats, &budget, u64::MAX));
+        assert!(Queue::budget_exhausted(&mut stats, &budget, u64::MAX));
         stats.operations_attempted = 0;
-        assert!(Queue::budget_exhausted(&stats, &budget, 0));
+        assert!(Queue::budget_exhausted(&mut stats, &budget, 0));
 
         fs::fault::inject("clock_monotonic_ns", 1);
-        assert!(Queue::budget_time_exceeded(u64::MAX));
+        assert!(Queue::budget_exhausted(&mut stats, &budget, u64::MAX));
         fs::fault::reset();
+        assert!(stats.phase_blocked);
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "clock_monotonic"));
     }
 
     #[test]
@@ -2276,7 +2313,7 @@ mod tests {
             &mut timed_out,
             "read",
             "directory",
-            &io::Error::new(io::ErrorKind::TimedOut, "deadline"),
+            &RecoveryDirectoryError::BudgetExhausted,
         );
         assert!(timed_out.budget_exhausted);
         assert!(!timed_out.phase_blocked);
@@ -2287,29 +2324,29 @@ mod tests {
             &mut io_failed,
             "read",
             "directory",
-            &io::Error::from_raw_os_error(libc::EIO),
+            &RecoveryDirectoryError::Io(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
         );
         assert!(!io_failed.budget_exhausted);
         assert!(io_failed.phase_blocked);
         assert_eq!(io_failed.errors.len(), 1);
+        assert_eq!(io_failed.errors[0].operation, "read");
+
+        let mut clock_failed = RecoveryStats::default();
+        Queue::stop_for_directory_error(
+            &mut clock_failed,
+            "read",
+            "directory",
+            &RecoveryDirectoryError::Clock(io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert!(!clock_failed.budget_exhausted);
+        assert!(clock_failed.phase_blocked);
+        assert_eq!(clock_failed.errors.len(), 1);
+        assert_eq!(clock_failed.errors[0].operation, "clock_monotonic");
     }
 
     #[test]
     fn recovery_phase_progress_prevents_early_phase_starvation_after_reopen() {
         let (tmp, mut queue) = create_test_queue();
-        assert!(matches!(
-            queue.enqueue(EnqueueInput {
-                maximum_attempts: 3,
-                content_type: "x".into(),
-                payload: b"expired lease".to_vec(),
-                ..Default::default()
-            }),
-            EnqueueOutcome::Committed(_)
-        ));
-        match queue.lease(0, 1_000_000_000) {
-            LeaseOutcome::Leased(_) => {}
-            outcome => panic!("lease failed: {outcome:?}"),
-        }
         let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
         std::fs::create_dir_all(&receipt_dir).unwrap();
         std::fs::write(receipt_dir.join("invalid.rct"), b"invalid").unwrap();
@@ -2629,7 +2666,24 @@ mod tests {
 
         let error = read_recovery_directory(dir.as_raw_fd(), 0).unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(error, RecoveryDirectoryError::BudgetExhausted));
+    }
+
+    #[test]
+    fn recovery_directory_read_propagates_clock_failure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno("clock_monotonic_ns", 1, libc::EIO);
+
+        let error = read_recovery_directory(dir.as_raw_fd(), u64::MAX).unwrap_err();
+
+        fs::fault::reset();
+        assert!(matches!(
+            error,
+            RecoveryDirectoryError::Clock(ref source)
+                if source.raw_os_error() == Some(libc::EIO)
+        ));
     }
 
     #[test]
