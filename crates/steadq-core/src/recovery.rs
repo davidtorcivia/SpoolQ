@@ -2810,6 +2810,18 @@ mod tests {
             assert_eq!(stats.entries_read, 0);
             assert_eq!(stats.name_bytes_read, 0);
         }
+
+        let exact_budget = WorkBudget {
+            max_entries_read: MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE,
+            max_name_bytes_read: MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE,
+            ..WorkBudget::default()
+        };
+        let mut stats = RecoveryStats::default();
+        let entries =
+            read_recovery_directory(dir.as_raw_fd(), u64::MAX, &exact_budget, &mut stats).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(stats.entries_read, 1);
+        assert_eq!(stats.name_bytes_read, 5);
     }
 
     #[test]
