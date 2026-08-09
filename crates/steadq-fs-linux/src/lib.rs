@@ -2154,6 +2154,35 @@ mod tests {
     }
 
     #[test]
+    fn fsync_dir_fd_records_ordered_directory_identities() {
+        fault::reset();
+        let first_dir = tempfile_dir("fsyncdir-record-first");
+        let second_dir = tempfile_dir("fsyncdir-record-second");
+        let first_fd = open_dir_absolute(&first_dir).unwrap();
+        let second_fd = open_dir_absolute(&second_dir).unwrap();
+        let first_stat = fstat(first_fd.as_raw_fd()).unwrap();
+        let second_stat = fstat(second_fd.as_raw_fd()).unwrap();
+        let expected = [
+            (first_stat.st_dev as u64, first_stat.st_ino as u64),
+            (second_stat.st_dev as u64, second_stat.st_ino as u64),
+        ];
+
+        fault::inject("fsync_dir_fd", u64::MAX);
+        fsync_dir_fd(first_fd.as_raw_fd()).unwrap();
+        fsync_dir_fd(second_fd.as_raw_fd()).unwrap();
+        assert_eq!(fault::fd_identities("fsync_dir_fd"), expected);
+        assert_eq!(fault::call_count("fsync_dir_fd"), 2);
+
+        let error = fault::record_fd_identity("invalid", -1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+
+        fault::reset();
+        assert!(fault::fd_identities("fsync_dir_fd").is_empty());
+        let _ = std::fs::remove_dir_all(&first_dir);
+        let _ = std::fs::remove_dir_all(&second_dir);
+    }
+
+    #[test]
     fn clocks_return_plausible_values() {
         // Kill Ok(1) whole-function mutants: real clocks are far above 1.
         let boot = clock_boottime_ns().unwrap();
