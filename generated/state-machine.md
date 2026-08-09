@@ -1,4 +1,4 @@
-<!-- Source: spec/state-machine.json; SHA-256: 98d2c334df4679cf27cbc45ce270590345f7dd1050305e46ce8fd1b960948e93 -->
+<!-- Source: spec/state-machine.json; SHA-256: e83f85741adae71434408593f076b82bac478ee42b87a9abc5d59bd38ef053fc -->
 
 # SteadQ/1 State Machine (Generated)
 
@@ -20,10 +20,12 @@
 | reap_expired_to_dead | leased | dead | increment | unchanged | none | attempts_exhausted | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | attempt >= maximum_attempts |
 | quarantine | active | quarantine | increment | unchanged | none | corruption | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | raw bytes preserved |
 
-## Replacing-rename exceptions
+## Exceptional mutations
 
-- **receipt_compaction**: Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname (uses replacing rename: true)
-- **wall_watermark_advancement**: Monotone wall-watermark record replaced under exclusive OFD lock (uses replacing rename: true)
+| Operation | Class | Linearization | Required syncs | Before failure | After failure | Description |
+|-----------|-------|---------------|----------------|----------------|---------------|-------------|
+| receipt_compaction | replacing_move | rename_replace | file_fsync, same_or_destination_dir_fsync | not_committed | outcome_unknown | Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname |
+| wall_watermark_advancement | replacing_move | rename_replace | file_fsync, same_or_destination_dir_fsync | not_committed | outcome_unknown | Monotone wall-watermark record replaced under exclusive OFD lock |
 
 ## Administrative re-entry (creates new identity)
 

@@ -4,12 +4,12 @@ use std::path::Path;
 
 use super::{
     AttemptChange, ExceptionName, FailureOutcome, GenerationChange, LinearizationPrimitive,
-    Operation, ReasonClass, ReentryName, State, SyncStep, TokenChange,
+    MutationClass, Operation, ReasonClass, ReentryName, State, SyncStep, TokenChange,
 };
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "5a6c352e7c6a7624e557b31c1f24cccd0ab0f0677152d09edf98cbbcbb943028";
+    "d371771461cf6331bc1ac335340dc788631e5e585b10dde2601c161e69532924";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =
@@ -68,7 +68,7 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     validate_schema_domain(
         &schema,
         "/properties/transitions/items/properties/linearization/enum",
-        &LinearizationPrimitive::ALL.map(LinearizationPrimitive::as_str),
+        &LinearizationPrimitive::TRANSITIONS.map(LinearizationPrimitive::as_str),
     )?;
     validate_schema_const(
         &schema,
@@ -84,6 +84,31 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
         &schema,
         "/properties/exceptions/items/properties/name/enum",
         &ExceptionName::ALL.map(ExceptionName::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/exceptions/items/properties/mutation_class/enum",
+        &MutationClass::ALL.map(MutationClass::as_str),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/exceptions/items/properties/linearization/const",
+        LinearizationPrimitive::RenameReplace.as_str(),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/exceptions/items/properties/required_syncs/items/enum",
+        &SyncStep::ALL.map(SyncStep::as_str),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/exceptions/items/properties/before_linearization_failure/const",
+        FailureOutcome::NotCommitted.as_str(),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/exceptions/items/properties/after_linearization_failure/const",
+        FailureOutcome::OutcomeUnknown.as_str(),
     )?;
     validate_schema_domain(
         &schema,

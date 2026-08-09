@@ -239,6 +239,56 @@ fn rejects_wrong_linearization_failure_outcomes() {
 }
 
 #[test]
+fn rejects_wrong_exception_mutation_semantics() {
+    let mut spec = fixture();
+    spec.exceptions[0].mutation_class = MutationClass::Unlink;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction has mutation class unlink; expected replacing_move"
+    );
+
+    let mut spec = fixture();
+    spec.exceptions[0].linearization = LinearizationPrimitive::RenameNoreplace;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction has linearization rename_noreplace; expected rename_replace"
+    );
+
+    let mut spec = fixture();
+    spec.exceptions[0].required_syncs = vec![SyncStep::File];
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction has syncs [\"file_fsync\"]; expected [\"file_fsync\", \"same_or_destination_dir_fsync\"]"
+    );
+
+    let mut spec = fixture();
+    spec.exceptions[0].before_linearization_failure = FailureOutcome::OutcomeUnknown;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction must classify pre-linearization failure as not_committed"
+    );
+
+    let mut spec = fixture();
+    spec.exceptions[0].after_linearization_failure = FailureOutcome::NotCommitted;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction must classify post-linearization failure as outcome_unknown"
+    );
+}
+
+#[test]
+fn rejects_duplicate_exception_sync() {
+    let mut spec = fixture();
+    spec.exceptions[0]
+        .required_syncs
+        .push(SyncStep::SameOrDestinationDir);
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction contains duplicate sync same_or_destination_dir_fsync"
+    );
+}
+
+#[test]
 fn generated_rust_contains_source_transition() {
     let output = render_rust(&fixture(), "fixture-digest");
     assert!(output.contains("operation: Operation::Claim"));
@@ -246,6 +296,7 @@ fn generated_rust_contains_source_transition() {
     assert!(output
         .contains("required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]"));
     assert!(output.contains("pub const EXCEPTIONS: &[ExceptionDef]"));
+    assert!(output.contains("linearization: LinearizationPrimitive::RenameReplace"));
     assert!(output.contains("pub const REENTRY: &[ReentryDef]"));
 }
 
@@ -349,7 +400,19 @@ fn every_exception_field_affects_every_projection() {
         spec.exceptions[0].description = "different exception documentation".into();
     });
     assert_every_projection_changes(|spec| {
-        spec.exceptions[0].uses_replacing_rename = false;
+        spec.exceptions[0].mutation_class = MutationClass::Unlink;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].linearization = LinearizationPrimitive::RenameNoreplace;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].required_syncs = vec![SyncStep::SourceDir];
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].before_linearization_failure = FailureOutcome::OutcomeUnknown;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].after_linearization_failure = FailureOutcome::NotCommitted;
     });
 }
 
@@ -407,6 +470,8 @@ fn rejects_unknown_protocol_domains() {
             "invented_outcome",
         ),
         ("/exceptions/0/name", "invented_exception"),
+        ("/exceptions/0/mutation_class", "invented_mutation_class"),
+        ("/exceptions/0/linearization", "invented_linearization"),
         ("/reentry/0/name", "invented_reentry"),
     ] {
         let mut input = fixture_value();
@@ -446,7 +511,15 @@ fn rejects_omitted_semantic_fields() {
         );
     }
 
-    for field in ["name", "description", "uses_replacing_rename"] {
+    for field in [
+        "name",
+        "description",
+        "mutation_class",
+        "linearization",
+        "required_syncs",
+        "before_linearization_failure",
+        "after_linearization_failure",
+    ] {
         let mut input = fixture_value();
         input["exceptions"][0]
             .as_object_mut()

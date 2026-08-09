@@ -123,6 +123,7 @@ enum SyncStep {
 enum LinearizationPrimitive {
     PublishNoreplace,
     RenameNoreplace,
+    RenameReplace,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -137,7 +138,21 @@ enum FailureOutcome {
 struct Exception {
     name: ExceptionName,
     description: String,
-    uses_replacing_rename: bool,
+    mutation_class: MutationClass,
+    linearization: LinearizationPrimitive,
+    required_syncs: Vec<SyncStep>,
+    before_linearization_failure: FailureOutcome,
+    after_linearization_failure: FailureOutcome,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum MutationClass {
+    NoOverwriteMove,
+    ReplacingMove,
+    Publication,
+    Unlink,
+    InPlaceReadOnlyBarrier,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -170,6 +185,12 @@ struct TransitionInvariant {
     attempt_change: AttemptChange,
     token_change: TokenChange,
     reason_class: Option<ReasonClass>,
+    required_syncs: &'static [SyncStep],
+}
+
+struct ExceptionInvariant {
+    mutation_class: MutationClass,
+    linearization: LinearizationPrimitive,
     required_syncs: &'static [SyncStep],
 }
 
@@ -257,12 +278,17 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
                 exception.name.as_str()
             ));
         }
-        if !exception.uses_replacing_rename {
-            return Err(format!(
-                "exception {} must declare replacing rename behavior",
-                exception.name.as_str()
-            ));
+        let mut syncs = HashSet::new();
+        for sync in &exception.required_syncs {
+            if !syncs.insert(*sync) {
+                return Err(format!(
+                    "exception {} contains duplicate sync {}",
+                    exception.name.as_str(),
+                    sync.as_str()
+                ));
+            }
         }
+        validate_exception_invariant(exception)?;
     }
     for exception in ExceptionName::ALL {
         if !exception_names.contains(&exception) {
@@ -306,6 +332,57 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
                 reentry.as_str()
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_exception_invariant(exception: &Exception) -> Result<(), String> {
+    let expected = exception.name.invariant();
+    if exception.mutation_class != expected.mutation_class {
+        return Err(format!(
+            "exception {} has mutation class {}; expected {}",
+            exception.name.as_str(),
+            exception.mutation_class.as_str(),
+            expected.mutation_class.as_str()
+        ));
+    }
+    if exception.linearization != expected.linearization {
+        return Err(format!(
+            "exception {} has linearization {}; expected {}",
+            exception.name.as_str(),
+            exception.linearization.as_str(),
+            expected.linearization.as_str()
+        ));
+    }
+    if exception.before_linearization_failure != FailureOutcome::NotCommitted {
+        return Err(format!(
+            "exception {} must classify pre-linearization failure as not_committed",
+            exception.name.as_str()
+        ));
+    }
+    if exception.after_linearization_failure != FailureOutcome::OutcomeUnknown {
+        return Err(format!(
+            "exception {} must classify post-linearization failure as outcome_unknown",
+            exception.name.as_str()
+        ));
+    }
+    if exception.required_syncs != expected.required_syncs {
+        let actual = exception
+            .required_syncs
+            .iter()
+            .copied()
+            .map(SyncStep::as_str)
+            .collect::<Vec<_>>();
+        let expected = expected
+            .required_syncs
+            .iter()
+            .copied()
+            .map(SyncStep::as_str)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "exception {} has syncs {actual:?}; expected {expected:?}",
+            exception.name.as_str()
+        ));
     }
     Ok(())
 }
@@ -780,12 +857,18 @@ impl SyncStep {
 }
 
 impl LinearizationPrimitive {
-    const ALL: [Self; 2] = [Self::PublishNoreplace, Self::RenameNoreplace];
+    const ALL: [Self; 3] = [
+        Self::PublishNoreplace,
+        Self::RenameNoreplace,
+        Self::RenameReplace,
+    ];
+    const TRANSITIONS: [Self; 2] = [Self::PublishNoreplace, Self::RenameNoreplace];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::PublishNoreplace => "publish_noreplace",
             Self::RenameNoreplace => "rename_noreplace",
+            Self::RenameReplace => "rename_replace",
         }
     }
 
@@ -793,6 +876,37 @@ impl LinearizationPrimitive {
         match self {
             Self::PublishNoreplace => "PublishNoreplace",
             Self::RenameNoreplace => "RenameNoreplace",
+            Self::RenameReplace => "RenameReplace",
+        }
+    }
+}
+
+impl MutationClass {
+    const ALL: [Self; 5] = [
+        Self::NoOverwriteMove,
+        Self::ReplacingMove,
+        Self::Publication,
+        Self::Unlink,
+        Self::InPlaceReadOnlyBarrier,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoOverwriteMove => "no_overwrite_move",
+            Self::ReplacingMove => "replacing_move",
+            Self::Publication => "publication",
+            Self::Unlink => "unlink",
+            Self::InPlaceReadOnlyBarrier => "in_place_read_only_barrier",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::NoOverwriteMove => "NoOverwriteMove",
+            Self::ReplacingMove => "ReplacingMove",
+            Self::Publication => "Publication",
+            Self::Unlink => "Unlink",
+            Self::InPlaceReadOnlyBarrier => "InPlaceReadOnlyBarrier",
         }
     }
 }
@@ -829,6 +943,14 @@ impl ExceptionName {
         match self {
             Self::ReceiptCompaction => "ReceiptCompaction",
             Self::WallWatermarkAdvancement => "WallWatermarkAdvancement",
+        }
+    }
+
+    fn invariant(self) -> ExceptionInvariant {
+        ExceptionInvariant {
+            mutation_class: MutationClass::ReplacingMove,
+            linearization: LinearizationPrimitive::RenameReplace,
+            required_syncs: &[SyncStep::File, SyncStep::SameOrDestinationDir],
         }
     }
 }

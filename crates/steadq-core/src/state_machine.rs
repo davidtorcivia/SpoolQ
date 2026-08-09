@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: 98d2c334df4679cf27cbc45ce270590345f7dd1050305e46ce8fd1b960948e93
+// Source SHA-256: e83f85741adae71434408593f076b82bac478ee42b87a9abc5d59bd38ef053fc
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -70,12 +70,22 @@ pub enum SyncStep {
 pub enum LinearizationPrimitive {
     PublishNoreplace,
     RenameNoreplace,
+    RenameReplace,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum FailureOutcome {
     NotCommitted,
     OutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MutationClass {
+    NoOverwriteMove,
+    ReplacingMove,
+    Publication,
+    Unlink,
+    InPlaceReadOnlyBarrier,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -113,7 +123,11 @@ pub struct TransitionDef {
 pub struct ExceptionDef {
     pub name: ExceptionName,
     pub description: &'static str,
-    pub uses_replacing_rename: bool,
+    pub mutation_class: MutationClass,
+    pub linearization: LinearizationPrimitive,
+    pub required_syncs: &'static [SyncStep],
+    pub before_linearization_failure: FailureOutcome,
+    pub after_linearization_failure: FailureOutcome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,12 +342,20 @@ pub const EXCEPTIONS: &[ExceptionDef] = &[
     ExceptionDef {
         name: ExceptionName::ReceiptCompaction,
         description: "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname",
-        uses_replacing_rename: true,
+        mutation_class: MutationClass::ReplacingMove,
+        linearization: LinearizationPrimitive::RenameReplace,
+        required_syncs: &[SyncStep::File, SyncStep::SameOrDestinationDirectory],
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
     },
     ExceptionDef {
         name: ExceptionName::WallWatermarkAdvancement,
         description: "Monotone wall-watermark record replaced under exclusive OFD lock",
-        uses_replacing_rename: true,
+        mutation_class: MutationClass::ReplacingMove,
+        linearization: LinearizationPrimitive::RenameReplace,
+        required_syncs: &[SyncStep::File, SyncStep::SameOrDestinationDirectory],
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
     },
 ];
 
@@ -409,9 +431,12 @@ mod tests {
             transition.before_linearization_failure == FailureOutcome::NotCommitted
                 && transition.after_linearization_failure == FailureOutcome::OutcomeUnknown
         }));
-        assert!(EXCEPTIONS
-            .iter()
-            .all(|exception| exception.uses_replacing_rename));
+        assert!(EXCEPTIONS.iter().all(|exception| exception.mutation_class
+            == MutationClass::ReplacingMove
+            && exception.linearization == LinearizationPrimitive::RenameReplace
+            && exception.required_syncs == [SyncStep::File, SyncStep::SameOrDestinationDirectory]
+            && exception.before_linearization_failure == FailureOutcome::NotCommitted
+            && exception.after_linearization_failure == FailureOutcome::OutcomeUnknown));
         assert!(REENTRY.iter().all(|reentry| reentry.creates_new_identity));
     }
 
