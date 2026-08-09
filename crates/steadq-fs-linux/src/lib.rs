@@ -1045,14 +1045,14 @@ pub fn read_dir_for_each<F: FnMut(&DirEntryName) -> bool>(
     dir_fd: RawFd,
     mut f: F,
 ) -> io::Result<usize> {
-    let dup_fd = unsafe { libc::dup(dir_fd) };
-    if dup_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let dir = unsafe { libc::fdopendir(dup_fd) };
+    let reopened = open_directory(dir_fd, ".")?;
+    let reopened_fd = reopened.into_raw_fd();
+    // SAFETY: `reopened_fd` is a live directory descriptor. `fdopendir`
+    // takes ownership on success and leaves ownership with the caller on failure.
+    let dir = unsafe { libc::fdopendir(reopened_fd) };
     if dir.is_null() {
-        // P1-16: Close the dup'd fd before returning to avoid descriptor leak.
-        unsafe { libc::close(dup_fd) };
+        // SAFETY: `fdopendir` failed, so `reopened_fd` remains caller-owned.
+        unsafe { libc::close(reopened_fd) };
         return Err(io::Error::last_os_error());
     }
     let mut count = 0usize;
@@ -1085,7 +1085,7 @@ pub fn read_dir_for_each<F: FnMut(&DirEntryName) -> bool>(
 }
 
 /// Read directory entries. Consumes the fd (fdopendir takes ownership).
-/// Prefer read_dir_entries_owned which dups the fd first.
+/// Prefer `read_dir_entries_owned`, which reopens the directory first.
 pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
     read_dir_entries_impl(dir_fd)
 }
@@ -1104,14 +1104,10 @@ pub const NFS_SUPER_MAGIC: i64 = 0x6969;
 pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const FUSE_SUPER_MAGIC: i64 = 0x65735546;
 
-/// Read directory entries without consuming the fd (uses dup first).
+/// Read directory entries without consuming the fd or its directory position.
 pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
-    // dup the fd so fdopendir doesn't consume the original
-    let dup_fd = unsafe { libc::dup(dir_fd) };
-    if dup_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    read_dir_entries_impl(dup_fd)
+    let reopened = open_directory(dir_fd, ".")?;
+    read_dir_entries_impl(reopened.into_raw_fd())
 }
 
 /// Read byte-preserving directory entries without consuming the caller's fd.
@@ -1732,6 +1728,13 @@ mod tests {
         .unwrap();
         assert_eq!(count_seen, 1);
 
+        let mut entries = read_dir_entries_owned(fd.as_raw_fd()).unwrap();
+        entries.sort();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].as_bytes(), b"a.txt");
+        assert_eq!(entries[1].as_bytes(), b"b.txt");
+        assert_eq!(entries[2].as_bytes(), b"c.txt");
+
         std::fs::remove_dir_all(&dir_path).ok();
     }
 
@@ -1845,10 +1848,13 @@ mod tests {
         std::fs::write(dir_path.join("beta"), b"b").unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let mut entries = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
-        entries.sort();
-        assert_eq!(entries[0].as_bytes(), b"alpha");
-        assert_eq!(entries[1].as_bytes(), b"beta");
+        let mut first = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        let mut second = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        first.sort();
+        second.sort();
+        assert_eq!(first, second);
+        assert_eq!(first[0].as_bytes(), b"alpha");
+        assert_eq!(first[1].as_bytes(), b"beta");
         std::fs::remove_dir_all(dir_path).unwrap();
     }
 
