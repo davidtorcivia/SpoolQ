@@ -1635,7 +1635,6 @@ impl Queue {
                     ) {
                         Ok(()) => continue,
                         Err(_) => {
-                            // P1-07: Don't ignore cleanup failure.
                             scan_had_error = true;
                             self.poison();
                             continue;
@@ -1924,11 +1923,22 @@ impl Queue {
                         if let Err(e) = self.verify_payload_on_fd(leased_file.as_fd()) {
                             match e {
                                 Error::PayloadCorrupt => {
-                                    let _ = self.quarantine_corrupt_lease(
+                                    if let Err(failure) = self.quarantine_corrupt_lease(
                                         leased_dir_fd.as_fd(),
                                         &leased_name,
                                         leased_file.as_fd(),
-                                    );
+                                    ) {
+                                        if failure.is_outcome_unknown() {
+                                            self.poison();
+                                            return LeaseOutcome::OutcomeUnknown(
+                                                claim_ticket.with_phase(
+                                                    ticket_phase_for_move_outcome_unknown(
+                                                        failure.phase().unwrap(),
+                                                    ),
+                                                ),
+                                            );
+                                        }
+                                    }
                                     return LeaseOutcome::NotCommitted(Error::PayloadCorrupt);
                                 }
                                 _ => {
@@ -2876,19 +2886,21 @@ impl Queue {
         common: &CommonFields,
         reason: DeadReason,
         wall_floor: WallFloor,
-    ) -> Result<(), io::Error> {
+    ) -> Result<(), Error> {
         let shard_str = ready_dir.rsplit('/').next().unwrap_or("0000");
-        let terminal_bucket =
-            steadq_math::bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "terminal bucket overflow")
-                })?;
+        let terminal_bucket = match steadq_math::bucket_number(
+            wall_floor.unix_ns(),
+            self.format.terminal_bucket_width_ns,
+        ) {
+            Some(bucket) => bucket,
+            None => return Err(Error::StateExhausted),
+        };
         let bucket_str = bucket_hex(terminal_bucket);
 
         let new_gen = common
             .generation
             .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "generation overflow"))?;
+            .ok_or(Error::StateExhausted)?;
         let dead_common = CommonFields {
             job_id: common.job_id,
             generation: new_gen,
@@ -2905,19 +2917,30 @@ impl Queue {
         );
         let dead_dir = format!("dead/{bucket_str}/{shard_str}");
 
-        let _ = self.ensure_dir(&dead_dir);
-        let dead_dir_fd = open_relative(self.root_fd.as_fd(), &dead_dir)?;
-        let ready_dir_fd = open_relative(self.root_fd.as_fd(), ready_dir)?;
+        self.ensure_dir(&dead_dir)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let dead_dir_fd = open_relative(self.root_fd.as_fd(), &dead_dir)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let ready_dir_fd = open_relative(self.root_fd.as_fd(), ready_dir)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
 
-        fs::renameat2_noreplace(
+        match engine::move_verified_noreplace(
             ready_dir_fd.as_fd(),
             ready_name,
             dead_dir_fd.as_fd(),
             &dead_name,
-        )?;
-        fs::fsync_dir_fd(dead_dir_fd.as_fd())?;
-        fs::fsync_dir_fd(ready_dir_fd.as_fd())?;
-        Ok(())
+            engine::MoveActor::Consumer,
+        ) {
+            Ok(()) => Ok(()),
+            Err(engine::MoveFailure::SourceMissing) => Ok(()),
+            Err(engine::MoveFailure::AlreadyExists) => Err(Error::IdentityCollision),
+            Err(engine::MoveFailure::NotCommitted { phase, source }) => Err(Error::IoFailure(
+                format!("dead-letter move failed at {phase:?}: {source}"),
+            )),
+            Err(engine::MoveFailure::OutcomeUnknown { phase, source }) => Err(Error::IoFailure(
+                format!("dead-letter move indeterminate at {phase:?}: {source}"),
+            )),
+        }
     }
     /// B-09: Read and verify the payload of a leased job.
     /// Validates source identity (B-04), then verifies envelope digest,
@@ -2952,25 +2975,48 @@ impl Queue {
         leased_dir_fd: BorrowedFd<'_>,
         leased_name: &str,
         held_fd: BorrowedFd<'_>,
-    ) -> Result<(), std::io::Error> {
-        // Verify held fd still names same inode before moving by pathname.
-        let held_stat = fs::fstat(held_fd)?;
-        let name_stat = fs::fstatat(leased_dir_fd, leased_name)?;
+    ) -> Result<(), engine::MoveFailure> {
+        let held_stat = fs::fstat(held_fd).map_err(|source| engine::MoveFailure::NotCommitted {
+            phase: engine::MovePhase::PreRename,
+            source: source.to_string(),
+        })?;
+        let name_stat = fs::fstatat(leased_dir_fd, leased_name).map_err(|source| {
+            engine::MoveFailure::NotCommitted {
+                phase: engine::MovePhase::PreRename,
+                source: source.to_string(),
+            }
+        })?;
         if held_stat.st_dev != name_stat.st_dev || held_stat.st_ino != name_stat.st_ino {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "quarantine target changed under held fd",
-            ));
+            return Err(engine::MoveFailure::SourceMissing);
         }
-        let qid = fs::random_128bit().map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?;
+        let source_identity = engine::MoveIdentity::new(held_stat.st_dev, held_stat.st_ino);
+
+        let qid = fs::random_128bit().map_err(|source| engine::MoveFailure::NotCommitted {
+            phase: engine::MovePhase::PreRename,
+            source: source.to_string(),
+        })?;
         let q_name =
             steadq_names::quarantine_filename(&qid, QuarantineReason::PayloadCorrupt as u16);
-        self.ensure_dir("quarantine")?;
-        let q_dir_fd = open_relative(self.root_fd.as_fd(), "quarantine")?;
-        fs::renameat2_noreplace(leased_dir_fd, leased_name, q_dir_fd.as_fd(), &q_name)?;
-        fs::fsync_dir_fd(q_dir_fd.as_fd())?;
-        fs::fsync_dir_fd(leased_dir_fd)?;
-        Ok(())
+        self.ensure_dir("quarantine")
+            .map_err(|source| engine::MoveFailure::NotCommitted {
+                phase: engine::MovePhase::PreRename,
+                source: source.to_string(),
+            })?;
+        let q_dir_fd = open_relative(self.root_fd.as_fd(), "quarantine").map_err(|source| {
+            engine::MoveFailure::NotCommitted {
+                phase: engine::MovePhase::PreRename,
+                source: source.to_string(),
+            }
+        })?;
+
+        engine::move_witnessed_noreplace(
+            leased_dir_fd,
+            leased_name,
+            q_dir_fd.as_fd(),
+            &q_name,
+            source_identity,
+            engine::MoveActor::Consumer,
+        )
     }
     /// R4-PERF: Read a chunk of a leased job's payload at the given offset.
     /// Returns the number of bytes read (0 at EOF).
@@ -2988,11 +3034,18 @@ impl Queue {
         // P0-01: Verify payload before delivering any bytes.
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
-                let _ = self.quarantine_corrupt_lease(
+                if let Err(engine::MoveFailure::OutcomeUnknown {
+                    phase,
+                    source: detail,
+                }) = self.quarantine_corrupt_lease(
                     source.directory_fd.as_fd(),
                     &source.name,
                     source.file_fd.as_fd(),
-                );
+                ) {
+                    return Err(Error::QueueCorrupt(format!(
+                        "payload is corrupt and quarantine is indeterminate at {phase:?}: {detail}"
+                    )));
+                }
             }
             return Err(e);
         }
@@ -3030,11 +3083,18 @@ impl Queue {
         // P0-01: Verify payload before streaming any bytes.
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
-                let _ = self.quarantine_corrupt_lease(
+                if let Err(engine::MoveFailure::OutcomeUnknown {
+                    phase,
+                    source: detail,
+                }) = self.quarantine_corrupt_lease(
                     source.directory_fd.as_fd(),
                     &source.name,
                     source.file_fd.as_fd(),
-                );
+                ) {
+                    return Err(Error::QueueCorrupt(format!(
+                        "payload is corrupt and quarantine is indeterminate at {phase:?}: {detail}"
+                    )));
+                }
             }
             return Err(e);
         }
@@ -7851,15 +7911,87 @@ mod tests {
             .rsplit_once('/')
             .map(|(_, n)| n)
             .unwrap();
-        // Same device, different inode should fail with NotFound.
+        // Different inode maps to SourceMissing.
         let res = queue.quarantine_corrupt_lease(dir_fd.as_fd(), name_a, dummy_fd.as_fd());
         let _ = dummy_fd;
         assert!(
-            res.is_err(),
-            "quarantine with mismatched held fd should fail, got ok"
+            matches!(res, Err(engine::MoveFailure::SourceMissing)),
+            "quarantine with mismatched held fd should be SourceMissing, got {res:?}"
         );
-        let err = res.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn dead_letter_move_preserves_each_failure_phase() {
+        for (fault, phase_unknown) in [("renameat2_noreplace", false), ("fsync_dir_fd", true)] {
+            let (tmp, mut queue) = create_test_queue();
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            let ticket = match queue.enqueue(EnqueueInput {
+                maximum_attempts: 1,
+                content_type: "x".to_string(),
+                payload: b"dead-letter fault".to_vec(),
+                ..Default::default()
+            }) {
+                EnqueueOutcome::Committed(t) => t,
+                o => panic!("enqueue failed: {o:?}"),
+            };
+            let (ready_dir, ready_name) = ticket.expected_relative_path.rsplit_once('/').unwrap();
+            let parsed = steadq_names::parse_ready(ready_name).unwrap();
+            let wall_floor = queue.wall_floor_for_mutation().unwrap();
+
+            fs::fault::inject_errno(fault, 1, libc::EIO);
+            let result = queue.move_to_dead(
+                ready_dir,
+                ready_name,
+                &parsed.common,
+                DeadReason::AttemptsExhausted,
+                wall_floor,
+            );
+            fs::fault::reset();
+
+            assert!(result.is_err(), "expected error for fault {fault}");
+            if phase_unknown {
+                // The object may or may not be in dead after post-rename failure.
+                assert!(
+                    tmp.path().join("dead").exists()
+                        || tmp.path().join(&ticket.expected_relative_path).exists()
+                );
+            } else {
+                // Pre-rename failure: object stays in ready.
+                assert!(tmp.path().join(&ticket.expected_relative_path).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_surfaces_indeterminate_outcome_from_read_path() {
+        let (tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"quarantine outcome".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            o => panic!("lease failed: {o:?}"),
+        };
+        // Corrupt the leased payload.
+        let src_path = tmp.path().join(&lease.exact_source_path);
+        let mut data = std::fs::read(&src_path).unwrap();
+        *data.last_mut().unwrap() ^= 0x01;
+        std::fs::write(&src_path, data).unwrap();
+
+        // Inject a post-rename fsync failure so the quarantine move
+        // linearizes but cannot prove durability.
+        fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+        let result = queue.read_lease_payload_chunk(&lease, &mut [0u8; 8], 0);
+        fs::fault::reset();
+
+        assert!(
+            matches!(result, Err(Error::QueueCorrupt(_))),
+            "expected QueueCorrupt for indeterminate quarantine, got {result:?}"
+        );
     }
 
     #[test]
