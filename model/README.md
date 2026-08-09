@@ -12,6 +12,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SteadQ.cfg model/SteadQ.tla -
 
 The separate namespace durability model and its two crash profiles are documented in `model/namespace/README.md`.
 The separate authenticated-wall and boottime scheduling model is documented in `model/scheduling/README.md`.
+The separate receipt-evidence, compaction, duplicate-ack, and retention model is documented in `model/receipts/README.md`.
 
 Download `tla2tools.jar` from https://github.com/tlaplus/tlaplus/releases.
 

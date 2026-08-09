@@ -30,6 +30,11 @@ const MODEL_EVIDENCE: &[ModelEvidence] = &[
         configs: &["model/scheduling/SteadQScheduling.cfg"],
         readme: "model/scheduling/README.md",
     },
+    ModelEvidence {
+        model: "model/SteadQReceipts.tla",
+        configs: &["model/receipts/SteadQReceipts.cfg"],
+        readme: "model/receipts/README.md",
+    },
 ];
 const INVARIANT_START: &str = "(* ---- Invariants ---- *)";
 const INVARIANT_END: &str = "(* ---- End invariants ---- *)";
