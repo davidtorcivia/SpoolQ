@@ -100,6 +100,13 @@ enum RecoveryDirectoryError {
     Io(io::Error),
 }
 
+struct RecoveryQuarantineCandidate<'a> {
+    source_directory_fd: std::os::unix::io::RawFd,
+    filename: &'a str,
+    relative_path: &'a str,
+    reason: crate::QuarantineReason,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RememberHierarchyRetry {
     Exact,
@@ -351,10 +358,18 @@ pub struct RecoveryStats {
     pub buckets_removed: u32,
     pub receipts_compacted: u32,
     pub receipts_expired: u32,
+    pub quarantined: Vec<RecoveryQuarantine>,
     pub budget_exhausted: bool,
     pub phase_blocked: bool,
     pub errors: Vec<RecoveryError>,
     pub scan_skips: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryQuarantine {
+    pub relative_path: String,
+    pub quarantine_id: [u8; 16],
+    pub quarantine_name: String,
 }
 
 /// Exact directory-enumeration work completed by a recovery pass.
@@ -700,20 +715,73 @@ impl Queue {
     /// B1: Quarantine an object during recovery.
     fn quarantine_recovery_object(
         &self,
-        src_dir_fd: std::os::unix::io::RawFd,
-        filename: &str,
-        full_path: &str,
-        reason: crate::QuarantineReason,
-    ) -> Result<(), Error> {
-        let qid = fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?;
-        let q_name = steadq_names::quarantine_filename(&qid, reason as u16);
-        let _ = self.ensure_dir("quarantine");
-        let q_dir_fd = crate::queue::open_relative(self.root_fd(), "quarantine")
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::durable_move_noreplace(src_dir_fd, filename, q_dir_fd.as_raw_fd(), &q_name)
-            .map_err(|e| Error::IoFailure(format!("quarantine move failed: {e}")))?;
-        let _ = full_path; // logged by caller
-        Ok(())
+        candidate: RecoveryQuarantineCandidate<'_>,
+        stats: &mut RecoveryStats,
+        budget: &WorkBudget,
+    ) -> bool {
+        self.quarantine_recovery_object_with_ids(candidate, stats, budget, fs::random_128bit)
+    }
+
+    fn quarantine_recovery_object_with_ids<F>(
+        &self,
+        candidate: RecoveryQuarantineCandidate<'_>,
+        stats: &mut RecoveryStats,
+        budget: &WorkBudget,
+        next_id: F,
+    ) -> bool
+    where
+        F: FnMut() -> io::Result<[u8; 16]>,
+    {
+        let remaining_attempts = budget
+            .max_operations
+            .saturating_sub(stats.operations_attempted);
+        if remaining_attempts == 0 {
+            stats.budget_exhausted = true;
+            return false;
+        }
+        let result = self.publish_quarantine_object_with_ids(
+            candidate.source_directory_fd,
+            candidate.filename,
+            candidate.reason,
+            usize::try_from(remaining_attempts).unwrap_or(usize::MAX),
+            next_id,
+        );
+        let attempts_consumed = match &result {
+            Ok(publication) => publication.attempts_consumed,
+            Err(error) => error.attempts_consumed(),
+        };
+        stats.operations_attempted = stats
+            .operations_attempted
+            .saturating_add(u32::try_from(attempts_consumed).unwrap_or(u32::MAX));
+        match result {
+            Ok(publication) => {
+                stats.quarantined.push(RecoveryQuarantine {
+                    relative_path: candidate.relative_path.to_string(),
+                    quarantine_id: publication.quarantine_id,
+                    quarantine_name: publication.quarantine_name,
+                });
+                true
+            }
+            Err(crate::quarantine::QuarantinePublishFailure::BudgetExhausted { .. }) => {
+                Self::record_error(
+                    stats,
+                    "quarantine_budget_exhausted",
+                    candidate.relative_path,
+                    "quarantine collision retries exhausted the remaining operation budget",
+                );
+                stats.budget_exhausted = true;
+                false
+            }
+            Err(error) => {
+                Self::record_error(
+                    stats,
+                    "quarantine",
+                    candidate.relative_path,
+                    &error.to_string(),
+                );
+                true
+            }
+        }
     }
 
     /// R2-H05: Check if the monotonic deadline has been exceeded.
@@ -1488,6 +1556,7 @@ impl Queue {
                             stats.budget_exhausted = true;
                             return;
                         }
+                        let previous_entry_cursor = self.recovery_cursor.reap_leases.clone();
                         self.recovery_cursor.reap_leases = Some(FourLevelCursor::new(
                             boot_dir_entry.as_bytes(),
                             bucket_entry.as_bytes(),
@@ -1547,15 +1616,22 @@ impl Queue {
                                 &format!("{e}"),
                             );
                             // B1: Quarantine corrupt objects
-                            if matches!(e, Error::QueueCorrupt(_)) {
-                                let _ = self.quarantine_recovery_object(
-                                    shard_fd.as_raw_fd(),
-                                    entry,
-                                    &format!(
-                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                    ),
-                                    crate::QuarantineReason::EnvelopeCorrupt,
-                                );
+                            if matches!(e, Error::QueueCorrupt(_))
+                                && !self.quarantine_recovery_object(
+                                    RecoveryQuarantineCandidate {
+                                        source_directory_fd: shard_fd.as_raw_fd(),
+                                        filename: entry,
+                                        relative_path: &format!(
+                                            "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                        ),
+                                        reason: crate::QuarantineReason::EnvelopeCorrupt,
+                                    },
+                                    stats,
+                                    budget,
+                                )
+                            {
+                                self.recovery_cursor.reap_leases = previous_entry_cursor;
+                                return;
                             }
                             continue;
                         }
@@ -2037,6 +2113,7 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
+                    let previous_entry_cursor = self.recovery_cursor.promote_delayed.clone();
                     self.recovery_cursor.promote_delayed = Some(ThreeLevelCursor::new(
                         bucket_entry.as_bytes(),
                         shard_entry.as_bytes(),
@@ -2076,13 +2153,22 @@ impl Queue {
                                 &format!("delayed/{bucket_name}/{shard_name}/{entry}"),
                                 &format!("{e}"),
                             );
-                            if matches!(e, Error::QueueCorrupt(_)) {
-                                let _ = self.quarantine_recovery_object(
-                                    shard_fd.as_raw_fd(),
-                                    entry,
-                                    &format!("delayed/{bucket_name}/{shard_name}/{entry}"),
-                                    crate::QuarantineReason::EnvelopeCorrupt,
-                                );
+                            if matches!(e, Error::QueueCorrupt(_))
+                                && !self.quarantine_recovery_object(
+                                    RecoveryQuarantineCandidate {
+                                        source_directory_fd: shard_fd.as_raw_fd(),
+                                        filename: entry,
+                                        relative_path: &format!(
+                                            "delayed/{bucket_name}/{shard_name}/{entry}"
+                                        ),
+                                        reason: crate::QuarantineReason::EnvelopeCorrupt,
+                                    },
+                                    stats,
+                                    budget,
+                                )
+                            {
+                                self.recovery_cursor.promote_delayed = previous_entry_cursor;
+                                return;
                             }
                             continue;
                         }
@@ -3313,6 +3399,210 @@ mod tests {
         )
         .unwrap();
         (tmp, queue)
+    }
+
+    #[test]
+    fn recovery_quarantine_records_identity_and_failure_context() {
+        let (tmp, queue) = create_test_queue();
+        std::fs::write(tmp.path().join("candidate.raw"), b"candidate").unwrap();
+        let mut stats = RecoveryStats::default();
+        queue.quarantine_recovery_object(
+            RecoveryQuarantineCandidate {
+                source_directory_fd: queue.root_fd(),
+                filename: "candidate.raw",
+                relative_path: "ready/00000000/candidate.raw",
+                reason: crate::QuarantineReason::EnvelopeCorrupt,
+            },
+            &mut stats,
+            &WorkBudget::default(),
+        );
+        assert_eq!(stats.operations_attempted, 1);
+        assert!(stats.errors.is_empty());
+        assert_eq!(stats.quarantined.len(), 1);
+        let quarantined = &stats.quarantined[0];
+        assert_eq!(quarantined.relative_path, "ready/00000000/candidate.raw");
+        assert!(tmp
+            .path()
+            .join("quarantine")
+            .join(&quarantined.quarantine_name)
+            .exists());
+        assert_eq!(
+            steadq_names::parse_quarantine(&quarantined.quarantine_name)
+                .unwrap()
+                .quarantine_id,
+            quarantined.quarantine_id
+        );
+
+        std::fs::write(tmp.path().join("failure.raw"), b"failure").unwrap();
+        let mut failed = RecoveryStats::default();
+        fs::fault::reset();
+        fs::fault::inject_errno("get_random", 1, libc::EIO);
+        queue.quarantine_recovery_object(
+            RecoveryQuarantineCandidate {
+                source_directory_fd: queue.root_fd(),
+                filename: "failure.raw",
+                relative_path: "delayed/0000000000000000/00000000/failure.raw",
+                reason: crate::QuarantineReason::EnvelopeCorrupt,
+            },
+            &mut failed,
+            &WorkBudget::default(),
+        );
+        fs::fault::reset();
+        assert_eq!(failed.operations_attempted, 0);
+        assert!(failed.quarantined.is_empty());
+        assert_eq!(failed.errors.len(), 1);
+        assert_eq!(failed.errors[0].operation, "quarantine");
+        assert_eq!(
+            failed.errors[0].relative_path,
+            "delayed/0000000000000000/00000000/failure.raw"
+        );
+        assert!(failed.errors[0].error.contains("phase=RandomName"));
+        assert!(tmp.path().join("failure.raw").exists());
+    }
+
+    #[test]
+    fn recovery_quarantine_collision_consumes_budget_and_replays() {
+        let (tmp, queue) = create_test_queue();
+        let collision_id = [0x31; 16];
+        let replay_id = [0x32; 16];
+        let reason = crate::QuarantineReason::EnvelopeCorrupt;
+        let collision_name = steadq_names::quarantine_filename(&collision_id, reason as u16);
+        std::fs::write(tmp.path().join("candidate.raw"), b"candidate").unwrap();
+        std::fs::write(
+            tmp.path().join("quarantine").join(&collision_name),
+            b"distinct",
+        )
+        .unwrap();
+
+        let mut exhausted = RecoveryStats::default();
+        let completed = queue.quarantine_recovery_object_with_ids(
+            RecoveryQuarantineCandidate {
+                source_directory_fd: queue.root_fd(),
+                filename: "candidate.raw",
+                relative_path: "ready/00000000/candidate.raw",
+                reason,
+            },
+            &mut exhausted,
+            &WorkBudget {
+                max_operations: 1,
+                ..WorkBudget::default()
+            },
+            || Ok(collision_id),
+        );
+        assert!(!completed);
+        assert_eq!(exhausted.operations_attempted, 1);
+        assert!(exhausted.budget_exhausted);
+        assert!(exhausted.quarantined.is_empty());
+        assert_eq!(exhausted.errors.len(), 1);
+        assert_eq!(exhausted.errors[0].operation, "quarantine_budget_exhausted");
+        assert_eq!(
+            std::fs::read(tmp.path().join("candidate.raw")).unwrap(),
+            b"candidate"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("quarantine").join(&collision_name)).unwrap(),
+            b"distinct"
+        );
+
+        let mut replayed = RecoveryStats::default();
+        let mut ids = [collision_id, replay_id].into_iter();
+        let completed = queue.quarantine_recovery_object_with_ids(
+            RecoveryQuarantineCandidate {
+                source_directory_fd: queue.root_fd(),
+                filename: "candidate.raw",
+                relative_path: "ready/00000000/candidate.raw",
+                reason,
+            },
+            &mut replayed,
+            &WorkBudget {
+                max_operations: 2,
+                ..WorkBudget::default()
+            },
+            || Ok(ids.next().unwrap()),
+        );
+        assert!(completed);
+        assert_eq!(replayed.operations_attempted, 2);
+        assert!(!replayed.budget_exhausted);
+        assert!(replayed.errors.is_empty());
+        assert_eq!(replayed.quarantined.len(), 1);
+        assert_eq!(replayed.quarantined[0].quarantine_id, replay_id);
+        assert!(!tmp.path().join("candidate.raw").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join("quarantine").join(collision_name)).unwrap(),
+            b"distinct"
+        );
+    }
+
+    #[test]
+    fn recovery_quarantine_budget_exhaustion_does_not_advance_cursor() {
+        let (tmp, mut queue) = create_test_queue();
+        let width = queue.format.delayed_bucket_width_ns;
+        let not_before = queue
+            .authenticated_wall_floor()
+            .unwrap()
+            .unix_ns()
+            .checked_add(width)
+            .unwrap();
+        let ticket = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            initial_not_before: Some(not_before),
+            payload: b"corrupt delayed".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("enqueue failed: {outcome:?}"),
+        };
+        let source = tmp.path().join(&ticket.expected_relative_path);
+        let mut corrupt = std::fs::read(&source).unwrap();
+        corrupt[0] ^= 0xff;
+        std::fs::write(&source, corrupt).unwrap();
+        let eligible_bucket = steadq_math::ceiling_bucket(not_before, width).unwrap();
+        write_wall_watermark(&tmp, eligible_bucket);
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("renameat2_noreplace", 1, libc::EEXIST);
+        queue.promote_delayed(
+            wall_floor,
+            &WorkBudget {
+                max_operations: 1,
+                ..WorkBudget::default()
+            },
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+        fs::fault::reset();
+
+        assert_eq!(stats.operations_attempted, 1, "stats: {stats:?}");
+        assert!(stats.budget_exhausted, "stats: {stats:?}");
+        assert!(stats.quarantined.is_empty());
+        assert_eq!(queue.recovery_cursor.promote_delayed, None);
+        assert!(source.exists());
+
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let replay_floor = reopened.authenticated_wall_floor().unwrap();
+        let replay = promote_eligible_with_budget(&mut reopened, replay_floor);
+        assert_eq!(replay.operations_attempted, 1);
+        assert_eq!(replay.quarantined.len(), 1, "errors: {:?}", replay.errors);
+        assert!(!source.exists());
     }
 
     fn enqueue_for_shard(

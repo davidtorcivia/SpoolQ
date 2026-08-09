@@ -6,7 +6,131 @@ use sha2::Digest;
 use steadq_fs_linux as fs;
 use steadq_names;
 
+use crate::queue::engine::{move_verified_noreplace, MoveActor, MoveFailure};
 use crate::queue::Queue;
+
+const QUARANTINE_NAME_ATTEMPTS: usize = 8;
+
+fn quarantine_destination_collision(failure: &MoveFailure) -> bool {
+    matches!(failure, MoveFailure::AlreadyExists)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantinePreparePhase {
+    AttemptBudget,
+    EnsureDirectory,
+    OpenDirectory,
+    RandomName,
+    SourceLock,
+    SourceIdentity,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum QuarantinePublishFailure {
+    Preparation {
+        phase: QuarantinePreparePhase,
+        source: String,
+        attempts_consumed: usize,
+    },
+    Move {
+        quarantine_id: [u8; 16],
+        quarantine_name: String,
+        failure: MoveFailure,
+        attempts_consumed: usize,
+    },
+    CollisionExhausted {
+        attempts: usize,
+        last_quarantine_id: [u8; 16],
+        last_quarantine_name: String,
+    },
+    BudgetExhausted {
+        attempts: usize,
+        last_quarantine_id: [u8; 16],
+        last_quarantine_name: String,
+    },
+}
+
+impl QuarantinePublishFailure {
+    pub(crate) fn attempts_consumed(&self) -> usize {
+        match self {
+            Self::Preparation {
+                attempts_consumed, ..
+            }
+            | Self::Move {
+                attempts_consumed, ..
+            } => *attempts_consumed,
+            Self::CollisionExhausted { attempts, .. } | Self::BudgetExhausted { attempts, .. } => {
+                *attempts
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for QuarantinePublishFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preparation { phase, source, .. } => {
+                write!(
+                    formatter,
+                    "quarantine not committed at phase={phase:?}: {source}"
+                )
+            }
+            Self::Move {
+                quarantine_id,
+                quarantine_name,
+                failure,
+                ..
+            } => {
+                let identity = steadq_names::hex_encode(quarantine_id);
+                match failure {
+                    MoveFailure::NotCommitted { phase, source } => write!(
+                        formatter,
+                        "quarantine not committed id={identity} name={quarantine_name} phase={phase:?}: {source}"
+                    ),
+                    MoveFailure::OutcomeUnknown { phase, source } => write!(
+                        formatter,
+                        "quarantine outcome unknown id={identity} name={quarantine_name} phase={phase:?}: {source}"
+                    ),
+                    MoveFailure::AlreadyExists => write!(
+                        formatter,
+                        "quarantine destination collision id={identity} name={quarantine_name}"
+                    ),
+                    MoveFailure::SourceMissing => write!(
+                        formatter,
+                        "quarantine source missing id={identity} name={quarantine_name}"
+                    ),
+                }
+            }
+            Self::CollisionExhausted {
+                attempts,
+                last_quarantine_id,
+                last_quarantine_name,
+            } => write!(
+                formatter,
+                "quarantine destination collision after {attempts} attempts last_id={} last_name={last_quarantine_name}",
+                steadq_names::hex_encode(last_quarantine_id)
+            ),
+            Self::BudgetExhausted {
+                attempts,
+                last_quarantine_id,
+                last_quarantine_name,
+            } => write!(
+                formatter,
+                "quarantine retry budget exhausted after {attempts} attempts last_id={} last_name={last_quarantine_name}",
+                steadq_names::hex_encode(last_quarantine_id)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QuarantinePublishFailure {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QuarantinePublication {
+    pub(crate) quarantine_id: [u8; 16],
+    pub(crate) quarantine_name: String,
+    pub(crate) attempts_consumed: usize,
+}
 
 /// Fsck options.
 #[derive(Clone, Debug)]
@@ -424,7 +548,7 @@ impl Queue {
                 details: "cannot read 128-byte header".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -446,7 +570,7 @@ impl Queue {
                     details: format!("header decode error: {e}"),
                 });
                 if opts.mode == FsckMode::Repair {
-                    let _ = self.quarantine_object(
+                    self.quarantine_object_or_record(
                         shard_fd,
                         filename,
                         full_path,
@@ -467,7 +591,7 @@ impl Queue {
                 details: "header job_id does not match filename".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -487,7 +611,7 @@ impl Queue {
                 details: "header maximum_attempts does not match filename".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -508,7 +632,7 @@ impl Queue {
                 details: format!("extension header length {ext_len} exceeds 65536"),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -527,7 +651,7 @@ impl Queue {
                 details: "cannot read extension header".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -545,7 +669,7 @@ impl Queue {
                 details: "envelope digest does not match header".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -569,7 +693,7 @@ impl Queue {
                 ),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -592,7 +716,7 @@ impl Queue {
                 ),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -621,7 +745,7 @@ impl Queue {
                 details: "name tag does not match computed tag for this context".into(),
             });
             if opts.mode == FsckMode::Repair {
-                let _ = self.quarantine_object(
+                self.quarantine_object_or_record(
                     shard_fd,
                     filename,
                     full_path,
@@ -648,7 +772,7 @@ impl Queue {
                         ),
                     });
                     if opts.mode == FsckMode::Repair {
-                        let _ = self.quarantine_object(
+                        self.quarantine_object_or_record(
                             shard_fd,
                             filename,
                             full_path,
@@ -703,7 +827,7 @@ impl Queue {
                     details: "payload digest does not match header".into(),
                 });
                 if opts.mode == FsckMode::Repair {
-                    let _ = self.quarantine_object(
+                    self.quarantine_object_or_record(
                         shard_fd,
                         filename,
                         full_path,
@@ -818,6 +942,107 @@ impl Queue {
         }
     }
 
+    pub(crate) fn publish_quarantine_object(
+        &self,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        reason: crate::QuarantineReason,
+    ) -> Result<QuarantinePublication, QuarantinePublishFailure> {
+        self.publish_quarantine_object_with_ids(
+            src_dir_fd,
+            filename,
+            reason,
+            QUARANTINE_NAME_ATTEMPTS,
+            fs::random_128bit,
+        )
+    }
+
+    pub(crate) fn publish_quarantine_object_with_ids<F>(
+        &self,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        reason: crate::QuarantineReason,
+        max_move_attempts: usize,
+        mut next_id: F,
+    ) -> Result<QuarantinePublication, QuarantinePublishFailure>
+    where
+        F: FnMut() -> std::io::Result<[u8; 16]>,
+    {
+        let attempt_limit = max_move_attempts.min(QUARANTINE_NAME_ATTEMPTS);
+        if attempt_limit == 0 {
+            return Err(QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::AttemptBudget,
+                source: "no quarantine move attempt budget remains".into(),
+                attempts_consumed: 0,
+            });
+        }
+        self.ensure_dir("quarantine")
+            .map_err(|error| QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::EnsureDirectory,
+                source: error.to_string(),
+                attempts_consumed: 0,
+            })?;
+        let quarantine_dir =
+            crate::queue::open_relative(self.root_fd(), "quarantine").map_err(|error| {
+                QuarantinePublishFailure::Preparation {
+                    phase: QuarantinePreparePhase::OpenDirectory,
+                    source: error.to_string(),
+                    attempts_consumed: 0,
+                }
+            })?;
+
+        for attempts in 1..=attempt_limit {
+            let quarantine_id =
+                next_id().map_err(|error| QuarantinePublishFailure::Preparation {
+                    phase: QuarantinePreparePhase::RandomName,
+                    source: error.to_string(),
+                    attempts_consumed: attempts - 1,
+                })?;
+            let quarantine_name = steadq_names::quarantine_filename(&quarantine_id, reason as u16);
+            match move_verified_noreplace(
+                src_dir_fd,
+                filename,
+                quarantine_dir.as_raw_fd(),
+                &quarantine_name,
+                MoveActor::Recovery,
+            ) {
+                Ok(()) => {
+                    return Ok(QuarantinePublication {
+                        quarantine_id,
+                        quarantine_name,
+                        attempts_consumed: attempts,
+                    })
+                }
+                Err(failure) if quarantine_destination_collision(&failure) => {
+                    if attempts == attempt_limit {
+                        return if attempt_limit == QUARANTINE_NAME_ATTEMPTS {
+                            Err(QuarantinePublishFailure::CollisionExhausted {
+                                attempts,
+                                last_quarantine_id: quarantine_id,
+                                last_quarantine_name: quarantine_name,
+                            })
+                        } else {
+                            Err(QuarantinePublishFailure::BudgetExhausted {
+                                attempts,
+                                last_quarantine_id: quarantine_id,
+                                last_quarantine_name: quarantine_name,
+                            })
+                        };
+                    }
+                }
+                Err(failure) => {
+                    return Err(QuarantinePublishFailure::Move {
+                        quarantine_id,
+                        quarantine_name,
+                        failure,
+                        attempts_consumed: attempts,
+                    })
+                }
+            }
+        }
+        unreachable!("quarantine attempt bound is nonzero")
+    }
+
     /// B-10: Move a corrupt object to quarantine via durable no-overwrite transition.
     fn quarantine_object(
         &self,
@@ -826,30 +1051,39 @@ impl Queue {
         full_path: &str,
         reason: crate::QuarantineReason,
         report: &mut FsckReport,
-    ) -> Result<(), std::io::Error> {
-        let qid = steadq_fs_linux::random_128bit()?;
-        let q_name = steadq_names::quarantine_filename(&qid, reason as u16);
-
-        // Ensure quarantine directory exists
-        let _ = self.ensure_dir("quarantine");
-        let q_dir_fd = crate::queue::open_relative(self.root_fd(), "quarantine")?;
-
-        // Durable no-overwrite move
-        steadq_fs_linux::durable_move_noreplace(
-            src_dir_fd,
-            filename,
-            q_dir_fd.as_raw_fd(),
-            &q_name,
-        )?;
-
-        report.quarantined.push(qid);
+    ) -> Result<(), QuarantinePublishFailure> {
+        let publication = self.publish_quarantine_object(src_dir_fd, filename, reason)?;
+        report.quarantined.push(publication.quarantine_id);
         report.findings.push(CorruptionFinding {
             relative_path: full_path.to_string(),
             finding_type: "quarantined".into(),
             severity: FindingSeverity::Warning,
-            details: format!("moved to quarantine as {q_name}"),
+            details: format!(
+                "moved to quarantine id={} name={}",
+                steadq_names::hex_encode(&publication.quarantine_id),
+                publication.quarantine_name
+            ),
         });
         Ok(())
+    }
+
+    fn quarantine_object_or_record(
+        &self,
+        src_dir_fd: std::os::unix::io::RawFd,
+        filename: &str,
+        full_path: &str,
+        reason: crate::QuarantineReason,
+        report: &mut FsckReport,
+    ) {
+        if let Err(error) = self.quarantine_object(src_dir_fd, filename, full_path, reason, report)
+        {
+            report.findings.push(CorruptionFinding {
+                relative_path: full_path.to_string(),
+                finding_type: "quarantine_failed".into(),
+                severity: FindingSeverity::Error,
+                details: error.to_string(),
+            });
+        }
     }
 
     fn repair_quarantine_candidate(
@@ -862,17 +1096,21 @@ impl Queue {
         report: &mut FsckReport,
     ) {
         let result = if state_name == "receipts" {
-            fs::openat(
+            match fs::openat(
                 src_dir_fd,
                 filename,
                 crate::queue::verified::receipt_write_open_flags(),
                 0,
-            )
-            .and_then(|opened| {
-                self.quarantine_opened_object(
+            ) {
+                Ok(opened) => self.quarantine_opened_object(
                     src_dir_fd, filename, full_path, &opened, reason, report,
-                )
-            })
+                ),
+                Err(error) => Err(QuarantinePublishFailure::Preparation {
+                    phase: QuarantinePreparePhase::SourceIdentity,
+                    source: error.to_string(),
+                    attempts_consumed: 0,
+                }),
+            }
         } else {
             self.quarantine_object(src_dir_fd, filename, full_path, reason, report)
         };
@@ -895,24 +1133,45 @@ impl Queue {
         opened: &std::os::fd::OwnedFd,
         reason: crate::QuarantineReason,
         report: &mut FsckReport,
-    ) -> Result<(), std::io::Error> {
-        if !steadq_fs_linux::try_ofd_write_lock(opened.as_raw_fd())? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "receipt is busy",
-            ));
+    ) -> Result<(), QuarantinePublishFailure> {
+        let locked = steadq_fs_linux::try_ofd_write_lock(opened.as_raw_fd()).map_err(|error| {
+            QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::SourceLock,
+                source: error.to_string(),
+                attempts_consumed: 0,
+            }
+        })?;
+        if !locked {
+            return Err(QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::SourceLock,
+                source: "receipt is busy".into(),
+                attempts_consumed: 0,
+            });
         }
-        let opened_stat = steadq_fs_linux::fstat(opened.as_raw_fd())?;
-        let current_stat = steadq_fs_linux::fstatat(src_dir_fd, filename)?;
+        let opened_stat = steadq_fs_linux::fstat(opened.as_raw_fd()).map_err(|error| {
+            QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::SourceIdentity,
+                source: error.to_string(),
+                attempts_consumed: 0,
+            }
+        })?;
+        let current_stat = steadq_fs_linux::fstatat(src_dir_fd, filename).map_err(|error| {
+            QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::SourceIdentity,
+                source: error.to_string(),
+                attempts_consumed: 0,
+            }
+        })?;
         if !crate::queue::verified::receipt_path_identity_matches(
             &current_stat,
             opened_stat.st_dev,
             opened_stat.st_ino,
         ) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "receipt path no longer names the verified inode",
-            ));
+            return Err(QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::SourceIdentity,
+                source: "receipt path no longer names the verified inode".into(),
+                attempts_consumed: 0,
+            });
         }
 
         self.quarantine_object(src_dir_fd, filename, full_path, reason, report)
@@ -1015,6 +1274,289 @@ mod tests {
     use super::*;
     use crate::queue::{CreateOptions, EnqueueInput, OpenOptions, Queue};
     use tempfile::TempDir;
+
+    fn open_test_queue(path: &std::path::Path) -> Queue {
+        Queue::open(
+            path,
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn queue_with_quarantine_candidate() -> (TempDir, Queue) {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        std::fs::write(tmp.path().join("candidate.raw"), b"candidate").unwrap();
+        let queue = open_test_queue(tmp.path());
+        (tmp, queue)
+    }
+
+    #[test]
+    fn quarantine_collision_and_attempt_boundaries_are_exact() {
+        assert!(quarantine_destination_collision(
+            &MoveFailure::AlreadyExists
+        ));
+        assert!(!quarantine_destination_collision(
+            &MoveFailure::SourceMissing
+        ));
+        assert!(!quarantine_destination_collision(
+            &MoveFailure::NotCommitted {
+                phase: crate::queue::engine::MovePhase::Rename,
+                source: "io".into(),
+            }
+        ));
+        assert!(!quarantine_destination_collision(
+            &MoveFailure::OutcomeUnknown {
+                phase: crate::queue::engine::MovePhase::DestFsync,
+                source: "io".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn quarantine_publication_faults_reopen_and_replay() {
+        for (fault, count, expected_phase, source_remains) in [
+            ("mkdirat", 1, "prepare:EnsureDirectory", true),
+            ("renameat2_noreplace", 1, "move:Rename", true),
+            ("fsync_dir_fd", 1, "move:DestFsync", false),
+            ("fsync_dir_fd", 2, "move:SourceFsync", false),
+        ] {
+            let (tmp, queue) = queue_with_quarantine_candidate();
+            let quarantine_id = [count as u8; 16];
+            let quarantine_name = steadq_names::quarantine_filename(
+                &quarantine_id,
+                crate::QuarantineReason::EnvelopeCorrupt as u16,
+            );
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let result = queue.publish_quarantine_object_with_ids(
+                queue.root_fd(),
+                "candidate.raw",
+                crate::QuarantineReason::EnvelopeCorrupt,
+                QUARANTINE_NAME_ATTEMPTS,
+                || Ok(quarantine_id),
+            );
+            fs::fault::reset();
+
+            let failure = result.unwrap_err();
+            match expected_phase {
+                "prepare:EnsureDirectory" => assert!(matches!(
+                    failure,
+                    QuarantinePublishFailure::Preparation {
+                        phase: QuarantinePreparePhase::EnsureDirectory,
+                        ..
+                    }
+                )),
+                "move:Rename" => assert!(matches!(
+                    failure,
+                    QuarantinePublishFailure::Move {
+                        failure: MoveFailure::NotCommitted {
+                            phase: crate::queue::engine::MovePhase::Rename,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                "move:DestFsync" => assert!(matches!(
+                    failure,
+                    QuarantinePublishFailure::Move {
+                        failure: MoveFailure::OutcomeUnknown {
+                            phase: crate::queue::engine::MovePhase::DestFsync,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                "move:SourceFsync" => assert!(matches!(
+                    failure,
+                    QuarantinePublishFailure::Move {
+                        failure: MoveFailure::OutcomeUnknown {
+                            phase: crate::queue::engine::MovePhase::SourceFsync,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                other => panic!("unexpected expected phase {other}"),
+            }
+            assert_eq!(tmp.path().join("candidate.raw").exists(), source_remains);
+            assert_eq!(
+                tmp.path()
+                    .join("quarantine")
+                    .join(&quarantine_name)
+                    .exists(),
+                !source_remains
+            );
+
+            drop(queue);
+            let reopened = open_test_queue(tmp.path());
+            if source_remains {
+                let publication = reopened
+                    .publish_quarantine_object_with_ids(
+                        reopened.root_fd(),
+                        "candidate.raw",
+                        crate::QuarantineReason::EnvelopeCorrupt,
+                        QUARANTINE_NAME_ATTEMPTS,
+                        || Ok(quarantine_id),
+                    )
+                    .unwrap();
+                assert_eq!(publication.quarantine_id, quarantine_id);
+                assert_eq!(publication.quarantine_name, quarantine_name);
+            } else {
+                assert_eq!(
+                    std::fs::read(tmp.path().join("quarantine").join(&quarantine_name)).unwrap(),
+                    b"candidate"
+                );
+                let replay_id = [0xf0; 16];
+                assert!(matches!(
+                    reopened.publish_quarantine_object_with_ids(
+                        reopened.root_fd(),
+                        "candidate.raw",
+                        crate::QuarantineReason::EnvelopeCorrupt,
+                        QUARANTINE_NAME_ATTEMPTS,
+                        || Ok(replay_id),
+                    ),
+                    Err(QuarantinePublishFailure::Move {
+                        failure: MoveFailure::SourceMissing,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_random_name_failure_reopens_and_replays() {
+        let (tmp, queue) = queue_with_quarantine_candidate();
+        fs::fault::reset();
+        fs::fault::inject_errno("get_random", 1, libc::EIO);
+        let result = queue.publish_quarantine_object(
+            queue.root_fd(),
+            "candidate.raw",
+            crate::QuarantineReason::EnvelopeCorrupt,
+        );
+        fs::fault::reset();
+        assert!(matches!(
+            result,
+            Err(QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::RandomName,
+                ..
+            })
+        ));
+        assert!(tmp.path().join("candidate.raw").exists());
+
+        drop(queue);
+        let reopened = open_test_queue(tmp.path());
+        let quarantine_id = [0x44; 16];
+        let publication = reopened
+            .publish_quarantine_object_with_ids(
+                reopened.root_fd(),
+                "candidate.raw",
+                crate::QuarantineReason::EnvelopeCorrupt,
+                QUARANTINE_NAME_ATTEMPTS,
+                || Ok(quarantine_id),
+            )
+            .unwrap();
+        assert_eq!(publication.quarantine_id, quarantine_id);
+    }
+
+    #[test]
+    fn quarantine_name_collisions_retry_without_overwrite_and_are_bounded() {
+        let first_id = [0x11; 16];
+        let second_id = [0x22; 16];
+        let reason = crate::QuarantineReason::EnvelopeCorrupt;
+
+        let (tmp, queue) = queue_with_quarantine_candidate();
+        let first_name = steadq_names::quarantine_filename(&first_id, reason as u16);
+        std::fs::write(tmp.path().join("quarantine").join(&first_name), b"distinct").unwrap();
+        let mut ids = [first_id, second_id].into_iter();
+        let publication = queue
+            .publish_quarantine_object_with_ids(
+                queue.root_fd(),
+                "candidate.raw",
+                reason,
+                QUARANTINE_NAME_ATTEMPTS,
+                || Ok(ids.next().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(publication.quarantine_id, second_id);
+        assert_eq!(publication.attempts_consumed, 2);
+        assert_eq!(
+            std::fs::read(tmp.path().join("quarantine").join(first_name)).unwrap(),
+            b"distinct"
+        );
+
+        let (tmp, queue) = queue_with_quarantine_candidate();
+        let collision_name = steadq_names::quarantine_filename(&first_id, reason as u16);
+        std::fs::write(
+            tmp.path().join("quarantine").join(&collision_name),
+            b"distinct",
+        )
+        .unwrap();
+        let mut attempts = 0;
+        let failure = queue
+            .publish_quarantine_object_with_ids(
+                queue.root_fd(),
+                "candidate.raw",
+                reason,
+                QUARANTINE_NAME_ATTEMPTS,
+                || {
+                    attempts += 1;
+                    Ok(first_id)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(attempts, QUARANTINE_NAME_ATTEMPTS);
+        assert_eq!(failure.attempts_consumed(), QUARANTINE_NAME_ATTEMPTS);
+        assert!(matches!(
+            failure,
+            QuarantinePublishFailure::CollisionExhausted {
+                attempts: QUARANTINE_NAME_ATTEMPTS,
+                last_quarantine_id,
+                ..
+            } if last_quarantine_id == first_id
+        ));
+        assert_eq!(
+            std::fs::read(tmp.path().join("candidate.raw")).unwrap(),
+            b"candidate"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("quarantine").join(collision_name)).unwrap(),
+            b"distinct"
+        );
+
+        let (tmp, queue) = queue_with_quarantine_candidate();
+        let collision_name = steadq_names::quarantine_filename(&first_id, reason as u16);
+        std::fs::write(
+            tmp.path().join("quarantine").join(&collision_name),
+            b"distinct",
+        )
+        .unwrap();
+        let failure = queue
+            .publish_quarantine_object_with_ids(queue.root_fd(), "candidate.raw", reason, 1, || {
+                Ok(first_id)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            QuarantinePublishFailure::BudgetExhausted {
+                attempts: 1,
+                last_quarantine_id,
+                ..
+            } if last_quarantine_id == first_id
+        ));
+        assert_eq!(
+            std::fs::read(tmp.path().join("candidate.raw")).unwrap(),
+            b"candidate"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("quarantine").join(collision_name)).unwrap(),
+            b"distinct"
+        );
+    }
 
     #[test]
     fn fsck_clean_queue() {
@@ -1285,7 +1827,13 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(matches!(
+            error,
+            QuarantinePublishFailure::Preparation {
+                phase: QuarantinePreparePhase::SourceIdentity,
+                ..
+            }
+        ));
         assert_eq!(std::fs::read(&candidate).unwrap(), b"replacement");
         assert_eq!(std::fs::read(&displaced).unwrap(), b"corrupt");
         assert!(report.quarantined.is_empty());
