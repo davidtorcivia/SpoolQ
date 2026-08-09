@@ -71,6 +71,8 @@ pub mod fault {
     struct State {
         faults: HashMap<String, Fault>,
         counts: HashMap<String, u64>,
+        readdir_rotation: usize,
+        readdir_reversed: bool,
     }
 
     impl State {
@@ -78,6 +80,8 @@ pub mod fault {
             State {
                 faults: HashMap::new(),
                 counts: HashMap::new(),
+                readdir_rotation: 0,
+                readdir_reversed: false,
             }
         }
     }
@@ -92,6 +96,31 @@ pub mod fault {
             let mut s = s.borrow_mut();
             s.faults.clear();
             s.counts.clear();
+            s.readdir_rotation = 0;
+            s.readdir_reversed = false;
+        });
+    }
+
+    /// Permute complete directory enumerations on this thread.
+    pub fn permute_readdir(rotation: usize, reversed: bool) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.readdir_rotation = rotation;
+            state.readdir_reversed = reversed;
+        });
+    }
+
+    pub(crate) fn permute_directory_entries<T>(entries: &mut [T]) {
+        STATE.with(|state| {
+            let state = state.borrow();
+            if entries.is_empty() {
+                return;
+            }
+            let rotation = state.readdir_rotation % entries.len();
+            entries.rotate_left(rotation);
+            if state.readdir_reversed {
+                entries.reverse();
+            }
         });
     }
 
@@ -944,6 +973,8 @@ where
 
     unsafe { libc::closedir(dir) };
 
+    fault::permute_directory_entries(&mut entries);
+
     Ok(DirectoryEnumeration { entries, progress })
 }
 
@@ -1679,6 +1710,38 @@ mod tests {
         assert_eq!(entries[1].as_str(), None);
         assert_eq!(entries[2].as_str(), Some("plain"));
         assert_eq!(format!("{:?}", entries[0]), "b\"bad-\\x80\"");
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn bounded_directory_read_applies_thread_local_permutation() {
+        let dir_path = unique_test_dir("permuted-directory-read");
+        std::fs::create_dir(&dir_path).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            std::fs::write(dir_path.join(name), name.as_bytes()).unwrap();
+        }
+        let dir = std::fs::File::open(&dir_path).unwrap();
+        fault::reset();
+        let baseline = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 4, usize::MAX).unwrap();
+
+        for (rotation, reversed) in [(1, false), (3, false), (0, true), (2, true)] {
+            let mut expected = baseline.clone();
+            let rotation = rotation % expected.len();
+            expected.rotate_left(rotation);
+            if reversed {
+                expected.reverse();
+            }
+            fault::permute_readdir(rotation, reversed);
+            let actual =
+                read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 4, usize::MAX).unwrap();
+            assert_eq!(actual, expected, "rotation={rotation} reversed={reversed}");
+        }
+
+        fault::reset();
+        assert_eq!(
+            read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 4, usize::MAX).unwrap(),
+            baseline
+        );
         std::fs::remove_dir_all(dir_path).unwrap();
     }
 
