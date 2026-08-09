@@ -97,15 +97,93 @@ impl Default for OpenOptions {
     }
 }
 
-/// Internal queue state.
-#[allow(dead_code)]
-/// R4-RES: In-memory cursor for resumable recovery. Tracks the last
-/// Entry level cursor so persistent entries do not starve later work.
-#[derive(Clone, Debug, Default)]
+/// Last fully classified entry in a three-level recovery hierarchy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ThreeLevelCursor {
+    pub(crate) first: Vec<u8>,
+    pub(crate) second: Vec<u8>,
+    pub(crate) resume_after: Vec<u8>,
+}
+
+impl ThreeLevelCursor {
+    pub(crate) fn new(first: &[u8], second: &[u8], resume_after: &[u8]) -> Self {
+        Self {
+            first: first.to_vec(),
+            second: second.to_vec(),
+            resume_after: resume_after.to_vec(),
+        }
+    }
+
+    pub(crate) fn should_skip(&self, first: &[u8], second: &[u8], entry: &[u8]) -> bool {
+        (first, second, entry)
+            <= (
+                self.first.as_slice(),
+                self.second.as_slice(),
+                self.resume_after.as_slice(),
+            )
+    }
+}
+
+/// Last fully classified entry in a four-level recovery hierarchy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FourLevelCursor {
+    pub(crate) first: Vec<u8>,
+    pub(crate) second: Vec<u8>,
+    pub(crate) third: Vec<u8>,
+    pub(crate) resume_after: Vec<u8>,
+}
+
+impl FourLevelCursor {
+    pub(crate) fn new(first: &[u8], second: &[u8], third: &[u8], resume_after: &[u8]) -> Self {
+        Self {
+            first: first.to_vec(),
+            second: second.to_vec(),
+            third: third.to_vec(),
+            resume_after: resume_after.to_vec(),
+        }
+    }
+
+    pub(crate) fn should_skip(
+        &self,
+        first: &[u8],
+        second: &[u8],
+        third: &[u8],
+        entry: &[u8],
+    ) -> bool {
+        (first, second, third, entry)
+            <= (
+                self.first.as_slice(),
+                self.second.as_slice(),
+                self.third.as_slice(),
+                self.resume_after.as_slice(),
+            )
+    }
+}
+
+/// Persisted progress for canonical, restartable recovery phases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryPhase {
+    #[default]
+    ReapLeases,
+    PromoteDelayed,
+    CleanupTemp,
+    CompactReceipts,
+    DeleteReceipts,
+}
+
+/// Persisted progress for canonical, restartable recovery phases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryCursor {
-    pub promote_delayed: Option<(String, String, String)>,
-    pub compact_receipts: Option<(String, String, String)>,
-    pub delete_receipts: Option<(String, String, String)>,
+    pub(crate) phase: RecoveryPhase,
+    pub(crate) reap_leases: Option<FourLevelCursor>,
+    pub(crate) promote_delayed: Option<ThreeLevelCursor>,
+    pub(crate) cleanup_temp: Option<ThreeLevelCursor>,
+    pub(crate) compact_receipts: Option<ThreeLevelCursor>,
+    pub(crate) delete_receipts: Option<ThreeLevelCursor>,
 }
 
 pub struct Queue {
@@ -571,7 +649,7 @@ impl Queue {
 
         // Create control lock files
         let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
-        for lock_file in ["maintenance.lock", "wall-watermark.lock"] {
+        for lock_file in ["maintenance.lock", "wall-watermark.lock", "recovery.lock"] {
             let fd =
                 fs::create_exclusive(control_fd.as_raw_fd(), lock_file, 0o600).or_else(|e| {
                     if e.kind() == io::ErrorKind::AlreadyExists {
@@ -766,6 +844,8 @@ impl Queue {
         if !locked {
             return Err(Error::MaintenanceBusy);
         }
+        let recovery_cursor =
+            crate::recovery::load_recovery_cursor(root_fd.as_raw_fd(), &format_rec.queue_id)?;
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -777,7 +857,7 @@ impl Queue {
             worker_nonce,
             options: opts.clone(),
             maint_lock_fd: Some(maint_fd),
-            recovery_cursor: RecoveryCursor::default(),
+            recovery_cursor,
         })
     }
 
@@ -4697,6 +4777,7 @@ mod tests {
         assert!(tmp.path().join("FORMAT").exists());
         assert!(tmp.path().join("control").exists());
         assert!(tmp.path().join("control/maintenance.lock").exists());
+        assert!(tmp.path().join("control/recovery.lock").exists());
         assert!(tmp.path().join("control/wall-watermark").exists());
         assert!(tmp.path().join("ready").exists());
         // Check shard dirs
