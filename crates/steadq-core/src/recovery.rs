@@ -679,6 +679,7 @@ impl Queue {
             }
         };
         boot_dirs.sort();
+        let mut cursor_can_advance = true;
 
         for boot_dir_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.reap_leases {
@@ -716,6 +717,7 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "reap_boot_open", boot_dir_name, &error.to_string());
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -737,6 +739,7 @@ impl Queue {
                     ) {
                         return;
                     }
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -801,6 +804,7 @@ impl Queue {
                             &format!("leased/{boot_dir_name}/{bucket_name}"),
                             &error.to_string(),
                         );
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -822,6 +826,7 @@ impl Queue {
                         ) {
                             return;
                         }
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -873,6 +878,7 @@ impl Queue {
                                 &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
                                 &error.to_string(),
                             );
+                            cursor_can_advance = false;
                             continue;
                         }
                     };
@@ -894,6 +900,7 @@ impl Queue {
                             ) {
                                 return;
                             }
+                            cursor_can_advance = false;
                             continue;
                         }
                     };
@@ -920,12 +927,14 @@ impl Queue {
                             stats.budget_exhausted = true;
                             return;
                         }
-                        self.recovery_cursor.reap_leases = Some(FourLevelCursor::new(
-                            boot_dir_entry.as_bytes(),
-                            bucket_entry.as_bytes(),
-                            shard_entry.as_bytes(),
-                            raw_entry.as_bytes(),
-                        ));
+                        if cursor_can_advance {
+                            self.recovery_cursor.reap_leases = Some(FourLevelCursor::new(
+                                boot_dir_entry.as_bytes(),
+                                bucket_entry.as_bytes(),
+                                shard_entry.as_bytes(),
+                                raw_entry.as_bytes(),
+                            ));
+                        }
                         let Some(entry) = raw_entry.as_str() else {
                             Self::record_error(
                                 stats,
@@ -1209,6 +1218,7 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
+        let mut cursor_can_advance = true;
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -1269,6 +1279,7 @@ impl Queue {
                         &format!("delayed/{bucket_name}"),
                         &error.to_string(),
                     );
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -1290,6 +1301,7 @@ impl Queue {
                     ) {
                         return;
                     }
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -1334,12 +1346,14 @@ impl Queue {
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(error) => {
+                        stats.scan_skips += 1;
                         Self::block_phase(
                             stats,
                             "promote_shard_open",
                             &format!("{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -1361,6 +1375,7 @@ impl Queue {
                         ) {
                             return;
                         }
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -1382,11 +1397,13 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.promote_delayed = Some(ThreeLevelCursor::new(
-                        bucket_entry.as_bytes(),
-                        shard_entry.as_bytes(),
-                        raw_entry.as_bytes(),
-                    ));
+                    if cursor_can_advance {
+                        self.recovery_cursor.promote_delayed = Some(ThreeLevelCursor::new(
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ));
+                    }
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -1526,6 +1543,7 @@ impl Queue {
             }
         };
         boot_dirs.sort();
+        let mut cursor_can_advance = true;
 
         for boot_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
@@ -1563,6 +1581,7 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "temp_boot_open", boot_dir_name, &error.to_string());
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -1580,6 +1599,7 @@ impl Queue {
                     {
                         return;
                     }
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -1630,6 +1650,7 @@ impl Queue {
                             &format!("tmp/{boot_dir_name}/{shard_name}"),
                             &error.to_string(),
                         );
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -1651,6 +1672,7 @@ impl Queue {
                         ) {
                             return;
                         }
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -1671,11 +1693,13 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.cleanup_temp = Some(ThreeLevelCursor::new(
-                        boot_entry.as_bytes(),
-                        shard_entry.as_bytes(),
-                        raw_entry.as_bytes(),
-                    ));
+                    if cursor_can_advance {
+                        self.recovery_cursor.cleanup_temp = Some(ThreeLevelCursor::new(
+                            boot_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ));
+                    }
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -1762,6 +1786,7 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
+        let mut cursor_can_advance = true;
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -1804,6 +1829,7 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -1825,6 +1851,7 @@ impl Queue {
                     ) {
                         return;
                     }
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -1876,6 +1903,7 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -1897,6 +1925,7 @@ impl Queue {
                         ) {
                             return;
                         }
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -1918,11 +1947,13 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.compact_receipts = Some(ThreeLevelCursor::new(
-                        bucket_entry.as_bytes(),
-                        shard_entry.as_bytes(),
-                        raw_entry.as_bytes(),
-                    ));
+                    if cursor_can_advance {
+                        self.recovery_cursor.compact_receipts = Some(ThreeLevelCursor::new(
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ));
+                    }
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -2106,6 +2137,7 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
+        let mut cursor_can_advance = true;
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -2171,6 +2203,7 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -2192,6 +2225,7 @@ impl Queue {
                     ) {
                         return;
                     }
+                    cursor_can_advance = false;
                     continue;
                 }
             };
@@ -2243,6 +2277,7 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -2264,6 +2299,7 @@ impl Queue {
                         ) {
                             return;
                         }
+                        cursor_can_advance = false;
                         continue;
                     }
                 };
@@ -2285,11 +2321,13 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.delete_receipts = Some(ThreeLevelCursor::new(
-                        bucket_entry.as_bytes(),
-                        shard_entry.as_bytes(),
-                        raw_entry.as_bytes(),
-                    ));
+                    if cursor_can_advance {
+                        self.recovery_cursor.delete_receipts = Some(ThreeLevelCursor::new(
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ));
+                    }
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -2488,8 +2526,7 @@ mod tests {
         lease
     }
 
-    fn reap_all_expired(queue: &mut Queue) -> RecoveryStats {
-        let budget = WorkBudget::default();
+    fn reap_expired_with_budget(queue: &mut Queue, budget: &WorkBudget) -> RecoveryStats {
         let scan_budget = RecoveryScanBudget::default();
         let mut scan_stats = RecoveryScanStats::default();
         let mut scan = RecoveryScanContext {
@@ -2500,7 +2537,7 @@ mod tests {
         queue.reap_expired_leases(
             u64::MAX,
             Some(queue.authenticated_wall_floor().unwrap()),
-            &budget,
+            budget,
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -2758,6 +2795,19 @@ mod tests {
             EnqueueOutcome::Committed(_)
         ));
         assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"second later work".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
+        assert!(matches!(
             queue.lease(0, 30_000_000_000),
             LeaseOutcome::Leased(_)
         ));
@@ -2765,9 +2815,14 @@ mod tests {
             .path()
             .join("leased/00000000-0000-0000-0000-000000000000");
         symlink(tmp.path(), &blocked).unwrap();
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
 
-        let first = reap_all_expired(&mut queue);
+        let first = reap_expired_with_budget(&mut queue, &budget);
         assert!(first.phase_blocked);
+        assert!(first.budget_exhausted);
         assert_eq!(first.scan_skips, 1);
         assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
         assert!(first
@@ -2775,10 +2830,7 @@ mod tests {
             .iter()
             .any(|error| error.operation == "reap_boot_open"));
         assert!(queue.recovery_cursor.reap_leases.is_none());
-        assert!(matches!(
-            queue.lease(0, 30_000_000_000),
-            LeaseOutcome::Leased(_)
-        ));
+        queue.persist_recovery_cursor().unwrap();
         drop(queue);
 
         let mut reopened = Queue::open(
@@ -2789,7 +2841,8 @@ mod tests {
             },
         )
         .unwrap();
-        let second = reap_all_expired(&mut reopened);
+        assert!(reopened.recovery_cursor.reap_leases.is_none());
+        let second = reap_expired_with_budget(&mut reopened, &budget);
         assert!(second.phase_blocked);
         assert_eq!(second.scan_skips, 1);
         assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
@@ -2806,20 +2859,27 @@ mod tests {
 
         let (tmp, mut queue) = create_test_queue();
         enqueue_and_ack(&mut queue);
+        enqueue_and_ack(&mut queue);
         let blocked = tmp.path().join("receipts/0000000000000000");
         symlink(tmp.path(), &blocked).unwrap();
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
 
         let mut first = RecoveryStats::default();
-        queue.compact_receipts(&WorkBudget::default(), &mut first, u64::MAX);
+        queue.compact_receipts(&budget, &mut first, u64::MAX);
         assert!(first.phase_blocked);
+        assert!(first.budget_exhausted);
         assert_eq!(first.scan_skips, 1);
         assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
         assert!(first
             .errors
             .iter()
             .any(|error| error.operation == "compact_bucket_open"));
+        assert!(queue.recovery_cursor.compact_receipts.is_none());
+        queue.persist_recovery_cursor().unwrap();
 
-        enqueue_and_ack(&mut queue);
         drop(queue);
         let mut reopened = Queue::open(
             tmp.path(),
@@ -2829,6 +2889,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(reopened.recovery_cursor.compact_receipts.is_none());
         let mut second = RecoveryStats::default();
         reopened.compact_receipts(&WorkBudget::default(), &mut second, u64::MAX);
         assert!(second.phase_blocked);
@@ -2838,6 +2899,70 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.operation == "compact_bucket_open"));
+        assert!(blocked.is_symlink());
+    }
+
+    #[test]
+    fn delayed_shard_open_failure_is_counted_and_does_not_starve_later_shard() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        let not_before = queue
+            .authenticated_wall_floor()
+            .unwrap()
+            .unix_ns()
+            .checked_add(queue.format.delayed_bucket_width_ns)
+            .unwrap();
+        let ticket = (0..128)
+            .find_map(|_| {
+                let ticket = match queue.enqueue(EnqueueInput {
+                    maximum_attempts: 3,
+                    content_type: "x".into(),
+                    initial_not_before: Some(not_before),
+                    payload: b"delayed later shard".to_vec(),
+                    ..Default::default()
+                }) {
+                    EnqueueOutcome::Committed(ticket) => ticket,
+                    outcome => panic!("enqueue failed: {outcome:?}"),
+                };
+                let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
+                if parts[2] != "0000" {
+                    return Some(ticket);
+                }
+                std::fs::remove_file(tmp.path().join(&ticket.expected_relative_path)).unwrap();
+                std::fs::remove_dir(tmp.path().join(format!("delayed/{}/0000", parts[1]))).unwrap();
+                None
+            })
+            .expect("128 random jobs must include a nonzero shard");
+        let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
+        let bucket = parts[1];
+        let blocked = tmp.path().join(format!("delayed/{bucket}/0000"));
+        symlink(tmp.path(), &blocked).unwrap();
+        write_wall_watermark(&tmp, steadq_names::bucket_from_hex(bucket).unwrap());
+
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.promote_delayed(
+            queue.authenticated_wall_floor().unwrap(),
+            &WorkBudget::default(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+
+        assert!(stats.phase_blocked);
+        assert_eq!(stats.scan_skips, 1);
+        assert_eq!(stats.delayed_promoted, 1, "errors: {:?}", stats.errors);
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "promote_shard_open"));
+        assert!(!tmp.path().join(ticket.expected_relative_path).exists());
         assert!(blocked.is_symlink());
     }
 
