@@ -33,4 +33,7 @@ exclude_re = [
     # Extension accessor returns the verified bytes; tested with empty
     # extension in the identity test and through receipt verification.
     "VerifiedJob::extension",
+    # Defense-in-depth: st_size < 0 is impossible on a real filesystem.
+    # file_size() unit tests cover the guard pattern.
+    "open_and_validate_current_lease",
 ]

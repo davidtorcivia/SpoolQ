@@ -408,7 +408,7 @@ fn move_noreplace<T, E>(
             Ok(stat) if source_identity.matches(&stat) => Some(MovedObject {
                 device: stat.st_dev,
                 inode: stat.st_ino,
-                size: stat.st_size as u64,
+                size: stat.st_size.max(0) as u64,
             }),
             Ok(_) => {
                 return Err(MoveFailureWith::OutcomeUnknown {
