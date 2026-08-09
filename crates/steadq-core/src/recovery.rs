@@ -17,6 +17,10 @@ const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
 const RECOVERY_CURSOR_VERSION: u16 = 1;
 const RECOVERY_CURSOR_FILE: &str = "recovery-cursor.json";
 const RECOVERY_CURSOR_MAX_BYTES: u64 = 16 * 1024;
+const RECOVERY_CURSOR_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW;
+const RECOVERY_LOCK_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW + libc::O_RDWR;
+const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 65_536;
+const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES * 255;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,13 +31,25 @@ struct RecoveryCursorRecord {
     cursor: RecoveryCursor,
 }
 
-fn cursor_component_is_valid(component: &str) -> bool {
+fn cursor_component_is_valid(component: &[u8]) -> bool {
     !component.is_empty()
         && component.len() <= 255
-        && component != "."
-        && component != ".."
-        && !component.contains('/')
-        && !component.contains('\0')
+        && component != b"."
+        && component != b".."
+        && !component.contains(&b'/')
+        && !component.contains(&b'\0')
+}
+
+fn read_recovery_directory(dir_fd: std::os::unix::io::RawFd) -> io::Result<Vec<fs::DirEntryName>> {
+    fs::read_dir_entry_names_bounded_owned(
+        dir_fd,
+        MAX_RECOVERY_DIRECTORY_ENTRIES,
+        MAX_RECOVERY_DIRECTORY_NAME_BYTES,
+    )
+}
+
+fn raw_name_for_error(name: &fs::DirEntryName) -> String {
+    format!("{name:?}")
 }
 
 fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
@@ -67,6 +83,30 @@ fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
             .is_none_or(three_level_is_valid)
 }
 
+fn cursor_file_metadata_is_valid(mode: libc::mode_t, link_count: libc::nlink_t) -> bool {
+    mode & libc::S_IFMT == libc::S_IFREG && link_count == 1
+}
+
+fn cursor_record_size_is_valid(size: u64) -> bool {
+    (1..=RECOVERY_CURSOR_MAX_BYTES).contains(&size)
+}
+
+fn cursor_record_version_is_supported(record: &RecoveryCursorRecord) -> bool {
+    record.schema == RECOVERY_CURSOR_SCHEMA && record.version == RECOVERY_CURSOR_VERSION
+}
+
+fn cursor_record_bytes_fit(size: usize) -> bool {
+    u64::try_from(size).is_ok_and(cursor_record_size_is_valid)
+}
+
+fn cursor_file_is_absent(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOENT)
+}
+
+fn recovery_lock_exists(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AlreadyExists
+}
+
 pub(crate) fn load_recovery_cursor(
     root_fd: std::os::unix::io::RawFd,
     queue_id: &[u8; 16],
@@ -76,25 +116,25 @@ pub(crate) fn load_recovery_cursor(
     let cursor_fd = match fs::openat(
         control_fd.as_raw_fd(),
         RECOVERY_CURSOR_FILE,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        RECOVERY_CURSOR_OPEN_FLAGS,
         0,
     ) {
         Ok(fd) => fd,
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+        Err(error) if cursor_file_is_absent(&error) => {
             return Ok(RecoveryCursor::default());
         }
         Err(error) => return Err(Error::IoFailure(error.to_string())),
     };
     let stat =
         fs::fstat(cursor_fd.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+    if !cursor_file_metadata_is_valid(stat.st_mode, stat.st_nlink) {
         return Err(Error::QueueCorrupt(
             "recovery cursor is not a singly linked regular file".into(),
         ));
     }
     let size = u64::try_from(stat.st_size)
         .map_err(|_| Error::QueueCorrupt("recovery cursor has negative size".into()))?;
-    if size == 0 || size > RECOVERY_CURSOR_MAX_BYTES {
+    if !cursor_record_size_is_valid(size) {
         return Err(Error::QueueCorrupt(
             "recovery cursor size is invalid".into(),
         ));
@@ -109,7 +149,7 @@ pub(crate) fn load_recovery_cursor(
         .map_err(|error| Error::IoFailure(error.to_string()))?;
     let record: RecoveryCursorRecord = serde_json::from_slice(&bytes)
         .map_err(|error| Error::QueueCorrupt(format!("recovery cursor decode: {error}")))?;
-    if record.schema != RECOVERY_CURSOR_SCHEMA || record.version != RECOVERY_CURSOR_VERSION {
+    if !cursor_record_version_is_supported(&record) {
         return Err(Error::QueueCorrupt(
             "recovery cursor schema or version is unsupported".into(),
         ));
@@ -155,6 +195,7 @@ pub struct RecoveryStats {
     pub receipts_compacted: u32,
     pub receipts_expired: u32,
     pub budget_exhausted: bool,
+    pub phase_blocked: bool,
     pub errors: Vec<RecoveryError>,
     pub scan_skips: u32,
 }
@@ -177,10 +218,10 @@ impl Queue {
                     .map_err(|error| Error::IoFailure(error.to_string()))?;
                 fd
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => fs::openat(
+            Err(error) if recovery_lock_exists(&error) => fs::openat(
                 control_fd.as_raw_fd(),
                 "recovery.lock",
-                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                RECOVERY_LOCK_OPEN_FLAGS,
                 0,
             )
             .map_err(|error| Error::IoFailure(error.to_string()))?,
@@ -203,7 +244,7 @@ impl Queue {
         };
         let bytes = serde_json::to_vec(&record)
             .map_err(|error| Error::IoFailure(format!("recovery cursor encode: {error}")))?;
-        if bytes.len() as u64 > RECOVERY_CURSOR_MAX_BYTES {
+        if !cursor_record_bytes_fit(bytes.len()) {
             return Err(Error::InvalidInput(
                 "recovery cursor exceeds maximum encoded size".into(),
             ));
@@ -390,7 +431,7 @@ impl Queue {
     fn budget_time_exceeded(deadline_mono: u64) -> bool {
         match fs::clock_monotonic_ns() {
             Ok(now) => now >= deadline_mono,
-            Err(_) => false,
+            Err(_) => true,
         }
     }
 
@@ -403,7 +444,7 @@ impl Queue {
     }
 
     fn has_recovery_budget(stats: &RecoveryStats) -> bool {
-        !stats.budget_exhausted
+        !stats.budget_exhausted && !stats.phase_blocked
     }
 
     /// R2-H06: Record a recovery error with full context.
@@ -414,6 +455,11 @@ impl Queue {
             relative_path: path.into(),
             error: err.into(),
         });
+    }
+
+    fn block_phase(stats: &mut RecoveryStats, op: &str, path: &str, err: &str) {
+        Self::record_error(stats, op, path, err);
+        stats.phase_blocked = true;
     }
 
     fn reap_expired_leases(
@@ -430,23 +476,23 @@ impl Queue {
         let leased_fd = match fs::open_directory(root_fd, "leased") {
             Ok(fd) => fd,
             Err(e) => {
-                Self::record_error(stats, "open_leased_dir", "leased", &e.to_string());
+                Self::block_phase(stats, "open_leased_dir", "leased", &e.to_string());
                 return;
             }
         };
 
-        let mut boot_dirs = match fs::read_dir_entries_owned(leased_fd.as_raw_fd()) {
+        let mut boot_dirs = match read_recovery_directory(leased_fd.as_raw_fd()) {
             Ok(e) => e,
             Err(e) => {
-                Self::record_error(stats, "read_leased_dirs", "leased", &e.to_string());
+                Self::block_phase(stats, "read_leased_dirs", "leased", &e.to_string());
                 return;
             }
         };
         boot_dirs.sort();
 
-        for boot_dir_name in &boot_dirs {
+        for boot_dir_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.reap_leases {
-                if boot_dir_name < &cursor.first {
+                if boot_dir_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
                 }
             }
@@ -454,29 +500,51 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
+            let Some(boot_dir_name) = boot_dir_entry.as_str() else {
+                Self::record_error(
+                    stats,
+                    "reap_boot_name",
+                    &raw_name_for_error(boot_dir_entry),
+                    "boot directory name is not UTF-8",
+                );
+                continue;
+            };
+            if steadq_names::boot_id_bytes(boot_dir_name).is_none() {
+                Self::record_error(
+                    stats,
+                    "reap_boot_name",
+                    boot_dir_name,
+                    "boot directory name is not canonical",
+                );
+                continue;
+            }
 
-            let is_current_boot = boot_dir_name == &self.boot_id;
+            let is_current_boot = boot_dir_name == self.boot_id;
 
             let boot_dir_fd = match fs::open_directory(leased_fd.as_raw_fd(), boot_dir_name) {
                 Ok(fd) => fd,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(stats, "reap_boot_open", boot_dir_name, &error.to_string());
+                    return;
                 }
             };
 
-            let mut bucket_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
+            let mut bucket_dirs = match read_recovery_directory(boot_dir_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(stats, "reap_bucket_read", boot_dir_name, &error.to_string());
+                    return;
                 }
             };
             bucket_dirs.sort();
 
-            for bucket_name in &bucket_dirs {
+            for bucket_entry in &bucket_dirs {
                 if let Some(cursor) = &self.recovery_cursor.reap_leases {
-                    if boot_dir_name == &cursor.first && bucket_name < &cursor.second {
+                    if boot_dir_entry.as_bytes() == cursor.first
+                        && bucket_entry.as_bytes() < cursor.second.as_slice()
+                    {
                         continue;
                     }
                 }
@@ -484,74 +552,145 @@ impl Queue {
                     stats.budget_exhausted = true;
                     return;
                 }
+                let Some(bucket_name) = bucket_entry.as_str() else {
+                    Self::record_error(
+                        stats,
+                        "reap_bucket_name",
+                        &raw_name_for_error(bucket_entry),
+                        "bucket directory name is not UTF-8",
+                    );
+                    continue;
+                };
+                let Some(bucket_num) = steadq_names::bucket_from_hex(bucket_name) else {
+                    Self::record_error(
+                        stats,
+                        "reap_bucket_name",
+                        bucket_name,
+                        "bucket directory name is not canonical",
+                    );
+                    continue;
+                };
 
                 // For current boot, check if bucket is expired
                 if is_current_boot {
-                    if let Ok(bucket_num) = u64::from_str_radix(bucket_name, 16) {
-                        let Some(current_bucket) = steadq_math::bucket_number(
-                            boottime_now,
-                            self.format.lease_bucket_width_ns,
-                        ) else {
-                            Self::record_error(
-                                stats,
-                                "reap_bucket_check",
-                                &format!("leased/{boot_dir_name}/{bucket_name}"),
-                                "invalid lease bucket width",
-                            );
-                            return;
-                        };
-                        if bucket_num > current_bucket {
-                            continue; // Not yet eligible
-                        }
+                    let Some(current_bucket) =
+                        steadq_math::bucket_number(boottime_now, self.format.lease_bucket_width_ns)
+                    else {
+                        Self::block_phase(
+                            stats,
+                            "reap_bucket_check",
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                            "invalid lease bucket width",
+                        );
+                        return;
+                    };
+                    if bucket_num > current_bucket {
+                        continue; // Not yet eligible
                     }
                 }
 
                 let bucket_fd = match fs::open_directory(boot_dir_fd.as_raw_fd(), bucket_name) {
                     Ok(fd) => fd,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "reap_bucket_open",
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
 
-                let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+                let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "reap_shard_read",
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
                 shard_dirs.sort();
 
-                for shard_name in &shard_dirs {
+                for shard_entry in &shard_dirs {
                     if let Some(cursor) = &self.recovery_cursor.reap_leases {
-                        if boot_dir_name == &cursor.first
-                            && bucket_name == &cursor.second
-                            && shard_name < &cursor.third
+                        if boot_dir_entry.as_bytes() == cursor.first
+                            && bucket_entry.as_bytes() == cursor.second
+                            && shard_entry.as_bytes() < cursor.third.as_slice()
                         {
                             continue;
                         }
                     }
+                    let Some(shard_name) = shard_entry.as_str() else {
+                        Self::record_error(
+                            stats,
+                            "reap_shard_name",
+                            &raw_name_for_error(shard_entry),
+                            "shard directory name is not UTF-8",
+                        );
+                        continue;
+                    };
+                    let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
+                        Self::record_error(
+                            stats,
+                            "reap_shard_name",
+                            shard_name,
+                            "shard directory name is not canonical",
+                        );
+                        continue;
+                    };
+                    if shard >= self.format.shard_count {
+                        Self::record_error(
+                            stats,
+                            "reap_shard_name",
+                            shard_name,
+                            "shard directory is outside the queue shard range",
+                        );
+                        continue;
+                    }
                     let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                         Ok(fd) => fd,
-                        Err(_) => {
+                        Err(error) => {
                             stats.scan_skips += 1;
-                            continue;
+                            Self::block_phase(
+                                stats,
+                                "reap_shard_open",
+                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                                &error.to_string(),
+                            );
+                            return;
                         }
                     };
 
-                    let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                    let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
                         Ok(e) => e,
-                        Err(_) => {
+                        Err(error) => {
                             stats.scan_skips += 1;
-                            continue;
+                            Self::block_phase(
+                                stats,
+                                "reap_entry_read",
+                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                                &error.to_string(),
+                            );
+                            return;
                         }
                     };
                     entries.sort();
 
-                    for entry in &entries {
+                    for raw_entry in &entries {
                         if let Some(cursor) = &self.recovery_cursor.reap_leases {
-                            if cursor.should_skip(boot_dir_name, bucket_name, shard_name, entry) {
+                            if cursor.should_skip(
+                                boot_dir_entry.as_bytes(),
+                                bucket_entry.as_bytes(),
+                                shard_entry.as_bytes(),
+                                raw_entry.as_bytes(),
+                            ) {
                                 continue;
                             }
                         }
@@ -560,11 +699,20 @@ impl Queue {
                             return;
                         }
                         self.recovery_cursor.reap_leases = Some(FourLevelCursor::new(
-                            boot_dir_name,
-                            bucket_name,
-                            shard_name,
-                            entry,
+                            boot_dir_entry.as_bytes(),
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
                         ));
+                        let Some(entry) = raw_entry.as_str() else {
+                            Self::record_error(
+                                stats,
+                                "reap_entry_name",
+                                &raw_name_for_error(raw_entry),
+                                "entry name is not UTF-8",
+                            );
+                            continue;
+                        };
 
                         if !entry.ends_with(".sqj") {
                             continue;
@@ -595,8 +743,8 @@ impl Queue {
 
                         // B1: Validate object structure before recovery transition
                         let leased_ctx = crate::ActivePathContext::Leased {
-                            boot_id: boot_dir_name.clone(),
-                            bucket: bucket_name.clone(),
+                            boot_id: boot_dir_name.to_string(),
+                            bucket: bucket_name.to_string(),
                             shard: shard_name.to_string(),
                         };
                         if let Err(e) =
@@ -819,19 +967,25 @@ impl Queue {
         let root_fd = self.root_fd();
         let delayed_fd = match fs::open_directory(root_fd, "delayed") {
             Ok(fd) => fd,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "promote_root_open", "delayed", &error.to_string());
+                return;
+            }
         };
 
-        let mut bucket_dirs = match fs::read_dir_entries_owned(delayed_fd.as_raw_fd()) {
+        let mut bucket_dirs = match read_recovery_directory(delayed_fd.as_raw_fd()) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "promote_bucket_read", "delayed", &error.to_string());
+                return;
+            }
         };
         bucket_dirs.sort();
 
-        for bucket_name in &bucket_dirs {
+        for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
             if let Some(cursor) = &self.recovery_cursor.promote_delayed {
-                if bucket_name.as_str() < cursor.first.as_str() {
+                if bucket_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
                 }
             }
@@ -840,10 +994,27 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
+            let Some(bucket_name) = bucket_entry.as_str() else {
+                Self::record_error(
+                    stats,
+                    "promote_bucket_name",
+                    &raw_name_for_error(bucket_entry),
+                    "bucket directory name is not UTF-8",
+                );
+                continue;
+            };
 
-            let bucket_num = match u64::from_str_radix(bucket_name, 16) {
-                Ok(n) => n,
-                Err(_) => continue,
+            let bucket_num = match steadq_names::bucket_from_hex(bucket_name) {
+                Some(bucket) => bucket,
+                None => {
+                    Self::record_error(
+                        stats,
+                        "promote_bucket_name",
+                        bucket_name,
+                        "bucket directory name is not canonical",
+                    );
+                    continue;
+                }
             };
 
             // Read effective wall floor
@@ -862,54 +1033,105 @@ impl Queue {
 
             let bucket_fd = match fs::open_directory(delayed_fd.as_raw_fd(), bucket_name) {
                 Ok(fd) => fd,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(
+                        stats,
+                        "promote_bucket_open",
+                        &format!("delayed/{bucket_name}"),
+                        &error.to_string(),
+                    );
+                    return;
                 }
             };
 
-            let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(
+                        stats,
+                        "promote_shard_read",
+                        &format!("delayed/{bucket_name}"),
+                        &error.to_string(),
+                    );
+                    return;
                 }
             };
             shard_dirs.sort();
 
-            for shard_name in &shard_dirs {
+            for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
                 if let Some(cursor) = &self.recovery_cursor.promote_delayed {
-                    if bucket_name == &cursor.first && shard_name < &cursor.second {
+                    if bucket_entry.as_bytes() == cursor.first
+                        && shard_entry.as_bytes() < cursor.second.as_slice()
+                    {
                         continue;
                     }
                 }
+                let Some(shard_name) = shard_entry.as_str() else {
+                    Self::record_error(
+                        stats,
+                        "promote_shard_name",
+                        &raw_name_for_error(shard_entry),
+                        "shard directory name is not UTF-8",
+                    );
+                    continue;
+                };
+                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
+                    Self::record_error(
+                        stats,
+                        "promote_shard_name",
+                        shard_name,
+                        "shard directory name is not canonical",
+                    );
+                    continue;
+                };
+                if shard >= self.format.shard_count {
+                    Self::record_error(
+                        stats,
+                        "promote_shard_name",
+                        shard_name,
+                        "shard directory is outside the queue shard range",
+                    );
+                    continue;
+                }
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => {
-                        Self::record_error(
+                    Err(error) => {
+                        Self::block_phase(
                             stats,
                             "promote_shard_open",
                             &format!("{bucket_name}/{shard_name}"),
-                            "shard dir open failed",
+                            &error.to_string(),
                         );
-                        continue;
+                        return;
                     }
                 };
 
-                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "promote_entry_read",
+                            &format!("delayed/{bucket_name}/{shard_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
                 entries.sort();
 
-                for entry in &entries {
+                for raw_entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
                     if let Some(cursor) = &self.recovery_cursor.promote_delayed {
-                        if cursor.should_skip(bucket_name, shard_name, entry) {
+                        if cursor.should_skip(
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ) {
                             continue;
                         }
                     }
@@ -917,8 +1139,20 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.promote_delayed =
-                        Some(ThreeLevelCursor::new(bucket_name, shard_name, entry));
+                    self.recovery_cursor.promote_delayed = Some(ThreeLevelCursor::new(
+                        bucket_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
+                    let Some(entry) = raw_entry.as_str() else {
+                        Self::record_error(
+                            stats,
+                            "promote_entry_name",
+                            &raw_name_for_error(raw_entry),
+                            "entry name is not UTF-8",
+                        );
+                        continue;
+                    };
 
                     if !entry.ends_with(".sqj") {
                         continue;
@@ -933,19 +1167,12 @@ impl Queue {
 
                     // B1: Validate object structure before promotion
                     {
-                        let src_dir_fd = match open_relative(
-                            self.root_fd(),
-                            &format!("delayed/{bucket_name}/{shard_name}"),
-                        ) {
-                            Ok(fd) => fd,
-                            Err(_) => continue,
-                        };
                         let delayed_ctx = crate::ActivePathContext::Delayed {
-                            bucket: bucket_name.clone(),
+                            bucket: bucket_name.to_string(),
                             shard: shard_name.to_string(),
                         };
                         if let Err(e) =
-                            self.validate_active_object(src_dir_fd.as_raw_fd(), entry, &delayed_ctx)
+                            self.validate_active_object(shard_fd.as_raw_fd(), entry, &delayed_ctx)
                         {
                             Self::record_error(
                                 stats,
@@ -955,7 +1182,7 @@ impl Queue {
                             );
                             if matches!(e, Error::QueueCorrupt(_)) {
                                 let _ = self.quarantine_recovery_object(
-                                    src_dir_fd.as_raw_fd(),
+                                    shard_fd.as_raw_fd(),
                                     entry,
                                     &format!("delayed/{bucket_name}/{shard_name}/{entry}"),
                                     crate::QuarantineReason::EnvelopeCorrupt,
@@ -1036,18 +1263,24 @@ impl Queue {
         let root_fd = self.root_fd();
         let tmp_fd = match fs::open_directory(root_fd, "tmp") {
             Ok(fd) => fd,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "temp_root_open", "tmp", &error.to_string());
+                return;
+            }
         };
 
-        let mut boot_dirs = match fs::read_dir_entries_owned(tmp_fd.as_raw_fd()) {
+        let mut boot_dirs = match read_recovery_directory(tmp_fd.as_raw_fd()) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "temp_boot_read", "tmp", &error.to_string());
+                return;
+            }
         };
         boot_dirs.sort();
 
-        for boot_dir_name in &boot_dirs {
+        for boot_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
-                if boot_dir_name < &cursor.first {
+                if boot_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
                 }
             }
@@ -1055,52 +1288,117 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
+            let Some(boot_dir_name) = boot_entry.as_str() else {
+                Self::record_error(
+                    stats,
+                    "temp_boot_name",
+                    &raw_name_for_error(boot_entry),
+                    "boot directory name is not UTF-8",
+                );
+                continue;
+            };
+            if steadq_names::boot_id_bytes(boot_dir_name).is_none() {
+                Self::record_error(
+                    stats,
+                    "temp_boot_name",
+                    boot_dir_name,
+                    "boot directory name is not canonical",
+                );
+                continue;
+            }
 
-            let is_current_boot = boot_dir_name == &self.boot_id;
+            let is_current_boot = boot_dir_name == self.boot_id;
 
             let boot_dir_fd = match fs::open_directory(tmp_fd.as_raw_fd(), boot_dir_name) {
                 Ok(fd) => fd,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(stats, "temp_boot_open", boot_dir_name, &error.to_string());
+                    return;
                 }
             };
 
-            let mut shard_dirs = match fs::read_dir_entries_owned(boot_dir_fd.as_raw_fd()) {
+            let mut shard_dirs = match read_recovery_directory(boot_dir_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(stats, "temp_shard_read", boot_dir_name, &error.to_string());
+                    return;
                 }
             };
             shard_dirs.sort();
 
-            for shard_name in &shard_dirs {
+            for shard_entry in &shard_dirs {
                 if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
-                    if boot_dir_name == &cursor.first && shard_name < &cursor.second {
+                    if boot_entry.as_bytes() == cursor.first
+                        && shard_entry.as_bytes() < cursor.second.as_slice()
+                    {
                         continue;
                     }
                 }
+                let Some(shard_name) = shard_entry.as_str() else {
+                    Self::record_error(
+                        stats,
+                        "temp_shard_name",
+                        &raw_name_for_error(shard_entry),
+                        "shard directory name is not UTF-8",
+                    );
+                    continue;
+                };
+                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
+                    Self::record_error(
+                        stats,
+                        "temp_shard_name",
+                        shard_name,
+                        "shard directory name is not canonical",
+                    );
+                    continue;
+                };
+                if shard >= self.format.shard_count {
+                    Self::record_error(
+                        stats,
+                        "temp_shard_name",
+                        shard_name,
+                        "shard directory is outside the queue shard range",
+                    );
+                    continue;
+                }
                 let shard_fd = match fs::open_directory(boot_dir_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "temp_shard_open",
+                            &format!("tmp/{boot_dir_name}/{shard_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
 
-                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "temp_entry_read",
+                            &format!("tmp/{boot_dir_name}/{shard_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
                 entries.sort();
 
-                for entry in &entries {
+                for raw_entry in &entries {
                     if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
-                        if cursor.should_skip(boot_dir_name, shard_name, entry) {
+                        if cursor.should_skip(
+                            boot_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ) {
                             continue;
                         }
                     }
@@ -1108,8 +1406,20 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.cleanup_temp =
-                        Some(ThreeLevelCursor::new(boot_dir_name, shard_name, entry));
+                    self.recovery_cursor.cleanup_temp = Some(ThreeLevelCursor::new(
+                        boot_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
+                    let Some(entry) = raw_entry.as_str() else {
+                        Self::record_error(
+                            stats,
+                            "temp_entry_name",
+                            &raw_name_for_error(raw_entry),
+                            "entry name is not UTF-8",
+                        );
+                        continue;
+                    };
 
                     if !entry.ends_with(".tmp") {
                         continue;
@@ -1152,19 +1462,25 @@ impl Queue {
         let root_fd = self.root_fd();
         let receipts_fd = match fs::open_directory(root_fd, "receipts") {
             Ok(fd) => fd,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "compact_root_open", "receipts", &error.to_string());
+                return;
+            }
         };
 
-        let mut bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd()) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "compact_bucket_read", "receipts", &error.to_string());
+                return;
+            }
         };
         bucket_dirs.sort();
 
-        for bucket_name in &bucket_dirs {
+        for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
             if let Some(cursor) = &self.recovery_cursor.compact_receipts {
-                if bucket_name.as_str() < cursor.first.as_str() {
+                if bucket_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
                 }
             }
@@ -1173,52 +1489,127 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
+            let Some(bucket_name) = bucket_entry.as_str() else {
+                Self::record_error(
+                    stats,
+                    "compact_bucket_name",
+                    &raw_name_for_error(bucket_entry),
+                    "bucket directory name is not UTF-8",
+                );
+                continue;
+            };
+            if steadq_names::bucket_from_hex(bucket_name).is_none() {
+                Self::record_error(
+                    stats,
+                    "compact_bucket_name",
+                    bucket_name,
+                    "bucket directory name is not canonical",
+                );
+                continue;
+            }
 
             let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
                 Ok(fd) => fd,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(
+                        stats,
+                        "compact_bucket_open",
+                        &format!("receipts/{bucket_name}"),
+                        &error.to_string(),
+                    );
+                    return;
                 }
             };
 
-            let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(
+                        stats,
+                        "compact_shard_read",
+                        &format!("receipts/{bucket_name}"),
+                        &error.to_string(),
+                    );
+                    return;
                 }
             };
             shard_dirs.sort();
 
-            for shard_name in &shard_dirs {
+            for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
                 if let Some(cursor) = &self.recovery_cursor.compact_receipts {
-                    if bucket_name == &cursor.first && shard_name < &cursor.second {
+                    if bucket_entry.as_bytes() == cursor.first
+                        && shard_entry.as_bytes() < cursor.second.as_slice()
+                    {
                         continue;
                     }
                 }
+                let Some(shard_name) = shard_entry.as_str() else {
+                    Self::record_error(
+                        stats,
+                        "compact_shard_name",
+                        &raw_name_for_error(shard_entry),
+                        "shard directory name is not UTF-8",
+                    );
+                    continue;
+                };
+                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
+                    Self::record_error(
+                        stats,
+                        "compact_shard_name",
+                        shard_name,
+                        "shard directory name is not canonical",
+                    );
+                    continue;
+                };
+                if shard >= self.format.shard_count {
+                    Self::record_error(
+                        stats,
+                        "compact_shard_name",
+                        shard_name,
+                        "shard directory is outside the queue shard range",
+                    );
+                    continue;
+                }
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "compact_shard_open",
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
 
-                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "compact_entry_read",
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
                 entries.sort();
 
-                for entry in &entries {
+                for raw_entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
                     if let Some(cursor) = &self.recovery_cursor.compact_receipts {
-                        if cursor.should_skip(bucket_name, shard_name, entry) {
+                        if cursor.should_skip(
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ) {
                             continue;
                         }
                     }
@@ -1226,8 +1617,20 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.compact_receipts =
-                        Some(ThreeLevelCursor::new(bucket_name, shard_name, entry));
+                    self.recovery_cursor.compact_receipts = Some(ThreeLevelCursor::new(
+                        bucket_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
+                    let Some(entry) = raw_entry.as_str() else {
+                        Self::record_error(
+                            stats,
+                            "compact_entry_name",
+                            &raw_name_for_error(raw_entry),
+                            "entry name is not UTF-8",
+                        );
+                        continue;
+                    };
 
                     if !entry.ends_with(".rct") {
                         continue;
@@ -1382,19 +1785,25 @@ impl Queue {
 
         let receipts_fd = match fs::open_directory(root_fd, "receipts") {
             Ok(fd) => fd,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "delete_root_open", "receipts", &error.to_string());
+                return;
+            }
         };
 
-        let mut bucket_dirs = match fs::read_dir_entries_owned(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd()) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(error) => {
+                Self::block_phase(stats, "delete_bucket_read", "receipts", &error.to_string());
+                return;
+            }
         };
         bucket_dirs.sort();
 
-        for bucket_name in &bucket_dirs {
+        for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
             if let Some(cursor) = &self.recovery_cursor.delete_receipts {
-                if bucket_name.as_str() < cursor.first.as_str() {
+                if bucket_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
                 }
             }
@@ -1403,10 +1812,27 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
+            let Some(bucket_name) = bucket_entry.as_str() else {
+                Self::record_error(
+                    stats,
+                    "delete_bucket_name",
+                    &raw_name_for_error(bucket_entry),
+                    "bucket directory name is not UTF-8",
+                );
+                continue;
+            };
 
-            let bucket_num = match u64::from_str_radix(bucket_name, 16) {
-                Ok(n) => n,
-                Err(_) => continue,
+            let bucket_num = match steadq_names::bucket_from_hex(bucket_name) {
+                Some(bucket) => bucket,
+                None => {
+                    Self::record_error(
+                        stats,
+                        "delete_bucket_name",
+                        bucket_name,
+                        "bucket directory name is not canonical",
+                    );
+                    continue;
+                }
             };
 
             let bucket_start = match bucket_num.checked_mul(self.format.terminal_bucket_width_ns) {
@@ -1430,63 +1856,131 @@ impl Queue {
 
             let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
                 Ok(fd) => fd,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(
+                        stats,
+                        "delete_bucket_open",
+                        &format!("receipts/{bucket_name}"),
+                        &error.to_string(),
+                    );
+                    return;
                 }
             };
 
-            let mut shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
                 Ok(e) => e,
-                Err(_) => {
+                Err(error) => {
                     stats.scan_skips += 1;
-                    continue;
+                    Self::block_phase(
+                        stats,
+                        "delete_shard_read",
+                        &format!("receipts/{bucket_name}"),
+                        &error.to_string(),
+                    );
+                    return;
                 }
             };
             shard_dirs.sort();
 
-            for shard_name in &shard_dirs {
+            for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
                 if let Some(cursor) = &self.recovery_cursor.delete_receipts {
-                    if bucket_name == &cursor.first && shard_name < &cursor.second {
+                    if bucket_entry.as_bytes() == cursor.first
+                        && shard_entry.as_bytes() < cursor.second.as_slice()
+                    {
                         continue;
                     }
                 }
+                let Some(shard_name) = shard_entry.as_str() else {
+                    Self::record_error(
+                        stats,
+                        "delete_shard_name",
+                        &raw_name_for_error(shard_entry),
+                        "shard directory name is not UTF-8",
+                    );
+                    continue;
+                };
+                let Some(shard) = steadq_names::shard_from_hex(shard_name) else {
+                    Self::record_error(
+                        stats,
+                        "delete_shard_name",
+                        shard_name,
+                        "shard directory name is not canonical",
+                    );
+                    continue;
+                };
+                if shard >= self.format.shard_count {
+                    Self::record_error(
+                        stats,
+                        "delete_shard_name",
+                        shard_name,
+                        "shard directory is outside the queue shard range",
+                    );
+                    continue;
+                }
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "delete_shard_open",
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
 
-                let mut entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
                     Ok(e) => e,
-                    Err(_) => {
+                    Err(error) => {
                         stats.scan_skips += 1;
-                        continue;
+                        Self::block_phase(
+                            stats,
+                            "delete_entry_read",
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                            &error.to_string(),
+                        );
+                        return;
                     }
                 };
                 entries.sort();
 
-                for entry in &entries {
+                for raw_entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
                     if let Some(cursor) = &self.recovery_cursor.delete_receipts {
-                        if cursor.should_skip(bucket_name, shard_name, entry) {
+                        if cursor.should_skip(
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ) {
                             continue;
                         }
                     }
-                    // R4-H08: Only process receipt files.
-                    if !entry.ends_with(".rct") {
-                        continue;
-                    }
-
                     if Self::budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    self.recovery_cursor.delete_receipts =
-                        Some(ThreeLevelCursor::new(bucket_name, shard_name, entry));
+                    self.recovery_cursor.delete_receipts = Some(ThreeLevelCursor::new(
+                        bucket_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
+                    let Some(entry) = raw_entry.as_str() else {
+                        Self::record_error(
+                            stats,
+                            "delete_entry_name",
+                            &raw_name_for_error(raw_entry),
+                            "entry name is not UTF-8",
+                        );
+                        continue;
+                    };
+                    // R4-H08: Only process receipt files.
+                    if !entry.ends_with(".rct") {
+                        continue;
+                    }
                     stats.operations_attempted += 1;
 
                     // R4-H08: Validate the receipt filename before operating.
@@ -1672,12 +2166,70 @@ mod tests {
         lease
     }
 
+    fn valid_cursor_record(queue: &Queue) -> RecoveryCursorRecord {
+        RecoveryCursorRecord {
+            schema: RECOVERY_CURSOR_SCHEMA.into(),
+            version: RECOVERY_CURSOR_VERSION,
+            queue_id: steadq_names::hex_encode(&queue.format.queue_id),
+            cursor: RecoveryCursor::default(),
+        }
+    }
+
     #[test]
     fn recovery_phase_budget_table() {
         let mut stats = RecoveryStats::default();
         assert!(Queue::has_recovery_budget(&stats));
         stats.budget_exhausted = true;
         assert!(!Queue::has_recovery_budget(&stats));
+        stats.budget_exhausted = false;
+        stats.phase_blocked = true;
+        assert!(!Queue::has_recovery_budget(&stats));
+    }
+
+    #[test]
+    fn recovery_scan_bounds_are_fixed_and_finite() {
+        assert_eq!(MAX_RECOVERY_DIRECTORY_ENTRIES, 65_536);
+        assert_eq!(MAX_RECOVERY_DIRECTORY_NAME_BYTES, 16_711_680);
+    }
+
+    #[test]
+    fn recovery_budget_predicates_cover_operation_time_and_clock_failure() {
+        fs::fault::reset();
+        assert!(Queue::budget_time_exceeded(0));
+        assert!(!Queue::budget_time_exceeded(u64::MAX));
+
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: u64::MAX,
+        };
+        let mut stats = RecoveryStats::default();
+        assert!(!Queue::budget_exhausted(&stats, &budget, u64::MAX));
+        stats.operations_attempted = 1;
+        assert!(Queue::budget_exhausted(&stats, &budget, u64::MAX));
+        stats.operations_attempted = 0;
+        assert!(Queue::budget_exhausted(&stats, &budget, 0));
+
+        fs::fault::inject("clock_monotonic_ns", 1);
+        assert!(Queue::budget_time_exceeded(u64::MAX));
+        fs::fault::reset();
+    }
+
+    #[test]
+    fn recovery_error_helpers_preserve_context_and_block_state() {
+        let mut stats = RecoveryStats::default();
+        Queue::record_error(&mut stats, "operation", "path", "error");
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(stats.errors[0].operation, "operation");
+        assert_eq!(stats.errors[0].relative_path, "path");
+        assert_eq!(stats.errors[0].error, "error");
+        assert!(!stats.phase_blocked);
+
+        Queue::block_phase(&mut stats, "blocked", "blocked-path", "blocked-error");
+        assert!(stats.phase_blocked);
+        assert_eq!(stats.errors.len(), 2);
+        assert_eq!(stats.errors[1].operation, "blocked");
+        assert_eq!(stats.errors[1].relative_path, "blocked-path");
+        assert_eq!(stats.errors[1].error, "blocked-error");
     }
 
     #[test]
@@ -1775,8 +2327,43 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_open_failure_cannot_advance_past_unclassified_work() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"later work".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            queue.lease(0, 1_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
+        let blocked = tmp
+            .path()
+            .join("leased/00000000-0000-0000-0000-000000000000");
+        symlink(tmp.path(), &blocked).unwrap();
+
+        let first = queue.recover(&WorkBudget::default());
+        assert!(first.phase_blocked);
+        assert_eq!(first.operations_attempted, 0);
+        assert_eq!(queue.recovery_cursor.phase, RecoveryPhase::ReapLeases);
+        assert!(queue.recovery_cursor.reap_leases.is_none());
+
+        std::fs::remove_file(blocked).unwrap();
+        let second = queue.recover(&WorkBudget::default());
+        assert!(!second.phase_blocked);
+        assert_eq!(second.operations_attempted, 1);
+    }
+
+    #[test]
     fn scan_cursor_skips_only_canonical_processed_prefix() {
-        let cursor = ThreeLevelCursor::new("0002", "0003", "middle.rct");
+        let cursor = ThreeLevelCursor::new(b"0002", b"0003", b"middle.rct");
         for (bucket, shard, entry, expected) in [
             ("0001", "ffff", "later.rct", true),
             ("0002", "0002", "later.rct", true),
@@ -1786,13 +2373,26 @@ mod tests {
             ("0002", "0004", "earlier.rct", false),
             ("0003", "0000", "earlier.rct", false),
         ] {
-            assert_eq!(cursor.should_skip(bucket, shard, entry), expected);
+            assert_eq!(
+                cursor.should_skip(bucket.as_bytes(), shard.as_bytes(), entry.as_bytes()),
+                expected
+            );
         }
     }
 
     #[test]
+    fn scan_cursor_preserves_non_utf8_order_exactly() {
+        let cursor = ThreeLevelCursor::new(b"0002", b"0003", b"bad-\x80.rct");
+        assert!(cursor.should_skip(b"0002", b"0003", b"bad-\x80.rct"));
+        assert!(!cursor.should_skip(b"0002", b"0003", b"bad-\x81.rct"));
+        let encoded = serde_json::to_vec(&cursor).unwrap();
+        let decoded: ThreeLevelCursor = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, cursor);
+    }
+
+    #[test]
     fn four_level_cursor_skips_only_canonical_processed_prefix() {
-        let cursor = FourLevelCursor::new("boot-b", "0002", "0003", "middle.sqj");
+        let cursor = FourLevelCursor::new(b"boot-b", b"0002", b"0003", b"middle.sqj");
         for (first, second, third, entry, expected) in [
             ("boot-a", "ffff", "ffff", "later.sqj", true),
             ("boot-b", "0001", "ffff", "later.sqj", true),
@@ -1802,7 +2402,15 @@ mod tests {
             ("boot-b", "0002", "0004", "earlier.sqj", false),
             ("boot-c", "0000", "0000", "earlier.sqj", false),
         ] {
-            assert_eq!(cursor.should_skip(first, second, third, entry), expected);
+            assert_eq!(
+                cursor.should_skip(
+                    first.as_bytes(),
+                    second.as_bytes(),
+                    third.as_bytes(),
+                    entry.as_bytes(),
+                ),
+                expected
+            );
         }
     }
 
@@ -1817,9 +2425,304 @@ mod tests {
             ("a/b", false),
             ("a\0b", false),
         ] {
-            assert_eq!(cursor_component_is_valid(component), expected);
+            assert_eq!(cursor_component_is_valid(component.as_bytes()), expected);
         }
-        assert!(!cursor_component_is_valid(&"x".repeat(256)));
+        assert!(!cursor_component_is_valid("x".repeat(256).as_bytes()));
+    }
+
+    #[test]
+    fn recovery_cursor_validation_checks_every_component() {
+        let valid_three = ThreeLevelCursor::new(b"first", b"second", b"entry");
+        let valid_four = FourLevelCursor::new(b"first", b"second", b"third", b"entry");
+        let valid = RecoveryCursor {
+            phase: RecoveryPhase::CompactReceipts,
+            reap_leases: Some(valid_four),
+            promote_delayed: Some(valid_three.clone()),
+            cleanup_temp: Some(valid_three.clone()),
+            compact_receipts: Some(valid_three.clone()),
+            delete_receipts: Some(valid_three),
+        };
+        assert!(cursor_is_valid(&valid));
+
+        let mut invalid = Vec::new();
+        for field in 0..4 {
+            let mut cursor = valid.clone();
+            let scan = cursor.reap_leases.as_mut().unwrap();
+            match field {
+                0 => scan.first.clear(),
+                1 => scan.second.clear(),
+                2 => scan.third.clear(),
+                3 => scan.resume_after.clear(),
+                _ => unreachable!(),
+            }
+            invalid.push(cursor);
+        }
+        for phase in 0..4 {
+            for field in 0..3 {
+                let mut cursor = valid.clone();
+                let scan = match phase {
+                    0 => cursor.promote_delayed.as_mut().unwrap(),
+                    1 => cursor.cleanup_temp.as_mut().unwrap(),
+                    2 => cursor.compact_receipts.as_mut().unwrap(),
+                    3 => cursor.delete_receipts.as_mut().unwrap(),
+                    _ => unreachable!(),
+                };
+                match field {
+                    0 => scan.first.clear(),
+                    1 => scan.second.clear(),
+                    2 => scan.resume_after.clear(),
+                    _ => unreachable!(),
+                }
+                invalid.push(cursor);
+            }
+        }
+        assert_eq!(invalid.len(), 16);
+        for (index, cursor) in invalid.iter().enumerate() {
+            assert!(!cursor_is_valid(cursor), "invalid cursor {index} accepted");
+        }
+    }
+
+    #[test]
+    fn recovery_cursor_record_boundary_table() {
+        assert_eq!(RECOVERY_CURSOR_MAX_BYTES, 16_384);
+        assert_eq!(
+            RECOVERY_CURSOR_OPEN_FLAGS,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        );
+        assert_eq!(
+            RECOVERY_LOCK_OPEN_FLAGS,
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        );
+        for (size, expected) in [
+            (0, false),
+            (1, true),
+            (RECOVERY_CURSOR_MAX_BYTES, true),
+            (RECOVERY_CURSOR_MAX_BYTES + 1, false),
+        ] {
+            assert_eq!(cursor_record_size_is_valid(size), expected);
+            assert_eq!(cursor_record_bytes_fit(size as usize), expected);
+        }
+        assert!(cursor_file_metadata_is_valid(libc::S_IFREG, 1));
+        assert!(!cursor_file_metadata_is_valid(libc::S_IFDIR, 1));
+        assert!(!cursor_file_metadata_is_valid(libc::S_IFREG, 2));
+        assert!(!cursor_file_metadata_is_valid(libc::S_IFDIR, 2));
+
+        let valid = RecoveryCursorRecord {
+            schema: RECOVERY_CURSOR_SCHEMA.into(),
+            version: RECOVERY_CURSOR_VERSION,
+            queue_id: steadq_names::hex_encode(&[0; 16]),
+            cursor: RecoveryCursor::default(),
+        };
+        assert!(cursor_record_version_is_supported(&valid));
+        let mut wrong_schema = RecoveryCursorRecord {
+            schema: "wrong".into(),
+            ..valid
+        };
+        assert!(!cursor_record_version_is_supported(&wrong_schema));
+        wrong_schema.schema = RECOVERY_CURSOR_SCHEMA.into();
+        wrong_schema.version = RECOVERY_CURSOR_VERSION + 1;
+        assert!(!cursor_record_version_is_supported(&wrong_schema));
+
+        assert!(cursor_file_is_absent(&io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(!cursor_file_is_absent(&io::Error::from_raw_os_error(
+            libc::EIO
+        )));
+        assert!(recovery_lock_exists(&io::Error::from_raw_os_error(
+            libc::EEXIST
+        )));
+        assert!(!recovery_lock_exists(&io::Error::from_raw_os_error(
+            libc::EIO
+        )));
+    }
+
+    #[test]
+    fn recovery_raw_name_diagnostic_preserves_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(OsStr::from_bytes(b"bad-\x80")), b"x").unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        let entries = read_recovery_directory(dir.as_raw_fd()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(raw_name_for_error(&entries[0]), "b\"bad-\\x80\"");
+    }
+
+    #[test]
+    fn recovery_cursor_load_distinguishes_absence_from_io_failure() {
+        let (_tmp, queue) = create_test_queue();
+        let absent = load_recovery_cursor(queue.root_fd(), &queue.format.queue_id).unwrap();
+        assert_eq!(absent, RecoveryCursor::default());
+
+        fs::fault::reset();
+        fs::fault::inject_errno("openat", 1, libc::EIO);
+        let error = load_recovery_cursor(queue.root_fd(), &queue.format.queue_id).unwrap_err();
+        fs::fault::reset();
+        assert!(matches!(
+            error,
+            Error::IoFailure(ref message) if message.contains("Input/output error")
+        ));
+    }
+
+    #[test]
+    fn recovery_cursor_load_rejects_invalid_metadata_and_sizes() {
+        let (directory_tmp, directory_queue) = create_test_queue();
+        std::fs::create_dir(directory_tmp.path().join("control/recovery-cursor.json")).unwrap();
+        assert!(matches!(
+            load_recovery_cursor(
+                directory_queue.root_fd(),
+                &directory_queue.format.queue_id
+            ),
+            Err(Error::QueueCorrupt(ref message))
+                if message == "recovery cursor is not a singly linked regular file"
+        ));
+
+        let (link_tmp, link_queue) = create_test_queue();
+        let source = link_tmp.path().join("control/cursor-source");
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&valid_cursor_record(&link_queue)).unwrap(),
+        )
+        .unwrap();
+        std::fs::hard_link(
+            &source,
+            link_tmp.path().join("control/recovery-cursor.json"),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_recovery_cursor(link_queue.root_fd(), &link_queue.format.queue_id),
+            Err(Error::QueueCorrupt(ref message))
+                if message == "recovery cursor is not a singly linked regular file"
+        ));
+
+        for bytes in [Vec::new(), vec![0; RECOVERY_CURSOR_MAX_BYTES as usize + 1]] {
+            let (tmp, queue) = create_test_queue();
+            std::fs::write(tmp.path().join("control/recovery-cursor.json"), bytes).unwrap();
+            assert!(matches!(
+                load_recovery_cursor(queue.root_fd(), &queue.format.queue_id),
+                Err(Error::QueueCorrupt(ref message))
+                    if message == "recovery cursor size is invalid"
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_cursor_load_rejects_schema_version_and_components() {
+        let (schema_tmp, schema_queue) = create_test_queue();
+        let mut wrong_schema = valid_cursor_record(&schema_queue);
+        wrong_schema.schema = "wrong".into();
+        std::fs::write(
+            schema_tmp.path().join("control/recovery-cursor.json"),
+            serde_json::to_vec(&wrong_schema).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_recovery_cursor(schema_queue.root_fd(), &schema_queue.format.queue_id),
+            Err(Error::QueueCorrupt(ref message))
+                if message == "recovery cursor schema or version is unsupported"
+        ));
+
+        let (version_tmp, version_queue) = create_test_queue();
+        let mut wrong_version = valid_cursor_record(&version_queue);
+        wrong_version.version += 1;
+        std::fs::write(
+            version_tmp.path().join("control/recovery-cursor.json"),
+            serde_json::to_vec(&wrong_version).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_recovery_cursor(version_queue.root_fd(), &version_queue.format.queue_id),
+            Err(Error::QueueCorrupt(ref message))
+                if message == "recovery cursor schema or version is unsupported"
+        ));
+
+        let (component_tmp, component_queue) = create_test_queue();
+        let mut invalid_component = valid_cursor_record(&component_queue);
+        invalid_component.cursor.promote_delayed =
+            Some(ThreeLevelCursor::new(b"", b"shard", b"entry"));
+        std::fs::write(
+            component_tmp.path().join("control/recovery-cursor.json"),
+            serde_json::to_vec(&invalid_component).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_recovery_cursor(
+                component_queue.root_fd(),
+                &component_queue.format.queue_id
+            ),
+            Err(Error::QueueCorrupt(ref message))
+                if message == "recovery cursor contains an invalid component"
+        ));
+    }
+
+    #[test]
+    fn recovery_cursor_load_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, queue) = create_test_queue();
+        let target = tmp.path().join("control/cursor-target");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&valid_cursor_record(&queue)).unwrap(),
+        )
+        .unwrap();
+        symlink(
+            "cursor-target",
+            tmp.path().join("control/recovery-cursor.json"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load_recovery_cursor(queue.root_fd(), &queue.format.queue_id),
+            Err(Error::IoFailure(_))
+        ));
+    }
+
+    #[test]
+    fn recovery_cursor_persist_rejects_oversized_record() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.recovery_cursor.promote_delayed = Some(ThreeLevelCursor::new(
+            &vec![b'x'; RECOVERY_CURSOR_MAX_BYTES as usize],
+            b"shard",
+            b"entry",
+        ));
+        assert!(matches!(
+            queue.persist_recovery_cursor(),
+            Err(Error::InvalidInput(ref message))
+                if message == "recovery cursor exceeds maximum encoded size"
+        ));
+    }
+
+    #[test]
+    fn recovery_lock_creation_error_is_not_treated_as_contention() {
+        let (_tmp, queue) = create_test_queue();
+        fs::fault::reset();
+        fs::fault::inject_errno("openat", 1, libc::EIO);
+        let error = queue.acquire_recovery_lock().unwrap_err();
+        fs::fault::reset();
+        assert!(matches!(
+            error,
+            Error::IoFailure(ref message) if message.contains("Input/output error")
+        ));
+    }
+
+    #[test]
+    fn recovery_lock_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, queue) = create_test_queue();
+        let target = tmp.path().join("lock-target");
+        std::fs::write(&target, b"target").unwrap();
+        let lock_path = tmp.path().join("control/recovery.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        symlink(&target, lock_path).unwrap();
+
+        assert!(matches!(
+            queue.acquire_recovery_lock(),
+            Err(Error::IoFailure(_))
+        ));
     }
 
     #[test]
@@ -1849,9 +2752,9 @@ mod tests {
         assert_eq!(
             queue.recovery_cursor.compact_receipts,
             Some(ThreeLevelCursor::new(
-                first_parts[0],
-                first_parts[1],
-                first_parts[2]
+                first_parts[0].as_bytes(),
+                first_parts[1].as_bytes(),
+                first_parts[2].as_bytes()
             ))
         );
         assert!(tmp.path().join("control/recovery-cursor.json").exists());
@@ -1903,7 +2806,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .resume_after,
-            "000-malformed.rct"
+            b"000-malformed.rct"
         );
         drop(queue);
 
@@ -1968,7 +2871,7 @@ mod tests {
     fn recovery_cursor_rejects_foreign_queue_identity() {
         let (tmp, mut queue) = create_test_queue();
         queue.recovery_cursor.compact_receipts =
-            Some(ThreeLevelCursor::new("0001", "0002", "entry.rct"));
+            Some(ThreeLevelCursor::new(b"0001", b"0002", b"entry.rct"));
         queue.persist_recovery_cursor().unwrap();
         drop(queue);
         let path = tmp.path().join("control/recovery-cursor.json");

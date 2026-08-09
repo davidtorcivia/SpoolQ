@@ -101,26 +101,26 @@ impl Default for OpenOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ThreeLevelCursor {
-    pub(crate) first: String,
-    pub(crate) second: String,
-    pub(crate) resume_after: String,
+    pub(crate) first: Vec<u8>,
+    pub(crate) second: Vec<u8>,
+    pub(crate) resume_after: Vec<u8>,
 }
 
 impl ThreeLevelCursor {
-    pub(crate) fn new(first: &str, second: &str, resume_after: &str) -> Self {
+    pub(crate) fn new(first: &[u8], second: &[u8], resume_after: &[u8]) -> Self {
         Self {
-            first: first.to_string(),
-            second: second.to_string(),
-            resume_after: resume_after.to_string(),
+            first: first.to_vec(),
+            second: second.to_vec(),
+            resume_after: resume_after.to_vec(),
         }
     }
 
-    pub(crate) fn should_skip(&self, first: &str, second: &str, entry: &str) -> bool {
+    pub(crate) fn should_skip(&self, first: &[u8], second: &[u8], entry: &[u8]) -> bool {
         (first, second, entry)
             <= (
-                self.first.as_str(),
-                self.second.as_str(),
-                self.resume_after.as_str(),
+                self.first.as_slice(),
+                self.second.as_slice(),
+                self.resume_after.as_slice(),
             )
     }
 }
@@ -129,29 +129,35 @@ impl ThreeLevelCursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FourLevelCursor {
-    pub(crate) first: String,
-    pub(crate) second: String,
-    pub(crate) third: String,
-    pub(crate) resume_after: String,
+    pub(crate) first: Vec<u8>,
+    pub(crate) second: Vec<u8>,
+    pub(crate) third: Vec<u8>,
+    pub(crate) resume_after: Vec<u8>,
 }
 
 impl FourLevelCursor {
-    pub(crate) fn new(first: &str, second: &str, third: &str, resume_after: &str) -> Self {
+    pub(crate) fn new(first: &[u8], second: &[u8], third: &[u8], resume_after: &[u8]) -> Self {
         Self {
-            first: first.to_string(),
-            second: second.to_string(),
-            third: third.to_string(),
-            resume_after: resume_after.to_string(),
+            first: first.to_vec(),
+            second: second.to_vec(),
+            third: third.to_vec(),
+            resume_after: resume_after.to_vec(),
         }
     }
 
-    pub(crate) fn should_skip(&self, first: &str, second: &str, third: &str, entry: &str) -> bool {
+    pub(crate) fn should_skip(
+        &self,
+        first: &[u8],
+        second: &[u8],
+        third: &[u8],
+        entry: &[u8],
+    ) -> bool {
         (first, second, third, entry)
             <= (
-                self.first.as_str(),
-                self.second.as_str(),
-                self.third.as_str(),
-                self.resume_after.as_str(),
+                self.first.as_slice(),
+                self.second.as_slice(),
+                self.third.as_slice(),
+                self.resume_after.as_slice(),
             )
     }
 }

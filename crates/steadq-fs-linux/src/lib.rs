@@ -4,7 +4,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 const MAX_COMPONENT_BYTES: usize = 255;
@@ -720,13 +720,48 @@ pub fn try_ofd_read_lock(fd: RawFd) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Read directory entries.
-/// Consumes the fd via fdopendir.
-fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
+/// Byte-preserving directory entry name.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DirEntryName(Vec<u8>);
+
+impl DirEntryName {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+}
+
+impl std::fmt::Debug for DirEntryName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "b\"")?;
+        for byte in &self.0 {
+            for escaped in std::ascii::escape_default(*byte) {
+                write!(formatter, "{}", char::from(escaped))?;
+            }
+        }
+        write!(formatter, "\"")
+    }
+}
+
+/// Read directory entries without losing non-UTF-8 names.
+/// Consumes the fd via fdopendir and rejects directories exceeding either
+/// bound before retaining an unbounded collection.
+fn read_dir_entry_names_impl(
+    dir_fd: RawFd,
+    max_entries: usize,
+    max_name_bytes: usize,
+) -> io::Result<Vec<DirEntryName>> {
     let mut entries = Vec::new();
+    let mut name_bytes_read = 0usize;
     let dir = unsafe { libc::fdopendir(dir_fd) };
     if dir.is_null() {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // fdopendir did not take ownership when it returned a null pointer.
+        unsafe { libc::close(dir_fd) };
+        return Err(error);
     }
 
     loop {
@@ -747,15 +782,40 @@ fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
             let len = libc::strlen(name_ptr);
             std::slice::from_raw_parts(name_ptr as *const u8, len)
         };
-        let name = String::from_utf8_lossy(name_bytes).to_string();
-        if name != "." && name != ".." {
-            entries.push(name);
+        if name_bytes != b"." && name_bytes != b".." {
+            let Some(next_name_bytes) = name_bytes_read.checked_add(name_bytes.len()) else {
+                unsafe { libc::closedir(dir) };
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "directory entry byte count overflow",
+                ));
+            };
+            if entries.len() >= max_entries || next_name_bytes > max_name_bytes {
+                unsafe { libc::closedir(dir) };
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "directory exceeds configured recovery scan bound",
+                ));
+            }
+            name_bytes_read = next_name_bytes;
+            entries.push(DirEntryName(name_bytes.to_vec()));
         }
     }
 
     unsafe { libc::closedir(dir) };
 
     Ok(entries)
+}
+
+/// Read directory entries as strings for legacy callers.
+/// Consumes the fd via fdopendir.
+fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
+    read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX).map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| String::from_utf8_lossy(entry.as_bytes()).into_owned())
+            .collect()
+    })
 }
 
 /// R4-PERF: Iterate directory entries with a callback, avoiding full
@@ -829,6 +889,18 @@ pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<String>> {
         return Err(io::Error::last_os_error());
     }
     read_dir_entries_impl(dup_fd)
+}
+
+/// Read byte-preserving directory entries without consuming the caller's fd.
+/// The function returns an error rather than materializing more than the
+/// configured entry or aggregate-name-byte bound.
+pub fn read_dir_entry_names_bounded_owned(
+    dir_fd: RawFd,
+    max_entries: usize,
+    max_name_bytes: usize,
+) -> io::Result<Vec<DirEntryName>> {
+    let reopened = open_directory(dir_fd, ".")?;
+    read_dir_entry_names_impl(reopened.into_raw_fd(), max_entries, max_name_bytes)
 }
 
 /// Change file mode relative to a directory fd.
@@ -1395,6 +1467,52 @@ mod tests {
         assert_eq!(count_seen, 1);
 
         std::fs::remove_dir_all(&dir_path).ok();
+    }
+
+    #[test]
+    fn bounded_directory_read_preserves_distinct_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir_path = unique_test_dir("raw-directory-names");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("plain"), b"plain").unwrap();
+        let first = OsStr::from_bytes(b"bad-\x80");
+        let second = OsStr::from_bytes(b"bad-\x81");
+        std::fs::write(dir_path.join(first), b"a").unwrap();
+        std::fs::write(dir_path.join(second), b"b").unwrap();
+        let dir = std::fs::File::open(&dir_path).unwrap();
+
+        let mut entries = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 3, 510).unwrap();
+        entries.sort();
+        assert_eq!(entries[0].as_bytes(), b"bad-\x80");
+        assert_eq!(entries[1].as_bytes(), b"bad-\x81");
+        assert_eq!(entries[2].as_bytes(), b"plain");
+        assert_eq!(entries[0].as_str(), None);
+        assert_eq!(entries[1].as_str(), None);
+        assert_eq!(entries[2].as_str(), Some("plain"));
+        assert_eq!(format!("{:?}", entries[0]), "b\"bad-\\x80\"");
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn bounded_directory_read_rejects_entry_and_byte_overflow() {
+        let dir_path = unique_test_dir("bounded-directory-read");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("a"), b"a").unwrap();
+        std::fs::write(dir_path.join("bb"), b"b").unwrap();
+        let dir = std::fs::File::open(&dir_path).unwrap();
+
+        let entry_error =
+            read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 1, usize::MAX).unwrap_err();
+        assert_eq!(entry_error.kind(), io::ErrorKind::FileTooLarge);
+        let byte_error = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 2, 2).unwrap_err();
+        assert_eq!(byte_error.kind(), io::ErrorKind::FileTooLarge);
+        let mut exact_entries = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 2, 3).unwrap();
+        exact_entries.sort();
+        assert_eq!(exact_entries[0].as_bytes(), b"a");
+        assert_eq!(exact_entries[1].as_bytes(), b"bb");
+        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
