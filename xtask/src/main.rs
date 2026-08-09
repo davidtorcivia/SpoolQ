@@ -48,7 +48,7 @@ fn check_all(root: &Path) -> Result<(), String> {
         usize::BITS,
     )?;
     check_generated(root)?;
-    model::check_invariant_evidence(root)?;
+    model::check_model_evidence(root)?;
     for required in [
         "SECURITY.md",
         "CONTRIBUTING.md",

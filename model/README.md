@@ -13,6 +13,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SteadQ.cfg model/SteadQ.tla -
 The separate namespace durability model and its two crash profiles are documented in `model/namespace/README.md`.
 The separate authenticated-wall and boottime scheduling model is documented in `model/scheduling/README.md`.
 The separate receipt-evidence, compaction, duplicate-ack, and retention model is documented in `model/receipts/README.md`.
+The separate persisted-maintenance progress and fairness model is documented in `model/maintenance/README.md`.
 
 Download `tla2tools.jar` from https://github.com/tlaplus/tlaplus/releases.
 
@@ -75,4 +76,4 @@ hidden.
 
 ## Not modeled
 
-The current checked predicates do not establish source and destination namespace observations, cryptographic token freshness or collision bounds, resolver soundness, wall scheduling and rollback safety, strict receipt and compaction evidence, recovery cursor progress, maintenance liveness, or queue-root containment. Delayed, receipt, dead, and quarantine states appear only in the bounded abstraction. These gaps remain open A-013 work under issue #59.
+The main model remains an abstract state-machine model. Separate bounded models now check namespace crash observations, authenticated scheduling, strict receipt evidence, and persisted maintenance progress under their individually documented assumptions. The model suite does not establish cryptographic collision bounds, real filesystem behavior, resolver implementation soundness, production trace conformance, queue-root containment, or implementation equivalence. Delayed, receipt, dead, and quarantine states remain abstract rather than byte- and path-level objects. These gaps remain open A-013 work under issue #59.

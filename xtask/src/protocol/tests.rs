@@ -55,6 +55,7 @@ fn temporary_workspace() -> TempDir {
         ".github",
         "docs",
         "model",
+        "model/maintenance",
         "model/namespace",
         "model/receipts",
         "model/scheduling",
@@ -131,6 +132,18 @@ fn temporary_workspace() -> TempDir {
         (
             "model/receipts/README.md",
             include_str!("../../../model/receipts/README.md"),
+        ),
+        (
+            "model/SteadQMaintenance.tla",
+            include_str!("../../../model/SteadQMaintenance.tla"),
+        ),
+        (
+            "model/maintenance/SteadQMaintenance.cfg",
+            include_str!("../../../model/maintenance/SteadQMaintenance.cfg"),
+        ),
+        (
+            "model/maintenance/README.md",
+            include_str!("../../../model/maintenance/README.md"),
         ),
         (
             CORE_RUST,

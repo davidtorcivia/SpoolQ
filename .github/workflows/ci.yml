@@ -160,6 +160,8 @@ jobs:
         run: java -cp /tmp/tla2tools.jar tlc2.TLC -config model/scheduling/SteadQScheduling.cfg model/SteadQScheduling.tla -workers auto
       - name: TLC receipt evidence model checking
         run: java -cp /tmp/tla2tools.jar tlc2.TLC -config model/receipts/SteadQReceipts.cfg model/SteadQReceipts.tla -workers auto
+      - name: TLC maintenance progress model checking
+        run: java -cp /tmp/tla2tools.jar tlc2.TLC -config model/maintenance/SteadQMaintenance.cfg model/SteadQMaintenance.tla -workers auto
 
   # Nightly lane: release-mode extended tests and benchmarks
   nightly:
