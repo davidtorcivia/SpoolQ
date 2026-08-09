@@ -228,6 +228,8 @@ pub(crate) struct RecoveryCursor {
     #[serde(default)]
     pub(crate) hierarchy_retries: Vec<RecoveryHierarchyRetry>,
     #[serde(default)]
+    pub(crate) hierarchy_retry_frontiers: Vec<RecoveryHierarchyRetry>,
+    #[serde(default)]
     pub(crate) hierarchy_retry_overflow: Vec<RecoveryPhase>,
 }
 

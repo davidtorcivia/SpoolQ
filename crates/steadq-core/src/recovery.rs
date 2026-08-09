@@ -179,6 +179,15 @@ fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
             .hierarchy_retries
             .windows(2)
             .all(|pair| pair[0] < pair[1])
+        && cursor.hierarchy_retry_frontiers.len() <= 5
+        && cursor
+            .hierarchy_retry_frontiers
+            .iter()
+            .all(retry_depth_is_valid)
+        && cursor
+            .hierarchy_retry_frontiers
+            .windows(2)
+            .all(|pair| pair[0].phase < pair[1].phase)
         && cursor
             .hierarchy_retry_overflow
             .windows(2)
@@ -695,6 +704,7 @@ impl Queue {
                     path,
                     &format!("directory budget clock unavailable during {op}: {error}"),
                 );
+                stats.budget_exhausted = true;
                 true
             }
             RecoveryDirectoryError::Io(error) => {
@@ -787,14 +797,10 @@ impl Queue {
         }
     }
 
-    fn retry_hierarchy_directories(
+    fn prepare_hierarchy_retry_phase(
         &mut self,
         phase: RecoveryPhase,
-        phase_root_fd: std::os::unix::io::RawFd,
-        scan: &mut RecoveryScanContext<'_>,
-        stats: &mut RecoveryStats,
-        deadline_mono: u64,
-    ) -> bool {
+    ) -> Option<RecoveryHierarchyRetry> {
         if let Ok(index) = self
             .recovery_cursor
             .hierarchy_retry_overflow
@@ -803,14 +809,82 @@ impl Queue {
             self.recovery_cursor.hierarchy_retry_overflow.remove(index);
             self.clear_phase_cursor(phase);
         }
+        self.next_hierarchy_retry(phase)
+    }
+
+    fn next_hierarchy_retry(&self, phase: RecoveryPhase) -> Option<RecoveryHierarchyRetry> {
         let retries = self
             .recovery_cursor
             .hierarchy_retries
             .iter()
             .filter(|retry| retry.phase == phase)
-            .cloned()
             .collect::<Vec<_>>();
-        for retry in retries {
+        let first = (*retries.first()?).clone();
+        let Some(frontier) = self
+            .recovery_cursor
+            .hierarchy_retry_frontiers
+            .iter()
+            .find(|frontier| frontier.phase == phase)
+        else {
+            return Some(first);
+        };
+        retries
+            .into_iter()
+            .find(|retry| *retry > frontier)
+            .cloned()
+            .or(Some(first))
+    }
+
+    fn advance_hierarchy_retry_frontier(&mut self, retry: RecoveryHierarchyRetry) {
+        match self
+            .recovery_cursor
+            .hierarchy_retry_frontiers
+            .binary_search_by_key(&retry.phase, |frontier| frontier.phase)
+        {
+            Ok(index) => self.recovery_cursor.hierarchy_retry_frontiers[index] = retry,
+            Err(index) => self
+                .recovery_cursor
+                .hierarchy_retry_frontiers
+                .insert(index, retry),
+        }
+    }
+
+    fn retry_one_hierarchy_directory(
+        &mut self,
+        phase: RecoveryPhase,
+        retry: Option<RecoveryHierarchyRetry>,
+        phase_root_fd: std::os::unix::io::RawFd,
+        scan: &mut RecoveryScanContext<'_>,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) -> bool {
+        let Some(retry) = retry else {
+            self.recovery_cursor
+                .hierarchy_retry_frontiers
+                .retain(|frontier| frontier.phase != phase);
+            return false;
+        };
+        match Self::budget_time_exceeded(deadline_mono) {
+            Ok(true) => {
+                stats.budget_exhausted = true;
+                return true;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                Self::block_phase(
+                    stats,
+                    "clock_monotonic",
+                    "/",
+                    &format!("recovery retry budget clock unavailable: {error}"),
+                );
+                stats.budget_exhausted = true;
+                return true;
+            }
+        }
+        let mut current = None::<OwnedFd>;
+        let mut failure = None;
+        let mut absent = false;
+        for component in &retry.components {
             match Self::budget_time_exceeded(deadline_mono) {
                 Ok(true) => {
                     stats.budget_exhausted = true;
@@ -824,92 +898,86 @@ impl Queue {
                         "/",
                         &format!("recovery retry budget clock unavailable: {error}"),
                     );
+                    stats.budget_exhausted = true;
                     return true;
                 }
             }
-            let mut current = None::<OwnedFd>;
-            let mut failure = None;
-            let mut absent = false;
-            for component in &retry.components {
-                match Self::budget_time_exceeded(deadline_mono) {
-                    Ok(true) => {
-                        stats.budget_exhausted = true;
-                        return true;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        Self::block_phase(
-                            stats,
-                            "clock_monotonic",
-                            "/",
-                            &format!("recovery retry budget clock unavailable: {error}"),
-                        );
-                        return true;
-                    }
+            let parent_fd = current
+                .as_ref()
+                .map_or(phase_root_fd, std::os::fd::AsRawFd::as_raw_fd);
+            match fs::open_directory(parent_fd, component) {
+                Ok(directory) => current = Some(directory),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    absent = true;
+                    break;
                 }
-                let parent_fd = current
-                    .as_ref()
-                    .map_or(phase_root_fd, std::os::fd::AsRawFd::as_raw_fd);
-                match fs::open_directory(parent_fd, component) {
-                    Ok(directory) => current = Some(directory),
-                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                        absent = true;
-                        break;
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
                 }
             }
-            if let Some(error) = failure {
-                stats.scan_skips += 1;
-                Self::block_phase(
+        }
+        if let Some(error) = failure {
+            stats.scan_skips += 1;
+            Self::block_phase(
+                stats,
+                "hierarchy_retry_open",
+                &retry
+                    .components
+                    .iter()
+                    .map(|component| steadq_names::hex_encode(component.as_bytes()))
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                &error.to_string(),
+            );
+            self.advance_hierarchy_retry_frontier(retry);
+            return false;
+        }
+
+        if !absent && retry.kind == RecoveryHierarchyRetryKind::Enumerate {
+            let directory = current
+                .as_ref()
+                .expect("validated retry paths contain at least one component");
+            if let Err(error) = read_recovery_directory(
+                directory.as_raw_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
+                if Self::record_directory_error(
                     stats,
-                    "hierarchy_retry_open",
+                    "hierarchy_retry_read",
                     &retry
                         .components
                         .iter()
                         .map(|component| steadq_names::hex_encode(component.as_bytes()))
                         .collect::<Vec<_>>()
                         .join("/"),
-                    &error.to_string(),
-                );
-                continue;
-            }
-
-            if !absent && retry.kind == RecoveryHierarchyRetryKind::Enumerate {
-                let directory = current
-                    .as_ref()
-                    .expect("validated retry paths contain at least one component");
-                if let Err(error) = read_recovery_directory(
-                    directory.as_raw_fd(),
-                    deadline_mono,
-                    scan.budget,
-                    scan.stats,
+                    &error,
                 ) {
-                    if Self::record_directory_error(
-                        stats,
-                        "hierarchy_retry_read",
-                        &retry
-                            .components
-                            .iter()
-                            .map(|component| steadq_names::hex_encode(component.as_bytes()))
-                            .collect::<Vec<_>>()
-                            .join("/"),
-                        &error,
-                    ) {
-                        return true;
-                    }
-                    stats.scan_skips += 1;
-                    continue;
+                    return true;
                 }
+                stats.scan_skips += 1;
+                self.advance_hierarchy_retry_frontier(retry);
+                return false;
             }
+        }
 
+        self.recovery_cursor
+            .hierarchy_retries
+            .retain(|candidate| candidate != &retry);
+        self.clear_phase_cursor(phase);
+        if self
+            .recovery_cursor
+            .hierarchy_retries
+            .iter()
+            .any(|candidate| candidate.phase == phase)
+        {
+            self.advance_hierarchy_retry_frontier(retry);
+        } else {
             self.recovery_cursor
-                .hierarchy_retries
-                .retain(|candidate| candidate != &retry);
-            self.clear_phase_cursor(phase);
+                .hierarchy_retry_frontiers
+                .retain(|frontier| frontier.phase != phase);
         }
         false
     }
@@ -947,15 +1015,7 @@ impl Queue {
             }
         };
         boot_dirs.sort();
-        if self.retry_hierarchy_directories(
-            RecoveryPhase::ReapLeases,
-            leased_fd.as_raw_fd(),
-            scan,
-            stats,
-            deadline_mono,
-        ) {
-            return;
-        }
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::ReapLeases);
 
         for boot_dir_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.reap_leases {
@@ -1423,6 +1483,16 @@ impl Queue {
                 }
             }
         }
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::ReapLeases,
+            hierarchy_retry,
+            leased_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.reap_leases = None;
     }
 
@@ -1548,15 +1618,7 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
-        if self.retry_hierarchy_directories(
-            RecoveryPhase::PromoteDelayed,
-            delayed_fd.as_raw_fd(),
-            scan,
-            stats,
-            deadline_mono,
-        ) {
-            return;
-        }
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::PromoteDelayed);
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -1877,6 +1939,16 @@ impl Queue {
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::PromoteDelayed,
+            hierarchy_retry,
+            delayed_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.promote_delayed = None;
     }
 
@@ -1910,15 +1982,7 @@ impl Queue {
             }
         };
         boot_dirs.sort();
-        if self.retry_hierarchy_directories(
-            RecoveryPhase::CleanupTemp,
-            tmp_fd.as_raw_fd(),
-            scan,
-            stats,
-            deadline_mono,
-        ) {
-            return;
-        }
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::CleanupTemp);
 
         for boot_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
@@ -2137,6 +2201,16 @@ impl Queue {
                 }
             }
         }
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::CleanupTemp,
+            hierarchy_retry,
+            tmp_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.cleanup_temp = None;
     }
 
@@ -2192,15 +2266,7 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
-        if self.retry_hierarchy_directories(
-            RecoveryPhase::CompactReceipts,
-            receipts_fd.as_raw_fd(),
-            scan,
-            stats,
-            deadline_mono,
-        ) {
-            return;
-        }
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::CompactReceipts);
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -2543,6 +2609,16 @@ impl Queue {
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            hierarchy_retry,
+            receipts_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.compact_receipts = None;
     }
 
@@ -2580,15 +2656,7 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
-        if self.retry_hierarchy_directories(
-            RecoveryPhase::DeleteReceipts,
-            receipts_fd.as_raw_fd(),
-            scan,
-            stats,
-            deadline_mono,
-        ) {
-            return;
-        }
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::DeleteReceipts);
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -2927,6 +2995,16 @@ impl Queue {
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::DeleteReceipts,
+            hierarchy_retry,
+            receipts_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.delete_receipts = None;
     }
 }
@@ -3023,6 +3101,18 @@ mod tests {
             u64::MAX,
         );
         stats
+    }
+
+    fn retry_next_hierarchy_directory(
+        queue: &mut Queue,
+        phase: RecoveryPhase,
+        phase_root_fd: std::os::unix::io::RawFd,
+        scan: &mut RecoveryScanContext<'_>,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) -> bool {
+        let retry = queue.next_hierarchy_retry(phase);
+        queue.retry_one_hierarchy_directory(phase, retry, phase_root_fd, scan, stats, deadline_mono)
     }
 
     fn valid_cursor_record(queue: &Queue) -> RecoveryCursorRecord {
@@ -3172,7 +3262,8 @@ mod tests {
             "directory",
             &RecoveryDirectoryError::Clock(io::Error::from_raw_os_error(libc::EIO)),
         ));
-        assert!(!clock_failed.budget_exhausted);
+        assert!(clock_failed.budget_exhausted);
+        assert!(!Queue::has_recovery_budget(&clock_failed));
         assert!(clock_failed.phase_blocked);
         assert_eq!(clock_failed.errors.len(), 1);
         assert_eq!(clock_failed.errors[0].operation, "clock_monotonic");
@@ -3543,6 +3634,7 @@ mod tests {
             compact_receipts: Some(valid_three.clone()),
             delete_receipts: Some(valid_three),
             hierarchy_retries: Vec::new(),
+            hierarchy_retry_frontiers: Vec::new(),
             hierarchy_retry_overflow: Vec::new(),
         };
         assert!(cursor_is_valid(&valid));
@@ -3700,6 +3792,30 @@ mod tests {
             ..Default::default()
         };
         assert!(cursor_is_valid(&ordered_overflow));
+
+        let frontier = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Enumerate,
+            components: vec!["0000000000000000".into(), "0000".into()],
+        };
+        let ordered_frontiers = RecoveryCursor {
+            hierarchy_retry_frontiers: vec![
+                RecoveryHierarchyRetry {
+                    phase: RecoveryPhase::ReapLeases,
+                    kind: RecoveryHierarchyRetryKind::Open,
+                    components: vec!["00000000-0000-0000-0000-000000000000".into()],
+                },
+                frontier.clone(),
+            ],
+            ..Default::default()
+        };
+        assert!(cursor_is_valid(&ordered_frontiers));
+
+        let duplicate_frontiers = RecoveryCursor {
+            hierarchy_retry_frontiers: vec![frontier.clone(), frontier],
+            ..Default::default()
+        };
+        assert!(!cursor_is_valid(&duplicate_frontiers));
     }
 
     #[test]
@@ -3770,6 +3886,15 @@ mod tests {
             RecoveryPhase::CompactReceipts,
             RecoveryPhase::DeleteReceipts,
         ];
+        queue.recovery_cursor.hierarchy_retry_frontiers = vec![RecoveryHierarchyRetry {
+            phase: RecoveryPhase::ReapLeases,
+            kind: RecoveryHierarchyRetryKind::Enumerate,
+            components: vec![
+                "00000000-0000-0000-0000-00000000003f".into(),
+                "0000000000000000".into(),
+                "0000".into(),
+            ],
+        }];
         queue.persist_recovery_cursor().unwrap();
     }
 
@@ -3801,7 +3926,8 @@ mod tests {
 
         fs::fault::reset();
         fs::fault::inject_errno("open_directory", 2, libc::EIO);
-        assert!(!queue.retry_hierarchy_directories(
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
             RecoveryPhase::CompactReceipts,
             receipts.as_raw_fd(),
             &mut scan,
@@ -3818,7 +3944,8 @@ mod tests {
             .any(|error| error.operation == "hierarchy_retry_read"));
 
         let mut stats = RecoveryStats::default();
-        assert!(!queue.retry_hierarchy_directories(
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
             RecoveryPhase::CompactReceipts,
             receipts.as_raw_fd(),
             &mut scan,
@@ -3862,7 +3989,16 @@ mod tests {
         };
         let mut stats = RecoveryStats::default();
 
-        assert!(!queue.retry_hierarchy_directories(
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
             RecoveryPhase::CompactReceipts,
             receipts.as_raw_fd(),
             &mut scan,
@@ -3895,7 +4031,8 @@ mod tests {
         };
         let mut stats = RecoveryStats::default();
 
-        assert!(queue.retry_hierarchy_directories(
+        assert!(retry_next_hierarchy_directory(
+            &mut queue,
             RecoveryPhase::CompactReceipts,
             receipts.as_raw_fd(),
             &mut scan,
@@ -3908,7 +4045,8 @@ mod tests {
         let mut stats = RecoveryStats::default();
         fs::fault::reset();
         fs::fault::inject("clock_monotonic_ns", 1);
-        assert!(queue.retry_hierarchy_directories(
+        assert!(retry_next_hierarchy_directory(
+            &mut queue,
             RecoveryPhase::CompactReceipts,
             receipts.as_raw_fd(),
             &mut scan,
@@ -3917,11 +4055,169 @@ mod tests {
         ));
         fs::fault::reset();
         assert!(stats.phase_blocked);
+        assert!(stats.budget_exhausted);
+        assert!(!Queue::has_recovery_budget(&stats));
         assert!(stats
             .errors
             .iter()
             .any(|error| error.operation == "clock_monotonic"));
         assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+    }
+
+    #[test]
+    fn retry_frontier_rotates_persistently_across_failures() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        for bucket in 0..3 {
+            symlink(
+                tmp.path(),
+                tmp.path().join(format!("receipts/{bucket:016x}")),
+            )
+            .unwrap();
+            assert_eq!(
+                queue.remember_hierarchy_retry(
+                    RecoveryPhase::CompactReceipts,
+                    RecoveryHierarchyRetryKind::Open,
+                    &[format!("{bucket:016x}").as_bytes()],
+                ),
+                RememberHierarchyRetry::Exact
+            );
+        }
+        let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+        let budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &budget,
+            stats: &mut scan_stats,
+        };
+
+        let mut stats = RecoveryStats::default();
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers[0].components,
+            vec!["0000000000000000"]
+        );
+        queue.persist_recovery_cursor().unwrap();
+        drop(receipts);
+        drop(queue);
+
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let receipts = fs::open_directory(reopened.root_fd(), "receipts").unwrap();
+        for expected in ["0000000000000001", "0000000000000002", "0000000000000000"] {
+            let mut stats = RecoveryStats::default();
+            assert!(!retry_next_hierarchy_directory(
+                &mut reopened,
+                RecoveryPhase::CompactReceipts,
+                receipts.as_raw_fd(),
+                &mut scan,
+                &mut stats,
+                u64::MAX,
+            ));
+            assert_eq!(
+                reopened.recovery_cursor.hierarchy_retry_frontiers[0].components,
+                vec![expected]
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_retry_updates_only_its_phase_frontier() {
+        let (_tmp, mut queue) = create_test_queue();
+        let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+        let budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &budget,
+            stats: &mut scan_stats,
+        };
+        let reap_frontier = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::ReapLeases,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["00000000-0000-0000-0000-000000000000".into()],
+        };
+        let compact_frontier = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["000000000000000f".into()],
+        };
+        queue.recovery_cursor.hierarchy_retry_frontiers =
+            vec![reap_frontier.clone(), compact_frontier];
+
+        let mut stats = RecoveryStats::default();
+        assert!(!queue.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            None,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers,
+            vec![reap_frontier.clone()]
+        );
+
+        let first = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["0000000000000000".into()],
+        };
+        let second = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["0000000000000001".into()],
+        };
+        queue.recovery_cursor.hierarchy_retries = vec![first.clone(), second.clone()];
+        assert!(!queue.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            Some(first.clone()),
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries,
+            vec![second.clone()]
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers,
+            vec![reap_frontier.clone(), first]
+        );
+
+        let other_phase_retry = reap_frontier.clone();
+        queue.recovery_cursor.hierarchy_retries = vec![other_phase_retry.clone(), second.clone()];
+        assert!(!queue.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            Some(second),
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries,
+            vec![other_phase_retry]
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers,
+            vec![reap_frontier]
+        );
     }
 
     #[test]
@@ -3980,9 +4276,14 @@ mod tests {
         value
             .as_object_mut()
             .unwrap()
+            .remove("hierarchy_retry_frontiers");
+        value
+            .as_object_mut()
+            .unwrap()
             .remove("hierarchy_retry_overflow");
         let decoded: RecoveryCursor = serde_json::from_value(value).unwrap();
         assert!(decoded.hierarchy_retries.is_empty());
+        assert!(decoded.hierarchy_retry_frontiers.is_empty());
         assert!(decoded.hierarchy_retry_overflow.is_empty());
 
         let mut cursor = RecoveryCursor::default();
