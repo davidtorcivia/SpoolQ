@@ -425,45 +425,98 @@ impl Queue {
                 "recovery cursor exceeds maximum encoded size".into(),
             ));
         }
-        let control_fd = fs::open_directory(self.root_fd(), "control")
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        let control_fd = fs::open_directory(self.root_fd(), "control").map_err(|error| {
+            Error::IoFailure(format!(
+                "recovery cursor publication not committed at phase=ControlOpen: {error}"
+            ))
+        })?;
         let temp_name = format!(
             ".recovery-cursor.{}.tmp",
-            steadq_names::hex_encode(
-                &fs::random_128bit().map_err(|error| Error::IoFailure(error.to_string()))?
-            )
+            steadq_names::hex_encode(&fs::random_128bit().map_err(|error| {
+                Error::IoFailure(format!(
+                    "recovery cursor publication not committed at phase=TempName: {error}"
+                ))
+            })?)
         );
-        let temp_fd = fs::create_exclusive(control_fd.as_raw_fd(), &temp_name, 0o600)
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
-        if let Err(error) = fs::write_all(temp_fd.as_raw_fd(), &bytes)
-            .and_then(|()| fs::fsync(temp_fd.as_raw_fd()))
-            .and_then(|()| {
-                fs::durable_move_replace(
-                    control_fd.as_raw_fd(),
-                    &temp_name,
-                    control_fd.as_raw_fd(),
-                    RECOVERY_CURSOR_FILE,
-                )
-            })
-        {
-            match fs::unlinkat(control_fd.as_raw_fd(), &temp_name) {
-                Ok(()) => {
-                    if let Err(cleanup_error) = fs::fsync_dir_fd(control_fd.as_raw_fd()) {
-                        return Err(Error::IoFailure(format!(
-                            "{error}; cleanup durability is unknown for stale recovery cursor temporary file control/{temp_name}: {cleanup_error}"
-                        )));
-                    }
-                }
-                Err(cleanup_error) if cursor_file_is_absent(&cleanup_error) => {}
-                Err(cleanup_error) => {
-                    return Err(Error::IoFailure(format!(
-                        "{error}; stale recovery cursor temporary file requires later cleanup at control/{temp_name}: {cleanup_error}"
-                    )));
+        let temp_fd =
+            fs::create_exclusive(control_fd.as_raw_fd(), &temp_name, 0o600).map_err(|error| {
+                Error::IoFailure(format!(
+                    "recovery cursor publication not committed at phase=TempCreate: {error}"
+                ))
+            })?;
+        if let Err(error) = fs::write_all(temp_fd.as_raw_fd(), &bytes) {
+            return Err(Self::cleanup_cursor_temporary_file(
+                control_fd.as_raw_fd(),
+                &temp_name,
+                format!("recovery cursor publication not committed at phase=TempWrite: {error}"),
+            ));
+        }
+        if let Err(error) = fs::fsync(temp_fd.as_raw_fd()) {
+            return Err(Self::cleanup_cursor_temporary_file(
+                control_fd.as_raw_fd(),
+                &temp_name,
+                format!("recovery cursor publication not committed at phase=TempFsync: {error}"),
+            ));
+        }
+
+        match replace_verified(
+            control_fd.as_raw_fd(),
+            &temp_name,
+            control_fd.as_raw_fd(),
+            RECOVERY_CURSOR_FILE,
+            None,
+            MoveActor::Recovery,
+        ) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let outcome_unknown = failure.is_outcome_unknown();
+                let failure = Self::cursor_replace_failure(failure);
+                if outcome_unknown {
+                    Err(Error::IoFailure(failure))
+                } else {
+                    Err(Self::cleanup_cursor_temporary_file(
+                        control_fd.as_raw_fd(),
+                        &temp_name,
+                        failure,
+                    ))
                 }
             }
-            return Err(Error::IoFailure(error.to_string()));
         }
-        Ok(())
+    }
+
+    fn cursor_replace_failure(failure: ReplaceFailure) -> String {
+        match failure {
+            ReplaceFailure::NotCommitted { phase, source } => format!(
+                "recovery cursor replacement not committed at phase={phase:?}: {source}"
+            ),
+            ReplaceFailure::OutcomeUnknown { phase, source } => format!(
+                "recovery cursor replacement outcome unknown at phase={phase:?}: {source}"
+            ),
+            ReplaceFailure::SourceMissing => {
+                "recovery cursor replacement not committed at phase=Rename: source is missing"
+                    .into()
+            }
+            ReplaceFailure::DestinationChanged => {
+                "recovery cursor replacement not committed at phase=DestinationIdentity: destination identity changed"
+                    .into()
+            }
+        }
+    }
+
+    fn cleanup_cursor_temporary_file(
+        control_fd: std::os::unix::io::RawFd,
+        temp_name: &str,
+        primary_failure: String,
+    ) -> Error {
+        match unlink_verified(control_fd, temp_name, MoveActor::Recovery) {
+            Ok(()) | Err(UnlinkFailure::SourceMissing) => Error::IoFailure(primary_failure),
+            Err(UnlinkFailure::NotCommitted { phase, source }) => Error::IoFailure(format!(
+                "{primary_failure}; stale recovery cursor temporary file requires later cleanup at control/{temp_name}: cleanup not committed at phase={phase:?}: {source}"
+            )),
+            Err(UnlinkFailure::OutcomeUnknown { phase, source }) => Error::IoFailure(format!(
+                "{primary_failure}; cleanup durability is unknown for stale recovery cursor temporary file control/{temp_name}: phase={phase:?}: {source}"
+            )),
+        }
     }
 
     /// Run one bounded recovery pass.
@@ -5621,18 +5674,15 @@ mod tests {
 
     #[test]
     fn recovery_cursor_publication_failures_reopen_old_or_complete_new_record() {
-        for (fault_name, fault_count, expects_new) in [
-            ("open_directory", 1, false),
-            ("get_random", 1, false),
-            ("openat", 1, false),
-            ("write_all", 1, false),
-            ("fsync", 1, false),
-            ("durable_move_replace", 1, false),
-            ("renameat", 1, false),
-            ("fstat", 1, true),
-            ("fstat", 2, true),
-            ("fsync_dir_fd", 1, true),
-            ("fsync", 2, true),
+        for (fault_name, fault_count, expected_phase, expects_new) in [
+            ("open_directory", 1, "phase=ControlOpen", false),
+            ("get_random", 1, "phase=TempName", false),
+            ("openat", 1, "phase=TempCreate", false),
+            ("write_all", 1, "phase=TempWrite", false),
+            ("fsync", 1, "phase=TempFsync", false),
+            ("renameat", 1, "phase=Rename", false),
+            ("fsync_dir_fd", 1, "phase=DestinationFsync", true),
+            ("fsync", 2, "phase=DestinationFsync", true),
         ] {
             let (tmp, mut queue) = create_test_queue();
             let old_cursor = RecoveryCursor {
@@ -5661,6 +5711,10 @@ mod tests {
             fs::fault::inject_errno(fault_name, fault_count, libc::EIO);
             let error = queue.persist_recovery_cursor().unwrap_err();
             assert!(matches!(error, Error::IoFailure(_)));
+            assert!(
+                error.to_string().contains(expected_phase),
+                "fault={fault_name} count={fault_count}: {error}"
+            );
             if expects_new {
                 assert!(
                     !error.to_string().contains("stale recovery cursor"),
@@ -5690,6 +5744,17 @@ mod tests {
                 .count();
             assert_eq!(stale_temps, 0, "fault={fault_name} count={fault_count}");
         }
+    }
+
+    #[test]
+    fn recovery_cursor_publication_does_not_use_legacy_replace_helper() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.recovery_cursor.phase = RecoveryPhase::DeleteReceipts;
+        fs::fault::reset();
+        fs::fault::inject_errno("durable_move_replace", 1, libc::EIO);
+        queue.persist_recovery_cursor().unwrap();
+        assert_eq!(fs::fault::call_count("durable_move_replace"), 0);
+        fs::fault::reset();
     }
 
     #[test]
