@@ -16,7 +16,7 @@
       "linearization": "publish_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe destination: observed = committed, absent = not committed",
+      "resolver_probe_topology": "destination_only",
       "qualification": "none"
     },
     {
@@ -35,7 +35,7 @@
       "linearization": "publish_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe destination: observed = committed, absent = not committed",
+      "resolver_probe_topology": "destination_only",
       "qualification": "none"
     },
     {
@@ -54,7 +54,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both: destination observed = committed, source only = not committed",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "none"
     },
     {
@@ -73,7 +73,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both directories",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "none"
     },
     {
@@ -92,7 +92,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "none"
     },
     {
@@ -110,7 +110,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe destination: new generation observed = renewed, old gen observed = lease lost",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "none"
     },
     {
@@ -129,7 +129,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe receipt buckets by exact name",
+      "resolver_probe_topology": "receipt_candidates_and_source",
       "qualification": "none"
     },
     {
@@ -148,7 +148,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "none"
     },
     {
@@ -167,7 +167,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "none"
     },
     {
@@ -186,7 +186,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "none"
     },
     {
@@ -205,7 +205,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "attempts_remaining"
     },
     {
@@ -224,7 +224,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "attempts_exhausted"
     },
     {
@@ -243,7 +243,7 @@
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
-      "resolution_behavior": "probe both",
+      "resolver_probe_topology": "source_and_destination",
       "qualification": "raw_bytes_preserved"
     }
   ],
