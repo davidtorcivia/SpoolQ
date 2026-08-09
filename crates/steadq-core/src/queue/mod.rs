@@ -5,7 +5,7 @@ pub mod layout;
 pub mod verified;
 
 use std::io;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use steadq_format::cbor::ExtensionHeader;
@@ -585,14 +585,14 @@ impl Queue {
             // Sync the parent directory so the root entry persists
             if let Some(parent) = root.parent() {
                 let parent_fd = fs::open_dir_absolute(parent)?;
-                fs::fsync_dir_fd(parent_fd.as_raw_fd())?;
+                fs::fsync_dir_fd(parent_fd.as_fd())?;
             }
         }
 
         let root_fd = fs::open_dir_absolute(root)?;
 
         // R2-B01: Refuse to overwrite an existing queue.
-        let format_exists = fs::fstatat(root_fd.as_raw_fd(), "FORMAT").is_ok();
+        let format_exists = fs::fstatat(root_fd.as_fd(), "FORMAT").is_ok();
         if format_exists {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -604,38 +604,28 @@ impl Queue {
         // P1-08: If .initializing already exists but FORMAT is absent, the previous
         // init was interrupted by a crash. Safe to clean up and retry since no FORMAT
         // means no queue identity was committed.
-        let _init_marker = match fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600) {
+        let _init_marker = match fs::create_exclusive(root_fd.as_fd(), ".initializing", 0o600) {
             Ok(fd) => fd,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 // .initializing exists. If FORMAT is absent, this is a stale marker
                 // from a crashed init. Safe to remove and retry.
-                if !format_exists {
-                    let _ = fs::unlinkat(root_fd.as_raw_fd(), ".initializing");
-                    // Retry the exclusive create.
-                    fs::create_exclusive(root_fd.as_raw_fd(), ".initializing", 0o600).map_err(
-                        |_| {
-                            io::Error::new(
-                                io::ErrorKind::AlreadyExists,
-                                "could not acquire init lock after cleaning stale marker",
-                            )
-                        },
-                    )?
-                } else {
-                    return Err(io::Error::new(
+                fs::unlinkat(root_fd.as_fd(), ".initializing")?;
+                fs::create_exclusive(root_fd.as_fd(), ".initializing", 0o600).map_err(|_| {
+                    io::Error::new(
                         io::ErrorKind::AlreadyExists,
-                        "queue already initialized; use open() to access an existing queue",
-                    ));
-                }
+                        "could not acquire init lock after cleaning stale marker",
+                    )
+                })?
             }
             Err(e) => return Err(e),
         };
 
         // R2-B01: Use RAII guard to clean up the init marker on any failure.
-        struct InitGuard {
-            root_fd: std::os::unix::io::RawFd,
+        struct InitGuard<'fd> {
+            root_fd: BorrowedFd<'fd>,
             armed: bool,
         }
-        impl Drop for InitGuard {
+        impl Drop for InitGuard<'_> {
             fn drop(&mut self) {
                 if self.armed {
                     // Remove the marker so a failed init can be retried
@@ -644,32 +634,22 @@ impl Queue {
             }
         }
         let mut init_guard = InitGuard {
-            root_fd: root_fd.as_raw_fd(),
+            root_fd: root_fd.as_fd(),
             armed: true,
         };
 
         // R2-B01: Create control/ early so we can hold the maintenance lock
         // with RAII (no mem::forget leak).
-        fs::mkdirat_eexist_ok(root_fd.as_raw_fd(), "control", 0o700)?;
-        let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
-        fs::create_exclusive(control_fd.as_raw_fd(), "maintenance.lock", 0o600).or_else(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                fs::openat(
-                    control_fd.as_raw_fd(),
-                    "maintenance.lock",
-                    libc::O_RDWR,
-                    0o600,
-                )
-            } else {
-                Err(e)
-            }
-        })?;
-        let lock_fd = fs::openat(
-            control_fd.as_raw_fd(),
-            "maintenance.lock",
-            libc::O_RDWR,
-            0o600,
-        )?;
+        fs::mkdirat_eexist_ok(root_fd.as_fd(), "control", 0o700)?;
+        let control_fd = fs::open_directory(root_fd.as_fd(), "control")?;
+        let lock_fd =
+            fs::create_exclusive(control_fd.as_fd(), "maintenance.lock", 0o600).or_else(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    fs::openat(control_fd.as_fd(), "maintenance.lock", libc::O_RDWR, 0o600)
+                } else {
+                    Err(e)
+                }
+            })?;
         let locked = fs::try_ofd_write_lock(lock_fd.as_fd())?;
         if !locked {
             return Err(io::Error::new(
@@ -706,37 +686,36 @@ impl Queue {
             "dead",
             "quarantine",
         ] {
-            fs::mkdirat_eexist_ok(root_fd.as_raw_fd(), dir, 0o700)?;
+            fs::mkdirat_eexist_ok(root_fd.as_fd(), dir, 0o700)?;
         }
         // Sync root after directory creation
-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(root_fd.as_fd())?;
 
         // Create static shard directories under ready/
-        let ready_fd = fs::open_directory(root_fd.as_raw_fd(), "ready")?;
+        let ready_fd = fs::open_directory(root_fd.as_fd(), "ready")?;
         for i in 0..opts.shard_count {
             let shard_name = format!("{i:04x}");
-            fs::mkdirat_eexist_ok(ready_fd.as_raw_fd(), &shard_name, 0o700)?;
+            fs::mkdirat_eexist_ok(ready_fd.as_fd(), &shard_name, 0o700)?;
         }
         // Sync ready/ after shard creation
-        fs::fsync_dir_fd(ready_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(ready_fd.as_fd())?;
         // Sync root
-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(root_fd.as_fd())?;
 
         // Create control lock files
-        let control_fd = fs::open_directory(root_fd.as_raw_fd(), "control")?;
+        let control_fd = fs::open_directory(root_fd.as_fd(), "control")?;
         for lock_file in ["maintenance.lock", "wall-watermark.lock", "recovery.lock"] {
-            let fd =
-                fs::create_exclusive(control_fd.as_raw_fd(), lock_file, 0o600).or_else(|e| {
-                    if e.kind() == io::ErrorKind::AlreadyExists {
-                        fs::openat(control_fd.as_raw_fd(), lock_file, 0o2, 0o600)
-                    } else {
-                        Err(e)
-                    }
-                })?;
+            let fd = fs::create_exclusive(control_fd.as_fd(), lock_file, 0o600).or_else(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    fs::openat(control_fd.as_fd(), lock_file, 0o2, 0o600)
+                } else {
+                    Err(e)
+                }
+            })?;
             fs::fsync(fd.as_fd())?;
         }
-        fs::fsync_dir_fd(control_fd.as_raw_fd())?;
-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(control_fd.as_fd())?;
+        fs::fsync_dir_fd(root_fd.as_fd())?;
 
         // Write initial wall watermark
         let wall_now = created_at;
@@ -755,16 +734,16 @@ impl Queue {
             ".wm.tmp.{}",
             steadq_names::hex_encode(&fs::random_128bit()?)
         );
-        let wm_tmp = fs::create_exclusive(control_fd.as_raw_fd(), &wm_tmp_name, 0o600)?;
+        let wm_tmp = fs::create_exclusive(control_fd.as_fd(), &wm_tmp_name, 0o600)?;
         fs::write_all(wm_tmp.as_fd(), &wm_bytes)?;
         fs::fsync(wm_tmp.as_fd())?;
         fs::renameat(
-            control_fd.as_raw_fd(),
+            control_fd.as_fd(),
             &wm_tmp_name,
-            control_fd.as_raw_fd(),
+            control_fd.as_fd(),
             "wall-watermark",
         )?;
-        fs::fsync_dir_fd(control_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(control_fd.as_fd())?;
 
         // Write FORMAT file
         let format_bytes = format_rec.encode();
@@ -773,21 +752,16 @@ impl Queue {
             ".format.tmp.{}",
             steadq_names::hex_encode(&fs::random_128bit()?)
         );
-        let fmt_tmp = fs::create_exclusive(root_fd.as_raw_fd(), &fmt_tmp_name, 0o600)?;
+        let fmt_tmp = fs::create_exclusive(root_fd.as_fd(), &fmt_tmp_name, 0o600)?;
         fs::write_all(fmt_tmp.as_fd(), &format_bytes)?;
         fs::fsync(fmt_tmp.as_fd())?;
         // R2-B01: Publish FORMAT with RENAME_NOREPLACE so two concurrent
         // initializers cannot overwrite each other.
-        match fs::renameat2_noreplace(
-            root_fd.as_raw_fd(),
-            &fmt_tmp_name,
-            root_fd.as_raw_fd(),
-            "FORMAT",
-        ) {
+        match fs::renameat2_noreplace(root_fd.as_fd(), &fmt_tmp_name, root_fd.as_fd(), "FORMAT") {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 // Another initializer won the race. Clean up our temp and bail.
-                let _ = fs::unlinkat(root_fd.as_raw_fd(), &fmt_tmp_name);
+                let _ = fs::unlinkat(root_fd.as_fd(), &fmt_tmp_name);
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "another initializer published FORMAT first",
@@ -796,15 +770,15 @@ impl Queue {
             Err(e) => return Err(e),
         }
         // C-02: Set FORMAT to read-only before final dir fsync.
-        fs::fchmodat(root_fd.as_raw_fd(), "FORMAT", 0o400)?;
-        fs::fsync_dir_fd(root_fd.as_raw_fd())?;
+        fs::fchmodat(root_fd.as_fd(), "FORMAT", 0o400)?;
+        fs::fsync_dir_fd(root_fd.as_fd())?;
 
         // P1-09: FORMAT is now durably published. All subsequent operations are
         // post-commit cleanup. Their failure does NOT mean init failed - the
         // queue exists and is usable. Log errors but don't fail the API call.
         init_guard.armed = false;
-        let _ = fs::unlinkat(root_fd.as_raw_fd(), ".initializing");
-        let _ = fs::fsync_dir_fd(root_fd.as_raw_fd());
+        let _ = fs::unlinkat(root_fd.as_fd(), ".initializing");
+        let _ = fs::fsync_dir_fd(root_fd.as_fd());
 
         Ok(format_rec)
     }
@@ -815,14 +789,13 @@ impl Queue {
         let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         // B-11: Validate root is a directory
-        let root_stat =
-            fs::fstat(root_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let root_stat = fs::fstat(root_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(Error::QueueCorrupt("root path is not a directory".into()));
         }
 
         // B-11: Read FORMAT through descriptor-relative open, not pathname
-        let format_fd = fs::openat(root_fd.as_raw_fd(), "FORMAT", libc::O_RDONLY, 0)
+        let format_fd = fs::openat(root_fd.as_fd(), "FORMAT", libc::O_RDONLY, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let mut format_bytes = Vec::new();
         {
@@ -882,7 +855,7 @@ impl Queue {
             "quarantine",
             "tmp",
         ] {
-            match fs::fstatat(root_fd.as_raw_fd(), state_dir) {
+            match fs::fstatat(root_fd.as_fd(), state_dir) {
                 Ok(stat) => {
                     if stat.st_dev != root_stat.st_dev {
                         return Err(Error::QueueCorrupt(format!(
@@ -912,7 +885,7 @@ impl Queue {
         let worker_nonce = fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?;
 
         // Acquire shared maintenance lock
-        let maint_fd = fs::openat(root_fd.as_raw_fd(), "control/maintenance.lock", 0o0, 0o600)
+        let maint_fd = fs::openat(root_fd.as_fd(), "control/maintenance.lock", 0o0, 0o600)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let locked =
             fs::try_ofd_read_lock(maint_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -920,7 +893,7 @@ impl Queue {
             return Err(Error::MaintenanceBusy);
         }
         let recovery_cursor =
-            crate::recovery::load_recovery_cursor(root_fd.as_raw_fd(), &format_rec.queue_id)?;
+            crate::recovery::load_recovery_cursor(root_fd.as_fd(), &format_rec.queue_id)?;
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -948,8 +921,8 @@ impl Queue {
         &self.boot_id
     }
 
-    pub fn root_fd(&self) -> RawFd {
-        self.root_fd.as_raw_fd()
+    pub fn root_fd(&self) -> BorrowedFd<'_> {
+        self.root_fd.as_fd()
     }
 
     pub fn is_poisoned(&self) -> bool {
@@ -1042,12 +1015,12 @@ impl Queue {
 
     fn with_wall_watermark_write_lock<T>(
         &self,
-        action: impl FnOnce(RawFd) -> Result<T, Error>,
+        action: impl FnOnce(BorrowedFd<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
+        let control_fd = fs::open_directory(self.root_fd.as_fd(), "control")
             .map_err(|error| Error::IoFailure(error.to_string()))?;
         let lock_fd = fs::openat(
-            control_fd.as_raw_fd(),
+            control_fd.as_fd(),
             "wall-watermark.lock",
             libc::O_RDWR,
             0o600,
@@ -1059,17 +1032,17 @@ impl Queue {
             return Err(Error::MaintenanceBusy);
         }
 
-        action(control_fd.as_raw_fd())
+        action(control_fd.as_fd())
     }
 
     /// Read the wall watermark record from control/wall-watermark.
     /// Returns Ok on success, Err(NotFound) when no watermark has been written yet,
     /// Err(Corrupt/Truncated) on digest or size mismatch, Err(Io) on I/O failure.
     fn read_wall_watermark(&self) -> Result<steadq_format::WatermarkRecord, WatermarkReadError> {
-        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
+        let control_fd = fs::open_directory(self.root_fd.as_fd(), "control")
             .map_err(|e| WatermarkReadError::Io(e.to_string()))?;
         let data = match fs::openat(
-            control_fd.as_raw_fd(),
+            control_fd.as_fd(),
             "wall-watermark",
             watermark_open_flags(),
             0,
@@ -1082,8 +1055,7 @@ impl Queue {
                 return Err(WatermarkReadError::Io(e.to_string()));
             }
         };
-        let stat =
-            fs::fstat(data.as_raw_fd()).map_err(|e| WatermarkReadError::Io(e.to_string()))?;
+        let stat = fs::fstat(data.as_fd()).map_err(|e| WatermarkReadError::Io(e.to_string()))?;
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
             return Err(WatermarkReadError::Corrupt(
                 "watermark is not a singly-linked regular file".into(),
@@ -1119,7 +1091,7 @@ impl Queue {
     fn advance_wall_watermark_locked(
         &self,
         observed: WallFloor,
-        control_fd: RawFd,
+        control_fd: BorrowedFd<'_>,
     ) -> Result<WallFloor, Error> {
         let observed_bucket =
             steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
@@ -1416,11 +1388,11 @@ impl Queue {
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // Open destination directory
-        let dest_fd = open_relative(self.root_fd.as_raw_fd(), dest_dir_relative)
+        let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // Try O_TMPFILE path first
-        match fs::open_tmpfile(dest_fd.as_raw_fd()) {
+        match fs::open_tmpfile(dest_fd.as_fd()) {
             Ok(tmp_fd) => {
                 // Write header (zeroed placeholder)
                 let header_bytes = header
@@ -1435,18 +1407,14 @@ impl Queue {
                 fs::fsync(tmp_fd.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
                 // Publish via linkat - C-09: capture errors for capability classification
-                let link1 =
-                    fs::linkat_empty_path(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
+                let link1 = fs::linkat_empty_path(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name);
                 if link1.is_ok() {
-                    fs::fsync_dir_fd(dest_fd.as_raw_fd())
-                        .map_err(PublishError::classify_post_fsync)?;
+                    fs::fsync_dir_fd(dest_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
                     return Ok(());
                 }
-                let link2 =
-                    fs::linkat_proc_self_fd(tmp_fd.as_raw_fd(), dest_fd.as_raw_fd(), dest_name);
+                let link2 = fs::linkat_proc_self_fd(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name);
                 if link2.is_ok() {
-                    fs::fsync_dir_fd(dest_fd.as_raw_fd())
-                        .map_err(PublishError::classify_post_fsync)?;
+                    fs::fsync_dir_fd(dest_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
                     return Ok(());
                 }
 
@@ -1487,7 +1455,7 @@ impl Queue {
         self.ensure_dir(&tmp_dir)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
-        let tmp_dir_fd = open_relative(self.root_fd.as_raw_fd(), &tmp_dir)
+        let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_dir)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // Create temp file name
@@ -1497,16 +1465,16 @@ impl Queue {
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
         let temp_name = temp_filename(boottime, &random);
 
-        let tmp_file = fs::create_exclusive(tmp_dir_fd.as_raw_fd(), &temp_name, 0o600)
+        let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // C-10: RAII guard to unlink temp file on early return
-        struct TempGuard<'a> {
-            dir_fd: std::os::unix::io::RawFd,
+        struct TempGuard<'a, 'fd> {
+            dir_fd: BorrowedFd<'fd>,
             name: &'a str,
             armed: bool,
         }
-        impl<'a> Drop for TempGuard<'a> {
+        impl Drop for TempGuard<'_, '_> {
             fn drop(&mut self) {
                 if self.armed {
                     let _ = fs::unlinkat(self.dir_fd, self.name);
@@ -1514,7 +1482,7 @@ impl Queue {
             }
         }
         let mut temp_guard = TempGuard {
-            dir_fd: tmp_dir_fd.as_raw_fd(),
+            dir_fd: tmp_dir_fd.as_fd(),
             name: &temp_name,
             armed: true,
         };
@@ -1531,22 +1499,16 @@ impl Queue {
         fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
         // Open destination directory for rename
-        let dest_fd = open_relative(self.root_fd.as_raw_fd(), dest_dir_relative)
+        let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // Rename with NOREPLACE
-        match fs::renameat2_noreplace(
-            tmp_dir_fd.as_raw_fd(),
-            &temp_name,
-            dest_fd.as_raw_fd(),
-            dest_name,
-        ) {
+        match fs::renameat2_noreplace(tmp_dir_fd.as_fd(), &temp_name, dest_fd.as_fd(), dest_name) {
             Ok(()) => {
                 temp_guard.armed = false; // C-10: disarm on success
                                           // Sync destination first, then source
-                fs::fsync_dir_fd(dest_fd.as_raw_fd()).map_err(PublishError::classify_post_fsync)?;
-                fs::fsync_dir_fd(tmp_dir_fd.as_raw_fd())
-                    .map_err(PublishError::classify_post_fsync)?;
+                fs::fsync_dir_fd(dest_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
+                fs::fsync_dir_fd(tmp_dir_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
                 Ok(())
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1559,23 +1521,20 @@ impl Queue {
     /// Create a directory path recursively, syncing parents.
     pub(crate) fn ensure_dir(&self, relative: &str) -> io::Result<()> {
         let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
-        let mut current_fd = self.root_fd.as_raw_fd();
-        let mut owned_fds = Vec::new();
+        let mut current = None::<OwnedFd>;
 
-        for (i, comp) in components.iter().enumerate() {
-            let was_created = fs::mkdirat_eexist_ok(current_fd, comp, 0o700)?;
+        for comp in components {
+            let parent = current
+                .as_ref()
+                .map_or(self.root_fd.as_fd(), |directory| directory.as_fd());
+            let was_created = fs::mkdirat_eexist_ok(parent, comp, 0o700)?;
             // Open the child
-            let child = fs::open_directory(current_fd, comp)?;
+            let child = fs::open_directory(parent, comp)?;
             // P-01: Only fsync parent when a new child entry was actually created
             if was_created {
-                if i > 0 {
-                    fs::fsync_dir_fd(current_fd)?;
-                } else {
-                    fs::fsync_dir_fd(self.root_fd.as_raw_fd())?;
-                }
+                fs::fsync_dir_fd(parent)?;
             }
-            current_fd = child.as_raw_fd();
-            owned_fds.push(child);
+            current = Some(child);
         }
         Ok(())
     }
@@ -1620,7 +1579,7 @@ impl Queue {
 
             // Open the ready shard directory
             let ready_dir = format!("ready/{shard_str}");
-            let shard_fd = match open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
+            let shard_fd = match open_relative(self.root_fd.as_fd(), &ready_dir) {
                 Ok(fd) => fd,
                 Err(_) => {
                     scan_had_error = true;
@@ -1771,7 +1730,7 @@ impl Queue {
                     continue;
                 }
 
-                let leased_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &leased_dir) {
+                let leased_dir_fd = match open_relative(self.root_fd.as_fd(), &leased_dir) {
                     Ok(fd) => fd,
                     Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                     Err(_) => {
@@ -1781,7 +1740,7 @@ impl Queue {
                 };
 
                 let claim_source = match Self::open_claim_source(
-                    shard_fd.as_raw_fd(),
+                    shard_fd.as_fd(),
                     entry,
                     &parsed.common.job_id,
                     parsed.common.maximum_attempts,
@@ -1804,7 +1763,7 @@ impl Queue {
                     Err(error) => return LeaseOutcome::NotCommitted(error),
                 };
 
-                match fs::fstatat(shard_fd.as_raw_fd(), entry) {
+                match fs::fstatat(shard_fd.as_fd(), entry) {
                     Ok(stat) => match classify_claim_source_identity(&stat, &claim_source) {
                         ClaimSourceIdentity::Match => {}
                         ClaimSourceIdentity::Mismatch => {
@@ -1822,14 +1781,13 @@ impl Queue {
 
                 // Rename ready -> leased with NOREPLACE
                 match fs::renameat2_noreplace(
-                    shard_fd.as_raw_fd(),
+                    shard_fd.as_fd(),
                     entry,
-                    leased_dir_fd.as_raw_fd(),
+                    leased_dir_fd.as_fd(),
                     &leased_name,
                 ) {
                     Ok(()) => {
-                        let leased_stat = match fs::fstatat(leased_dir_fd.as_raw_fd(), &leased_name)
-                        {
+                        let leased_stat = match fs::fstatat(leased_dir_fd.as_fd(), &leased_name) {
                             Ok(stat) => {
                                 match classify_claim_source_identity(&stat, &claim_source) {
                                     ClaimSourceIdentity::Match => stat,
@@ -1876,22 +1834,18 @@ impl Queue {
                                 );
                             }
                         };
-                        // Sync both directories
-                        let same_dir = false; // different directories
-                        if !same_dir {
-                            if fs::fsync_dir_fd(leased_dir_fd.as_raw_fd()).is_err() {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket.with_phase(TransitionPhase::Linearized),
-                                );
-                            }
-                            if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_err() {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::DestinationDirectoryDurable),
-                                );
-                            }
+                        if fs::fsync_dir_fd(leased_dir_fd.as_fd()).is_err() {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::Linearized),
+                            );
+                        }
+                        if fs::fsync_dir_fd(shard_fd.as_fd()).is_err() {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket
+                                    .with_phase(TransitionPhase::DestinationDirectoryDurable),
+                            );
                         }
 
                         // B-03: Post-rename validation failures must NOT continue as Empty.
@@ -2036,9 +1990,9 @@ impl Queue {
                             match e {
                                 Error::PayloadCorrupt => {
                                     let _ = self.quarantine_corrupt_lease(
-                                        leased_dir_fd.as_raw_fd(),
+                                        leased_dir_fd.as_fd(),
                                         &leased_name,
-                                        leased_file.as_raw_fd(),
+                                        leased_file.as_fd(),
                                     );
                                     return LeaseOutcome::NotCommitted(Error::PayloadCorrupt);
                                 }
@@ -2138,7 +2092,7 @@ impl Queue {
             return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
         }
 
-        let receipt_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &receipt_dir) {
+        let receipt_dir_fd = match open_relative(self.root_fd.as_fd(), &receipt_dir) {
             Ok(fd) => fd,
             Err(e) => return AckOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
@@ -2167,20 +2121,17 @@ impl Queue {
         }
 
         // Rename leased -> receipt with NOREPLACE
-        match Self::rename_leased_witness_noreplace(
-            &source,
-            receipt_dir_fd.as_raw_fd(),
-            &receipt_name,
-        ) {
+        match Self::rename_leased_witness_noreplace(&source, receipt_dir_fd.as_fd(), &receipt_name)
+        {
             WitnessedRenameOutcome::Linearized => {
                 // Sync both directories
-                if fs::fsync_dir_fd(receipt_dir_fd.as_raw_fd()).is_err() {
+                if fs::fsync_dir_fd(receipt_dir_fd.as_fd()).is_err() {
                     self.poison();
                     return AckOutcome::OutcomeUnknown(
                         transition_ticket.with_phase(TransitionPhase::Linearized),
                     );
                 }
-                if fs::fsync_dir_fd(source.directory_fd.as_raw_fd()).is_err() {
+                if fs::fsync_dir_fd(source.directory_fd.as_fd()).is_err() {
                     self.poison();
                     return AckOutcome::OutcomeUnknown(
                         transition_ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
@@ -2630,7 +2581,7 @@ impl Queue {
         };
 
         // R2-H02: Only ENOENT means "source gone". Other errors are real failures.
-        let src_dir_fd = match open_relative(self.root_fd.as_raw_fd(), &src_dir) {
+        let src_dir_fd = match open_relative(self.root_fd.as_fd(), &src_dir) {
             Ok(fd) => fd,
             Err(error) => match classify_lease_directory_open_failure(&error) {
                 LeaseDirectoryOpenFailure::Gone => return Ok(None),
@@ -2645,7 +2596,7 @@ impl Queue {
             },
         };
 
-        let src_stat = match fs::fstatat(src_dir_fd.as_raw_fd(), &src_name) {
+        let src_stat = match fs::fstatat(src_dir_fd.as_fd(), &src_name) {
             Ok(s) => s,
             Err(error) => match classify_presence_failure(&error) {
                 PresenceFailure::Absent => return Ok(None),
@@ -2703,15 +2654,10 @@ impl Queue {
             return Err(Error::QueueCorrupt("source name tag mismatch".into()));
         }
 
-        let file_fd = fs::openat(
-            src_dir_fd.as_raw_fd(),
-            &src_name,
-            resolver_file_open_flags(),
-            0,
-        )
-        .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let file_fd = fs::openat(src_dir_fd.as_fd(), &src_name, resolver_file_open_flags(), 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
         let opened_stat =
-            fs::fstat(file_fd.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+            fs::fstat(file_fd.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
         if !stat_matches_witness(&opened_stat, lease.expected_dev, lease.expected_inode) {
             return Err(Error::QueueCorrupt(
                 "opened source identity does not match lease handle".into(),
@@ -2799,7 +2745,7 @@ impl Queue {
     fn observe_leased_source_path(
         source: &LeasedSourceWitness,
     ) -> Result<WitnessPathObservation, Error> {
-        match fs::fstatat(source.directory_fd.as_raw_fd(), &source.name) {
+        match fs::fstatat(source.directory_fd.as_fd(), &source.name) {
             Ok(stat) if stat_matches_witness(&stat, source.device, source.inode) => {
                 Ok(WitnessPathObservation::Match)
             }
@@ -2813,7 +2759,7 @@ impl Queue {
 
     fn rename_leased_witness_noreplace(
         source: &LeasedSourceWitness,
-        destination_directory_fd: RawFd,
+        destination_directory_fd: BorrowedFd<'_>,
         destination_name: &str,
     ) -> WitnessedRenameOutcome {
         match Self::observe_leased_source_path(source) {
@@ -2826,7 +2772,7 @@ impl Queue {
         }
 
         match fs::renameat2_noreplace(
-            source.directory_fd.as_raw_fd(),
+            source.directory_fd.as_fd(),
             &source.name,
             destination_directory_fd,
             destination_name,
@@ -2857,7 +2803,7 @@ impl Queue {
             return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string()));
         }
 
-        let dest_dir_fd = match open_relative(self.root_fd.as_raw_fd(), dest_dir) {
+        let dest_dir_fd = match open_relative(self.root_fd.as_fd(), dest_dir) {
             Ok(fd) => fd,
             Err(e) => return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
@@ -2873,27 +2819,27 @@ impl Queue {
             Err(e) => return TransitionOutcome::NotCommitted(e),
         };
 
-        match Self::rename_leased_witness_noreplace(&source, dest_dir_fd.as_raw_fd(), dest_name) {
+        match Self::rename_leased_witness_noreplace(&source, dest_dir_fd.as_fd(), dest_name) {
             WitnessedRenameOutcome::Linearized => {
                 // Check if source and destination are the same directory
-                let src_stat = fs::fstat(source.directory_fd.as_raw_fd()).ok();
-                let dest_stat = fs::fstat(dest_dir_fd.as_raw_fd()).ok();
+                let src_stat = fs::fstat(source.directory_fd.as_fd()).ok();
+                let dest_stat = fs::fstat(dest_dir_fd.as_fd()).ok();
                 let src_same = same_directory_identity(src_stat.as_ref(), dest_stat.as_ref());
                 if src_same {
-                    if fs::fsync_dir_fd(dest_dir_fd.as_raw_fd()).is_err() {
+                    if fs::fsync_dir_fd(dest_dir_fd.as_fd()).is_err() {
                         self.poison();
                         return TransitionOutcome::OutcomeUnknown(
                             ticket.with_phase(TransitionPhase::Linearized),
                         );
                     }
                 } else {
-                    if fs::fsync_dir_fd(dest_dir_fd.as_raw_fd()).is_err() {
+                    if fs::fsync_dir_fd(dest_dir_fd.as_fd()).is_err() {
                         self.poison();
                         return TransitionOutcome::OutcomeUnknown(
                             ticket.with_phase(TransitionPhase::Linearized),
                         );
                     }
-                    if fs::fsync_dir_fd(source.directory_fd.as_raw_fd()).is_err() {
+                    if fs::fsync_dir_fd(source.directory_fd.as_fd()).is_err() {
                         self.poison();
                         return TransitionOutcome::OutcomeUnknown(
                             ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
@@ -2988,15 +2934,14 @@ impl Queue {
     }
 
     fn open_claim_source(
-        directory_fd: RawFd,
+        directory_fd: BorrowedFd<'_>,
         name: &str,
         expected_job_id: &[u8; 16],
         expected_maximum_attempts: u32,
     ) -> Result<ClaimSourceWitness, Error> {
         let file = fs::openat(directory_fd, name, resolver_file_open_flags(), 0)
             .map_err(|error| Error::IoFailure(error.to_string()))?;
-        let stat =
-            fs::fstat(file.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+        let stat = fs::fstat(file.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
         if !is_singly_linked_regular(stat.st_mode, stat.st_nlink) {
             return Err(Error::QueueCorrupt(
                 "ready source is not a singly-linked regular file".into(),
@@ -3074,17 +3019,17 @@ impl Queue {
         let dead_dir = format!("dead/{bucket_str}/{shard_str}");
 
         let _ = self.ensure_dir(&dead_dir);
-        let dead_dir_fd = open_relative(self.root_fd.as_raw_fd(), &dead_dir)?;
-        let ready_dir_fd = open_relative(self.root_fd.as_raw_fd(), ready_dir)?;
+        let dead_dir_fd = open_relative(self.root_fd.as_fd(), &dead_dir)?;
+        let ready_dir_fd = open_relative(self.root_fd.as_fd(), ready_dir)?;
 
         fs::renameat2_noreplace(
-            ready_dir_fd.as_raw_fd(),
+            ready_dir_fd.as_fd(),
             ready_name,
-            dead_dir_fd.as_raw_fd(),
+            dead_dir_fd.as_fd(),
             &dead_name,
         )?;
-        fs::fsync_dir_fd(dead_dir_fd.as_raw_fd())?;
-        fs::fsync_dir_fd(ready_dir_fd.as_raw_fd())?;
+        fs::fsync_dir_fd(dead_dir_fd.as_fd())?;
+        fs::fsync_dir_fd(ready_dir_fd.as_fd())?;
         Ok(())
     }
     /// B-09: Read and verify the payload of a leased job.
@@ -3117,9 +3062,9 @@ impl Queue {
 
     fn quarantine_corrupt_lease(
         &self,
-        leased_dir_fd: std::os::unix::io::RawFd,
+        leased_dir_fd: BorrowedFd<'_>,
         leased_name: &str,
-        held_fd: std::os::unix::io::RawFd,
+        held_fd: BorrowedFd<'_>,
     ) -> Result<(), std::io::Error> {
         // Verify held fd still names same inode before moving by pathname.
         let held_stat = fs::fstat(held_fd)?;
@@ -3134,9 +3079,9 @@ impl Queue {
         let q_name =
             steadq_names::quarantine_filename(&qid, QuarantineReason::PayloadCorrupt as u16);
         self.ensure_dir("quarantine")?;
-        let q_dir_fd = open_relative(self.root_fd.as_raw_fd(), "quarantine")?;
-        fs::renameat2_noreplace(leased_dir_fd, leased_name, q_dir_fd.as_raw_fd(), &q_name)?;
-        fs::fsync_dir_fd(q_dir_fd.as_raw_fd())?;
+        let q_dir_fd = open_relative(self.root_fd.as_fd(), "quarantine")?;
+        fs::renameat2_noreplace(leased_dir_fd, leased_name, q_dir_fd.as_fd(), &q_name)?;
+        fs::fsync_dir_fd(q_dir_fd.as_fd())?;
         fs::fsync_dir_fd(leased_dir_fd)?;
         Ok(())
     }
@@ -3157,9 +3102,9 @@ impl Queue {
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 let _ = self.quarantine_corrupt_lease(
-                    source.directory_fd.as_raw_fd(),
+                    source.directory_fd.as_fd(),
                     &source.name,
-                    source.file_fd.as_raw_fd(),
+                    source.file_fd.as_fd(),
                 );
             }
             return Err(e);
@@ -3199,9 +3144,9 @@ impl Queue {
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 let _ = self.quarantine_corrupt_lease(
-                    source.directory_fd.as_raw_fd(),
+                    source.directory_fd.as_fd(),
                     &source.name,
-                    source.file_fd.as_raw_fd(),
+                    source.file_fd.as_fd(),
                 );
             }
             return Err(e);
@@ -3246,7 +3191,7 @@ impl Queue {
 
         // Check ready
         let ready_dir = format!("ready/{shard_str}");
-        if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
+        if let Ok(dir_fd) = open_relative(self.root_fd.as_fd(), &ready_dir) {
             if let Ok(entries) = fs::read_dir_entries(dir_fd.as_fd()) {
                 for entry in entries {
                     let Some(entry) = entry.as_ascii_str() else {
@@ -3271,14 +3216,14 @@ impl Queue {
         }
 
         // Check leased (scan boot dirs)
-        if let Ok(leased_root) = fs::open_directory(self.root_fd.as_raw_fd(), "leased") {
+        if let Ok(leased_root) = fs::open_directory(self.root_fd.as_fd(), "leased") {
             if let Ok(boot_dirs) = fs::read_dir_entries(leased_root.as_fd()) {
                 for boot_dir in boot_dirs {
                     let Some(boot_dir) = boot_dir.as_ascii_str() else {
                         continue;
                     };
                     let boot_path = format!("leased/{boot_dir}");
-                    if let Ok(boot_fd) = open_relative(self.root_fd.as_raw_fd(), &boot_path) {
+                    if let Ok(boot_fd) = open_relative(self.root_fd.as_fd(), &boot_path) {
                         if let Ok(bucket_dirs) = fs::read_dir_entries(boot_fd.as_fd()) {
                             for bucket_dir in bucket_dirs {
                                 let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
@@ -3286,7 +3231,7 @@ impl Queue {
                                 };
                                 let shard_path = format!("{boot_path}/{bucket_dir}/{shard_str}");
                                 if let Ok(shard_fd) =
-                                    open_relative(self.root_fd.as_raw_fd(), &shard_path)
+                                    open_relative(self.root_fd.as_fd(), &shard_path)
                                 {
                                     if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                                         for entry in entries {
@@ -3322,14 +3267,14 @@ impl Queue {
         }
 
         // Check delayed
-        if let Ok(delayed_root) = fs::open_directory(self.root_fd.as_raw_fd(), "delayed") {
+        if let Ok(delayed_root) = fs::open_directory(self.root_fd.as_fd(), "delayed") {
             if let Ok(bucket_dirs) = fs::read_dir_entries(delayed_root.as_fd()) {
                 for bucket_dir in bucket_dirs {
                     let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
                         continue;
                     };
                     let shard_path = format!("delayed/{bucket_dir}/{shard_str}");
-                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
+                    if let Ok(shard_fd) = open_relative(self.root_fd.as_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                             for entry in entries {
                                 let Some(entry) = entry.as_ascii_str() else {
@@ -3357,14 +3302,14 @@ impl Queue {
         }
 
         // Check dead
-        if let Ok(dead_root) = fs::open_directory(self.root_fd.as_raw_fd(), "dead") {
+        if let Ok(dead_root) = fs::open_directory(self.root_fd.as_fd(), "dead") {
             if let Ok(bucket_dirs) = fs::read_dir_entries(dead_root.as_fd()) {
                 for bucket_dir in bucket_dirs {
                     let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
                         continue;
                     };
                     let shard_path = format!("dead/{bucket_dir}/{shard_str}");
-                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
+                    if let Ok(shard_fd) = open_relative(self.root_fd.as_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                             for entry in entries {
                                 let Some(entry) = entry.as_ascii_str() else {
@@ -3392,14 +3337,14 @@ impl Queue {
         }
 
         // Check receipts
-        if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
+        if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_fd(), "receipts") {
             if let Ok(bucket_dirs) = fs::read_dir_entries(receipts_root.as_fd()) {
                 for bucket_dir in bucket_dirs {
                     let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
                         continue;
                     };
                     let shard_path = format!("receipts/{bucket_dir}/{shard_str}");
-                    if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
+                    if let Ok(shard_fd) = open_relative(self.root_fd.as_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                             for entry in entries {
                                 let Some(entry) = entry.as_ascii_str() else {
@@ -3408,7 +3353,7 @@ impl Queue {
                                 if let Ok(parsed) = steadq_names::parse_receipt(entry) {
                                     if parsed.common.job_id == *job_id {
                                         let file_fd = match fs::openat(
-                                            shard_fd.as_raw_fd(),
+                                            shard_fd.as_fd(),
                                             entry,
                                             verified::receipt_read_open_flags(),
                                             0,
@@ -3476,7 +3421,7 @@ impl Queue {
     /// Returns the validated header on success.
     pub(crate) fn validate_active_object(
         &self,
-        dir_fd: std::os::unix::io::RawFd,
+        dir_fd: BorrowedFd<'_>,
         name: &str,
         ctx: &ActivePathContext,
     ) -> Result<FixedHeader, Error> {
@@ -3647,7 +3592,7 @@ impl Queue {
             envelope_digest: lease.envelope_digest,
             payload_length: lease.payload_length,
         };
-        let dir_fd = match open_relative(self.root_fd.as_raw_fd(), dir) {
+        let dir_fd = match open_relative(self.root_fd.as_fd(), dir) {
             Ok(fd) => fd,
             Err(_) => return false,
         };
@@ -3656,12 +3601,8 @@ impl Queue {
             3 => (parts[1], parts[2]),
             _ => return false,
         };
-        let file_fd = match fs::openat(
-            dir_fd.as_raw_fd(),
-            name,
-            verified::receipt_read_open_flags(),
-            0,
-        ) {
+        let file_fd = match fs::openat(dir_fd.as_fd(), name, verified::receipt_read_open_flags(), 0)
+        {
             Ok(f) => f,
             Err(_) => return false,
         };
@@ -3725,9 +3666,9 @@ impl Queue {
                 &lease.token,
             );
             let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
-            if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &receipt_dir) {
+            if let Ok(dir_fd) = open_relative(self.root_fd.as_fd(), &receipt_dir) {
                 if let Ok(file_fd) = fs::openat(
-                    dir_fd.as_raw_fd(),
+                    dir_fd.as_fd(),
                     &receipt_name,
                     verified::receipt_read_open_flags(),
                     0,
@@ -3901,7 +3842,7 @@ impl Queue {
             None => return ResolveObj::Conflict,
         };
 
-        let dir_fd = match fs::open_directory_beneath(self.root_fd.as_raw_fd(), path.directory) {
+        let dir_fd = match fs::open_directory_beneath(self.root_fd.as_fd(), path.directory) {
             Ok(fd) => fd,
             Err(error) => match classify_presence_failure(&error) {
                 PresenceFailure::Absent => return ResolveObj::Absent,
@@ -3910,12 +3851,12 @@ impl Queue {
                 }
             },
         };
-        let directory_stat = match fs::fstat(dir_fd.as_raw_fd()) {
+        let directory_stat = match fs::fstat(dir_fd.as_fd()) {
             Ok(stat) => stat,
             Err(error) => return ResolveObj::Error(Error::IoFailure(error.to_string())),
         };
 
-        let file_fd = match fs::openat(dir_fd.as_raw_fd(), name, resolver_file_open_flags(), 0) {
+        let file_fd = match fs::openat(dir_fd.as_fd(), name, resolver_file_open_flags(), 0) {
             Ok(fd) => fd,
             Err(error) => match classify_resolver_object_open_failure(&error) {
                 ResolverObjectOpenFailure::Absent => return ResolveObj::Absent,
@@ -3925,7 +3866,7 @@ impl Queue {
                 }
             },
         };
-        let stat = match fs::fstat(file_fd.as_raw_fd()) {
+        let stat = match fs::fstat(file_fd.as_fd()) {
             Ok(stat) => stat,
             Err(error) => return ResolveObj::Error(Error::IoFailure(error.to_string())),
         };
@@ -4126,10 +4067,10 @@ impl Queue {
         object: &ResolvedObject,
     ) -> Result<bool, Error> {
         fs::fsync(object.file_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync_dir_fd(object.directory_fd.as_raw_fd())
+        fs::fsync_dir_fd(object.directory_fd.as_fd())
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let current_directory =
-            match fs::open_directory_beneath(self.root_fd.as_raw_fd(), path.directory) {
+            match fs::open_directory_beneath(self.root_fd.as_fd(), path.directory) {
                 Ok(directory) => directory,
                 Err(error) => {
                     if resolver_error_is_not_found(&error) {
@@ -4138,7 +4079,7 @@ impl Queue {
                     return Err(Error::IoFailure(error.to_string()));
                 }
             };
-        let current_directory_stat = fs::fstat(current_directory.as_raw_fd())
+        let current_directory_stat = fs::fstat(current_directory.as_fd())
             .map_err(|error| Error::IoFailure(error.to_string()))?;
         if !identity_matches(
             current_directory_stat.st_dev as u64,
@@ -4148,7 +4089,7 @@ impl Queue {
         ) {
             return Ok(false);
         }
-        let current = match fs::fstatat(current_directory.as_raw_fd(), path.name) {
+        let current = match fs::fstatat(current_directory.as_fd(), path.name) {
             Ok(stat) => stat,
             Err(error) => {
                 if resolver_error_is_not_found(&error) {
@@ -4168,13 +4109,13 @@ impl Queue {
 }
 
 /// Open a relative path from a directory fd.
-pub(crate) fn open_relative(root_fd: RawFd, relative: &str) -> io::Result<OwnedFd> {
+pub(crate) fn open_relative(root_fd: BorrowedFd<'_>, relative: &str) -> io::Result<OwnedFd> {
     let relative = fs::ValidatedRelativePath::new(relative)?;
     let mut current = None::<OwnedFd>;
     for component in relative.components() {
         let parent_fd = current
             .as_ref()
-            .map_or(root_fd, std::os::fd::AsRawFd::as_raw_fd);
+            .map_or(root_fd, |directory| directory.as_fd());
         current = Some(fs::open_directory(parent_fd, component)?);
     }
     current.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty relative path"))
@@ -4531,7 +4472,7 @@ mod tests {
         let (_tmp, queue) = create_test_queue();
         fs::fault::reset();
         fs::fault::inject("open_directory", 1);
-        let result = open_relative(queue.root_fd().as_raw_fd(), "ready/../../outside");
+        let result = open_relative(queue.root_fd().as_fd(), "ready/../../outside");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(fs::fault::call_count("open_directory"), 0);
         fs::fault::reset();
@@ -4601,21 +4542,21 @@ mod tests {
             outcome => panic!("expected committed enqueue, got {outcome:?}"),
         };
         let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
-        let directory_fd = open_relative(queue.root_fd().as_raw_fd(), directory).unwrap();
+        let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
 
         let witness =
-            Queue::open_claim_source(directory_fd.as_raw_fd(), name, &enqueue.job_id, 3).unwrap();
+            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3).unwrap();
         assert_eq!(witness.evidence.envelope_digest, enqueue.envelope_digest);
         assert_eq!(witness.evidence.payload_length, 15);
 
         let mut wrong_job_id = enqueue.job_id;
         wrong_job_id[0] ^= 0xff;
         assert!(matches!(
-            Queue::open_claim_source(directory_fd.as_raw_fd(), name, &wrong_job_id, 3,),
+            Queue::open_claim_source(directory_fd.as_fd(), name, &wrong_job_id, 3,),
             Err(Error::QueueCorrupt(_))
         ));
         assert!(matches!(
-            Queue::open_claim_source(directory_fd.as_raw_fd(), name, &enqueue.job_id, 4,),
+            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 4,),
             Err(Error::QueueCorrupt(_))
         ));
     }
@@ -4633,20 +4574,20 @@ mod tests {
             outcome => panic!("expected committed enqueue, got {outcome:?}"),
         };
         let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
-        let directory_fd = open_relative(queue.root_fd().as_raw_fd(), directory).unwrap();
+        let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
         let witness =
-            Queue::open_claim_source(directory_fd.as_raw_fd(), name, &enqueue.job_id, 3).unwrap();
+            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3).unwrap();
         let source = tmp.path().join(&enqueue.expected_relative_path);
         let displaced = tmp.path().join("tmp/displaced-ready.sqj");
         std::fs::rename(&source, &displaced).unwrap();
         std::fs::copy(&displaced, &source).unwrap();
-        let replacement = fs::fstatat(directory_fd.as_raw_fd(), name).unwrap();
+        let replacement = fs::fstatat(directory_fd.as_fd(), name).unwrap();
 
         assert_eq!(
             classify_claim_source_identity(&replacement, &witness),
             ClaimSourceIdentity::Mismatch
         );
-        let original = fs::fstat(witness.file_fd.as_raw_fd()).unwrap();
+        let original = fs::fstat(witness.file_fd.as_fd()).unwrap();
         assert_eq!(
             classify_claim_source_identity(&original, &witness),
             ClaimSourceIdentity::Match
@@ -4680,7 +4621,7 @@ mod tests {
         assert!(matches!(
             Queue::rename_leased_witness_noreplace(
                 &source,
-                destination_directory.as_raw_fd(),
+                destination_directory.as_fd(),
                 &ready.filename,
             ),
             WitnessedRenameOutcome::SourceChanged
@@ -4739,7 +4680,7 @@ mod tests {
             .open_and_validate_current_lease(&lease)
             .unwrap()
             .unwrap();
-        let mut stat = fs::fstat(source.file_fd.as_raw_fd()).unwrap();
+        let mut stat = fs::fstat(source.file_fd.as_fd()).unwrap();
         assert!(matches!(
             classify_renamed_destination(Some(&stat), source.device, source.inode),
             WitnessedRenameOutcome::Linearized
@@ -4779,7 +4720,7 @@ mod tests {
             fs::fault::inject_errno("renameat2_noreplace", 1, errno);
             let outcome = Queue::rename_leased_witness_noreplace(
                 &source,
-                destination_directory.as_raw_fd(),
+                destination_directory.as_fd(),
                 &ready.filename,
             );
             match expected {
@@ -4812,7 +4753,7 @@ mod tests {
         assert!(matches!(
             Queue::rename_leased_witness_noreplace(
                 &source,
-                destination_directory.as_raw_fd(),
+                destination_directory.as_fd(),
                 &ready.filename,
             ),
             WitnessedRenameOutcome::LinearizedIdentityUnknown
@@ -4841,9 +4782,9 @@ mod tests {
             outcome => panic!("expected committed enqueue, got {outcome:?}"),
         };
         let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
-        let directory_fd = open_relative(queue.root_fd().as_raw_fd(), directory).unwrap();
+        let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
         let witness =
-            Queue::open_claim_source(directory_fd.as_raw_fd(), name, &enqueue.job_id, 3).unwrap();
+            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3).unwrap();
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(tmp.path().join(enqueue.expected_relative_path))
@@ -4926,6 +4867,20 @@ mod tests {
         // Check shard dirs
         assert!(tmp.path().join("ready/0000").exists());
         assert!(tmp.path().join("ready/003f").exists());
+    }
+
+    #[test]
+    fn init_resumes_an_interrupted_control_layout() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".initializing"), b"").unwrap();
+        std::fs::create_dir(tmp.path().join("control")).unwrap();
+        std::fs::write(tmp.path().join("control/maintenance.lock"), b"").unwrap();
+
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+
+        assert!(tmp.path().join("FORMAT").is_file());
+        assert!(!tmp.path().join(".initializing").exists());
+        Queue::open(tmp.path(), &OpenOptions::default()).unwrap();
     }
 
     #[test]
@@ -5102,12 +5057,12 @@ mod tests {
                 source_directory.clone()
             };
             let source_directory_fd =
-                open_relative(queue.root_fd.as_raw_fd(), &source_directory).unwrap();
-            let source_stat = fs::fstat(source_directory_fd.as_raw_fd()).unwrap();
+                open_relative(queue.root_fd.as_fd(), &source_directory).unwrap();
+            let source_stat = fs::fstat(source_directory_fd.as_fd()).unwrap();
             let source_identity = (source_stat.st_dev as u64, source_stat.st_ino as u64);
             let destination_directory_fd =
-                open_relative(queue.root_fd.as_raw_fd(), &destination_directory).unwrap();
-            let destination_stat = fs::fstat(destination_directory_fd.as_raw_fd()).unwrap();
+                open_relative(queue.root_fd.as_fd(), &destination_directory).unwrap();
+            let destination_stat = fs::fstat(destination_directory_fd.as_fd()).unwrap();
             let destination_identity = (
                 destination_stat.st_dev as u64,
                 destination_stat.st_ino as u64,
@@ -6864,13 +6819,8 @@ mod tests {
         let (tmp, mut queue) = create_test_queue();
         write_wall_watermark(&tmp, 0, 1);
         let control_fd = fs::open_directory(queue.root_fd(), "control").unwrap();
-        let lock_fd = fs::openat(
-            control_fd.as_raw_fd(),
-            "wall-watermark.lock",
-            libc::O_RDWR,
-            0,
-        )
-        .unwrap();
+        let lock_fd =
+            fs::openat(control_fd.as_fd(), "wall-watermark.lock", libc::O_RDWR, 0).unwrap();
         assert!(fs::try_ofd_write_lock(lock_fd.as_fd()).unwrap());
 
         let outcome = queue.enqueue(EnqueueInput {
@@ -6893,13 +6843,8 @@ mod tests {
         let lease = enqueue_and_lease(&mut queue);
 
         let control_fd = fs::open_directory(queue.root_fd(), "control").unwrap();
-        let lock_fd = fs::openat(
-            control_fd.as_raw_fd(),
-            "wall-watermark.lock",
-            libc::O_RDWR,
-            0,
-        )
-        .unwrap();
+        let lock_fd =
+            fs::openat(control_fd.as_fd(), "wall-watermark.lock", libc::O_RDWR, 0).unwrap();
         assert!(fs::try_ofd_write_lock(lock_fd.as_fd()).unwrap());
 
         assert!(matches!(
@@ -6923,13 +6868,8 @@ mod tests {
             current.watermark_sequence(),
         );
         let control_fd = fs::open_directory(queue.root_fd(), "control").unwrap();
-        let lock_fd = fs::openat(
-            control_fd.as_raw_fd(),
-            "wall-watermark.lock",
-            libc::O_RDWR,
-            0,
-        )
-        .unwrap();
+        let lock_fd =
+            fs::openat(control_fd.as_fd(), "wall-watermark.lock", libc::O_RDWR, 0).unwrap();
         assert!(fs::try_ofd_write_lock(lock_fd.as_fd()).unwrap());
 
         let outcome = queue.enqueue(EnqueueInput {
@@ -7009,7 +6949,7 @@ mod tests {
             let control_fd = fs::open_directory(queue.root_fd(), "control")
                 .map_err(|error| Error::IoFailure(error.to_string()))?;
             let competing_fd = fs::openat(
-                control_fd.as_raw_fd(),
+                control_fd.as_fd(),
                 "wall-watermark.lock",
                 libc::O_RDWR,
                 0o600,
@@ -7745,10 +7685,10 @@ mod tests {
             .rsplit_once('/')
             .map(|(d, _)| d)
             .unwrap();
-        let dir_fd = crate::queue::open_relative(queue.root_fd().as_raw_fd(), dir_path).unwrap();
+        let dir_fd = crate::queue::open_relative(queue.root_fd().as_fd(), dir_path).unwrap();
         // Create dummy file in same dir
         let dummy_fd = steadq_fs_linux::openat(
-            dir_fd.as_raw_fd(),
+            dir_fd.as_fd(),
             "dummy.sqj",
             libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
             0o600,
@@ -7760,7 +7700,7 @@ mod tests {
             .map(|(_, n)| n)
             .unwrap();
         // Same device, different inode should fail with NotFound.
-        let res = queue.quarantine_corrupt_lease(dir_fd.as_raw_fd(), name_a, dummy_fd.as_raw_fd());
+        let res = queue.quarantine_corrupt_lease(dir_fd.as_fd(), name_a, dummy_fd.as_fd());
         let _ = dummy_fd;
         assert!(
             res.is_err(),
@@ -7809,11 +7749,11 @@ mod tests {
             shard: shard_name.clone(),
         };
         let dir_fd = crate::queue::open_relative(
-            queue.root_fd().as_raw_fd(),
+            queue.root_fd().as_fd(),
             &format!("delayed/{bucket_name}/{shard_name}"),
         )
         .unwrap();
-        let ok = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &correct_ctx);
+        let ok = queue.validate_active_object(dir_fd.as_fd(), &file_name, &correct_ctx);
         assert!(
             ok.is_ok(),
             "correct delayed bucket must validate, got {ok:?}"
@@ -7828,14 +7768,14 @@ mod tests {
             shard: shard_name.clone(),
         };
         let wrong_fd = crate::queue::open_relative(
-            queue.root_fd().as_raw_fd(),
+            queue.root_fd().as_fd(),
             &format!("delayed/{bucket_name}/{shard_name}"),
         )
         .unwrap();
         // validate_active_object checks the filename bucket against the directory bucket.
         // With a mismatched bucket in the context, it must return QueueCorrupt.
         // Under the mutant that changes != to ==, this would incorrectly return Ok.
-        let wrong = queue.validate_active_object(wrong_fd.as_raw_fd(), &file_name, &wrong_ctx);
+        let wrong = queue.validate_active_object(wrong_fd.as_fd(), &file_name, &wrong_ctx);
         assert!(
             matches!(wrong, Err(Error::QueueCorrupt(_))),
             "wrong delayed bucket must be rejected, got {wrong:?}"
@@ -7869,17 +7809,15 @@ mod tests {
         let correct_ctx = crate::ActivePathContext::Ready {
             shard: shard_name.clone(),
         };
-        let dir_fd = crate::queue::open_relative(
-            queue.root_fd().as_raw_fd(),
-            &format!("ready/{shard_name}"),
-        )
-        .unwrap();
-        let ok = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &correct_ctx);
+        let dir_fd =
+            crate::queue::open_relative(queue.root_fd().as_fd(), &format!("ready/{shard_name}"))
+                .unwrap();
+        let ok = queue.validate_active_object(dir_fd.as_fd(), &file_name, &correct_ctx);
         assert!(ok.is_ok(), "correct tag must validate, got {ok:?}");
         let wrong_ctx = crate::ActivePathContext::Ready {
             shard: "ffff".to_string(),
         };
-        let bad = queue.validate_active_object(dir_fd.as_raw_fd(), &file_name, &wrong_ctx);
+        let bad = queue.validate_active_object(dir_fd.as_fd(), &file_name, &wrong_ctx);
         assert!(
             matches!(bad, Err(Error::QueueCorrupt(_))),
             "wrong shard must cause tag mismatch, got {bad:?}"

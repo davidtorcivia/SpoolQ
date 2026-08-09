@@ -4,7 +4,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::Path;
 use std::ptr::NonNull;
 
@@ -237,7 +237,7 @@ macro_rules! fault_check {
 }
 
 /// Open or create a file with O_TMPFILE.
-pub fn open_tmpfile(dir_fd: RawFd) -> io::Result<OwnedFd> {
+pub fn open_tmpfile(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     fault_check!("open_tmpfile");
     // Use libc::O_TMPFILE which correctly includes O_DIRECTORY on all arches.
     // Fall back to the defined constant if libc does not expose it.
@@ -245,7 +245,7 @@ pub fn open_tmpfile(dir_fd: RawFd) -> io::Result<OwnedFd> {
     let dot = CString::new(".").unwrap();
     let fd = unsafe {
         libc::openat(
-            dir_fd,
+            dir_fd.as_raw_fd(),
             dot.as_ptr(),
             o_tmpfile | libc::O_RDWR | libc::O_CLOEXEC,
             0o600,
@@ -274,13 +274,13 @@ fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CString> {
 }
 
 /// Open a directory for reading.
-pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
+pub fn open_directory(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
     fault_check!("open_directory");
     // R2-B06: Use O_NOFOLLOW to prevent symlink traversal on state directories.
     let c_name = cstr_from_name(name)?;
     let fd = unsafe {
         libc::openat(
-            dir_fd,
+            dir_fd.as_raw_fd(),
             c_name.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
@@ -293,7 +293,7 @@ pub fn open_directory(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
 
 /// Open a directory path while the kernel enforces confinement beneath `root_fd`.
 pub fn open_directory_beneath(
-    root_fd: RawFd,
+    root_fd: BorrowedFd<'_>,
     relative: ValidatedRelativePath<'_>,
 ) -> io::Result<OwnedFd> {
     fault_check!("openat2_beneath");
@@ -308,7 +308,7 @@ pub fn open_directory_beneath(
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
-            root_fd,
+            root_fd.as_raw_fd(),
             path.as_ptr(),
             &how as *const OpenHow,
             std::mem::size_of::<OpenHow>(),
@@ -322,10 +322,10 @@ pub fn open_directory_beneath(
 }
 
 /// Open a path relative to a directory fd with given flags.
-pub fn openat(dir_fd: RawFd, name: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
+pub fn openat(dir_fd: BorrowedFd<'_>, name: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
     fault_check!("openat");
     let c_name = cstr_from_name(name)?;
-    let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), flags, mode) };
+    let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags, mode) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -333,10 +333,10 @@ pub fn openat(dir_fd: RawFd, name: &str, flags: i32, mode: u32) -> io::Result<Ow
 }
 
 /// Create a directory.
-pub fn mkdirat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
+pub fn mkdirat(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<()> {
     fault_check!("mkdirat");
     let c_name = cstr_from_name(name)?;
-    let rc = unsafe { libc::mkdirat(dir_fd, c_name.as_ptr(), mode) };
+    let rc = unsafe { libc::mkdirat(dir_fd.as_raw_fd(), c_name.as_ptr(), mode) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -345,7 +345,7 @@ pub fn mkdirat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
 
 /// Create a directory, treating EEXIST as Ok.
 /// Returns true if the directory was newly created, false if it already existed.
-pub fn mkdirat_eexist_ok(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<bool> {
+pub fn mkdirat_eexist_ok(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<bool> {
     match mkdirat(dir_fd, name, mode) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
@@ -355,12 +355,8 @@ pub fn mkdirat_eexist_ok(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<boo
 
 /// fsync a file descriptor.
 pub fn fsync(fd: BorrowedFd<'_>) -> io::Result<()> {
-    fsync_raw(fd.as_raw_fd())
-}
-
-fn fsync_raw(fd: RawFd) -> io::Result<()> {
     fault_check!("fsync");
-    let rc = unsafe { libc::fsync(fd) };
+    let rc = unsafe { libc::fsync(fd.as_raw_fd()) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -368,24 +364,24 @@ fn fsync_raw(fd: RawFd) -> io::Result<()> {
 }
 
 /// fsync a directory by opening it read-only and syncing.
-pub fn fsync_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
+pub fn fsync_dir(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     fault_check!("fsync_dir");
     let fd = open_directory(dir_fd, name)?;
     fsync(fd.as_fd())
 }
 
 /// fsync a directory by its already-open fd.
-pub fn fsync_dir_fd(fd: RawFd) -> io::Result<()> {
-    fault::record_fd_identity("fsync_dir_fd", fd)?;
+pub fn fsync_dir_fd(fd: BorrowedFd<'_>) -> io::Result<()> {
+    fault::record_fd_identity("fsync_dir_fd", fd.as_raw_fd())?;
     fault_check!("fsync_dir_fd");
-    fsync_raw(fd)
+    fsync(fd)
 }
 
 /// Rename with RENAME_NOREPLACE.
 pub fn renameat2_noreplace(
-    old_dir_fd: RawFd,
+    old_dir_fd: BorrowedFd<'_>,
     old_name: &str,
-    new_dir_fd: RawFd,
+    new_dir_fd: BorrowedFd<'_>,
     new_name: &str,
 ) -> io::Result<()> {
     fault_check!("renameat2_noreplace");
@@ -395,9 +391,9 @@ pub fn renameat2_noreplace(
     let rc = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            old_dir_fd,
+            old_dir_fd.as_raw_fd(),
             c_old.as_ptr(),
-            new_dir_fd,
+            new_dir_fd.as_raw_fd(),
             c_new.as_ptr(),
             RENAME_NOREPLACE,
         )
@@ -410,15 +406,22 @@ pub fn renameat2_noreplace(
 
 /// Plain rename (for receipt compaction).
 pub fn renameat(
-    old_dir_fd: RawFd,
+    old_dir_fd: BorrowedFd<'_>,
     old_name: &str,
-    new_dir_fd: RawFd,
+    new_dir_fd: BorrowedFd<'_>,
     new_name: &str,
 ) -> io::Result<()> {
     fault_check!("renameat");
     let c_old = cstr_from_name(old_name)?;
     let c_new = cstr_from_name(new_name)?;
-    let rc = unsafe { libc::renameat(old_dir_fd, c_old.as_ptr(), new_dir_fd, c_new.as_ptr()) };
+    let rc = unsafe {
+        libc::renameat(
+            old_dir_fd.as_raw_fd(),
+            c_old.as_ptr(),
+            new_dir_fd.as_raw_fd(),
+            c_new.as_ptr(),
+        )
+    };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -426,7 +429,11 @@ pub fn renameat(
 }
 
 /// linkat with AT_EMPTY_PATH for O_TMPFILE publication.
-pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::Result<()> {
+pub fn linkat_empty_path(
+    fd: BorrowedFd<'_>,
+    dest_dir_fd: BorrowedFd<'_>,
+    dest_name: &str,
+) -> io::Result<()> {
     fault_check!("linkat_empty_path");
     const AT_EMPTY_PATH: i32 = 0x1000;
     let c_dest = cstr_from_name(dest_name)?;
@@ -434,9 +441,9 @@ pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
-            fd,
+            fd.as_raw_fd(),
             empty.as_ptr(),
-            dest_dir_fd,
+            dest_dir_fd.as_raw_fd(),
             c_dest.as_ptr(),
             AT_EMPTY_PATH,
         )
@@ -448,18 +455,22 @@ pub fn linkat_empty_path(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::
 }
 
 /// linkat via /proc/self/fd for unprivileged O_TMPFILE publication.
-pub fn linkat_proc_self_fd(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io::Result<()> {
+pub fn linkat_proc_self_fd(
+    fd: BorrowedFd<'_>,
+    dest_dir_fd: BorrowedFd<'_>,
+    dest_name: &str,
+) -> io::Result<()> {
     fault_check!("linkat_proc_self_fd");
     const AT_SYMLINK_FOLLOW: i32 = 0x400;
     #[allow(clippy::manual_c_str_literals)]
-    let proc_path = format!("/proc/self/fd/{fd}\0");
+    let proc_path = format!("/proc/self/fd/{}\0", fd.as_raw_fd());
     let c_dest = cstr_from_name(dest_name)?;
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
             libc::AT_FDCWD,
             proc_path.as_ptr() as *const _,
-            dest_dir_fd,
+            dest_dir_fd.as_raw_fd(),
             c_dest.as_ptr(),
             AT_SYMLINK_FOLLOW,
         )
@@ -471,10 +482,10 @@ pub fn linkat_proc_self_fd(fd: RawFd, dest_dir_fd: RawFd, dest_name: &str) -> io
 }
 
 /// unlinkat - remove a file.
-pub fn unlinkat(dir_fd: RawFd, name: &str) -> io::Result<()> {
+pub fn unlinkat(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     fault_check!("unlinkat");
     let c_name = cstr_from_name(name)?;
-    let rc = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
+    let rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -482,11 +493,11 @@ pub fn unlinkat(dir_fd: RawFd, name: &str) -> io::Result<()> {
 }
 
 /// Remove a directory (must be empty).
-pub fn unlinkat_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
+pub fn unlinkat_dir(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     fault_check!("unlinkat_dir");
     const AT_REMOVEDIR: i32 = 0x200;
     let c_name = cstr_from_name(name)?;
-    let rc = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), AT_REMOVEDIR) };
+    let rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), AT_REMOVEDIR) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -494,13 +505,13 @@ pub fn unlinkat_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
 }
 
 /// stat a file relative to a directory fd using AT_SYMLINK_NOFOLLOW.
-pub fn fstatat(dir_fd: RawFd, name: &str) -> io::Result<libc::stat> {
+pub fn fstatat(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<libc::stat> {
     fault_check!("fstatat");
     let c_name = cstr_from_name(name)?;
     let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::fstatat(
-            dir_fd,
+            dir_fd.as_raw_fd(),
             c_name.as_ptr(),
             &mut statbuf,
             libc::AT_SYMLINK_NOFOLLOW,
@@ -513,10 +524,10 @@ pub fn fstatat(dir_fd: RawFd, name: &str) -> io::Result<libc::stat> {
 }
 
 /// fstat on an already-open fd.
-pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
     fault_check!("fstat");
     let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstat(fd, &mut statbuf) };
+    let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut statbuf) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -784,7 +795,7 @@ pub fn open_dir_absolute(path: &Path) -> io::Result<OwnedFd> {
 }
 
 /// Create a file with O_CREAT | O_EXCL | O_NOFOLLOW.
-pub fn create_exclusive(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<OwnedFd> {
+pub fn create_exclusive(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<OwnedFd> {
     openat(
         dir_fd,
         name,
@@ -1031,7 +1042,7 @@ impl Drop for DirectoryStream {
 }
 
 fn reopen_directory(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
-    open_directory(dir_fd.as_raw_fd(), ".")
+    open_directory(dir_fd, ".")
 }
 
 /// Read directory entries without losing non-UTF-8 names.
@@ -1195,9 +1206,9 @@ where
 }
 
 /// Change file mode relative to a directory fd.
-pub fn fchmodat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
+pub fn fchmodat(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<()> {
     let c_name = cstr_from_name(name)?;
-    let rc = unsafe { libc::fchmodat(dir_fd, c_name.as_ptr(), mode, 0) };
+    let rc = unsafe { libc::fchmodat(dir_fd.as_raw_fd(), c_name.as_ptr(), mode, 0) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1216,9 +1227,9 @@ pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
 /// Durable no-overwrite move: renameat2 with RENAME_NOREPLACE, then sync directories.
 /// If source and destination are the same directory, sync once.
 pub fn durable_move_noreplace(
-    src_dir_fd: RawFd,
+    src_dir_fd: BorrowedFd<'_>,
     src_name: &str,
-    dest_dir_fd: RawFd,
+    dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
 ) -> io::Result<()> {
     fault_check!("durable_move_noreplace");
@@ -1242,9 +1253,9 @@ pub fn durable_move_noreplace(
 /// Replacing rename: for receipt compaction and wall-watermark replacement only.
 /// Performs a standard rename (overwrites destination), then syncs the directory.
 pub fn durable_move_replace(
-    src_dir_fd: RawFd,
+    src_dir_fd: BorrowedFd<'_>,
     src_name: &str,
-    dest_dir_fd: RawFd,
+    dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
 ) -> io::Result<()> {
     fault_check!("durable_move_replace");
@@ -1269,13 +1280,14 @@ pub fn stabilize(fd: BorrowedFd<'_>) -> io::Result<()> {
 }
 
 /// Stabilize a directory by its fd.
-pub fn stabilize_dir(fd: RawFd) -> io::Result<()> {
+pub fn stabilize_dir(fd: BorrowedFd<'_>) -> io::Result<()> {
     fsync_dir_fd(fd)
 }
 
 /// syncfs: sync an entire filesystem. Caller must assert the queue owns the mount.
-pub fn syncfs(fd: RawFd) -> io::Result<()> {
-    let rc = unsafe { libc::syscall(libc::SYS_syncfs, fd) };
+pub fn syncfs(fd: BorrowedFd<'_>) -> io::Result<()> {
+    fault_check!("syncfs");
+    let rc = unsafe { libc::syscall(libc::SYS_syncfs, fd.as_raw_fd()) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1332,7 +1344,7 @@ pub enum PublicationMode {
 }
 
 /// Probe publication capability by creating a temp file and trying to link it.
-pub fn probe_publication_mode(dir_fd: RawFd) -> io::Result<PublicationMode> {
+pub fn probe_publication_mode(dir_fd: BorrowedFd<'_>) -> io::Result<PublicationMode> {
     // Create a temp file via O_TMPFILE
     let tmp = match open_tmpfile(dir_fd) {
         Ok(fd) => fd,
@@ -1350,13 +1362,13 @@ pub fn probe_publication_mode(dir_fd: RawFd) -> io::Result<PublicationMode> {
 
     // Try AT_EMPTY_PATH first
     let name = probe_name.trim_end_matches('\0');
-    if linkat_empty_path(tmp.as_raw_fd(), dir_fd, name).is_ok() {
+    if linkat_empty_path(tmp.as_fd(), dir_fd, name).is_ok() {
         let _ = unlinkat(dir_fd, name);
         return Ok(PublicationMode::DirectAtEmptyPath);
     }
 
     // Try /proc/self/fd
-    if linkat_proc_self_fd(tmp.as_raw_fd(), dir_fd, name).is_ok() {
+    if linkat_proc_self_fd(tmp.as_fd(), dir_fd, name).is_ok() {
         let _ = unlinkat(dir_fd, name);
         return Ok(PublicationMode::ProcSelfFd);
     }
@@ -1365,7 +1377,7 @@ pub fn probe_publication_mode(dir_fd: RawFd) -> io::Result<PublicationMode> {
 }
 
 /// Probe no-overwrite rename support.
-pub fn probe_rename_noreplace(dir_fd: RawFd) -> io::Result<bool> {
+pub fn probe_rename_noreplace(dir_fd: BorrowedFd<'_>) -> io::Result<bool> {
     let rand1 = random_128bit()?;
     let rand2 = random_128bit()?;
     let name1 = format!(
@@ -1398,7 +1410,7 @@ pub fn probe_rename_noreplace(dir_fd: RawFd) -> io::Result<bool> {
 }
 
 /// Probe directory fsync support.
-pub fn probe_dir_fsync(dir_fd: RawFd) -> io::Result<bool> {
+pub fn probe_dir_fsync(dir_fd: BorrowedFd<'_>) -> io::Result<bool> {
     match fsync_dir_fd(dir_fd) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
@@ -1484,13 +1496,20 @@ pub fn validate_relative_path(path: &str) -> io::Result<ValidatedRelativePath<'_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, RawFd};
 
-    fn assert_fd_closed(fd: RawFd) {
-        // SAFETY: `F_GETFD` only inspects the integer descriptor value.
-        let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_eq!(result, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    fn assert_fd_released(fd: RawFd, expected_device: u64, expected_inode: u64) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `stat` is writable for the duration of the syscall. The raw
+        // descriptor is inspected only to prove the transferred handle was released.
+        if unsafe { libc::fstat(fd, &mut stat) } == 0 {
+            assert_ne!(
+                (stat.st_dev, stat.st_ino),
+                (expected_device, expected_inode)
+            );
+        } else {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {
@@ -1539,7 +1558,7 @@ mod tests {
         let path = unique_test_dir("write_all");
         std::fs::create_dir(&path).unwrap();
         let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
-        let file = create_exclusive(dir.as_raw_fd(), "data", 0o600).unwrap();
+        let file = create_exclusive(dir.as_fd(), "data", 0o600).unwrap();
         write_all(file.as_fd(), b"complete").unwrap();
         let mut bytes = [0u8; 8];
         pread_exact(file.as_fd(), &mut bytes, 0).unwrap();
@@ -1554,8 +1573,8 @@ mod tests {
         let path = unique_test_dir("write_lock");
         std::fs::create_dir(&path).unwrap();
         let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
-        let first = create_exclusive(dir.as_raw_fd(), "lock", 0o600).unwrap();
-        let second = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
+        let first = create_exclusive(dir.as_fd(), "lock", 0o600).unwrap();
+        let second = openat(dir.as_fd(), "lock", libc::O_RDWR, 0).unwrap();
         assert!(try_ofd_write_lock(first.as_fd()).unwrap());
         assert!(!try_ofd_write_lock(second.as_fd()).unwrap());
         drop(second);
@@ -1569,12 +1588,12 @@ mod tests {
         let path = unique_test_dir("read_lock");
         std::fs::create_dir(&path).unwrap();
         let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
-        let reader = create_exclusive(dir.as_raw_fd(), "lock", 0o600).unwrap();
+        let reader = create_exclusive(dir.as_fd(), "lock", 0o600).unwrap();
         assert!(try_ofd_read_lock(reader.as_fd()).unwrap());
         drop(reader);
 
-        let writer = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
-        let blocked_reader = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
+        let writer = openat(dir.as_fd(), "lock", libc::O_RDWR, 0).unwrap();
+        let blocked_reader = openat(dir.as_fd(), "lock", libc::O_RDWR, 0).unwrap();
         assert!(try_ofd_write_lock(writer.as_fd()).unwrap());
         assert!(!try_ofd_read_lock(blocked_reader.as_fd()).unwrap());
         drop(blocked_reader);
@@ -1661,8 +1680,8 @@ mod tests {
         std::fs::create_dir_all(base.join("root/a/b")).unwrap();
         let root = std::fs::File::open(base.join("root")).unwrap();
         let path = ValidatedRelativePath::new("a/b").unwrap();
-        let opened = open_directory_beneath(root.as_raw_fd(), path).unwrap();
-        let stat = fstat(opened.as_raw_fd()).unwrap();
+        let opened = open_directory_beneath(root.as_fd(), path).unwrap();
+        let stat = fstat(opened.as_fd()).unwrap();
         assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
         // SAFETY: `opened` owns a valid descriptor for the duration of the call.
         let descriptor_flags = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_GETFD) };
@@ -1681,7 +1700,7 @@ mod tests {
         let root = std::fs::File::open(base.join("root")).unwrap();
         let path = ValidatedRelativePath::new("link/secret").unwrap();
         symlink(base.join("outside"), base.join("root/link")).unwrap();
-        assert!(open_directory_beneath(root.as_raw_fd(), path).is_err());
+        assert!(open_directory_beneath(root.as_fd(), path).is_err());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -1694,10 +1713,10 @@ mod tests {
         let root = std::fs::File::open(base.join("root")).unwrap();
 
         let forged_escape = ValidatedRelativePath { path: "../outside" };
-        assert!(open_directory_beneath(root.as_raw_fd(), forged_escape).is_err());
+        assert!(open_directory_beneath(root.as_fd(), forged_escape).is_err());
 
         let file = ValidatedRelativePath::new("file").unwrap();
-        assert!(open_directory_beneath(root.as_raw_fd(), file).is_err());
+        assert!(open_directory_beneath(root.as_fd(), file).is_err());
 
         assert_eq!(RESOLVER_RESOLVE_FLAGS, 0x0e);
         assert_eq!(resolver_open_flags(), libc::O_DIRECTORY | libc::O_CLOEXEC);
@@ -1713,7 +1732,7 @@ mod tests {
 
         fault::reset();
         fault::inject_errno("openat2_beneath", 1, libc::ENOSYS);
-        let error = open_directory_beneath(root.as_raw_fd(), path).unwrap_err();
+        let error = open_directory_beneath(root.as_fd(), path).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOSYS));
         assert_eq!(fault::call_count("openat2_beneath"), 1);
         assert_eq!(fault::call_count("open_directory"), 0);
@@ -1780,20 +1799,22 @@ mod tests {
 
         let directory: OwnedFd = std::fs::File::open(&dir_path).unwrap().into();
         let directory_fd = directory.as_raw_fd();
+        let directory_stat = fstat(directory.as_fd()).unwrap();
         let stream = DirectoryStream::open(directory).unwrap();
         drop(stream);
-        assert_fd_closed(directory_fd);
+        assert_fd_released(directory_fd, directory_stat.st_dev, directory_stat.st_ino);
 
         let file_path = dir_path.join("plain-file");
         std::fs::write(&file_path, b"data").unwrap();
         let file: OwnedFd = std::fs::File::open(file_path).unwrap().into();
         let file_fd = file.as_raw_fd();
+        let file_stat = fstat(file.as_fd()).unwrap();
         let error = match DirectoryStream::open(file) {
             Ok(_) => panic!("fdopendir accepted a regular file"),
             Err(error) => error,
         };
         assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
-        assert_fd_closed(file_fd);
+        assert_fd_released(file_fd, file_stat.st_dev, file_stat.st_ino);
 
         std::fs::remove_dir_all(dir_path).unwrap();
     }
@@ -1806,7 +1827,7 @@ mod tests {
 
         let error = read_dir_entries(file.as_fd()).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
-        assert_eq!(fstat(file.as_raw_fd()).unwrap().st_size, 4);
+        assert_eq!(fstat(file.as_fd()).unwrap().st_size, 4);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -2135,9 +2156,9 @@ mod tests {
         fault::reset();
         let dir_path = tempfile_dir("borrowed-file-owner");
         let dir = open_dir_absolute(&dir_path).unwrap();
-        let file = create_exclusive(dir.as_raw_fd(), "data", 0o600).unwrap();
+        let file = create_exclusive(dir.as_fd(), "data", 0o600).unwrap();
         fchmod(file.as_fd(), 0o700).unwrap();
-        assert_eq!(fstat(file.as_raw_fd()).unwrap().st_mode & 0o777, 0o700);
+        assert_eq!(fstat(file.as_fd()).unwrap().st_mode & 0o777, 0o700);
         write_all(file.as_fd(), b"data").unwrap();
         // SAFETY: `file` owns this descriptor for the duration of the call.
         assert_eq!(
@@ -2168,11 +2189,62 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_directory_operations_preserve_the_owner() {
+        fault::reset();
+        let dir_path = tempfile_dir("borrowed-directory-owner");
+        let directory = open_dir_absolute(&dir_path).unwrap();
+
+        mkdirat(directory.as_fd(), "child", 0o700).unwrap();
+        let child = open_directory(directory.as_fd(), "child").unwrap();
+        create_exclusive(child.as_fd(), "source", 0o600).unwrap();
+        fchmodat(child.as_fd(), "source", 0o400).unwrap();
+        assert_eq!(
+            fstatat(child.as_fd(), "source").unwrap().st_mode & 0o777,
+            0o400
+        );
+        renameat2_noreplace(child.as_fd(), "source", child.as_fd(), "destination").unwrap();
+        fsync_dir_fd(child.as_fd()).unwrap();
+        unlinkat(child.as_fd(), "destination").unwrap();
+
+        fault::inject_errno("open_directory", 1, libc::EIO);
+        assert_eq!(
+            open_directory(directory.as_fd(), "child")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(
+            fstat(directory.as_fd()).unwrap().st_mode & libc::S_IFMT,
+            libc::S_IFDIR
+        );
+        assert_eq!(
+            fstat(child.as_fd()).unwrap().st_mode & libc::S_IFMT,
+            libc::S_IFDIR
+        );
+
+        fault::reset();
+        fault::inject_errno("syncfs", 1, libc::EIO);
+        assert_eq!(
+            syncfs(directory.as_fd()).unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(
+            fstat(directory.as_fd()).unwrap().st_mode & libc::S_IFMT,
+            libc::S_IFDIR
+        );
+
+        fault::reset();
+        drop(child);
+        drop(directory);
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
     fn empty_write_is_a_noop_without_consuming_a_fault() {
         fault::reset();
         let dir_path = tempfile_dir("empty-write");
         let dir = open_dir_absolute(&dir_path).unwrap();
-        let file = create_exclusive(dir.as_raw_fd(), "data", 0o600).unwrap();
+        let file = create_exclusive(dir.as_fd(), "data", 0o600).unwrap();
         fault::inject_errno("write_all", 1, libc::EIO);
 
         write_all(file.as_fd(), b"").unwrap();
@@ -2195,9 +2267,9 @@ mod tests {
         let fd = open_dir_absolute(&dir).unwrap();
         std::fs::write(dir.join("src1"), b"1").unwrap();
         std::fs::write(dir.join("src2"), b"2").unwrap();
-        let r1 = renameat2_noreplace(fd.as_raw_fd(), "src1", fd.as_raw_fd(), "dst1");
+        let r1 = renameat2_noreplace(fd.as_fd(), "src1", fd.as_fd(), "dst1");
         assert!(r1.is_ok(), "first call should succeed: {r1:?}");
-        let r2 = renameat2_noreplace(fd.as_raw_fd(), "src2", fd.as_raw_fd(), "dst2");
+        let r2 = renameat2_noreplace(fd.as_fd(), "src2", fd.as_fd(), "dst2");
         assert!(r2.is_err(), "second call should fault: {r2:?}");
         assert_eq!(r2.unwrap_err().raw_os_error(), Some(libc::EIO));
         fault::reset();
@@ -2211,7 +2283,7 @@ mod tests {
         let dir = tempfile_dir("enotdir");
         let fd = open_dir_absolute(&dir).unwrap();
         std::fs::write(dir.join("f"), b"x").unwrap();
-        let err = fstatat(fd.as_raw_fd(), "f").unwrap_err();
+        let err = fstatat(fd.as_fd(), "f").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
         fault::reset();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2277,12 +2349,12 @@ mod tests {
     fn mkdirat_and_unlinkat_dir_round_trip() {
         let dir = tempfile_dir("mkdir");
         let fd = open_dir_absolute(&dir).unwrap();
-        mkdirat(fd.as_raw_fd(), "child", 0o700).unwrap();
+        mkdirat(fd.as_fd(), "child", 0o700).unwrap();
         // Open proves the directory was created (Ok(()) no-op mutant fails here).
-        let child = open_directory(fd.as_raw_fd(), "child").unwrap();
+        let child = open_directory(fd.as_fd(), "child").unwrap();
         drop(child);
-        unlinkat_dir(fd.as_raw_fd(), "child").unwrap();
-        assert!(open_directory(fd.as_raw_fd(), "child").is_err());
+        unlinkat_dir(fd.as_fd(), "child").unwrap();
+        assert!(open_directory(fd.as_fd(), "child").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2291,9 +2363,9 @@ mod tests {
         let dir = tempfile_dir("unlink");
         let fd = open_dir_absolute(&dir).unwrap();
         std::fs::write(dir.join("f"), b"x").unwrap();
-        fstatat(fd.as_raw_fd(), "f").unwrap();
-        unlinkat(fd.as_raw_fd(), "f").unwrap();
-        assert!(fstatat(fd.as_raw_fd(), "f").is_err());
+        fstatat(fd.as_fd(), "f").unwrap();
+        unlinkat(fd.as_fd(), "f").unwrap();
+        assert!(fstatat(fd.as_fd(), "f").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2302,9 +2374,9 @@ mod tests {
         let dir = tempfile_dir("renameat");
         let fd = open_dir_absolute(&dir).unwrap();
         std::fs::write(dir.join("a"), b"z").unwrap();
-        renameat(fd.as_raw_fd(), "a", fd.as_raw_fd(), "b").unwrap();
-        assert!(fstatat(fd.as_raw_fd(), "a").is_err());
-        assert!(fstatat(fd.as_raw_fd(), "b").is_ok());
+        renameat(fd.as_fd(), "a", fd.as_fd(), "b").unwrap();
+        assert!(fstatat(fd.as_fd(), "a").is_err());
+        assert!(fstatat(fd.as_fd(), "b").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2313,10 +2385,10 @@ mod tests {
         let dir = tempfile_dir("fsyncdir");
         let fd = open_dir_absolute(&dir).unwrap();
         std::fs::write(dir.join("x"), b"1").unwrap();
-        fsync_dir_fd(fd.as_raw_fd()).unwrap();
+        fsync_dir_fd(fd.as_fd()).unwrap();
         // Nested child dir
-        mkdirat(fd.as_raw_fd(), "nested", 0o700).unwrap();
-        fsync_dir(fd.as_raw_fd(), "nested").unwrap();
+        mkdirat(fd.as_fd(), "nested", 0o700).unwrap();
+        fsync_dir(fd.as_fd(), "nested").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2327,19 +2399,17 @@ mod tests {
         fault::reset();
         let dir = tempfile_dir("fsyncdir-fault");
         let fd = open_dir_absolute(&dir).unwrap();
-        let err = fsync_dir_fd(-1).unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
         fault::inject("fsync_dir_fd", 1);
-        let err = fsync_dir_fd(fd.as_raw_fd()).unwrap_err();
+        let err = fsync_dir_fd(fd.as_fd()).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         fault::reset();
         fault::inject("fsync", 1);
-        let err = fsync_dir_fd(fd.as_raw_fd()).unwrap_err();
+        let err = fsync_dir_fd(fd.as_fd()).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         fault::reset();
         fault::inject("fsync_dir", 1);
-        mkdirat(fd.as_raw_fd(), "nested", 0o700).unwrap();
-        let err = fsync_dir(fd.as_raw_fd(), "nested").unwrap_err();
+        mkdirat(fd.as_fd(), "nested", 0o700).unwrap();
+        let err = fsync_dir(fd.as_fd(), "nested").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         fault::reset();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2352,16 +2422,16 @@ mod tests {
         let second_dir = tempfile_dir("fsyncdir-record-second");
         let first_fd = open_dir_absolute(&first_dir).unwrap();
         let second_fd = open_dir_absolute(&second_dir).unwrap();
-        let first_stat = fstat(first_fd.as_raw_fd()).unwrap();
-        let second_stat = fstat(second_fd.as_raw_fd()).unwrap();
+        let first_stat = fstat(first_fd.as_fd()).unwrap();
+        let second_stat = fstat(second_fd.as_fd()).unwrap();
         let expected = [
             (first_stat.st_dev as u64, first_stat.st_ino as u64),
             (second_stat.st_dev as u64, second_stat.st_ino as u64),
         ];
 
         fault::inject("fsync_dir_fd", u64::MAX);
-        fsync_dir_fd(first_fd.as_raw_fd()).unwrap();
-        fsync_dir_fd(second_fd.as_raw_fd()).unwrap();
+        fsync_dir_fd(first_fd.as_fd()).unwrap();
+        fsync_dir_fd(second_fd.as_fd()).unwrap();
         assert_eq!(fault::fd_identities("fsync_dir_fd"), expected);
         assert_eq!(fault::call_count("fsync_dir_fd"), 2);
 
@@ -2394,7 +2464,7 @@ mod tests {
         let dir = tempfile_dir("pwrite");
         let fd = open_dir_absolute(&dir).unwrap();
         let file = openat(
-            fd.as_raw_fd(),
+            fd.as_fd(),
             "blob",
             libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
             0o600,
@@ -2415,14 +2485,14 @@ mod tests {
     fn durable_move_noreplace_moves_and_syncs() {
         let dir = tempfile_dir("dmnr");
         let fd = open_dir_absolute(&dir).unwrap();
-        mkdirat(fd.as_raw_fd(), "src", 0o700).unwrap();
-        mkdirat(fd.as_raw_fd(), "dst", 0o700).unwrap();
-        let src = open_directory(fd.as_raw_fd(), "src").unwrap();
-        let dst = open_directory(fd.as_raw_fd(), "dst").unwrap();
+        mkdirat(fd.as_fd(), "src", 0o700).unwrap();
+        mkdirat(fd.as_fd(), "dst", 0o700).unwrap();
+        let src = open_directory(fd.as_fd(), "src").unwrap();
+        let dst = open_directory(fd.as_fd(), "dst").unwrap();
         std::fs::write(dir.join("src/f"), b"payload").unwrap();
-        durable_move_noreplace(src.as_raw_fd(), "f", dst.as_raw_fd(), "f").unwrap();
-        assert!(fstatat(src.as_raw_fd(), "f").is_err());
-        assert!(fstatat(dst.as_raw_fd(), "f").is_ok());
+        durable_move_noreplace(src.as_fd(), "f", dst.as_fd(), "f").unwrap();
+        assert!(fstatat(src.as_fd(), "f").is_err());
+        assert!(fstatat(dst.as_fd(), "f").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2430,15 +2500,15 @@ mod tests {
     fn durable_move_replace_overwrites() {
         let dir = tempfile_dir("dmr");
         let fd = open_dir_absolute(&dir).unwrap();
-        mkdirat(fd.as_raw_fd(), "src", 0o700).unwrap();
-        mkdirat(fd.as_raw_fd(), "dst", 0o700).unwrap();
-        let src = open_directory(fd.as_raw_fd(), "src").unwrap();
-        let dst = open_directory(fd.as_raw_fd(), "dst").unwrap();
+        mkdirat(fd.as_fd(), "src", 0o700).unwrap();
+        mkdirat(fd.as_fd(), "dst", 0o700).unwrap();
+        let src = open_directory(fd.as_fd(), "src").unwrap();
+        let dst = open_directory(fd.as_fd(), "dst").unwrap();
         std::fs::write(dir.join("src/f"), b"new").unwrap();
         std::fs::write(dir.join("dst/f"), b"old").unwrap();
-        durable_move_replace(src.as_raw_fd(), "f", dst.as_raw_fd(), "f").unwrap();
-        assert!(fstatat(src.as_raw_fd(), "f").is_err());
-        let st = fstatat(dst.as_raw_fd(), "f").unwrap();
+        durable_move_replace(src.as_fd(), "f", dst.as_fd(), "f").unwrap();
+        assert!(fstatat(src.as_fd(), "f").is_err());
+        let st = fstatat(dst.as_fd(), "f").unwrap();
         assert_eq!(st.st_size as usize, 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2448,7 +2518,7 @@ mod tests {
         let dir = tempfile_dir("tmpfile");
         let fd = open_dir_absolute(&dir).unwrap();
         // O_TMPFILE may be unsupported on some filesystems; skip if so.
-        let tmp = match open_tmpfile(fd.as_raw_fd()) {
+        let tmp = match open_tmpfile(fd.as_fd()) {
             Ok(t) => t,
             Err(_) => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -2457,10 +2527,10 @@ mod tests {
         };
         write_all(tmp.as_fd(), b"tmp").unwrap();
         // Prefer empty_path; fall back to proc path.
-        let linked = linkat_empty_path(tmp.as_raw_fd(), fd.as_raw_fd(), "pub1")
-            .or_else(|_| linkat_proc_self_fd(tmp.as_raw_fd(), fd.as_raw_fd(), "pub1"));
+        let linked = linkat_empty_path(tmp.as_fd(), fd.as_fd(), "pub1")
+            .or_else(|_| linkat_proc_self_fd(tmp.as_fd(), fd.as_fd(), "pub1"));
         assert!(linked.is_ok(), "tmpfile link failed: {linked:?}");
-        assert!(fstatat(fd.as_raw_fd(), "pub1").is_ok());
+        assert!(fstatat(fd.as_fd(), "pub1").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2471,7 +2541,7 @@ mod tests {
         fault::reset();
         let dir = tempfile_dir("linkat-proc-fault");
         let fd = open_dir_absolute(&dir).unwrap();
-        let tmp = match open_tmpfile(fd.as_raw_fd()) {
+        let tmp = match open_tmpfile(fd.as_fd()) {
             Ok(t) => t,
             Err(_) => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -2479,12 +2549,12 @@ mod tests {
             }
         };
         fault::inject("linkat_proc_self_fd", 1);
-        let err = linkat_proc_self_fd(tmp.as_raw_fd(), fd.as_raw_fd(), "pub-fault").unwrap_err();
+        let err = linkat_proc_self_fd(tmp.as_fd(), fd.as_fd(), "pub-fault").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         fault::reset();
         // Real publication via proc path when empty_path is not used.
-        linkat_proc_self_fd(tmp.as_raw_fd(), fd.as_raw_fd(), "pub-proc").unwrap();
-        assert!(fstatat(fd.as_raw_fd(), "pub-proc").is_ok());
+        linkat_proc_self_fd(tmp.as_fd(), fd.as_fd(), "pub-proc").unwrap();
+        assert!(fstatat(fd.as_fd(), "pub-proc").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

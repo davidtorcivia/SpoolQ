@@ -5,8 +5,7 @@
 // retryable (NotCommitted), errors at the rename are classified by errno,
 // and errors during the durability barrier are OutcomeUnknown with poison.
 
-#[allow(unused_imports)]
-use std::os::unix::io::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 
 use steadq_fs_linux as fs;
 
@@ -177,9 +176,9 @@ pub fn is_not_found_io_kind(kind: std::io::ErrorKind) -> bool {
 }
 
 pub fn move_verified_noreplace(
-    src_dir_fd: std::os::unix::io::RawFd,
+    src_dir_fd: BorrowedFd<'_>,
     src_name: &str,
-    dest_dir_fd: std::os::unix::io::RawFd,
+    dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     _actor: MoveActor,
 ) -> Result<(), MoveFailure> {
@@ -215,7 +214,7 @@ pub fn move_verified_noreplace(
 }
 
 pub fn unlink_verified(
-    directory_fd: std::os::unix::io::RawFd,
+    directory_fd: BorrowedFd<'_>,
     name: &str,
     _actor: MoveActor,
 ) -> Result<(), UnlinkFailure> {
@@ -245,7 +244,7 @@ fn is_directory_not_empty(error: &std::io::Error) -> bool {
 }
 
 pub fn remove_empty_directory_verified(
-    parent_directory_fd: std::os::unix::io::RawFd,
+    parent_directory_fd: BorrowedFd<'_>,
     name: &str,
     _actor: MoveActor,
 ) -> Result<(), RemoveDirectoryFailure> {
@@ -274,9 +273,9 @@ pub fn remove_empty_directory_verified(
 /// replacement. The rename is the linearization point, so every later failure
 /// is outcome unknown.
 pub fn replace_verified(
-    src_dir_fd: std::os::unix::io::RawFd,
+    src_dir_fd: BorrowedFd<'_>,
     src_name: &str,
-    dest_dir_fd: std::os::unix::io::RawFd,
+    dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     expected_destination: Option<ReplaceIdentity>,
     _actor: MoveActor,
@@ -305,7 +304,7 @@ pub fn replace_verified(
         }
     }
 
-    if src_dir_fd == dest_dir_fd {
+    if src_dir_fd.as_raw_fd() == dest_dir_fd.as_raw_fd() {
         return fs::fsync_dir_fd(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
             phase: ReplacePhase::DestinationFsync,
             source: error.to_string(),
@@ -368,6 +367,7 @@ pub fn is_not_committed_phase(phase: MovePhase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
 
     #[test]
     fn is_already_exists_table() {
@@ -481,14 +481,16 @@ mod tests {
             .read(true)
             .open(dest_dir.path())
             .unwrap();
-        let bad_fd: i32 = -1;
+        fs::fault::reset();
+        fs::fault::inject_errno("renameat2_noreplace", 1, libc::EIO);
         let r = move_verified_noreplace(
-            bad_fd,
+            dest_fd.as_fd(),
             "nope.raw",
-            dest_fd.as_raw_fd(),
+            dest_fd.as_fd(),
             "dest.raw",
             MoveActor::Recovery,
         );
+        fs::fault::reset();
         assert!(matches!(
             &r,
             Err(MoveFailure::NotCommitted {
@@ -518,9 +520,9 @@ mod tests {
             .open(dest_dir.path())
             .unwrap();
         let r = move_verified_noreplace(
-            src_fd.as_raw_fd(),
+            src_fd.as_fd(),
             "src.raw",
-            dest_fd.as_raw_fd(),
+            dest_fd.as_fd(),
             "dest.raw",
             MoveActor::Recovery,
         );
@@ -530,9 +532,9 @@ mod tests {
 
         // second move of same source should be SourceMissing
         let r2 = move_verified_noreplace(
-            src_fd.as_raw_fd(),
+            src_fd.as_fd(),
             "src.raw",
-            dest_fd.as_raw_fd(),
+            dest_fd.as_fd(),
             "dest2.raw",
             MoveActor::Recovery,
         );
@@ -541,9 +543,9 @@ mod tests {
         // recreate source and try to overwrite existing dest
         std::fs::write(src_dir.path().join("src.raw"), b"again").unwrap();
         let r3 = move_verified_noreplace(
-            src_fd.as_raw_fd(),
+            src_fd.as_fd(),
             "src.raw",
-            dest_fd.as_raw_fd(),
+            dest_fd.as_fd(),
             "dest.raw",
             MoveActor::Recovery,
         );
@@ -565,8 +567,7 @@ mod tests {
                 .unwrap();
             fs::fault::reset();
             fs::fault::inject_errno(fault, 1, libc::EIO);
-            let result =
-                unlink_verified(directory_fd.as_raw_fd(), "object.raw", MoveActor::Recovery);
+            let result = unlink_verified(directory_fd.as_fd(), "object.raw", MoveActor::Recovery);
             fs::fault::reset();
             let failure = result.unwrap_err();
             assert_eq!(failure.phase(), Some(expected_phase));
@@ -583,16 +584,19 @@ mod tests {
             .open(dir.path())
             .unwrap();
         assert!(matches!(
-            unlink_verified(directory_fd.as_raw_fd(), "missing.raw", MoveActor::Recovery),
+            unlink_verified(directory_fd.as_fd(), "missing.raw", MoveActor::Recovery),
             Err(UnlinkFailure::SourceMissing)
         ));
+        fs::fault::reset();
+        fs::fault::inject_errno("unlinkat", 1, libc::EIO);
         assert!(matches!(
-            unlink_verified(-1, "missing.raw", MoveActor::Recovery),
+            unlink_verified(directory_fd.as_fd(), "missing.raw", MoveActor::Recovery),
             Err(UnlinkFailure::NotCommitted {
                 phase: UnlinkPhase::Unlink,
                 ..
             })
         ));
+        fs::fault::reset();
     }
 
     #[test]
@@ -632,7 +636,7 @@ mod tests {
             fs::fault::reset();
             fs::fault::inject_errno(fault, 1, libc::EIO);
             let result =
-                remove_empty_directory_verified(parent.as_raw_fd(), "empty", MoveActor::Recovery);
+                remove_empty_directory_verified(parent.as_fd(), "empty", MoveActor::Recovery);
             fs::fault::reset();
             let failure = result.unwrap_err();
             assert_eq!(failure.phase(), Some(expected_phase));
@@ -649,7 +653,7 @@ mod tests {
                 .open(root.path())
                 .unwrap();
             let replay =
-                remove_empty_directory_verified(reopened.as_raw_fd(), "empty", MoveActor::Recovery);
+                remove_empty_directory_verified(reopened.as_fd(), "empty", MoveActor::Recovery);
             if directory_remains {
                 assert!(replay.is_ok());
             } else {
@@ -668,20 +672,23 @@ mod tests {
             .open(root.path())
             .unwrap();
         assert!(matches!(
-            remove_empty_directory_verified(parent.as_raw_fd(), "missing", MoveActor::Recovery),
+            remove_empty_directory_verified(parent.as_fd(), "missing", MoveActor::Recovery),
             Err(RemoveDirectoryFailure::SourceMissing)
         ));
         assert!(matches!(
-            remove_empty_directory_verified(parent.as_raw_fd(), "nonempty", MoveActor::Recovery),
+            remove_empty_directory_verified(parent.as_fd(), "nonempty", MoveActor::Recovery),
             Err(RemoveDirectoryFailure::NotEmpty)
         ));
+        fs::fault::reset();
+        fs::fault::inject_errno("unlinkat_dir", 1, libc::EIO);
         assert!(matches!(
-            remove_empty_directory_verified(-1, "missing", MoveActor::Recovery),
+            remove_empty_directory_verified(parent.as_fd(), "missing", MoveActor::Recovery),
             Err(RemoveDirectoryFailure::NotCommitted {
                 phase: RemoveDirectoryPhase::Remove,
                 ..
             })
         ));
+        fs::fault::reset();
         assert!(root.path().join("nonempty/object").exists());
     }
 
@@ -703,9 +710,9 @@ mod tests {
             fs::fault::reset();
             fs::fault::inject_errno(fault, 1, libc::EIO);
             let result = replace_verified(
-                directory_fd.as_raw_fd(),
+                directory_fd.as_fd(),
                 "replacement.tmp",
-                directory_fd.as_raw_fd(),
+                directory_fd.as_fd(),
                 "receipt.rct",
                 None,
                 MoveActor::Recovery,
@@ -731,9 +738,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             replace_verified(
-                directory_fd.as_raw_fd(),
+                directory_fd.as_fd(),
                 "missing.tmp",
-                directory_fd.as_raw_fd(),
+                directory_fd.as_fd(),
                 "receipt.rct",
                 None,
                 MoveActor::Recovery,
@@ -741,11 +748,13 @@ mod tests {
             Err(ReplaceFailure::SourceMissing)
         ));
         std::fs::write(dir.path().join("source.tmp"), b"new").unwrap();
+        fs::fault::reset();
+        fs::fault::inject_errno("renameat", 1, libc::EIO);
         assert!(matches!(
             replace_verified(
-                -1,
+                directory_fd.as_fd(),
                 "source.tmp",
-                directory_fd.as_raw_fd(),
+                directory_fd.as_fd(),
                 "receipt.rct",
                 None,
                 MoveActor::Recovery,
@@ -755,6 +764,7 @@ mod tests {
                 ..
             })
         ));
+        fs::fault::reset();
     }
 
     #[test]
@@ -784,9 +794,9 @@ mod tests {
             fs::fault::reset();
             fs::fault::inject_errno(fault, fault_count, libc::EIO);
             let failure = replace_verified(
-                source_fd.as_raw_fd(),
+                source_fd.as_fd(),
                 "replacement.tmp",
-                destination_fd.as_raw_fd(),
+                destination_fd.as_fd(),
                 "receipt.rct",
                 None,
                 MoveActor::Recovery,
@@ -821,9 +831,9 @@ mod tests {
         fs::fault::reset();
         fs::fault::inject_errno("fsync_dir_fd", 2, libc::EIO);
         replace_verified(
-            source_fd.as_raw_fd(),
+            source_fd.as_fd(),
             "replacement.tmp",
-            destination_fd.as_raw_fd(),
+            destination_fd.as_fd(),
             "receipt.rct",
             None,
             MoveActor::Recovery,
@@ -844,12 +854,12 @@ mod tests {
             .read(true)
             .open(dir.path())
             .unwrap();
-        let destination_stat = fs::fstatat(directory_fd.as_raw_fd(), "receipt.rct").unwrap();
+        let destination_stat = fs::fstatat(directory_fd.as_fd(), "receipt.rct").unwrap();
 
         let changed = replace_verified(
-            directory_fd.as_raw_fd(),
+            directory_fd.as_fd(),
             "replacement.tmp",
-            directory_fd.as_raw_fd(),
+            directory_fd.as_fd(),
             "receipt.rct",
             Some(ReplaceIdentity::new(
                 destination_stat.st_dev,
@@ -862,9 +872,9 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"old");
 
         replace_verified(
-            directory_fd.as_raw_fd(),
+            directory_fd.as_fd(),
             "replacement.tmp",
-            directory_fd.as_raw_fd(),
+            directory_fd.as_fd(),
             "receipt.rct",
             Some(ReplaceIdentity::new(
                 destination_stat.st_dev,

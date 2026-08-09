@@ -4,7 +4,7 @@
 // header decode, extension length bound, envelope digest, size, and payload digest.
 // This prevents delivery of corrupt objects via lease or read paths.
 
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::BorrowedFd;
 
 use sha2::Digest;
 
@@ -171,8 +171,7 @@ pub(crate) fn verify_receipt_on_fd(
     context: ReceiptContext<'_>,
     expected: Option<&ExpectedReceipt>,
 ) -> Result<VerifiedReceipt, VerificationError> {
-    let stat =
-        fs::fstat(fd.as_raw_fd()).map_err(|error| VerificationError::Io(error.to_string()))?;
+    let stat = fs::fstat(fd).map_err(|error| VerificationError::Io(error.to_string()))?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(VerificationError::Corrupt(
             "receipt is not a regular file".into(),
@@ -346,7 +345,7 @@ fn verify_size(
     header: &FixedHeader,
     ext_len: usize,
 ) -> Result<(), VerificationError> {
-    let file_stat = fs::fstat(fd.as_raw_fd()).map_err(|e| VerificationError::Io(e.to_string()))?;
+    let file_stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
     let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
     if is_size_mismatch(expected_size, file_stat.st_size as u64) {
         return Err(VerificationError::Corrupt(format!(
@@ -411,7 +410,6 @@ mod tests {
     use std::os::fd::AsFd;
 
     use super::*;
-    use std::os::fd::AsRawFd;
 
     #[test]
     fn is_extension_too_large_table() {
@@ -715,7 +713,7 @@ mod tests {
         );
 
         let temp = tempfile::tempfile().unwrap();
-        let stat = fs::fstat(temp.as_raw_fd()).unwrap();
+        let stat = fs::fstat(temp.as_fd()).unwrap();
         assert!(receipt_path_identity_matches(
             &stat,
             stat.st_dev,
