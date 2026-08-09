@@ -190,6 +190,8 @@ pub(crate) fn load_recovery_cursor(
 pub struct WorkBudget {
     pub max_operations: u32,
     pub max_duration_ms: u64,
+    pub max_entries_read: u64,
+    pub max_name_bytes_read: u64,
 }
 
 impl Default for WorkBudget {
@@ -197,6 +199,8 @@ impl Default for WorkBudget {
         Self {
             max_operations: 1000,
             max_duration_ms: 100,
+            max_entries_read: (MAX_RECOVERY_DIRECTORY_ENTRIES as u64) * 5,
+            max_name_bytes_read: (MAX_RECOVERY_DIRECTORY_NAME_BYTES as u64) * 5,
         }
     }
 }
@@ -205,6 +209,8 @@ impl Default for WorkBudget {
 #[derive(Clone, Debug, Default)]
 pub struct RecoveryStats {
     pub operations_attempted: u32,
+    pub entries_read: u64,
+    pub name_bytes_read: u64,
     pub temp_files_deleted: u32,
     pub delayed_promoted: u32,
     pub leases_reaped: u32,
@@ -2273,6 +2279,7 @@ mod tests {
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: u64::MAX,
+            ..WorkBudget::default()
         };
         let mut stats = RecoveryStats::default();
         assert!(!Queue::budget_exhausted(&mut stats, &budget, u64::MAX));
@@ -2354,6 +2361,7 @@ mod tests {
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: 5_000,
+            ..WorkBudget::default()
         };
         let first = queue.recover(&budget);
         assert_eq!(first.operations_attempted, 1, "errors: {:?}", first.errors);
@@ -2406,6 +2414,7 @@ mod tests {
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: 5_000,
+            ..WorkBudget::default()
         };
 
         let first_stats = first.recover(&budget);
@@ -2881,6 +2890,7 @@ mod tests {
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: 5_000,
+            ..WorkBudget::default()
         };
 
         let first = queue.recover(&budget);
@@ -2928,6 +2938,7 @@ mod tests {
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: 5_000,
+            ..WorkBudget::default()
         };
 
         let first = queue.recover(&budget);
@@ -2981,6 +2992,7 @@ mod tests {
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: 5_000,
+            ..WorkBudget::default()
         };
 
         let first = queue.recover(&budget);

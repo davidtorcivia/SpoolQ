@@ -800,6 +800,7 @@ fn main() -> ExitCode {
             let budget = steadq_core::WorkBudget {
                 max_operations: budget_ops,
                 max_duration_ms: budget_ms,
+                ..steadq_core::WorkBudget::default()
             };
             let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                 Ok(q) => q,
