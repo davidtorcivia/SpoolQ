@@ -30,7 +30,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P1-007 Init/open protocol](https://github.com/davidtorcivia/SteadQ/issues/67) | A-008 | Open |
 | [SQ-P1-008 Incomplete fsck namespace accounting](https://github.com/davidtorcivia/SteadQ/issues/68) | A-012 | Open |
 | [SQ-P1-009 Inconsistent compact receipt validation](https://github.com/davidtorcivia/SteadQ/issues/69) | A-005 | Complete in [#83](https://github.com/davidtorcivia/SteadQ/pull/83) |
-| [SQ-P1-010 Destructive maintenance TOCTOU](https://github.com/davidtorcivia/SteadQ/issues/70) | A-008/A-012 | Open |
+| [SQ-P1-010 Destructive maintenance TOCTOU](https://github.com/davidtorcivia/SteadQ/issues/70) | A-008/A-012 | Complete: maintenance paths authenticate path-to-inode identity via fstatat before mutation; residual POSIX TOCTOU window documented |
 | [SQ-P1-011 String-flattened errors](https://github.com/davidtorcivia/SteadQ/issues/71) | A-008/A-017/A-018 | Open |
 | [SQ-P1-012 Critical mutation exclusions](https://github.com/davidtorcivia/SteadQ/issues/72) | A-019 | Open |
 | [SQ-P1-013 Self-referential testkit](https://github.com/davidtorcivia/SteadQ/issues/73) | A-014 | Open |
