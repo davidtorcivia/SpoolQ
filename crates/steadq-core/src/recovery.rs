@@ -249,6 +249,17 @@ impl Queue {
                 return stats;
             }
         };
+        self.recovery_cursor = match load_recovery_cursor(self.root_fd(), &self.format.queue_id) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                stats.errors.push(RecoveryError {
+                    operation: "recovery_cursor_reload".into(),
+                    relative_path: format!("control/{RECOVERY_CURSOR_FILE}"),
+                    error: error.to_string(),
+                });
+                return stats;
+            }
+        };
         let boottime_now = match fs::clock_boottime_ns() {
             Ok(t) => t,
             Err(e) => {
@@ -1723,6 +1734,44 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.operation == "receipt_compact_invalid"));
+    }
+
+    #[test]
+    fn recovery_reloads_cursor_after_lock_acquisition() {
+        let (tmp, mut first) = create_test_queue();
+        let mut stale = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
+        std::fs::create_dir_all(&receipt_dir).unwrap();
+        std::fs::write(receipt_dir.join("a.rct"), b"invalid a").unwrap();
+        std::fs::write(receipt_dir.join("b.rct"), b"invalid b").unwrap();
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+
+        let first_stats = first.recover(&budget);
+        assert!(first_stats.budget_exhausted);
+        assert!(first_stats
+            .errors
+            .iter()
+            .any(|error| error.relative_path.ends_with("/a.rct")));
+
+        let stale_stats = stale.recover(&budget);
+        assert!(stale_stats
+            .errors
+            .iter()
+            .any(|error| error.relative_path.ends_with("/b.rct")));
+        assert!(!stale_stats
+            .errors
+            .iter()
+            .any(|error| error.relative_path.ends_with("/a.rct")));
     }
 
     #[test]
