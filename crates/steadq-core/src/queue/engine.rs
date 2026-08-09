@@ -25,6 +25,7 @@ pub enum MovePhase {
     PreRename,
     Rename,
     DestinationIdentity,
+    PostLinearization,
     DestFsync,
     SourceFsync,
 }
@@ -43,8 +44,30 @@ impl MoveIdentity {
     fn matches(self, stat: &libc::stat) -> bool {
         stat.st_mode & libc::S_IFMT == libc::S_IFREG
             && stat.st_nlink == 1
+            && stat.st_size >= 0
             && stat.st_dev == self.device
             && stat.st_ino == self.inode
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MovedObject {
+    device: u64,
+    inode: u64,
+    size: u64,
+}
+
+impl MovedObject {
+    pub fn device(self) -> u64 {
+        self.device
+    }
+
+    pub fn inode(self) -> u64 {
+        self.inode
+    }
+
+    pub fn size(self) -> u64 {
+        self.size
     }
 }
 
@@ -201,7 +224,15 @@ pub fn move_verified_noreplace(
     dest_name: &str,
     _actor: MoveActor,
 ) -> Result<(), MoveFailure> {
-    move_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name, None, false)
+    move_noreplace(
+        src_dir_fd,
+        src_name,
+        dest_dir_fd,
+        dest_name,
+        None,
+        false,
+        |_| Ok(()),
+    )
 }
 
 pub fn move_witnessed_noreplace(
@@ -212,6 +243,27 @@ pub fn move_witnessed_noreplace(
     source_identity: MoveIdentity,
     _actor: MoveActor,
 ) -> Result<(), MoveFailure> {
+    move_witnessed_noreplace_with(
+        src_dir_fd,
+        src_name,
+        dest_dir_fd,
+        dest_name,
+        source_identity,
+        _actor,
+        |_| Ok(()),
+    )
+    .map(|_| ())
+}
+
+pub fn move_witnessed_noreplace_with<T>(
+    src_dir_fd: BorrowedFd<'_>,
+    src_name: &str,
+    dest_dir_fd: BorrowedFd<'_>,
+    dest_name: &str,
+    source_identity: MoveIdentity,
+    _actor: MoveActor,
+    after_linearization: impl FnOnce(MovedObject) -> Result<T, String>,
+) -> Result<(MovedObject, T), MoveFailure> {
     move_noreplace(
         src_dir_fd,
         src_name,
@@ -219,17 +271,22 @@ pub fn move_witnessed_noreplace(
         dest_name,
         Some(source_identity),
         true,
+        move |moved| {
+            let moved = moved.expect("witnessed move authenticates its destination");
+            after_linearization(moved).map(|output| (moved, output))
+        },
     )
 }
 
-fn move_noreplace(
+fn move_noreplace<T>(
     src_dir_fd: BorrowedFd<'_>,
     src_name: &str,
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
     source_identity: Option<MoveIdentity>,
     detect_same_directory: bool,
-) -> Result<(), MoveFailure> {
+    after_linearization: impl FnOnce(Option<MovedObject>) -> Result<T, String>,
+) -> Result<T, MoveFailure> {
     match fs::renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name) {
         Ok(()) => {}
         Err(e) if is_already_exists_io_kind(e.kind()) => {
@@ -246,9 +303,13 @@ fn move_noreplace(
         }
     };
 
-    if let Some(source_identity) = source_identity {
+    let moved = if let Some(source_identity) = source_identity {
         match fs::fstatat(dest_dir_fd, dest_name) {
-            Ok(stat) if source_identity.matches(&stat) => {}
+            Ok(stat) if source_identity.matches(&stat) => Some(MovedObject {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+                size: stat.st_size as u64,
+            }),
             Ok(_) => {
                 return Err(MoveFailure::OutcomeUnknown {
                     phase: MovePhase::DestinationIdentity,
@@ -262,7 +323,14 @@ fn move_noreplace(
                 });
             }
         }
-    }
+    } else {
+        None
+    };
+
+    let output = after_linearization(moved).map_err(|source| MoveFailure::OutcomeUnknown {
+        phase: MovePhase::PostLinearization,
+        source,
+    })?;
 
     if let Err(e) = fs::fsync_dir_fd(dest_dir_fd) {
         return Err(MoveFailure::OutcomeUnknown {
@@ -272,7 +340,7 @@ fn move_noreplace(
     }
 
     if detect_same_directory && same_directory(src_dir_fd, dest_dir_fd) {
-        return Ok(());
+        return Ok(output);
     }
 
     if let Err(e) = fs::fsync_dir_fd(src_dir_fd) {
@@ -281,7 +349,7 @@ fn move_noreplace(
             source: e.to_string(),
         });
     }
-    Ok(())
+    Ok(output)
 }
 
 fn same_directory(source: BorrowedFd<'_>, destination: BorrowedFd<'_>) -> bool {
@@ -440,7 +508,10 @@ pub fn is_source_missing(f: &MoveFailure) -> bool {
 pub fn is_outcome_unknown_phase(phase: MovePhase) -> bool {
     matches!(
         phase,
-        MovePhase::DestinationIdentity | MovePhase::DestFsync | MovePhase::SourceFsync
+        MovePhase::DestinationIdentity
+            | MovePhase::PostLinearization
+            | MovePhase::DestFsync
+            | MovePhase::SourceFsync
     )
 }
 pub fn is_not_committed_phase(phase: MovePhase) -> bool {
@@ -482,6 +553,7 @@ mod tests {
     #[test]
     fn is_outcome_unknown_phase_table() {
         assert!(is_outcome_unknown_phase(MovePhase::DestinationIdentity));
+        assert!(is_outcome_unknown_phase(MovePhase::PostLinearization));
         assert!(is_outcome_unknown_phase(MovePhase::DestFsync));
         assert!(is_outcome_unknown_phase(MovePhase::SourceFsync));
         assert!(!is_outcome_unknown_phase(MovePhase::Rename));
@@ -495,6 +567,7 @@ mod tests {
         assert!(is_not_committed_phase(MovePhase::PreRename));
         assert!(is_not_committed_phase(MovePhase::Rename));
         assert!(!is_not_committed_phase(MovePhase::DestinationIdentity));
+        assert!(!is_not_committed_phase(MovePhase::PostLinearization));
         assert!(!is_not_committed_phase(MovePhase::DestFsync));
         assert!(!is_not_committed_phase(MovePhase::SourceFsync));
     }
@@ -659,6 +732,10 @@ mod tests {
         wrong_link_count.st_nlink = 2;
         assert!(!identity.matches(&wrong_link_count));
 
+        let mut negative_size = stat;
+        negative_size.st_size = -1;
+        assert!(!identity.matches(&negative_size));
+
         let mut wrong_device = stat;
         wrong_device.st_dev = wrong_device.st_dev.wrapping_add(1);
         assert!(!identity.matches(&wrong_device));
@@ -762,6 +839,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::fault::call_count("fsync_dir_fd"), 1);
+        fs::fault::reset();
+    }
+
+    #[test]
+    fn witnessed_move_runs_post_linearization_work_before_barriers() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let destination_dir = root.path().join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&destination_dir).unwrap();
+        let contents = b"source evidence";
+        std::fs::write(source_dir.join("source.raw"), contents).unwrap();
+        let source_fd = std::fs::File::open(&source_dir).unwrap();
+        let destination_fd = std::fs::File::open(&destination_dir).unwrap();
+        let source_stat = fs::fstatat(source_fd.as_fd(), "source.raw").unwrap();
+
+        fs::fault::reset();
+        let failure = move_witnessed_noreplace_with(
+            source_fd.as_fd(),
+            "source.raw",
+            destination_fd.as_fd(),
+            "destination.raw",
+            MoveIdentity::new(source_stat.st_dev, source_stat.st_ino),
+            MoveActor::Consumer,
+            |moved| {
+                assert!(!source_dir.join("source.raw").exists());
+                assert!(destination_dir.join("destination.raw").exists());
+                assert_eq!(moved.device(), source_stat.st_dev);
+                assert_eq!(moved.inode(), source_stat.st_ino);
+                assert_eq!(moved.size(), contents.len() as u64);
+                Err::<(), _>("evidence refresh failed".to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            failure,
+            MoveFailure::OutcomeUnknown {
+                phase: MovePhase::PostLinearization,
+                ..
+            }
+        ));
+        assert_eq!(fs::fault::call_count("fsync_dir_fd"), 0);
         fs::fault::reset();
     }
 
