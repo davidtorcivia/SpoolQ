@@ -5046,7 +5046,7 @@ mod tests {
 
     #[test]
     fn renew_syncs_source_directory_only_when_distinct() {
-        fn sync_count(distinct_destination: bool) -> u64 {
+        fn synced_directories(distinct_destination: bool) -> Vec<(u64, u64)> {
             let (_tmp, mut queue) = create_test_queue();
             queue.enqueue(EnqueueInput {
                 maximum_attempts: 3,
@@ -5069,8 +5069,19 @@ mod tests {
                 queue.ensure_dir(&directory).unwrap();
                 directory
             } else {
-                source_directory
+                source_directory.clone()
             };
+            let source_directory_fd =
+                open_relative(queue.root_fd.as_raw_fd(), &source_directory).unwrap();
+            let source_stat = fs::fstat(source_directory_fd.as_raw_fd()).unwrap();
+            let source_identity = (source_stat.st_dev as u64, source_stat.st_ino as u64);
+            let destination_directory_fd =
+                open_relative(queue.root_fd.as_raw_fd(), &destination_directory).unwrap();
+            let destination_stat = fs::fstat(destination_directory_fd.as_raw_fd()).unwrap();
+            let destination_identity = (
+                destination_stat.st_dev as u64,
+                destination_stat.st_ino as u64,
+            );
             let ticket = queue
                 .transition_ticket_for_lease(
                     &lease,
@@ -5091,14 +5102,19 @@ mod tests {
                 "renew-barrier-test.sqj",
                 &ticket,
             );
-            let count = fs::fault::call_count("fsync_dir_fd");
+            let identities = fs::fault::fd_identities("fsync_dir_fd");
             fs::fault::reset();
             assert!(matches!(outcome, TransitionOutcome::Committed));
-            count
+            if distinct_destination {
+                assert_eq!(identities, [destination_identity, source_identity]);
+            } else {
+                assert_eq!(identities, [destination_identity]);
+            }
+            identities
         }
 
-        assert_eq!(sync_count(false), 1);
-        assert_eq!(sync_count(true), 2);
+        assert_eq!(synced_directories(false).len(), 1);
+        assert_eq!(synced_directories(true).len(), 2);
     }
 
     #[test]
