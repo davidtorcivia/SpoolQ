@@ -5216,11 +5216,25 @@ mod tests {
                     match queue.lease(0, 30_000_000_000) {
                         LeaseOutcome::Leased(lease) => {
                             lc.fetch_add(1, Ordering::SeqCst);
-                            match queue.ack(&lease) {
-                                AckOutcome::Acked => {
-                                    ac.fetch_add(1, Ordering::SeqCst);
+                            let mut ack_attempts = 0;
+                            loop {
+                                ack_attempts += 1;
+                                assert!(
+                                    ack_attempts <= 1_000,
+                                    "ack remained contended after {ack_attempts} attempts; leased {} acked {}",
+                                    lc.load(Ordering::SeqCst),
+                                    ac.load(Ordering::SeqCst)
+                                );
+                                match queue.ack(&lease) {
+                                    AckOutcome::Acked => {
+                                        ac.fetch_add(1, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    AckOutcome::NotCommitted(Error::MaintenanceBusy) => {
+                                        std::thread::yield_now();
+                                    }
+                                    outcome => panic!("concurrent ack failed: {outcome:?}"),
                                 }
-                                outcome => panic!("concurrent ack failed: {outcome:?}"),
                             }
                         }
                         LeaseOutcome::Empty => {
@@ -6690,6 +6704,31 @@ mod tests {
         ));
         assert!(!queue.is_poisoned());
         assert!(find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_none());
+    }
+
+    #[test]
+    fn ack_can_retry_same_lease_after_wall_stabilization_contention() {
+        let (_tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+
+        let control_fd = fs::open_directory(queue.root_fd(), "control").unwrap();
+        let lock_fd = fs::openat(
+            control_fd.as_raw_fd(),
+            "wall-watermark.lock",
+            libc::O_RDWR,
+            0,
+        )
+        .unwrap();
+        assert!(fs::try_ofd_write_lock(lock_fd.as_raw_fd()).unwrap());
+
+        assert!(matches!(
+            queue.ack(&lease),
+            AckOutcome::NotCommitted(Error::MaintenanceBusy)
+        ));
+        assert!(!queue.is_poisoned());
+
+        drop(lock_fd);
+        assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
     }
 
     #[test]
