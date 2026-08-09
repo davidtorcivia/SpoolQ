@@ -271,10 +271,20 @@ impl Queue {
                         report,
                     );
                 } else {
-                    // Another directory level (shard under bucket)
+                    // Another directory level (shard under bucket) or unexpected file.
                     let shard_fd = match fs::open_directory(sub_fd.as_fd(), sub_entry) {
                         Ok(fd) => fd,
-                        Err(_) => continue,
+                        Err(_) => {
+                            report.findings.push(CorruptionFinding {
+                                relative_path: format!("{state_name}/{entry}/{sub_entry}"),
+                                finding_type: "unexpected_entry".into(),
+                                severity: FindingSeverity::Warning,
+                                details: format!(
+                                    "unrecognized entry in state directory: {sub_entry}"
+                                ),
+                            });
+                            continue;
+                        }
                     };
                     let files = match fs::read_dir_entries(shard_fd.as_fd()) {
                         Ok(e) => e,
@@ -287,7 +297,6 @@ impl Queue {
                         };
                         if file.ends_with(".sqj") || file.ends_with(".rct") {
                             report.total_objects += 1;
-                            // C-41: Full path includes all directory levels
                             let full_path = format!("{state_name}/{entry}/{sub_entry}/{file}");
                             self.fsck_file(
                                 shard_fd.as_fd(),
@@ -297,6 +306,13 @@ impl Queue {
                                 opts,
                                 report,
                             );
+                        } else {
+                            report.findings.push(CorruptionFinding {
+                                relative_path: format!("{state_name}/{entry}/{sub_entry}/{file}"),
+                                finding_type: "unexpected_entry".into(),
+                                severity: FindingSeverity::Warning,
+                                details: format!("unrecognized file in shard directory: {file}"),
+                            });
                         }
                     }
                 }
@@ -373,6 +389,15 @@ impl Queue {
                                 opts,
                                 report,
                             );
+                        } else {
+                            report.findings.push(CorruptionFinding {
+                                relative_path: format!(
+                                    "leased/{boot_dir}/{bucket_dir}/{shard_dir}/{file}"
+                                ),
+                                finding_type: "unexpected_entry".into(),
+                                severity: FindingSeverity::Warning,
+                                details: format!("unrecognized file in leased shard: {file}"),
+                            });
                         }
                     }
                 }
@@ -1630,6 +1655,46 @@ mod tests {
         assert_eq!(
             std::fs::read(tmp.path().join("quarantine").join(collision_name)).unwrap(),
             b"distinct"
+        );
+    }
+
+    #[test]
+    fn fsck_reports_unexpected_entries() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = open_test_queue(tmp.path());
+        // Place an unexpected file directly in a ready shard directory.
+        let ready_shard = tmp.path().join("ready/0000");
+        std::fs::write(ready_shard.join("unexpected.txt"), b"garbage").unwrap();
+        // Place an unexpected file in a deep shard (delayed bucket/shard).
+        std::fs::create_dir_all(tmp.path().join("delayed/0000000000000000/0001")).unwrap();
+        std::fs::write(
+            tmp.path().join("delayed/0000000000000000/0001/stray.bin"),
+            b"garbage",
+        )
+        .unwrap();
+
+        let report = queue.fsck(&FsckOptions::default());
+        let unexpected: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.finding_type == "unexpected_entry")
+            .collect();
+        assert!(
+            !unexpected.is_empty(),
+            "expected unexpected_entry findings, got {} findings: {:?}",
+            report.findings.len(),
+            report.findings
+        );
+
+        // A clean queue should have zero objects and zero findings.
+        let clean_tmp = TempDir::new().unwrap();
+        Queue::init(clean_tmp.path(), &CreateOptions::default()).unwrap();
+        let clean_queue = open_test_queue(clean_tmp.path());
+        let clean_report = clean_queue.fsck(&FsckOptions::default());
+        assert_eq!(
+            clean_report.total_objects, 0,
+            "empty queue should have zero objects"
         );
     }
 
