@@ -526,7 +526,7 @@ impl Queue {
             let path_parts: Vec<&str> = full_path.split('/').collect();
             let receipt_result = match path_parts.as_slice() {
                 ["receipts", bucket, shard, _] => crate::queue::verified::verify_receipt_on_fd(
-                    file_fd.as_raw_fd(),
+                    file_fd.as_fd(),
                     crate::queue::verified::ReceiptContext {
                         queue_id,
                         shard_count: self.format.shard_count,
@@ -586,7 +586,7 @@ impl Queue {
         }
 
         let mut header_buf = [0u8; 128];
-        if fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0).is_err() {
+        if fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0).is_err() {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
                 finding_type: "header_read_failed".into(),
@@ -689,7 +689,7 @@ impl Queue {
             return;
         }
         let mut ext_buf = vec![0u8; ext_len];
-        if ext_len > 0 && fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128).is_err() {
+        if ext_len > 0 && fs::pread_exact(file_fd.as_fd(), &mut ext_buf, 128).is_err() {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
                 finding_type: "extension_read_failed".into(),
@@ -843,7 +843,7 @@ impl Queue {
             let mut read_ok = true;
             while remaining > 0 {
                 let to_read = remaining.min(buf.len());
-                match fs::pread(file_fd.as_raw_fd(), &mut buf[..to_read], offset) {
+                match fs::pread(file_fd.as_fd(), &mut buf[..to_read], offset) {
                     Ok(n) if n > 0 => {
                         hasher.update(&buf[..n]);
                         offset += n as u64;
@@ -1180,7 +1180,7 @@ impl Queue {
         reason: crate::QuarantineReason,
         report: &mut FsckReport,
     ) -> Result<(), QuarantinePublishFailure> {
-        let locked = steadq_fs_linux::try_ofd_write_lock(opened.as_raw_fd()).map_err(|error| {
+        let locked = steadq_fs_linux::try_ofd_write_lock(opened.as_fd()).map_err(|error| {
             QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::SourceLock,
                 source: error.to_string(),

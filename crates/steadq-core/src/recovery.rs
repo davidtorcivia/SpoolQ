@@ -298,7 +298,7 @@ pub(crate) fn load_recovery_cursor(
             "recovery cursor size is unsupported".into()
         ))?
     ];
-    fs::pread_exact(cursor_fd.as_raw_fd(), &mut bytes, 0)
+    fs::pread_exact(cursor_fd.as_fd(), &mut bytes, 0)
         .map_err(|error| Error::IoFailure(error.to_string()))?;
     let record: RecoveryCursorRecord = serde_json::from_slice(&bytes)
         .map_err(|error| Error::QueueCorrupt(format!("recovery cursor decode: {error}")))?;
@@ -463,7 +463,7 @@ impl Queue {
             .map_err(|error| Error::IoFailure(error.to_string()))?;
         let lock_fd = match fs::create_exclusive(control_fd.as_raw_fd(), "recovery.lock", 0o600) {
             Ok(fd) => {
-                fs::fsync(fd.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+                fs::fsync(fd.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
                 fs::fsync_dir_fd(control_fd.as_raw_fd())
                     .map_err(|error| Error::IoFailure(error.to_string()))?;
                 fd
@@ -477,7 +477,7 @@ impl Queue {
             .map_err(|error| Error::IoFailure(error.to_string()))?,
             Err(error) => return Err(Error::IoFailure(error.to_string())),
         };
-        if !fs::try_ofd_write_lock(lock_fd.as_raw_fd())
+        if !fs::try_ofd_write_lock(lock_fd.as_fd())
             .map_err(|error| Error::IoFailure(error.to_string()))?
         {
             return Err(Error::MaintenanceBusy);
@@ -518,14 +518,14 @@ impl Queue {
                     "recovery cursor publication not committed at phase=TempCreate: {error}"
                 ))
             })?;
-        if let Err(error) = fs::write_all(temp_fd.as_raw_fd(), &bytes) {
+        if let Err(error) = fs::write_all(temp_fd.as_fd(), &bytes) {
             return Err(Self::cleanup_cursor_temporary_file(
                 control_fd.as_raw_fd(),
                 &temp_name,
                 format!("recovery cursor publication not committed at phase=TempWrite: {error}"),
             ));
         }
-        if let Err(error) = fs::fsync(temp_fd.as_raw_fd()) {
+        if let Err(error) = fs::fsync(temp_fd.as_fd()) {
             return Err(Self::cleanup_cursor_temporary_file(
                 control_fd.as_raw_fd(),
                 &temp_name,
@@ -2893,12 +2893,12 @@ impl Queue {
                         Err(_) => continue,
                     };
 
-                    if !fs::try_ofd_write_lock(receipt_fd.as_raw_fd()).unwrap_or(false) {
+                    if !fs::try_ofd_write_lock(receipt_fd.as_fd()).unwrap_or(false) {
                         continue; // busy, skip
                     }
 
                     let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
-                        receipt_fd.as_raw_fd(),
+                        receipt_fd.as_fd(),
                         crate::queue::verified::ReceiptContext {
                             queue_id: &self.format.queue_id,
                             shard_count: self.format.shard_count,
@@ -2991,7 +2991,7 @@ impl Queue {
                         }
                     };
 
-                    if let Err(error) = fs::write_all(tmp_fd.as_raw_fd(), &compact_bytes) {
+                    if let Err(error) = fs::write_all(tmp_fd.as_fd(), &compact_bytes) {
                         Self::record_error(
                             stats,
                             "receipt_compact_temp_write_not_committed",
@@ -3006,7 +3006,7 @@ impl Queue {
                         );
                         continue;
                     }
-                    if let Err(error) = fs::fsync(tmp_fd.as_raw_fd()) {
+                    if let Err(error) = fs::fsync(tmp_fd.as_fd()) {
                         Self::record_error(
                             stats,
                             "receipt_compact_temp_fsync_not_committed",
@@ -3360,12 +3360,12 @@ impl Queue {
                         Err(_) => continue,
                     };
 
-                    if !fs::try_ofd_write_lock(receipt_fd.as_raw_fd()).unwrap_or(false) {
+                    if !fs::try_ofd_write_lock(receipt_fd.as_fd()).unwrap_or(false) {
                         continue;
                     }
 
                     let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
-                        receipt_fd.as_raw_fd(),
+                        receipt_fd.as_fd(),
                         crate::queue::verified::ReceiptContext {
                             queue_id: &self.format.queue_id,
                             shard_count: self.format.shard_count,
@@ -6605,7 +6605,7 @@ mod tests {
             .open(&receipts[0])
             .unwrap();
         let held_original_len = std::fs::metadata(&receipts[0]).unwrap().len();
-        assert!(fs::try_ofd_write_lock(held.as_raw_fd()).unwrap());
+        assert!(fs::try_ofd_write_lock(held.as_fd()).unwrap());
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: 5_000,

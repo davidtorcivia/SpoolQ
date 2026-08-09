@@ -4,6 +4,8 @@
 // header decode, extension length bound, envelope digest, size, and payload digest.
 // This prevents delivery of corrupt objects via lease or read paths.
 
+use std::os::fd::{AsRawFd, BorrowedFd};
+
 use sha2::Digest;
 
 use steadq_format::{CompactReceipt, FixedHeader, COMPACT_RECEIPT_SIZE, RECEIPT_MAGIC};
@@ -165,11 +167,12 @@ fn full_evidence_matches(header: &FixedHeader, expected: &ExpectedReceipt) -> bo
 /// stronger than envelope-only inspection because compaction and duplicate
 /// acknowledgment must never erase or trust corrupt payload evidence.
 pub(crate) fn verify_receipt_on_fd(
-    fd: std::os::unix::io::RawFd,
+    fd: BorrowedFd<'_>,
     context: ReceiptContext<'_>,
     expected: Option<&ExpectedReceipt>,
 ) -> Result<VerifiedReceipt, VerificationError> {
-    let stat = fs::fstat(fd).map_err(|error| VerificationError::Io(error.to_string()))?;
+    let stat =
+        fs::fstat(fd.as_raw_fd()).map_err(|error| VerificationError::Io(error.to_string()))?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(VerificationError::Corrupt(
             "receipt is not a regular file".into(),
@@ -283,7 +286,7 @@ pub(crate) fn verify_receipt_on_fd(
 
 /// Verify the envelope and payload on an already-open fd. The fd must remain
 /// open across any subsequent operation to prevent TOCTOU swap.
-pub fn verify_job_on_fd(fd: std::os::unix::io::RawFd) -> Result<VerifiedJob, VerificationError> {
+pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationError> {
     let header = read_and_verify_header(fd)?;
     verify_size(fd, &header, header.extension_header_length as usize)?;
     verify_payload(fd, &header, header.extension_header_length as usize)?;
@@ -301,9 +304,7 @@ pub fn verify_job_on_fd(fd: std::os::unix::io::RawFd) -> Result<VerifiedJob, Ver
 
 /// Light envelope-only verification (no payload hash). Used for inspection paths
 /// that have not yet delivered payload to a consumer.
-pub fn verify_envelope_on_fd(
-    fd: std::os::unix::io::RawFd,
-) -> Result<VerifiedJob, VerificationError> {
+pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationError> {
     let header = read_and_verify_header(fd)?;
     let ext = read_extension(fd, header.extension_header_length as usize)?;
     if !steadq_format::verify_envelope_digest(&header, &ext) {
@@ -318,7 +319,7 @@ pub fn verify_envelope_on_fd(
     })
 }
 
-fn read_and_verify_header(fd: std::os::unix::io::RawFd) -> Result<FixedHeader, VerificationError> {
+fn read_and_verify_header(fd: BorrowedFd<'_>) -> Result<FixedHeader, VerificationError> {
     let mut header_buf = [0u8; 128];
     fs::pread_exact(fd, &mut header_buf, 0).map_err(|e| VerificationError::Io(e.to_string()))?;
     let header = FixedHeader::decode(&header_buf)
@@ -332,10 +333,7 @@ fn read_and_verify_header(fd: std::os::unix::io::RawFd) -> Result<FixedHeader, V
     Ok(header)
 }
 
-fn read_extension(
-    fd: std::os::unix::io::RawFd,
-    ext_len: usize,
-) -> Result<Vec<u8>, VerificationError> {
+fn read_extension(fd: BorrowedFd<'_>, ext_len: usize) -> Result<Vec<u8>, VerificationError> {
     let mut ext_buf = vec![0u8; ext_len];
     if is_extension_present(ext_len) {
         fs::pread_exact(fd, &mut ext_buf, 128).map_err(|e| VerificationError::Io(e.to_string()))?;
@@ -344,11 +342,11 @@ fn read_extension(
 }
 
 fn verify_size(
-    fd: std::os::unix::io::RawFd,
+    fd: BorrowedFd<'_>,
     header: &FixedHeader,
     ext_len: usize,
 ) -> Result<(), VerificationError> {
-    let file_stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
+    let file_stat = fs::fstat(fd.as_raw_fd()).map_err(|e| VerificationError::Io(e.to_string()))?;
     let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
     if is_size_mismatch(expected_size, file_stat.st_size as u64) {
         return Err(VerificationError::Corrupt(format!(
@@ -360,7 +358,7 @@ fn verify_size(
 }
 
 fn verify_payload(
-    fd: std::os::unix::io::RawFd,
+    fd: BorrowedFd<'_>,
     header: &FixedHeader,
     ext_len: usize,
 ) -> Result<(), VerificationError> {
@@ -410,6 +408,8 @@ pub fn is_size_mismatch(expected: u64, actual: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsFd;
+
     use super::*;
     use std::os::fd::AsRawFd;
 
@@ -538,7 +538,7 @@ mod tests {
         let header_buf = h.encode(&ext).unwrap();
         std::fs::write(&path, header_buf).unwrap();
         let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
-        let res = verify_size(file.as_raw_fd(), &h, 0);
+        let res = verify_size(file.as_fd(), &h, 0);
         assert!(matches!(res, Err(VerificationError::Corrupt(_))));
         drop(file);
         let mut full = Vec::with_capacity(138);
@@ -546,7 +546,7 @@ mod tests {
         full.extend_from_slice(&[0u8; 10]);
         std::fs::write(&path, &full).unwrap();
         let file2 = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
-        let res2 = verify_size(file2.as_raw_fd(), &h, 0);
+        let res2 = verify_size(file2.as_fd(), &h, 0);
         assert!(res2.is_ok());
     }
 
@@ -593,7 +593,7 @@ mod tests {
 
         let verify = |bucket: &str, shard: &str, filename: &str, expected: &ExpectedReceipt| {
             verify_receipt_on_fd(
-                file.as_raw_fd(),
+                file.as_fd(),
                 ReceiptContext {
                     queue_id: &queue_id,
                     shard_count,
@@ -683,7 +683,7 @@ mod tests {
         let file = std::fs::File::open(path).unwrap();
 
         let verified = verify_receipt_on_fd(
-            file.as_raw_fd(),
+            file.as_fd(),
             ReceiptContext {
                 queue_id: &queue_id,
                 shard_count,

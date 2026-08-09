@@ -4,7 +4,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::ptr::NonNull;
 
@@ -354,7 +354,11 @@ pub fn mkdirat_eexist_ok(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<boo
 }
 
 /// fsync a file descriptor.
-pub fn fsync(fd: RawFd) -> io::Result<()> {
+pub fn fsync(fd: BorrowedFd<'_>) -> io::Result<()> {
+    fsync_raw(fd.as_raw_fd())
+}
+
+fn fsync_raw(fd: RawFd) -> io::Result<()> {
     fault_check!("fsync");
     let rc = unsafe { libc::fsync(fd) };
     if rc < 0 {
@@ -367,14 +371,14 @@ pub fn fsync(fd: RawFd) -> io::Result<()> {
 pub fn fsync_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
     fault_check!("fsync_dir");
     let fd = open_directory(dir_fd, name)?;
-    fsync(fd.as_raw_fd())
+    fsync(fd.as_fd())
 }
 
 /// fsync a directory by its already-open fd.
 pub fn fsync_dir_fd(fd: RawFd) -> io::Result<()> {
     fault::record_fd_identity("fsync_dir_fd", fd)?;
     fault_check!("fsync_dir_fd");
-    fsync(fd)
+    fsync_raw(fd)
 }
 
 /// Rename with RENAME_NOREPLACE.
@@ -634,9 +638,16 @@ pub fn random_128bit() -> io::Result<[u8; 16]> {
 }
 
 /// pwrite to a file descriptor at a given offset.
-pub fn pwrite(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
+pub fn pwrite(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<usize> {
     fault_check!("pwrite");
-    let rc = unsafe { libc::pwrite(fd, buf.as_ptr() as *const _, buf.len(), offset as i64) };
+    let rc = unsafe {
+        libc::pwrite(
+            fd.as_raw_fd(),
+            buf.as_ptr() as *const _,
+            buf.len(),
+            offset as i64,
+        )
+    };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -645,12 +656,21 @@ pub fn pwrite(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<usize> {
 
 /// Write all bytes, retrying on partial writes. Rejects zero progress.
 /// Returns an error if write returns 0 (no progress) rather than looping forever.
-pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
+pub fn write_all(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
     fault_check!("write_all");
     let mut written = 0;
     while written < buf.len() {
-        let rc =
-            unsafe { libc::write(fd, buf[written..].as_ptr() as *const _, buf.len() - written) };
+        let remaining = &buf[written..];
+        let rc = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                remaining.as_ptr() as *const _,
+                remaining.len(),
+            )
+        };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -673,7 +693,7 @@ pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
 
 /// Write all bytes at a given offset using pwrite, retrying on partial writes.
 /// Returns an error if pwrite returns 0 (no progress).
-pub fn pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
+pub fn pwrite_all(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<()> {
     let mut written = 0;
     let mut current_offset = offset;
     while written < buf.len() {
@@ -691,9 +711,9 @@ pub fn pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
 }
 
 /// Read from a file descriptor.
-pub fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+pub fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     loop {
-        let rc = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        let rc = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -706,10 +726,17 @@ pub fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// Read at a specific offset using pread.
-pub fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     fault_check!("pread");
     loop {
-        let rc = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), offset as i64) };
+        let rc = unsafe {
+            libc::pread(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+                offset as i64,
+            )
+        };
         if rc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -722,7 +749,7 @@ pub fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 }
 
 /// Read exactly `buf.len()` bytes at `offset`, or return an error.
-pub fn pread_exact(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<()> {
+pub fn pread_exact(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<()> {
     let mut filled = 0;
     let mut cur = offset;
     while filled < buf.len() {
@@ -768,14 +795,14 @@ pub fn create_exclusive(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<Owne
 
 /// Try a nonblocking exclusive OFD lock on a file.
 /// Returns Ok(true) if acquired, Ok(false) if contended.
-pub fn try_ofd_write_lock(fd: RawFd) -> io::Result<bool> {
+pub fn try_ofd_write_lock(fd: BorrowedFd<'_>) -> io::Result<bool> {
     fault_check!("try_ofd_write_lock");
     let mut flock: libc::flock = unsafe { std::mem::zeroed() };
     flock.l_type = libc::F_WRLCK as i16;
     flock.l_whence = libc::SEEK_SET as i16;
     flock.l_start = 0;
     flock.l_len = 0;
-    let rc = unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &flock) };
+    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_SETLK, &flock) };
     if rc < 0 {
         let e = io::Error::last_os_error();
         if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EAGAIN) {
@@ -787,14 +814,14 @@ pub fn try_ofd_write_lock(fd: RawFd) -> io::Result<bool> {
 }
 
 /// Try a nonblocking shared OFD lock on a file.
-pub fn try_ofd_read_lock(fd: RawFd) -> io::Result<bool> {
+pub fn try_ofd_read_lock(fd: BorrowedFd<'_>) -> io::Result<bool> {
     fault_check!("try_ofd_read_lock");
     let mut flock: libc::flock = unsafe { std::mem::zeroed() };
     flock.l_type = libc::F_RDLCK as i16;
     flock.l_whence = libc::SEEK_SET as i16;
     flock.l_start = 0;
     flock.l_len = 0;
-    let rc = unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &flock) };
+    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_SETLK, &flock) };
     if rc < 0 {
         let e = io::Error::last_os_error();
         if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EAGAIN) {
@@ -1178,8 +1205,8 @@ pub fn fchmodat(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<()> {
 }
 
 /// Change file mode on an open fd.
-pub fn fchmod(fd: RawFd, mode: u32) -> io::Result<()> {
-    let rc = unsafe { libc::fchmod(fd, mode) };
+pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
+    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1237,7 +1264,7 @@ pub fn durable_move_replace(
 
 /// Stabilization sync: sync a verified destination and its parent directories.
 /// Non-mutating: only performs fsync, no rename or write.
-pub fn stabilize(fd: RawFd) -> io::Result<()> {
+pub fn stabilize(fd: BorrowedFd<'_>) -> io::Result<()> {
     fsync(fd)
 }
 
@@ -1313,7 +1340,7 @@ pub fn probe_publication_mode(dir_fd: RawFd) -> io::Result<PublicationMode> {
     };
 
     // Write a byte so it's not empty
-    write_all(tmp.as_raw_fd(), b"x")?;
+    write_all(tmp.as_fd(), b"x")?;
 
     let rand = random_128bit()?;
     let probe_name = format!(
@@ -1513,9 +1540,9 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
         let file = create_exclusive(dir.as_raw_fd(), "data", 0o600).unwrap();
-        write_all(file.as_raw_fd(), b"complete").unwrap();
+        write_all(file.as_fd(), b"complete").unwrap();
         let mut bytes = [0u8; 8];
-        pread_exact(file.as_raw_fd(), &mut bytes, 0).unwrap();
+        pread_exact(file.as_fd(), &mut bytes, 0).unwrap();
         assert_eq!(&bytes, b"complete");
         drop(file);
         drop(dir);
@@ -1529,8 +1556,8 @@ mod tests {
         let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
         let first = create_exclusive(dir.as_raw_fd(), "lock", 0o600).unwrap();
         let second = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
-        assert!(try_ofd_write_lock(first.as_raw_fd()).unwrap());
-        assert!(!try_ofd_write_lock(second.as_raw_fd()).unwrap());
+        assert!(try_ofd_write_lock(first.as_fd()).unwrap());
+        assert!(!try_ofd_write_lock(second.as_fd()).unwrap());
         drop(second);
         drop(first);
         drop(dir);
@@ -1543,13 +1570,13 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let dir: OwnedFd = std::fs::File::open(&path).unwrap().into();
         let reader = create_exclusive(dir.as_raw_fd(), "lock", 0o600).unwrap();
-        assert!(try_ofd_read_lock(reader.as_raw_fd()).unwrap());
+        assert!(try_ofd_read_lock(reader.as_fd()).unwrap());
         drop(reader);
 
         let writer = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
         let blocked_reader = openat(dir.as_raw_fd(), "lock", libc::O_RDWR, 0).unwrap();
-        assert!(try_ofd_write_lock(writer.as_raw_fd()).unwrap());
-        assert!(!try_ofd_read_lock(blocked_reader.as_raw_fd()).unwrap());
+        assert!(try_ofd_write_lock(writer.as_fd()).unwrap());
+        assert!(!try_ofd_read_lock(blocked_reader.as_fd()).unwrap());
         drop(blocked_reader);
         drop(writer);
         drop(dir);
@@ -2095,11 +2122,69 @@ mod tests {
         fault::reset();
         fault::inject("fsync", 1);
         // Use a real fd (stdout). The fault fires before the syscall.
-        let err = fsync(1).unwrap_err();
+        let stdout = std::io::stdout();
+        let err = fsync(stdout.as_fd()).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         // Second call is not faulted.
-        let _ = fsync(1);
+        let _ = fsync(stdout.as_fd());
         fault::reset();
+    }
+
+    #[test]
+    fn borrowed_file_operations_preserve_the_owner() {
+        fault::reset();
+        let dir_path = tempfile_dir("borrowed-file-owner");
+        let dir = open_dir_absolute(&dir_path).unwrap();
+        let file = create_exclusive(dir.as_raw_fd(), "data", 0o600).unwrap();
+        fchmod(file.as_fd(), 0o700).unwrap();
+        assert_eq!(fstat(file.as_raw_fd()).unwrap().st_mode & 0o777, 0o700);
+        write_all(file.as_fd(), b"data").unwrap();
+        // SAFETY: `file` owns this descriptor for the duration of the call.
+        assert_eq!(
+            unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) },
+            0
+        );
+        let mut sequential = [0u8; 4];
+        assert_eq!(read(file.as_fd(), &mut sequential).unwrap(), 4);
+        assert_eq!(&sequential, b"data");
+
+        fault::inject_errno("pread", 1, libc::EIO);
+        let mut bytes = [0u8; 4];
+        assert_eq!(
+            pread_exact(file.as_fd(), &mut bytes, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        // SAFETY: `file` owns this descriptor for the duration of the call.
+        assert_ne!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) }, -1);
+        pread_exact(file.as_fd(), &mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"data");
+
+        fault::reset();
+        drop(file);
+        drop(dir);
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn empty_write_is_a_noop_without_consuming_a_fault() {
+        fault::reset();
+        let dir_path = tempfile_dir("empty-write");
+        let dir = open_dir_absolute(&dir_path).unwrap();
+        let file = create_exclusive(dir.as_raw_fd(), "data", 0o600).unwrap();
+        fault::inject_errno("write_all", 1, libc::EIO);
+
+        write_all(file.as_fd(), b"").unwrap();
+        assert_eq!(
+            write_all(file.as_fd(), b"data").unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+
+        fault::reset();
+        drop(file);
+        drop(dir);
+        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
@@ -2167,7 +2252,7 @@ mod tests {
         assert_eq!(fault::call_count("fsync"), 0);
         let dir = tempfile_dir("idle");
         let fd = open_dir_absolute(&dir).unwrap();
-        fsync(fd.as_raw_fd()).unwrap();
+        fsync(fd.as_fd()).unwrap();
         // Idle threads do not count checks when no faults are armed.
         assert_eq!(fault::call_count("fsync"), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2242,7 +2327,13 @@ mod tests {
         fault::reset();
         let dir = tempfile_dir("fsyncdir-fault");
         let fd = open_dir_absolute(&dir).unwrap();
+        let err = fsync_dir_fd(-1).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
         fault::inject("fsync_dir_fd", 1);
+        let err = fsync_dir_fd(fd.as_raw_fd()).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        fault::reset();
+        fault::inject("fsync", 1);
         let err = fsync_dir_fd(fd.as_raw_fd()).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         fault::reset();
@@ -2310,11 +2401,11 @@ mod tests {
         )
         .unwrap();
         let data = b"hello-steadq";
-        let n = pwrite(file.as_raw_fd(), data, 0).unwrap();
+        let n = pwrite(file.as_fd(), data, 0).unwrap();
         assert_eq!(n, data.len());
-        fsync(file.as_raw_fd()).unwrap();
+        fsync(file.as_fd()).unwrap();
         let mut buf = vec![0u8; data.len()];
-        let r = pread(file.as_raw_fd(), &mut buf, 0).unwrap();
+        let r = pread(file.as_fd(), &mut buf, 0).unwrap();
         assert_eq!(r, data.len());
         assert_eq!(&buf, data);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2364,7 +2455,7 @@ mod tests {
                 return;
             }
         };
-        write_all(tmp.as_raw_fd(), b"tmp").unwrap();
+        write_all(tmp.as_fd(), b"tmp").unwrap();
         // Prefer empty_path; fall back to proc path.
         let linked = linkat_empty_path(tmp.as_raw_fd(), fd.as_raw_fd(), "pub1")
             .or_else(|_| linkat_proc_self_fd(tmp.as_raw_fd(), fd.as_raw_fd(), "pub1"));
