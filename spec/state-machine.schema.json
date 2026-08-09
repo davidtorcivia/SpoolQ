@@ -8,6 +8,7 @@
     "version",
     "transitions",
     "exceptions",
+    "unlinks",
     "reentry"
   ],
   "properties": {
@@ -17,8 +18,8 @@
     },
     "version": {
       "type": "integer",
-      "minimum": 2,
-      "const": 2
+      "minimum": 3,
+      "const": 3
     },
     "transitions": {
       "type": "array",
@@ -276,6 +277,85 @@
           },
           "linearization": {
             "const": "rename_replace"
+          },
+          "required_syncs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "file_fsync",
+                "destination_dir_fsync",
+                "source_dir_fsync",
+                "same_or_destination_dir_fsync",
+                "source_dir_fsync_if_distinct"
+              ]
+            }
+          },
+          "before_linearization_failure": {
+            "const": "not_committed"
+          },
+          "after_linearization_failure": {
+            "const": "outcome_unknown"
+          }
+        }
+      }
+    },
+    "unlinks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description",
+          "source_object_kind",
+          "clock_requirement",
+          "mutation_class",
+          "linearization",
+          "required_syncs",
+          "before_linearization_failure",
+          "after_linearization_failure"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "full_receipt_retention_deletion",
+              "compact_receipt_retention_deletion"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_object_kind": {
+            "type": "string",
+            "enum": [
+              "full_job",
+              "full_receipt",
+              "compact_receipt",
+              "raw_object",
+              "watermark_record"
+            ]
+          },
+          "clock_requirement": {
+            "type": "string",
+            "enum": [
+              "none",
+              "authenticated_wall_floor",
+              "boottime_and_authenticated_wall_floor",
+              "lease_expiration_evidence",
+              "lease_expiration_evidence_and_authenticated_wall_floor"
+            ]
+          },
+          "mutation_class": {
+            "const": "unlink"
+          },
+          "linearization": {
+            "const": "unlink"
           },
           "required_syncs": {
             "type": "array",

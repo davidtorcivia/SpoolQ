@@ -1,9 +1,9 @@
 -------------------------- MODULE SteadQProtocol --------------------------
 (* Auto-generated from spec/state-machine.json. Do not edit by hand. *)
-(* Source SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008 *)
+(* Source SHA-256: f3bb2bfbe1bff8c37f8c4a3f684ed41a55ddee8546defd1a69c7d53488094d63 *)
 
 ProtocolIRIdentity == "steadq-state-machine"
-ProtocolIRVersion == 2
+ProtocolIRVersion == 3
 
 OperationEnqueueImmediate == "enqueue_immediate"
 OperationEnqueueDelayed == "enqueue_delayed"
@@ -76,7 +76,8 @@ ProtocolSyncSteps == {SyncStepFile, SyncStepDestinationDirectory, SyncStepSource
 LinearizationPublishNoreplace == "publish_noreplace"
 LinearizationRenameNoreplace == "rename_noreplace"
 LinearizationRenameReplace == "rename_replace"
-ProtocolLinearizationPrimitives == {LinearizationPublishNoreplace, LinearizationRenameNoreplace, LinearizationRenameReplace}
+LinearizationUnlink == "unlink"
+ProtocolLinearizationPrimitives == {LinearizationPublishNoreplace, LinearizationRenameNoreplace, LinearizationRenameReplace, LinearizationUnlink}
 
 FailureOutcomeNotCommitted == "not_committed"
 FailureOutcomeOutcomeUnknown == "outcome_unknown"
@@ -103,6 +104,10 @@ ProtocolMutationClasses == {MutationClassNoOverwriteMove, MutationClassReplacing
 ExceptionReceiptCompaction == "receipt_compaction"
 ExceptionWallWatermarkAdvancement == "wall_watermark_advancement"
 ProtocolExceptionNames == {ExceptionReceiptCompaction, ExceptionWallWatermarkAdvancement}
+
+UnlinkFullReceiptRetentionDeletion == "full_receipt_retention_deletion"
+UnlinkCompactReceiptRetentionDeletion == "compact_receipt_retention_deletion"
+ProtocolUnlinkNames == {UnlinkFullReceiptRetentionDeletion, UnlinkCompactReceiptRetentionDeletion}
 
 ReentryRequeueDead == "requeue_dead"
 ReentryRequeueQuarantine == "requeue_quarantine"
@@ -339,6 +344,27 @@ ProtocolExceptions == <<
      mutationClass |-> MutationClassReplacingMove,
      linearization |-> LinearizationRenameReplace,
      requiredSyncs |-> <<SyncStepFile, SyncStepSameOrDestinationDirectory>>,
+     beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
+     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown]
+>>
+
+ProtocolUnlinks == <<
+    [name |-> UnlinkFullReceiptRetentionDeletion,
+     descriptionUtf8Hex |-> "41757468656e7469636174656420726574656e74696f6e2064656c6574696f6e206f6620616e20656c696769626c652066756c6c2072656365697074",
+     sourceObjectKind |-> ObjectKindFullReceipt,
+     clockRequirement |-> ClockRequirementAuthenticatedWallFloor,
+     mutationClass |-> MutationClassUnlink,
+     linearization |-> LinearizationUnlink,
+     requiredSyncs |-> <<SyncStepSourceDirectory>>,
+     beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
+     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown],
+    [name |-> UnlinkCompactReceiptRetentionDeletion,
+     descriptionUtf8Hex |-> "41757468656e7469636174656420726574656e74696f6e2064656c6574696f6e206f6620616e20656c696769626c6520636f6d706163742072656365697074",
+     sourceObjectKind |-> ObjectKindCompactReceipt,
+     clockRequirement |-> ClockRequirementAuthenticatedWallFloor,
+     mutationClass |-> MutationClassUnlink,
+     linearization |-> LinearizationUnlink,
+     requiredSyncs |-> <<SyncStepSourceDirectory>>,
      beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
      afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown]
 >>

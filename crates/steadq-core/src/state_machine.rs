@@ -1,8 +1,8 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008
+// Source SHA-256: f3bb2bfbe1bff8c37f8c4a3f684ed41a55ddee8546defd1a69c7d53488094d63
 
 pub const PROTOCOL_IR_IDENTITY: &str = "steadq-state-machine";
-pub const PROTOCOL_IR_VERSION: u32 = 2;
+pub const PROTOCOL_IR_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -108,6 +108,7 @@ pub enum LinearizationPrimitive {
     PublishNoreplace,
     RenameNoreplace,
     RenameReplace,
+    Unlink,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -129,6 +130,12 @@ pub enum MutationClass {
 pub enum ExceptionName {
     ReceiptCompaction,
     WallWatermarkAdvancement,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum UnlinkName {
+    FullReceiptRetentionDeletion,
+    CompactReceiptRetentionDeletion,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -163,6 +170,19 @@ pub struct ExceptionDef {
     pub description: &'static str,
     pub source_object_kind: ObjectKind,
     pub destination_object_kind: ObjectKind,
+    pub clock_requirement: ClockRequirement,
+    pub mutation_class: MutationClass,
+    pub linearization: LinearizationPrimitive,
+    pub required_syncs: &'static [SyncStep],
+    pub before_linearization_failure: FailureOutcome,
+    pub after_linearization_failure: FailureOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnlinkDef {
+    pub name: UnlinkName,
+    pub description: &'static str,
+    pub source_object_kind: ObjectKind,
     pub clock_requirement: ClockRequirement,
     pub mutation_class: MutationClass,
     pub linearization: LinearizationPrimitive,
@@ -446,6 +466,31 @@ pub const EXCEPTIONS: &[ExceptionDef] = &[
     },
 ];
 
+pub const UNLINKS: &[UnlinkDef] = &[
+    UnlinkDef {
+        name: UnlinkName::FullReceiptRetentionDeletion,
+        description: "Authenticated retention deletion of an eligible full receipt",
+        source_object_kind: ObjectKind::FullReceipt,
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
+        mutation_class: MutationClass::Unlink,
+        linearization: LinearizationPrimitive::Unlink,
+        required_syncs: &[SyncStep::SourceDirectory],
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
+    },
+    UnlinkDef {
+        name: UnlinkName::CompactReceiptRetentionDeletion,
+        description: "Authenticated retention deletion of an eligible compact receipt",
+        source_object_kind: ObjectKind::CompactReceipt,
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
+        mutation_class: MutationClass::Unlink,
+        linearization: LinearizationPrimitive::Unlink,
+        required_syncs: &[SyncStep::SourceDirectory],
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
+    },
+];
+
 pub const REENTRY: &[ReentryDef] = &[
     ReentryDef {
         name: ReentryName::RequeueDead,
@@ -639,6 +684,44 @@ mod tests {
         );
         assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);
         assert_eq!(REENTRY[0].source, State::Dead);
+    }
+}
+
+#[cfg(test)]
+mod unlink_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_retention_unlinks_are_complete() {
+        assert_eq!(UNLINKS.len(), 2);
+
+        let full = UNLINKS
+            .iter()
+            .find(|unlink| unlink.name == UnlinkName::FullReceiptRetentionDeletion)
+            .unwrap();
+        assert_eq!(full.source_object_kind, ObjectKind::FullReceipt);
+        let compact = UNLINKS
+            .iter()
+            .find(|unlink| unlink.name == UnlinkName::CompactReceiptRetentionDeletion)
+            .unwrap();
+        assert_eq!(compact.source_object_kind, ObjectKind::CompactReceipt);
+        for unlink in UNLINKS {
+            assert_eq!(
+                unlink.clock_requirement,
+                ClockRequirement::AuthenticatedWallFloor
+            );
+            assert_eq!(unlink.mutation_class, MutationClass::Unlink);
+            assert_eq!(unlink.linearization, LinearizationPrimitive::Unlink);
+            assert_eq!(unlink.required_syncs, &[SyncStep::SourceDirectory]);
+            assert_eq!(
+                unlink.before_linearization_failure,
+                FailureOutcome::NotCommitted
+            );
+            assert_eq!(
+                unlink.after_linearization_failure,
+                FailureOutcome::OutcomeUnknown
+            );
+        }
     }
 }
 

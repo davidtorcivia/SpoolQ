@@ -37,8 +37,8 @@ fn rejects_schema_integer_const_drift() {
     let schema = serde_json::json!({"version": {"const": 1}});
     assert!(validate_schema_u64_const(&schema, "/version/const", 1).is_ok());
     assert_eq!(
-        validate_schema_u64_const(&schema, "/version/const", 2).unwrap_err(),
-        "spec/state-machine.schema.json integer at /version/const differs from xtask: expected 2, got 1"
+        validate_schema_u64_const(&schema, "/version/const", 3).unwrap_err(),
+        "spec/state-machine.schema.json integer at /version/const differs from xtask: expected 3, got 1"
     );
     assert_eq!(
         validate_schema_u64_const(&schema, "/missing/const", 1).unwrap_err(),
@@ -172,7 +172,7 @@ fn rejects_unsupported_protocol_ir_identity_and_version() {
         spec.version = version;
         assert_eq!(
             validate_spec(&spec).unwrap_err(),
-            format!("unsupported protocol IR version: expected 2, got {version}")
+            format!("unsupported protocol IR version: expected 3, got {version}")
         );
     }
 }
@@ -470,6 +470,68 @@ fn rejects_duplicate_exception_sync() {
 }
 
 #[test]
+fn rejects_wrong_receipt_retention_unlink_semantics() {
+    let mut spec = fixture();
+    spec.unlinks[0].source_object_kind = ObjectKind::CompactReceipt;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has source object kind compact_receipt; expected full_receipt"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].clock_requirement = ClockRequirement::None;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has clock requirement none; expected authenticated_wall_floor"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].mutation_class = MutationClass::ReplacingMove;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has mutation class replacing_move; expected unlink"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].linearization = LinearizationPrimitive::RenameReplace;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has linearization rename_replace; expected unlink"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].required_syncs = vec![SyncStep::DestinationDir];
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has syncs [\"destination_dir_fsync\"]; expected [\"source_dir_fsync\"]"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].before_linearization_failure = FailureOutcome::OutcomeUnknown;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion must classify pre-linearization failure as not_committed"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].after_linearization_failure = FailureOutcome::NotCommitted;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion must classify post-linearization failure as outcome_unknown"
+    );
+}
+
+#[test]
+fn rejects_duplicate_unlink_sync() {
+    let mut spec = fixture();
+    spec.unlinks[0].required_syncs.push(SyncStep::SourceDir);
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion contains duplicate sync source_dir_fsync"
+    );
+}
+
+#[test]
 fn renew_requires_conditional_source_directory_barrier_in_order() {
     for (syncs, expected) in [
         (
@@ -517,6 +579,9 @@ fn generated_rust_contains_source_transition() {
         .contains("required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]"));
     assert!(output.contains("pub const EXCEPTIONS: &[ExceptionDef]"));
     assert!(output.contains("linearization: LinearizationPrimitive::RenameReplace"));
+    assert!(output.contains("pub const UNLINKS: &[UnlinkDef]"));
+    assert!(output.contains("name: UnlinkName::FullReceiptRetentionDeletion"));
+    assert!(output.contains("linearization: LinearizationPrimitive::Unlink"));
     assert!(
         output.contains("clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor")
     );
@@ -529,7 +594,7 @@ fn generated_tla_contains_complete_protocol_metadata() {
     assert!(output.contains("MODULE SteadQProtocol"));
     assert!(output.contains("Source SHA-256: fixture-digest"));
     assert!(output.contains("ProtocolIRIdentity == \"steadq-state-machine\""));
-    assert!(output.contains("ProtocolIRVersion == 2"));
+    assert!(output.contains("ProtocolIRVersion == 3"));
     assert!(output.contains("ProtocolOperations =="));
     assert!(output.contains("ProtocolStates =="));
     let operations = Operation::ALL
@@ -548,6 +613,11 @@ fn generated_tla_contains_complete_protocol_metadata() {
         output.matches("    [name |-> Exception").count(),
         ExceptionName::ALL.len()
     );
+    assert_eq!(
+        output.matches("    [name |-> Unlink").count(),
+        UnlinkName::ALL.len()
+    );
+    assert!(output.contains("ProtocolUnlinks == <<"));
     assert_eq!(
         output.matches("    [name |-> Reentry").count(),
         ReentryName::ALL.len()
@@ -700,6 +770,37 @@ fn every_exception_field_affects_every_projection() {
 }
 
 #[test]
+fn every_unlink_field_affects_every_projection() {
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].name = UnlinkName::CompactReceiptRetentionDeletion;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].description = "different unlink documentation".into();
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].source_object_kind = ObjectKind::CompactReceipt;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].clock_requirement = ClockRequirement::None;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].mutation_class = MutationClass::ReplacingMove;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].linearization = LinearizationPrimitive::RenameReplace;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].required_syncs = vec![SyncStep::DestinationDir];
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].before_linearization_failure = FailureOutcome::OutcomeUnknown;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].after_linearization_failure = FailureOutcome::NotCommitted;
+    });
+}
+
+#[test]
 fn every_reentry_field_affects_every_projection() {
     assert_every_projection_changes(|spec| {
         spec.reentry[0].name = ReentryName::RequeueQuarantine;
@@ -725,7 +826,13 @@ fn production_and_generated_rust_are_identical() {
 
 #[test]
 fn rejects_unknown_source_field() {
-    for pointer in ["", "/transitions/0", "/exceptions/0", "/reentry/0"] {
+    for pointer in [
+        "",
+        "/transitions/0",
+        "/exceptions/0",
+        "/unlinks/0",
+        "/reentry/0",
+    ] {
         let mut input = fixture_value();
         input
             .pointer_mut(pointer)
@@ -772,6 +879,12 @@ fn rejects_unknown_protocol_domains() {
         ("/exceptions/0/clock_requirement", "invented_clock"),
         ("/exceptions/0/mutation_class", "invented_mutation_class"),
         ("/exceptions/0/linearization", "invented_linearization"),
+        ("/unlinks/0/name", "invented_unlink"),
+        ("/unlinks/0/source_object_kind", "invented_object_kind"),
+        ("/unlinks/0/clock_requirement", "invented_clock"),
+        ("/unlinks/0/mutation_class", "invented_mutation_class"),
+        ("/unlinks/0/linearization", "invented_linearization"),
+        ("/unlinks/0/required_syncs/0", "invented_sync"),
         ("/reentry/0/name", "invented_reentry"),
     ] {
         let mut input = fixture_value();
@@ -837,6 +950,25 @@ fn rejects_omitted_semantic_fields() {
         );
     }
 
+    for field in [
+        "name",
+        "description",
+        "source_object_kind",
+        "clock_requirement",
+        "mutation_class",
+        "linearization",
+        "required_syncs",
+        "before_linearization_failure",
+        "after_linearization_failure",
+    ] {
+        let mut input = fixture_value();
+        input["unlinks"][0].as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<StateMachineSpec>(input).is_err(),
+            "accepted unlink without {field}"
+        );
+    }
+
     for field in ["name", "source", "description", "creates_new_identity"] {
         let mut input = fixture_value();
         input["reentry"][0].as_object_mut().unwrap().remove(field);
@@ -851,6 +983,7 @@ fn rejects_omitted_semantic_fields() {
         "version",
         "transitions",
         "exceptions",
+        "unlinks",
         "reentry",
     ] {
         let mut input = fixture_value();
@@ -994,6 +1127,14 @@ fn rejects_missing_closed_domain_members() {
     );
 
     let mut spec = fixture();
+    spec.unlinks
+        .retain(|unlink| unlink.name != UnlinkName::CompactReceiptRetentionDeletion);
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "state-machine spec is missing unlink: compact_receipt_retention_deletion"
+    );
+
+    let mut spec = fixture();
     spec.reentry
         .retain(|reentry| reentry.name != ReentryName::RequeueQuarantine);
     assert_eq!(
@@ -1014,6 +1155,7 @@ fn schema_closes_every_object() {
             "version",
             "transitions",
             "exceptions",
+            "unlinks",
             "reentry"
         ])
     );

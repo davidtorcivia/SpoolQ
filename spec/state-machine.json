@@ -1,6 +1,6 @@
 {
   "protocol": "steadq-state-machine",
-  "version": 2,
+  "version": 3,
   "transitions": [
     {
       "operation": "enqueue_immediate",
@@ -303,6 +303,34 @@
       "required_syncs": [
         "file_fsync",
         "same_or_destination_dir_fsync"
+      ],
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown"
+    }
+  ],
+  "unlinks": [
+    {
+      "name": "full_receipt_retention_deletion",
+      "description": "Authenticated retention deletion of an eligible full receipt",
+      "source_object_kind": "full_receipt",
+      "clock_requirement": "authenticated_wall_floor",
+      "mutation_class": "unlink",
+      "linearization": "unlink",
+      "required_syncs": [
+        "source_dir_fsync"
+      ],
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown"
+    },
+    {
+      "name": "compact_receipt_retention_deletion",
+      "description": "Authenticated retention deletion of an eligible compact receipt",
+      "source_object_kind": "compact_receipt",
+      "clock_requirement": "authenticated_wall_floor",
+      "mutation_class": "unlink",
+      "linearization": "unlink",
+      "required_syncs": [
+        "source_dir_fsync"
       ],
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown"

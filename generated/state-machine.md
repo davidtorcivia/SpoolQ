@@ -1,8 +1,8 @@
-<!-- Source: spec/state-machine.json; SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008 -->
+<!-- Source: spec/state-machine.json; SHA-256: f3bb2bfbe1bff8c37f8c4a3f684ed41a55ddee8546defd1a69c7d53488094d63 -->
 
 # SteadQ/1 State Machine (Generated)
 
-Protocol IR: `steadq-state-machine`, version `2`.
+Protocol IR: `steadq-state-machine`, version `3`.
 
 ## Transitions
 
@@ -28,6 +28,13 @@ Protocol IR: `steadq-state-machine`, version `2`.
 |-----------|-------------|------------------|-------------------|-------|---------------|----------------|----------------|---------------|-------------|
 | receipt_compaction | full_receipt | compact_receipt | none | replacing_move | rename_replace | file_fsync, same_or_destination_dir_fsync | not_committed | outcome_unknown | Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname |
 | wall_watermark_advancement | watermark_record | watermark_record | authenticated_wall_floor | replacing_move | rename_replace | file_fsync, same_or_destination_dir_fsync | not_committed | outcome_unknown | Monotone wall-watermark record replaced under exclusive OFD lock |
+
+## Unlink mutations
+
+| Operation | Source kind | Clock requirement | Class | Linearization | Required syncs | Before failure | After failure | Description |
+|-----------|-------------|-------------------|-------|---------------|----------------|----------------|---------------|-------------|
+| full_receipt_retention_deletion | full_receipt | authenticated_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | Authenticated retention deletion of an eligible full receipt |
+| compact_receipt_retention_deletion | compact_receipt | authenticated_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | Authenticated retention deletion of an eligible compact receipt |
 
 ## Administrative re-entry (creates new identity)
 

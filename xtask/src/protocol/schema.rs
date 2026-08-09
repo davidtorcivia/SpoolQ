@@ -5,13 +5,13 @@ use std::path::Path;
 use super::{
     AttemptChange, ClockRequirement, ExceptionName, FailureOutcome, GenerationChange,
     LinearizationPrimitive, MutationClass, ObjectKind, Operation, ReasonClass, ReentryName,
-    ResolverProbeTopology, State, SyncStep, TokenChange, TransitionQualification,
+    ResolverProbeTopology, State, SyncStep, TokenChange, TransitionQualification, UnlinkName,
     PROTOCOL_IR_IDENTITY, PROTOCOL_IR_VERSION,
 };
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "254f56e4f53b70389edea9725ccc12b4443efcdd9a1040106723d6ad6b57fe3e";
+    "4d1f94d76058d48baace488d7ef520dfdfff6b9bda9874da98706a02237bd5c5";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =
@@ -161,6 +161,46 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     validate_schema_const(
         &schema,
         "/properties/exceptions/items/properties/after_linearization_failure/const",
+        FailureOutcome::OutcomeUnknown.as_str(),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/unlinks/items/properties/name/enum",
+        &UnlinkName::ALL.map(UnlinkName::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/unlinks/items/properties/source_object_kind/enum",
+        &ObjectKind::ALL.map(ObjectKind::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/unlinks/items/properties/clock_requirement/enum",
+        &ClockRequirement::ALL.map(ClockRequirement::as_str),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/unlinks/items/properties/mutation_class/const",
+        MutationClass::Unlink.as_str(),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/unlinks/items/properties/linearization/const",
+        LinearizationPrimitive::Unlink.as_str(),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/unlinks/items/properties/required_syncs/items/enum",
+        &SyncStep::ALL.map(SyncStep::as_str),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/unlinks/items/properties/before_linearization_failure/const",
+        FailureOutcome::NotCommitted.as_str(),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/unlinks/items/properties/after_linearization_failure/const",
         FailureOutcome::OutcomeUnknown.as_str(),
     )?;
     validate_schema_domain(

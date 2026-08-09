@@ -9,7 +9,7 @@ mod schema;
 
 const SPEC: &str = "spec/state-machine.json";
 const PROTOCOL_IR_IDENTITY: &str = "steadq-state-machine";
-const PROTOCOL_IR_VERSION: u32 = 2;
+const PROTOCOL_IR_VERSION: u32 = 3;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +18,7 @@ struct StateMachineSpec {
     version: u32,
     transitions: Vec<Transition>,
     exceptions: Vec<Exception>,
+    unlinks: Vec<Unlink>,
     reentry: Vec<Reentry>,
 }
 
@@ -170,6 +171,7 @@ enum LinearizationPrimitive {
     PublishNoreplace,
     RenameNoreplace,
     RenameReplace,
+    Unlink,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -213,6 +215,27 @@ enum ExceptionName {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Unlink {
+    name: UnlinkName,
+    description: String,
+    source_object_kind: ObjectKind,
+    clock_requirement: ClockRequirement,
+    mutation_class: MutationClass,
+    linearization: LinearizationPrimitive,
+    required_syncs: Vec<SyncStep>,
+    before_linearization_failure: FailureOutcome,
+    after_linearization_failure: FailureOutcome,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum UnlinkName {
+    FullReceiptRetentionDeletion,
+    CompactReceiptRetentionDeletion,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Reentry {
     name: ReentryName,
     source: State,
@@ -245,6 +268,12 @@ struct ExceptionInvariant {
     clock_requirement: ClockRequirement,
     mutation_class: MutationClass,
     linearization: LinearizationPrimitive,
+    required_syncs: &'static [SyncStep],
+}
+
+struct UnlinkInvariant {
+    source_object_kind: ObjectKind,
+    clock_requirement: ClockRequirement,
     required_syncs: &'static [SyncStep],
 }
 
@@ -350,6 +379,38 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
         }
     }
 
+    let mut unlink_names = HashSet::new();
+    for unlink in &spec.unlinks {
+        if !unlink_names.insert(unlink.name) {
+            return Err(format!("duplicate unlink: {}", unlink.name.as_str()));
+        }
+        if unlink.description.trim().is_empty() {
+            return Err(format!(
+                "unlink {} has no description",
+                unlink.name.as_str()
+            ));
+        }
+        let mut syncs = HashSet::new();
+        for sync in &unlink.required_syncs {
+            if !syncs.insert(*sync) {
+                return Err(format!(
+                    "unlink {} contains duplicate sync {}",
+                    unlink.name.as_str(),
+                    sync.as_str()
+                ));
+            }
+        }
+        validate_unlink_invariant(unlink)?;
+    }
+    for unlink in UnlinkName::ALL {
+        if !unlink_names.contains(&unlink) {
+            return Err(format!(
+                "state-machine spec is missing unlink: {}",
+                unlink.as_str()
+            ));
+        }
+    }
+
     let mut reentry_names = HashSet::new();
     for reentry in &spec.reentry {
         if !reentry_names.insert(reentry.name) {
@@ -383,6 +444,71 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
                 reentry.as_str()
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_unlink_invariant(unlink: &Unlink) -> Result<(), String> {
+    let expected = unlink.name.invariant();
+    if unlink.source_object_kind != expected.source_object_kind {
+        return Err(format!(
+            "unlink {} has source object kind {}; expected {}",
+            unlink.name.as_str(),
+            unlink.source_object_kind.as_str(),
+            expected.source_object_kind.as_str()
+        ));
+    }
+    if unlink.clock_requirement != expected.clock_requirement {
+        return Err(format!(
+            "unlink {} has clock requirement {}; expected {}",
+            unlink.name.as_str(),
+            unlink.clock_requirement.as_str(),
+            expected.clock_requirement.as_str()
+        ));
+    }
+    if unlink.mutation_class != MutationClass::Unlink {
+        return Err(format!(
+            "unlink {} has mutation class {}; expected unlink",
+            unlink.name.as_str(),
+            unlink.mutation_class.as_str()
+        ));
+    }
+    if unlink.linearization != LinearizationPrimitive::Unlink {
+        return Err(format!(
+            "unlink {} has linearization {}; expected unlink",
+            unlink.name.as_str(),
+            unlink.linearization.as_str()
+        ));
+    }
+    if unlink.before_linearization_failure != FailureOutcome::NotCommitted {
+        return Err(format!(
+            "unlink {} must classify pre-linearization failure as not_committed",
+            unlink.name.as_str()
+        ));
+    }
+    if unlink.after_linearization_failure != FailureOutcome::OutcomeUnknown {
+        return Err(format!(
+            "unlink {} must classify post-linearization failure as outcome_unknown",
+            unlink.name.as_str()
+        ));
+    }
+    if unlink.required_syncs != expected.required_syncs {
+        let actual = unlink
+            .required_syncs
+            .iter()
+            .copied()
+            .map(SyncStep::as_str)
+            .collect::<Vec<_>>();
+        let expected = expected
+            .required_syncs
+            .iter()
+            .copied()
+            .map(SyncStep::as_str)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "unlink {} has syncs {actual:?}; expected {expected:?}",
+            unlink.name.as_str()
+        ));
     }
     Ok(())
 }
@@ -1175,10 +1301,11 @@ impl SyncStep {
 }
 
 impl LinearizationPrimitive {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::PublishNoreplace,
         Self::RenameNoreplace,
         Self::RenameReplace,
+        Self::Unlink,
     ];
     const TRANSITIONS: [Self; 2] = [Self::PublishNoreplace, Self::RenameNoreplace];
 
@@ -1187,6 +1314,7 @@ impl LinearizationPrimitive {
             Self::PublishNoreplace => "publish_noreplace",
             Self::RenameNoreplace => "rename_noreplace",
             Self::RenameReplace => "rename_replace",
+            Self::Unlink => "unlink",
         }
     }
 
@@ -1195,6 +1323,7 @@ impl LinearizationPrimitive {
             Self::PublishNoreplace => "PublishNoreplace",
             Self::RenameNoreplace => "RenameNoreplace",
             Self::RenameReplace => "RenameReplace",
+            Self::Unlink => "Unlink",
         }
     }
 }
@@ -1281,6 +1410,38 @@ impl ExceptionName {
             mutation_class: MutationClass::ReplacingMove,
             linearization: LinearizationPrimitive::RenameReplace,
             required_syncs: &[SyncStep::File, SyncStep::SameOrDestinationDir],
+        }
+    }
+}
+
+impl UnlinkName {
+    const ALL: [Self; 2] = [
+        Self::FullReceiptRetentionDeletion,
+        Self::CompactReceiptRetentionDeletion,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FullReceiptRetentionDeletion => "full_receipt_retention_deletion",
+            Self::CompactReceiptRetentionDeletion => "compact_receipt_retention_deletion",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::FullReceiptRetentionDeletion => "FullReceiptRetentionDeletion",
+            Self::CompactReceiptRetentionDeletion => "CompactReceiptRetentionDeletion",
+        }
+    }
+
+    fn invariant(self) -> UnlinkInvariant {
+        UnlinkInvariant {
+            source_object_kind: match self {
+                Self::FullReceiptRetentionDeletion => ObjectKind::FullReceipt,
+                Self::CompactReceiptRetentionDeletion => ObjectKind::CompactReceipt,
+            },
+            clock_requirement: ClockRequirement::AuthenticatedWallFloor,
+            required_syncs: &[SyncStep::SourceDir],
         }
     }
 }
