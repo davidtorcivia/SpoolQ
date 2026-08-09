@@ -22,7 +22,9 @@ struct StateMachineSpec {
 struct Transition {
     operation: Operation,
     source: State,
+    source_object_kind: ObjectKind,
     destination: State,
+    destination_object_kind: ObjectKind,
     generation_change: GenerationChange,
     attempt_change: AttemptChange,
     token_change: TokenChange,
@@ -72,6 +74,16 @@ enum State {
     Receipt,
     Quarantine,
     Active,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ObjectKind {
+    FullJob,
+    FullReceipt,
+    CompactReceipt,
+    RawObject,
+    WatermarkRecord,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -166,6 +178,8 @@ enum FailureOutcome {
 struct Exception {
     name: ExceptionName,
     description: String,
+    source_object_kind: ObjectKind,
+    destination_object_kind: ObjectKind,
     clock_requirement: ClockRequirement,
     mutation_class: MutationClass,
     linearization: LinearizationPrimitive,
@@ -209,7 +223,9 @@ enum ReentryName {
 
 struct TransitionInvariant {
     source: State,
+    source_object_kind: ObjectKind,
     destination: State,
+    destination_object_kind: ObjectKind,
     generation_change: GenerationChange,
     attempt_change: AttemptChange,
     token_change: TokenChange,
@@ -218,6 +234,8 @@ struct TransitionInvariant {
 }
 
 struct ExceptionInvariant {
+    source_object_kind: ObjectKind,
+    destination_object_kind: ObjectKind,
     clock_requirement: ClockRequirement,
     mutation_class: MutationClass,
     linearization: LinearizationPrimitive,
@@ -353,6 +371,22 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
 
 fn validate_exception_invariant(exception: &Exception) -> Result<(), String> {
     let expected = exception.name.invariant();
+    if exception.source_object_kind != expected.source_object_kind {
+        return Err(format!(
+            "exception {} has source object kind {}; expected {}",
+            exception.name.as_str(),
+            exception.source_object_kind.as_str(),
+            expected.source_object_kind.as_str()
+        ));
+    }
+    if exception.destination_object_kind != expected.destination_object_kind {
+        return Err(format!(
+            "exception {} has destination object kind {}; expected {}",
+            exception.name.as_str(),
+            exception.destination_object_kind.as_str(),
+            expected.destination_object_kind.as_str()
+        ));
+    }
     if exception.clock_requirement != expected.clock_requirement {
         return Err(format!(
             "exception {} has clock requirement {}; expected {}",
@@ -468,12 +502,28 @@ fn validate_transition_invariant(transition: &Transition) -> Result<(), String> 
             expected.source.as_str()
         ));
     }
+    if transition.source_object_kind != expected.source_object_kind {
+        return Err(format!(
+            "transition {} has source object kind {}; expected {}",
+            transition.operation.as_str(),
+            transition.source_object_kind.as_str(),
+            expected.source_object_kind.as_str()
+        ));
+    }
     if transition.destination != expected.destination {
         return Err(format!(
             "transition {} has destination {}; expected {}",
             transition.operation.as_str(),
             transition.destination.as_str(),
             expected.destination.as_str()
+        ));
+    }
+    if transition.destination_object_kind != expected.destination_object_kind {
+        return Err(format!(
+            "transition {} has destination object kind {}; expected {}",
+            transition.operation.as_str(),
+            transition.destination_object_kind.as_str(),
+            expected.destination_object_kind.as_str()
         ));
     }
     if transition.generation_change != expected.generation_change {
@@ -681,6 +731,7 @@ impl Operation {
     fn invariant(self) -> TransitionInvariant {
         use AttemptChange::{Increment as AttemptIncrement, Unchanged, Zero as AttemptZero};
         use GenerationChange::{Increment as GenerationIncrement, Zero as GenerationZero};
+        use ObjectKind::{FullJob, FullReceipt, RawObject};
         use ReasonClass::{ApplicationDefined, AttemptsExhausted, Corruption};
         use State::{Active, Dead, Delayed, Hidden, Leased, Quarantine, Ready, Receipt};
         use SyncStep::{DestinationDir, File, SameOrDestinationDir, SourceDir};
@@ -689,7 +740,9 @@ impl Operation {
         match self {
             Self::EnqueueImmediate => TransitionInvariant {
                 source: Hidden,
+                source_object_kind: FullJob,
                 destination: Ready,
+                destination_object_kind: FullJob,
                 generation_change: GenerationZero,
                 attempt_change: AttemptZero,
                 token_change: NoToken,
@@ -698,7 +751,9 @@ impl Operation {
             },
             Self::EnqueueDelayed => TransitionInvariant {
                 source: Hidden,
+                source_object_kind: FullJob,
                 destination: Delayed,
+                destination_object_kind: FullJob,
                 generation_change: GenerationZero,
                 attempt_change: AttemptZero,
                 token_change: NoToken,
@@ -707,7 +762,9 @@ impl Operation {
             },
             Self::Promote => TransitionInvariant {
                 source: Delayed,
+                source_object_kind: FullJob,
                 destination: Ready,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -716,7 +773,9 @@ impl Operation {
             },
             Self::Claim => TransitionInvariant {
                 source: Ready,
+                source_object_kind: FullJob,
                 destination: Leased,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: AttemptIncrement,
                 token_change: New,
@@ -725,7 +784,9 @@ impl Operation {
             },
             Self::ExhaustedReadyCleanup => TransitionInvariant {
                 source: Ready,
+                source_object_kind: FullJob,
                 destination: Dead,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -734,7 +795,9 @@ impl Operation {
             },
             Self::Renew => TransitionInvariant {
                 source: Leased,
+                source_object_kind: FullJob,
                 destination: Leased,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: Same,
@@ -743,7 +806,9 @@ impl Operation {
             },
             Self::Acknowledge => TransitionInvariant {
                 source: Leased,
+                source_object_kind: FullJob,
                 destination: Receipt,
+                destination_object_kind: FullReceipt,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: Same,
@@ -752,7 +817,9 @@ impl Operation {
             },
             Self::RetryNow => TransitionInvariant {
                 source: Leased,
+                source_object_kind: FullJob,
                 destination: Ready,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -761,7 +828,9 @@ impl Operation {
             },
             Self::RetryLater => TransitionInvariant {
                 source: Leased,
+                source_object_kind: FullJob,
                 destination: Delayed,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -770,7 +839,9 @@ impl Operation {
             },
             Self::Bury => TransitionInvariant {
                 source: Leased,
+                source_object_kind: FullJob,
                 destination: Dead,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -779,7 +850,9 @@ impl Operation {
             },
             Self::ReapExpiredToReady => TransitionInvariant {
                 source: Leased,
+                source_object_kind: FullJob,
                 destination: Ready,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -788,7 +861,9 @@ impl Operation {
             },
             Self::ReapExpiredToDead => TransitionInvariant {
                 source: Leased,
+                source_object_kind: FullJob,
                 destination: Dead,
+                destination_object_kind: FullJob,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -797,7 +872,9 @@ impl Operation {
             },
             Self::Quarantine => TransitionInvariant {
                 source: Active,
+                source_object_kind: RawObject,
                 destination: Quarantine,
+                destination_object_kind: RawObject,
                 generation_change: GenerationIncrement,
                 attempt_change: Unchanged,
                 token_change: NoToken,
@@ -865,6 +942,36 @@ impl State {
                 | Self::Receipt
                 | Self::Quarantine
         )
+    }
+}
+
+impl ObjectKind {
+    const ALL: [Self; 5] = [
+        Self::FullJob,
+        Self::FullReceipt,
+        Self::CompactReceipt,
+        Self::RawObject,
+        Self::WatermarkRecord,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FullJob => "full_job",
+            Self::FullReceipt => "full_receipt",
+            Self::CompactReceipt => "compact_receipt",
+            Self::RawObject => "raw_object",
+            Self::WatermarkRecord => "watermark_record",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::FullJob => "FullJob",
+            Self::FullReceipt => "FullReceipt",
+            Self::CompactReceipt => "CompactReceipt",
+            Self::RawObject => "RawObject",
+            Self::WatermarkRecord => "WatermarkRecord",
+        }
     }
 }
 
@@ -1136,6 +1243,14 @@ impl ExceptionName {
 
     fn invariant(self) -> ExceptionInvariant {
         ExceptionInvariant {
+            source_object_kind: match self {
+                Self::ReceiptCompaction => ObjectKind::FullReceipt,
+                Self::WallWatermarkAdvancement => ObjectKind::WatermarkRecord,
+            },
+            destination_object_kind: match self {
+                Self::ReceiptCompaction => ObjectKind::CompactReceipt,
+                Self::WallWatermarkAdvancement => ObjectKind::WatermarkRecord,
+            },
             clock_requirement: match self {
                 Self::ReceiptCompaction => ClockRequirement::None,
                 Self::WallWatermarkAdvancement => ClockRequirement::AuthenticatedWallFloor,

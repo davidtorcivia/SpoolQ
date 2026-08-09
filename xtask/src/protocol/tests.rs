@@ -181,7 +181,9 @@ fn rejects_duplicate_operation() {
     spec.transitions.push(Transition {
         operation: Operation::Claim,
         source: State::Ready,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Leased,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Increment,
         token_change: TokenChange::New,
@@ -291,6 +293,37 @@ fn rejects_wrong_resolver_probe_topology() {
 }
 
 #[test]
+fn rejects_wrong_object_kinds() {
+    let mut spec = fixture();
+    spec.transitions[6].source_object_kind = ObjectKind::FullReceipt;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition acknowledge has source object kind full_receipt; expected full_job"
+    );
+
+    let mut spec = fixture();
+    spec.transitions[6].destination_object_kind = ObjectKind::CompactReceipt;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition acknowledge has destination object kind compact_receipt; expected full_receipt"
+    );
+
+    let mut spec = fixture();
+    spec.exceptions[0].source_object_kind = ObjectKind::CompactReceipt;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction has source object kind compact_receipt; expected full_receipt"
+    );
+
+    let mut spec = fixture();
+    spec.exceptions[1].destination_object_kind = ObjectKind::CompactReceipt;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception wall_watermark_advancement has destination object kind compact_receipt; expected watermark_record"
+    );
+}
+
+#[test]
 fn rejects_wrong_exception_mutation_semantics() {
     let mut spec = fixture();
     spec.exceptions[0].mutation_class = MutationClass::Unlink;
@@ -344,6 +377,8 @@ fn rejects_duplicate_exception_sync() {
 fn generated_rust_contains_source_transition() {
     let output = render_rust(&fixture(), "fixture-digest");
     assert!(output.contains("operation: Operation::Claim"));
+    assert!(output.contains("source_object_kind: ObjectKind::FullJob"));
+    assert!(output.contains("destination_object_kind: ObjectKind::FullReceipt"));
     assert!(output.contains("attempt_change: AttemptChange::Increment"));
     assert!(output
         .contains("required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]"));
@@ -401,7 +436,13 @@ fn every_transition_field_affects_every_projection() {
         spec.transitions[0].source = State::Ready;
     });
     assert_every_projection_changes(|spec| {
+        spec.transitions[0].source_object_kind = ObjectKind::RawObject;
+    });
+    assert_every_projection_changes(|spec| {
         spec.transitions[0].destination = State::Delayed;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].destination_object_kind = ObjectKind::FullReceipt;
     });
     assert_every_projection_changes(|spec| {
         spec.transitions[0].generation_change = GenerationChange::Increment;
@@ -445,6 +486,12 @@ fn every_exception_field_affects_every_projection() {
     });
     assert_every_projection_changes(|spec| {
         spec.exceptions[0].description = "different exception documentation".into();
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].source_object_kind = ObjectKind::CompactReceipt;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].destination_object_kind = ObjectKind::FullReceipt;
     });
     assert_every_projection_changes(|spec| {
         spec.exceptions[0].clock_requirement = ClockRequirement::AuthenticatedWallFloor;
@@ -512,6 +559,11 @@ fn rejects_unknown_protocol_domains() {
     for (pointer, value) in [
         ("/transitions/0/operation", "invented_operation"),
         ("/transitions/0/source", "invented_state"),
+        ("/transitions/0/source_object_kind", "invented_object_kind"),
+        (
+            "/transitions/0/destination_object_kind",
+            "invented_object_kind",
+        ),
         ("/transitions/0/reason_class", "invented_reason"),
         ("/transitions/0/clock_requirement", "invented_clock"),
         ("/transitions/0/qualification", "invented_qualification"),
@@ -526,6 +578,11 @@ fn rejects_unknown_protocol_domains() {
             "invented_outcome",
         ),
         ("/exceptions/0/name", "invented_exception"),
+        ("/exceptions/0/source_object_kind", "invented_object_kind"),
+        (
+            "/exceptions/0/destination_object_kind",
+            "invented_object_kind",
+        ),
         ("/exceptions/0/clock_requirement", "invented_clock"),
         ("/exceptions/0/mutation_class", "invented_mutation_class"),
         ("/exceptions/0/linearization", "invented_linearization"),
@@ -545,7 +602,9 @@ fn rejects_omitted_semantic_fields() {
     for field in [
         "operation",
         "source",
+        "source_object_kind",
         "destination",
+        "destination_object_kind",
         "generation_change",
         "attempt_change",
         "token_change",
@@ -572,6 +631,8 @@ fn rejects_omitted_semantic_fields() {
     for field in [
         "name",
         "description",
+        "source_object_kind",
+        "destination_object_kind",
         "clock_requirement",
         "mutation_class",
         "linearization",
@@ -633,7 +694,15 @@ fn rejects_non_terminal_reentry_source() {
 fn rejects_each_cross_field_transition_mutation() {
     for (pointer, value) in [
         ("/transitions/3/source", serde_json::json!("dead")),
+        (
+            "/transitions/3/source_object_kind",
+            serde_json::json!("raw_object"),
+        ),
         ("/transitions/3/destination", serde_json::json!("receipt")),
+        (
+            "/transitions/3/destination_object_kind",
+            serde_json::json!("full_receipt"),
+        ),
         (
             "/transitions/3/generation_change",
             serde_json::json!("zero"),

@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: edbcbf72a8e4ed58b488516f6300f2e7795a8d3c304b74ade0c5c4794d98ad07
+// Source SHA-256: 454b8dbb183e68d24608501f888bdecc6e9910ae43b675ee1d38af9fb859d3eb
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -28,6 +28,15 @@ pub enum State {
     Receipt,
     Quarantine,
     Active,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ObjectKind {
+    FullJob,
+    FullReceipt,
+    CompactReceipt,
+    RawObject,
+    WatermarkRecord,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -128,7 +137,9 @@ pub enum ReentryName {
 pub struct TransitionDef {
     pub operation: Operation,
     pub source: State,
+    pub source_object_kind: ObjectKind,
     pub destination: State,
+    pub destination_object_kind: ObjectKind,
     pub generation_change: GenerationChange,
     pub attempt_change: AttemptChange,
     pub token_change: TokenChange,
@@ -146,6 +157,8 @@ pub struct TransitionDef {
 pub struct ExceptionDef {
     pub name: ExceptionName,
     pub description: &'static str,
+    pub source_object_kind: ObjectKind,
+    pub destination_object_kind: ObjectKind,
     pub clock_requirement: ClockRequirement,
     pub mutation_class: MutationClass,
     pub linearization: LinearizationPrimitive,
@@ -166,7 +179,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::EnqueueImmediate,
         source: State::Hidden,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Ready,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Zero,
         attempt_change: AttemptChange::Zero,
         token_change: TokenChange::None,
@@ -182,7 +197,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::EnqueueDelayed,
         source: State::Hidden,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Delayed,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Zero,
         attempt_change: AttemptChange::Zero,
         token_change: TokenChange::None,
@@ -198,7 +215,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::Promote,
         source: State::Delayed,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Ready,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -214,7 +233,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::Claim,
         source: State::Ready,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Leased,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Increment,
         token_change: TokenChange::New,
@@ -230,7 +251,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::ExhaustedReadyCleanup,
         source: State::Ready,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Dead,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -246,7 +269,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::Renew,
         source: State::Leased,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Leased,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::Same,
@@ -262,7 +287,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::Acknowledge,
         source: State::Leased,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Receipt,
+        destination_object_kind: ObjectKind::FullReceipt,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::Same,
@@ -278,7 +305,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::RetryNow,
         source: State::Leased,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Ready,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -294,7 +323,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::RetryLater,
         source: State::Leased,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Delayed,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -310,7 +341,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::Bury,
         source: State::Leased,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Dead,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -326,7 +359,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::ReapExpiredToReady,
         source: State::Leased,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Ready,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -342,7 +377,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::ReapExpiredToDead,
         source: State::Leased,
+        source_object_kind: ObjectKind::FullJob,
         destination: State::Dead,
+        destination_object_kind: ObjectKind::FullJob,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -358,7 +395,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef {
         operation: Operation::Quarantine,
         source: State::Active,
+        source_object_kind: ObjectKind::RawObject,
         destination: State::Quarantine,
+        destination_object_kind: ObjectKind::RawObject,
         generation_change: GenerationChange::Increment,
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
@@ -377,6 +416,8 @@ pub const EXCEPTIONS: &[ExceptionDef] = &[
     ExceptionDef {
         name: ExceptionName::ReceiptCompaction,
         description: "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname",
+        source_object_kind: ObjectKind::FullReceipt,
+        destination_object_kind: ObjectKind::CompactReceipt,
         clock_requirement: ClockRequirement::None,
         mutation_class: MutationClass::ReplacingMove,
         linearization: LinearizationPrimitive::RenameReplace,
@@ -387,6 +428,8 @@ pub const EXCEPTIONS: &[ExceptionDef] = &[
     ExceptionDef {
         name: ExceptionName::WallWatermarkAdvancement,
         description: "Monotone wall-watermark record replaced under exclusive OFD lock",
+        source_object_kind: ObjectKind::WatermarkRecord,
+        destination_object_kind: ObjectKind::WatermarkRecord,
         clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         mutation_class: MutationClass::ReplacingMove,
         linearization: LinearizationPrimitive::RenameReplace,
@@ -500,7 +543,9 @@ mod tests {
             .find(|transition| transition.operation == Operation::Claim)
             .unwrap();
         assert_eq!(claim.source, State::Ready);
+        assert_eq!(claim.source_object_kind, ObjectKind::FullJob);
         assert_eq!(claim.destination, State::Leased);
+        assert_eq!(claim.destination_object_kind, ObjectKind::FullJob);
         assert_eq!(claim.attempt_change, AttemptChange::Increment);
         assert_eq!(claim.generation_change, GenerationChange::Increment);
         assert_eq!(claim.token_change, TokenChange::New);
@@ -552,8 +597,27 @@ mod tests {
             reap.qualification,
             TransitionQualification::AttemptsExhausted
         );
+        let acknowledge = transition(Operation::Acknowledge);
+        assert_eq!(acknowledge.source_object_kind, ObjectKind::FullJob);
+        assert_eq!(acknowledge.destination_object_kind, ObjectKind::FullReceipt);
+        let quarantine = transition(Operation::Quarantine);
+        assert_eq!(quarantine.source_object_kind, ObjectKind::RawObject);
+        assert_eq!(quarantine.destination_object_kind, ObjectKind::RawObject);
         assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);
+        assert_eq!(EXCEPTIONS[0].source_object_kind, ObjectKind::FullReceipt);
+        assert_eq!(
+            EXCEPTIONS[0].destination_object_kind,
+            ObjectKind::CompactReceipt
+        );
         assert_eq!(EXCEPTIONS[0].clock_requirement, ClockRequirement::None);
+        assert_eq!(
+            EXCEPTIONS[1].source_object_kind,
+            ObjectKind::WatermarkRecord
+        );
+        assert_eq!(
+            EXCEPTIONS[1].destination_object_kind,
+            ObjectKind::WatermarkRecord
+        );
         assert_eq!(
             EXCEPTIONS[1].clock_requirement,
             ClockRequirement::AuthenticatedWallFloor
