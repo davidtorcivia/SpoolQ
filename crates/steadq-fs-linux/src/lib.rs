@@ -4,8 +4,9 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::ptr::NonNull;
 
 const MAX_COMPONENT_BYTES: usize = 255;
 const MAX_RELATIVE_PATH_BYTES: usize = 4095;
@@ -936,11 +937,66 @@ impl DirectoryEnumerationProgressError {
     }
 }
 
+struct DirectoryStream(NonNull<libc::DIR>);
+
+impl DirectoryStream {
+    fn open(fd: OwnedFd) -> io::Result<Self> {
+        let raw_fd = fd.into_raw_fd();
+        // SAFETY: `raw_fd` is a live directory descriptor. `fdopendir`
+        // takes ownership on success and leaves ownership with the caller on failure.
+        let dir = unsafe { libc::fdopendir(raw_fd) };
+        match NonNull::new(dir) {
+            Some(dir) => Ok(Self(dir)),
+            None => {
+                let error = io::Error::last_os_error();
+                // SAFETY: `fdopendir` failed, so `raw_fd` remains caller-owned.
+                drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                Err(error)
+            }
+        }
+    }
+
+    fn next(&mut self) -> io::Result<Option<DirEntryName>> {
+        // SAFETY: the thread-local errno location is writable for this thread.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `self.0` is a live DIR stream owned by this value.
+        let entry = unsafe { libc::readdir(self.0.as_ptr()) };
+        if entry.is_null() {
+            // SAFETY: the thread-local errno location remains valid.
+            let errno = unsafe { *libc::__errno_location() };
+            return if errno == 0 {
+                Ok(None)
+            } else {
+                Err(io::Error::from_raw_os_error(errno))
+            };
+        }
+        // SAFETY: `entry` is valid until the next directory-stream operation.
+        // The name bytes are copied before returning.
+        let name = unsafe {
+            let name_ptr = (*entry).d_name.as_ptr();
+            let len = libc::strlen(name_ptr);
+            std::slice::from_raw_parts(name_ptr.cast::<u8>(), len)
+        };
+        Ok(Some(DirEntryName(name.to_vec())))
+    }
+}
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this value uniquely owns the live DIR stream.
+        unsafe { libc::closedir(self.0.as_ptr()) };
+    }
+}
+
+fn reopen_directory(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    open_directory(dir_fd.as_raw_fd(), ".")
+}
+
 /// Read directory entries without losing non-UTF-8 names.
-/// Consumes the fd via fdopendir and rejects directories exceeding either
+/// Consumes the owned descriptor and rejects directories exceeding either
 /// bound before retaining an unbounded collection.
 fn read_dir_entry_names_impl<F>(
-    dir_fd: RawFd,
+    dir_fd: OwnedFd,
     max_entries: usize,
     max_name_bytes: usize,
     mut should_stop: F,
@@ -951,54 +1007,33 @@ where
     let mut entries = Vec::new();
     let mut name_bytes_read = 0usize;
     let mut progress = DirectoryEnumerationProgress::default();
-    let dir = unsafe { libc::fdopendir(dir_fd) };
-    if dir.is_null() {
-        let error = io::Error::last_os_error();
-        // fdopendir did not take ownership when it returned a null pointer.
-        unsafe { libc::close(dir_fd) };
-        return Err(DirectoryEnumerationProgressError::Io { error, progress });
-    }
+    let mut dir = DirectoryStream::open(dir_fd)
+        .map_err(|error| DirectoryEnumerationProgressError::Io { error, progress })?;
 
     loop {
         match should_stop() {
             Ok(true) => {
-                unsafe { libc::closedir(dir) };
                 return Err(DirectoryEnumerationProgressError::Cancelled(progress));
             }
             Ok(false) => {}
             Err(error) => {
-                unsafe { libc::closedir(dir) };
                 return Err(DirectoryEnumerationProgressError::CancellationCheck {
                     error,
                     progress,
                 });
             }
         }
-        // B5: Set errno to 0 before readdir to distinguish EOF from error.
-        unsafe { *libc::__errno_location() = 0 };
-        let entry = unsafe { libc::readdir(dir) };
-        if entry.is_null() {
-            // B5: Check errno to distinguish EOF from error.
-            let errno = unsafe { *libc::__errno_location() };
-            if errno != 0 {
-                unsafe { libc::closedir(dir) };
-                return Err(DirectoryEnumerationProgressError::Io {
-                    error: io::Error::from_raw_os_error(errno),
-                    progress,
-                });
-            }
+        let Some(name) = dir
+            .next()
+            .map_err(|error| DirectoryEnumerationProgressError::Io { error, progress })?
+        else {
             break;
-        }
-        let name_bytes = unsafe {
-            let name_ptr = (*entry).d_name.as_ptr();
-            let len = libc::strlen(name_ptr);
-            std::slice::from_raw_parts(name_ptr as *const u8, len)
         };
+        let name_bytes = name.as_bytes();
         if name_bytes != b"." && name_bytes != b".." {
             progress.entries_read = progress.entries_read.saturating_add(1);
             progress.name_bytes_read = progress.name_bytes_read.saturating_add(name_bytes.len());
             let Some(next_name_bytes) = name_bytes_read.checked_add(name_bytes.len()) else {
-                unsafe { libc::closedir(dir) };
                 return Err(DirectoryEnumerationProgressError::Io {
                     error: io::Error::new(
                         io::ErrorKind::FileTooLarge,
@@ -1008,7 +1043,6 @@ where
                 });
             };
             if entries.len() >= max_entries || next_name_bytes > max_name_bytes {
-                unsafe { libc::closedir(dir) };
                 return Err(DirectoryEnumerationProgressError::Io {
                     error: io::Error::new(
                         io::ErrorKind::FileTooLarge,
@@ -1018,20 +1052,16 @@ where
                 });
             }
             name_bytes_read = next_name_bytes;
-            entries.push(DirEntryName(name_bytes.to_vec()));
+            entries.push(name);
         }
     }
-
-    unsafe { libc::closedir(dir) };
 
     fault::permute_directory_entries(&mut entries);
 
     Ok(DirectoryEnumeration { entries, progress })
 }
 
-/// Read byte-preserving directory entries.
-/// Consumes the fd via fdopendir.
-fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
+fn read_dir_entries_impl(dir_fd: OwnedFd) -> io::Result<Vec<DirEntryName>> {
     read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX, || Ok(false))
         .map_err(DirectoryEnumerationProgressError::into_legacy)
         .map_err(DirectoryEnumerationError::into_io_error)
@@ -1042,52 +1072,20 @@ fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
 /// materialization. The callback returns true to continue, false to stop.
 /// Returns the number of entries processed.
 pub fn read_dir_for_each<F: FnMut(&DirEntryName) -> bool>(
-    dir_fd: RawFd,
+    dir_fd: BorrowedFd<'_>,
     mut f: F,
 ) -> io::Result<usize> {
-    let reopened = open_directory(dir_fd, ".")?;
-    let reopened_fd = reopened.into_raw_fd();
-    // SAFETY: `reopened_fd` is a live directory descriptor. `fdopendir`
-    // takes ownership on success and leaves ownership with the caller on failure.
-    let dir = unsafe { libc::fdopendir(reopened_fd) };
-    if dir.is_null() {
-        // SAFETY: `fdopendir` failed, so `reopened_fd` remains caller-owned.
-        unsafe { libc::close(reopened_fd) };
-        return Err(io::Error::last_os_error());
-    }
+    let mut dir = DirectoryStream::open(reopen_directory(dir_fd)?)?;
     let mut count = 0usize;
-    loop {
-        unsafe { *libc::__errno_location() = 0 };
-        let entry = unsafe { libc::readdir(dir) };
-        if entry.is_null() {
-            let errno = unsafe { *libc::__errno_location() };
-            if errno != 0 {
-                unsafe { libc::closedir(dir) };
-                return Err(io::Error::from_raw_os_error(errno));
-            }
-            break;
-        }
-        let name_bytes = unsafe {
-            let name_ptr = (*entry).d_name.as_ptr();
-            let len = libc::strlen(name_ptr);
-            std::slice::from_raw_parts(name_ptr as *const u8, len)
-        };
-        if name_bytes != b"." && name_bytes != b".." {
-            let name = DirEntryName(name_bytes.to_vec());
+    while let Some(name) = dir.next()? {
+        if name.as_bytes() != b"." && name.as_bytes() != b".." {
             count += 1;
             if !f(&name) {
                 break;
             }
         }
     }
-    unsafe { libc::closedir(dir) };
     Ok(count)
-}
-
-/// Read directory entries. Consumes the fd (fdopendir takes ownership).
-/// Prefer `read_dir_entries_owned`, which reopens the directory first.
-pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
-    read_dir_entries_impl(dir_fd)
 }
 
 /// Get the filesystem type magic number.
@@ -1104,27 +1102,26 @@ pub const NFS_SUPER_MAGIC: i64 = 0x6969;
 pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const FUSE_SUPER_MAGIC: i64 = 0x65735546;
 
-/// Read directory entries without consuming the fd or its directory position.
-pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
-    let reopened = open_directory(dir_fd, ".")?;
-    read_dir_entries_impl(reopened.into_raw_fd())
+/// Read directory entries without consuming the descriptor or its position.
+pub fn read_dir_entries(dir_fd: BorrowedFd<'_>) -> io::Result<Vec<DirEntryName>> {
+    read_dir_entries_impl(reopen_directory(dir_fd)?)
 }
 
 /// Read byte-preserving directory entries without consuming the caller's fd.
 /// The function returns an error rather than materializing more than the
 /// configured entry or aggregate-name-byte bound.
-pub fn read_dir_entry_names_bounded_owned(
-    dir_fd: RawFd,
+pub fn read_dir_entries_bounded(
+    dir_fd: BorrowedFd<'_>,
     max_entries: usize,
     max_name_bytes: usize,
 ) -> io::Result<Vec<DirEntryName>> {
-    read_dir_entry_names_bounded_owned_until(dir_fd, max_entries, max_name_bytes, || Ok(false))
+    read_dir_entries_bounded_until(dir_fd, max_entries, max_name_bytes, || Ok(false))
         .map_err(DirectoryEnumerationError::into_io_error)
 }
 
 /// Read bounded byte-preserving directory entries with cooperative cancellation.
-pub fn read_dir_entry_names_bounded_owned_until<F>(
-    dir_fd: RawFd,
+pub fn read_dir_entries_bounded_until<F>(
+    dir_fd: BorrowedFd<'_>,
     max_entries: usize,
     max_name_bytes: usize,
     should_stop: F,
@@ -1132,19 +1129,14 @@ pub fn read_dir_entry_names_bounded_owned_until<F>(
 where
     F: FnMut() -> io::Result<bool>,
 {
-    read_dir_entry_names_bounded_owned_until_with_progress(
-        dir_fd,
-        max_entries,
-        max_name_bytes,
-        should_stop,
-    )
-    .map(|enumeration| enumeration.entries)
-    .map_err(DirectoryEnumerationProgressError::into_legacy)
+    read_dir_entries_bounded_until_with_progress(dir_fd, max_entries, max_name_bytes, should_stop)
+        .map(|enumeration| enumeration.entries)
+        .map_err(DirectoryEnumerationProgressError::into_legacy)
 }
 
 /// Read bounded byte-preserving entries and retain exact partial progress.
-pub fn read_dir_entry_names_bounded_owned_until_with_progress<F>(
-    dir_fd: RawFd,
+pub fn read_dir_entries_bounded_until_with_progress<F>(
+    dir_fd: BorrowedFd<'_>,
     max_entries: usize,
     max_name_bytes: usize,
     should_stop: F,
@@ -1153,16 +1145,11 @@ where
     F: FnMut() -> io::Result<bool>,
 {
     let reopened =
-        open_directory(dir_fd, ".").map_err(|error| DirectoryEnumerationProgressError::Io {
+        reopen_directory(dir_fd).map_err(|error| DirectoryEnumerationProgressError::Io {
             error,
             progress: DirectoryEnumerationProgress::default(),
         })?;
-    read_dir_entry_names_impl(
-        reopened.into_raw_fd(),
-        max_entries,
-        max_name_bytes,
-        should_stop,
-    )
+    read_dir_entry_names_impl(reopened, max_entries, max_name_bytes, should_stop)
 }
 
 /// Change file mode relative to a directory fd.
@@ -1455,6 +1442,14 @@ pub fn validate_relative_path(path: &str) -> io::Result<ValidatedRelativePath<'_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
+
+    fn assert_fd_closed(fd: RawFd) {
+        // SAFETY: `F_GETFD` only inspects the integer descriptor value.
+        let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(result, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1694,9 +1689,8 @@ mod tests {
         std::fs::write(dir_path.join("b.txt"), b"y").unwrap();
 
         let fd = std::fs::File::open(&dir_path).unwrap();
-        use std::os::unix::io::AsRawFd;
         let mut names = Vec::new();
-        let count = read_dir_for_each(fd.as_raw_fd(), |name| {
+        let count = read_dir_for_each(fd.as_fd(), |name| {
             names.push(name.as_bytes().to_vec());
             true
         })
@@ -1719,16 +1713,15 @@ mod tests {
         std::fs::write(dir_path.join("c.txt"), b"z").unwrap();
 
         let fd = std::fs::File::open(&dir_path).unwrap();
-        use std::os::unix::io::AsRawFd;
         let mut count_seen = 0;
-        let _count = read_dir_for_each(fd.as_raw_fd(), |_| {
+        let _count = read_dir_for_each(fd.as_fd(), |_| {
             count_seen += 1;
             false // stop immediately
         })
         .unwrap();
         assert_eq!(count_seen, 1);
 
-        let mut entries = read_dir_entries_owned(fd.as_raw_fd()).unwrap();
+        let mut entries = read_dir_entries(fd.as_fd()).unwrap();
         entries.sort();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].as_bytes(), b"a.txt");
@@ -1736,6 +1729,44 @@ mod tests {
         assert_eq!(entries[2].as_bytes(), b"c.txt");
 
         std::fs::remove_dir_all(&dir_path).ok();
+    }
+
+    #[test]
+    fn directory_stream_closes_consumed_descriptor_on_success_and_failure() {
+        let dir_path = unique_test_dir("directory-stream-ownership");
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let directory: OwnedFd = std::fs::File::open(&dir_path).unwrap().into();
+        let directory_fd = directory.as_raw_fd();
+        let stream = DirectoryStream::open(directory).unwrap();
+        drop(stream);
+        assert_fd_closed(directory_fd);
+
+        let file_path = dir_path.join("plain-file");
+        std::fs::write(&file_path, b"data").unwrap();
+        let file: OwnedFd = std::fs::File::open(file_path).unwrap().into();
+        let file_fd = file.as_raw_fd();
+        let error = match DirectoryStream::open(file) {
+            Ok(_) => panic!("fdopendir accepted a regular file"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+        assert_fd_closed(file_fd);
+
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn borrowed_enumeration_failure_keeps_caller_descriptor_open() {
+        let path = unique_test_dir("borrowed-enumeration-failure");
+        std::fs::write(&path, b"data").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let error = read_dir_entries(file.as_fd()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+        assert_eq!(fstat(file.as_raw_fd()).unwrap().st_size, 4);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1752,7 +1783,7 @@ mod tests {
         std::fs::write(dir_path.join(second), b"b").unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let mut entries = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 3, 510).unwrap();
+        let mut entries = read_dir_entries_bounded(dir.as_fd(), 3, 510).unwrap();
         entries.sort();
         assert_eq!(entries[0].as_bytes(), b"bad-\x80");
         assert_eq!(entries[1].as_bytes(), b"bad-\x81");
@@ -1763,14 +1794,14 @@ mod tests {
         assert_eq!(entries[2].as_ascii_str(), Some("plain"));
         assert_eq!(format!("{:?}", entries[0]), "b\"bad-\\x80\"");
 
-        let mut owned = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        let mut owned = read_dir_entries(dir.as_fd()).unwrap();
         owned.sort();
         assert_eq!(owned[0].as_bytes(), b"bad-\x80");
         assert_eq!(owned[1].as_bytes(), b"bad-\x81");
 
         let callback_dir = std::fs::File::open(&dir_path).unwrap();
         let mut visited = Vec::new();
-        read_dir_for_each(callback_dir.as_raw_fd(), |entry| {
+        read_dir_for_each(callback_dir.as_fd(), |entry| {
             visited.push(entry.as_bytes().to_vec());
             true
         })
@@ -1797,7 +1828,7 @@ mod tests {
         }
         let dir = std::fs::File::open(&dir_path).unwrap();
         fault::reset();
-        let baseline = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 4, usize::MAX).unwrap();
+        let baseline = read_dir_entries_bounded(dir.as_fd(), 4, usize::MAX).unwrap();
 
         for (rotation, reversed) in [(1, false), (3, false), (0, true), (2, true)] {
             let mut expected = baseline.clone();
@@ -1807,14 +1838,13 @@ mod tests {
                 expected.reverse();
             }
             fault::permute_readdir(rotation, reversed);
-            let actual =
-                read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 4, usize::MAX).unwrap();
+            let actual = read_dir_entries_bounded(dir.as_fd(), 4, usize::MAX).unwrap();
             assert_eq!(actual, expected, "rotation={rotation} reversed={reversed}");
         }
 
         fault::reset();
         assert_eq!(
-            read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 4, usize::MAX).unwrap(),
+            read_dir_entries_bounded(dir.as_fd(), 4, usize::MAX).unwrap(),
             baseline
         );
         std::fs::remove_dir_all(dir_path).unwrap();
@@ -1828,12 +1858,11 @@ mod tests {
         std::fs::write(dir_path.join("bb"), b"b").unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let entry_error =
-            read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 1, usize::MAX).unwrap_err();
+        let entry_error = read_dir_entries_bounded(dir.as_fd(), 1, usize::MAX).unwrap_err();
         assert_eq!(entry_error.kind(), io::ErrorKind::FileTooLarge);
-        let byte_error = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 2, 2).unwrap_err();
+        let byte_error = read_dir_entries_bounded(dir.as_fd(), 2, 2).unwrap_err();
         assert_eq!(byte_error.kind(), io::ErrorKind::FileTooLarge);
-        let mut exact_entries = read_dir_entry_names_bounded_owned(dir.as_raw_fd(), 2, 3).unwrap();
+        let mut exact_entries = read_dir_entries_bounded(dir.as_fd(), 2, 3).unwrap();
         exact_entries.sort();
         assert_eq!(exact_entries[0].as_bytes(), b"a");
         assert_eq!(exact_entries[1].as_bytes(), b"bb");
@@ -1848,8 +1877,8 @@ mod tests {
         std::fs::write(dir_path.join("beta"), b"b").unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let mut first = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
-        let mut second = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        let mut first = read_dir_entries(dir.as_fd()).unwrap();
+        let mut second = read_dir_entries(dir.as_fd()).unwrap();
         first.sort();
         second.sort();
         assert_eq!(first, second);
@@ -1866,8 +1895,8 @@ mod tests {
         let dir = std::fs::File::open(&dir_path).unwrap();
         let mut checks = 0;
 
-        let error = read_dir_entry_names_bounded_owned_until_with_progress(
-            dir.as_raw_fd(),
+        let error = read_dir_entries_bounded_until_with_progress(
+            dir.as_fd(),
             usize::MAX,
             usize::MAX,
             || {
@@ -1885,33 +1914,26 @@ mod tests {
             })
         ));
         assert_eq!(checks, 1);
+        assert_eq!(read_dir_entries(dir.as_fd()).unwrap().len(), 1);
         std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]
-    fn legacy_cancellable_directory_api_retains_its_result_shape() {
+    fn cancellable_directory_api_preserves_error_shape() {
         let dir_path = unique_test_dir("bounded-directory-legacy-result");
         std::fs::create_dir(&dir_path).unwrap();
         std::fs::write(dir_path.join("alpha"), b"a").unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let entries = read_dir_entry_names_bounded_owned_until(
-            dir.as_raw_fd(),
-            usize::MAX,
-            usize::MAX,
-            || Ok(false),
-        )
-        .unwrap();
+        let entries =
+            read_dir_entries_bounded_until(dir.as_fd(), usize::MAX, usize::MAX, || Ok(false))
+                .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].as_bytes(), b"alpha");
 
-        let error = read_dir_entry_names_bounded_owned_until(
-            dir.as_raw_fd(),
-            usize::MAX,
-            usize::MAX,
-            || Ok(true),
-        )
-        .unwrap_err();
+        let error =
+            read_dir_entries_bounded_until(dir.as_fd(), usize::MAX, usize::MAX, || Ok(true))
+                .unwrap_err();
         assert!(matches!(error, DirectoryEnumerationError::Cancelled));
         std::fs::remove_dir_all(dir_path).unwrap();
     }
@@ -1926,8 +1948,8 @@ mod tests {
         let dir = std::fs::File::open(&dir_path).unwrap();
         let mut checks = 0;
 
-        let error = read_dir_entry_names_bounded_owned_until_with_progress(
-            dir.as_raw_fd(),
+        let error = read_dir_entries_bounded_until_with_progress(
+            dir.as_fd(),
             usize::MAX,
             usize::MAX,
             || {
@@ -1954,8 +1976,8 @@ mod tests {
         std::fs::create_dir(&dir_path).unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let error = read_dir_entry_names_bounded_owned_until_with_progress(
-            dir.as_raw_fd(),
+        let error = read_dir_entries_bounded_until_with_progress(
+            dir.as_fd(),
             usize::MAX,
             usize::MAX,
             || Err(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
@@ -2036,13 +2058,9 @@ mod tests {
         std::fs::write(dir_path.join("bb"), b"b").unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let error = read_dir_entry_names_bounded_owned_until_with_progress(
-            dir.as_raw_fd(),
-            1,
-            usize::MAX,
-            || Ok(false),
-        )
-        .unwrap_err();
+        let error =
+            read_dir_entries_bounded_until_with_progress(dir.as_fd(), 1, usize::MAX, || Ok(false))
+                .unwrap_err();
 
         assert!(matches!(
             error,

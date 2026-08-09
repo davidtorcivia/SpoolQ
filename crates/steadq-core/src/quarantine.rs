@@ -1,6 +1,6 @@
 // SteadQ/1 quarantine and fsck operations.
 
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 
 use sha2::Digest;
 use steadq_fs_linux as fs;
@@ -234,7 +234,7 @@ impl Queue {
             Err(_) => return,
         };
 
-        let top_entries = match fs::read_dir_entries_owned(state_fd.as_raw_fd()) {
+        let top_entries = match fs::read_dir_entries(state_fd.as_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -248,7 +248,7 @@ impl Queue {
                 Err(_) => continue,
             };
 
-            let sub_entries = match fs::read_dir_entries_owned(sub_fd.as_raw_fd()) {
+            let sub_entries = match fs::read_dir_entries(sub_fd.as_fd()) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -276,7 +276,7 @@ impl Queue {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
-                    let files = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                    let files = match fs::read_dir_entries(shard_fd.as_fd()) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -311,7 +311,7 @@ impl Queue {
             Err(_) => return,
         };
 
-        let boot_dirs = match fs::read_dir_entries_owned(leased_fd.as_raw_fd()) {
+        let boot_dirs = match fs::read_dir_entries(leased_fd.as_fd()) {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -324,7 +324,7 @@ impl Queue {
                 Ok(fd) => fd,
                 Err(_) => continue,
             };
-            let bucket_dirs = match fs::read_dir_entries_owned(boot_fd.as_raw_fd()) {
+            let bucket_dirs = match fs::read_dir_entries(boot_fd.as_fd()) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -338,7 +338,7 @@ impl Queue {
                     Ok(fd) => fd,
                     Err(_) => continue,
                 };
-                let shard_dirs = match fs::read_dir_entries_owned(bucket_fd.as_raw_fd()) {
+                let shard_dirs = match fs::read_dir_entries(bucket_fd.as_fd()) {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
@@ -352,7 +352,7 @@ impl Queue {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
-                    let files = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                    let files = match fs::read_dir_entries(shard_fd.as_fd()) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
