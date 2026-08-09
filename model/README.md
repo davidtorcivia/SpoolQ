@@ -28,17 +28,23 @@ Bounded configuration: 2 jobs, 2 workers, and MaxAttempts=2. The `Crash` action 
 
 ## Invariants checked
 
-I1: No visible active object has an incomplete envelope (fileSynced must be true).
+- `TypeInvariant`: every model variable remains in its declared bounded domain.
 
-I9: Committed lease returns never exceed MaxAttempts.
+- `CompleteVisibleEnvelope`: every modeled visible job retains its abstract file-durability witness.
 
-I11: A delivered (leased) job has attempt >= 1.
+- `LeaseHasToken`: every modeled lease has a non-null worker-valued token.
 
-All three are conjoined as `Inv` in `model/SteadQ.cfg`.
+- `AttemptWithinLimit`: modeled attempts do not exceed `MaxAttempts`.
+
+- `ReceiptIsTerminal`: a receipt cannot execute another acknowledgment action.
+
+- `DeliveredAttemptIsPositive`: every modeled lease has a positive attempt.
+
+`model/SteadQ.cfg` names each predicate separately. `cargo xtask check` rejects drift between this list, the invariant section in `model/SteadQ.tla`, and the TLC configuration.
 
 ## Fixes applied
 
-Enqueue now sets `fileSynced` to `TRUE` before publish, so `I1` holds for `Ready`.
+Enqueue sets `fileSynced` to `TRUE` before publish, so `CompleteVisibleEnvelope` holds for `StateReady`.
 `Claim`, `Ack`, `RetryNow`, `Bury` carry a per-worker token `w \in Workers` and
 require `token[j] = w` with `w \notin poisoned`. `Crash` preserves file
 durability (`fileSynced[j]` stays `TRUE` if it was) and clears a stale lease
@@ -56,7 +62,4 @@ hidden.
 
 ## Not modeled
 
-Full delayed scheduling, wall watermark, bucket creation, receipt compaction,
-and quarantine are represented at the state level but not exhaustively
-crash-tested in this bounded model. These will be added as the model is
-refined.
+The current checked predicates do not establish source and destination namespace observations, per-lease capability tokens, stale-token exclusion, resolver soundness, wall scheduling and rollback safety, strict receipt and compaction evidence, recovery cursor progress, maintenance liveness, or queue-root containment. Delayed, receipt, dead, and quarantine states appear only in the bounded abstraction. These gaps remain open A-013 work under issue #59.
