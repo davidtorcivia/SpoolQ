@@ -746,11 +746,40 @@ impl std::fmt::Debug for DirEntryName {
     }
 }
 
+/// Exact protocol-visible work completed by a directory enumeration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DirectoryEnumerationProgress {
+    /// Non-dot entries returned by `readdir`.
+    pub entries_read: usize,
+    /// Raw name bytes across those entries.
+    pub name_bytes_read: usize,
+}
+
+/// A complete bounded enumeration and its work accounting.
+#[derive(Debug)]
+pub struct DirectoryEnumeration {
+    pub entries: Vec<DirEntryName>,
+    pub progress: DirectoryEnumerationProgress,
+}
+
 #[derive(Debug)]
 pub enum DirectoryEnumerationError {
     Cancelled,
     CancellationCheck(io::Error),
     Io(io::Error),
+}
+
+#[derive(Debug)]
+pub enum DirectoryEnumerationProgressError {
+    Cancelled(DirectoryEnumerationProgress),
+    CancellationCheck {
+        error: io::Error,
+        progress: DirectoryEnumerationProgress,
+    },
+    Io {
+        error: io::Error,
+        progress: DirectoryEnumerationProgress,
+    },
 }
 
 impl std::fmt::Display for DirectoryEnumerationError {
@@ -786,6 +815,47 @@ impl DirectoryEnumerationError {
     }
 }
 
+impl std::fmt::Display for DirectoryEnumerationProgressError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled(_) => write!(formatter, "directory enumeration cancelled"),
+            Self::CancellationCheck { error, .. } => {
+                write!(formatter, "directory cancellation check failed: {error}")
+            }
+            Self::Io { error, .. } => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DirectoryEnumerationProgressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cancelled(_) => None,
+            Self::CancellationCheck { error, .. } | Self::Io { error, .. } => Some(error),
+        }
+    }
+}
+
+impl DirectoryEnumerationProgressError {
+    pub fn progress(&self) -> DirectoryEnumerationProgress {
+        match self {
+            Self::Cancelled(progress)
+            | Self::CancellationCheck { progress, .. }
+            | Self::Io { progress, .. } => *progress,
+        }
+    }
+
+    fn into_legacy(self) -> DirectoryEnumerationError {
+        match self {
+            Self::Cancelled(_) => DirectoryEnumerationError::Cancelled,
+            Self::CancellationCheck { error, .. } => {
+                DirectoryEnumerationError::CancellationCheck(error)
+            }
+            Self::Io { error, .. } => DirectoryEnumerationError::Io(error),
+        }
+    }
+}
+
 /// Read directory entries without losing non-UTF-8 names.
 /// Consumes the fd via fdopendir and rejects directories exceeding either
 /// bound before retaining an unbounded collection.
@@ -794,30 +864,34 @@ fn read_dir_entry_names_impl<F>(
     max_entries: usize,
     max_name_bytes: usize,
     mut should_stop: F,
-) -> Result<Vec<DirEntryName>, DirectoryEnumerationError>
+) -> Result<DirectoryEnumeration, DirectoryEnumerationProgressError>
 where
     F: FnMut() -> io::Result<bool>,
 {
     let mut entries = Vec::new();
     let mut name_bytes_read = 0usize;
+    let mut progress = DirectoryEnumerationProgress::default();
     let dir = unsafe { libc::fdopendir(dir_fd) };
     if dir.is_null() {
         let error = io::Error::last_os_error();
         // fdopendir did not take ownership when it returned a null pointer.
         unsafe { libc::close(dir_fd) };
-        return Err(DirectoryEnumerationError::Io(error));
+        return Err(DirectoryEnumerationProgressError::Io { error, progress });
     }
 
     loop {
         match should_stop() {
             Ok(true) => {
                 unsafe { libc::closedir(dir) };
-                return Err(DirectoryEnumerationError::Cancelled);
+                return Err(DirectoryEnumerationProgressError::Cancelled(progress));
             }
             Ok(false) => {}
             Err(error) => {
                 unsafe { libc::closedir(dir) };
-                return Err(DirectoryEnumerationError::CancellationCheck(error));
+                return Err(DirectoryEnumerationProgressError::CancellationCheck {
+                    error,
+                    progress,
+                });
             }
         }
         // B5: Set errno to 0 before readdir to distinguish EOF from error.
@@ -828,9 +902,10 @@ where
             let errno = unsafe { *libc::__errno_location() };
             if errno != 0 {
                 unsafe { libc::closedir(dir) };
-                return Err(DirectoryEnumerationError::Io(io::Error::from_raw_os_error(
-                    errno,
-                )));
+                return Err(DirectoryEnumerationProgressError::Io {
+                    error: io::Error::from_raw_os_error(errno),
+                    progress,
+                });
             }
             break;
         }
@@ -840,19 +915,27 @@ where
             std::slice::from_raw_parts(name_ptr as *const u8, len)
         };
         if name_bytes != b"." && name_bytes != b".." {
+            progress.entries_read = progress.entries_read.saturating_add(1);
+            progress.name_bytes_read = progress.name_bytes_read.saturating_add(name_bytes.len());
             let Some(next_name_bytes) = name_bytes_read.checked_add(name_bytes.len()) else {
                 unsafe { libc::closedir(dir) };
-                return Err(DirectoryEnumerationError::Io(io::Error::new(
-                    io::ErrorKind::FileTooLarge,
-                    "directory entry byte count overflow",
-                )));
+                return Err(DirectoryEnumerationProgressError::Io {
+                    error: io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        "directory entry byte count overflow",
+                    ),
+                    progress,
+                });
             };
             if entries.len() >= max_entries || next_name_bytes > max_name_bytes {
                 unsafe { libc::closedir(dir) };
-                return Err(DirectoryEnumerationError::Io(io::Error::new(
-                    io::ErrorKind::FileTooLarge,
-                    "directory exceeds configured recovery scan bound",
-                )));
+                return Err(DirectoryEnumerationProgressError::Io {
+                    error: io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        "directory exceeds configured recovery scan bound",
+                    ),
+                    progress,
+                });
             }
             name_bytes_read = next_name_bytes;
             entries.push(DirEntryName(name_bytes.to_vec()));
@@ -861,16 +944,18 @@ where
 
     unsafe { libc::closedir(dir) };
 
-    Ok(entries)
+    Ok(DirectoryEnumeration { entries, progress })
 }
 
 /// Read directory entries as strings for legacy callers.
 /// Consumes the fd via fdopendir.
 fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
     read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX, || Ok(false))
+        .map_err(DirectoryEnumerationProgressError::into_legacy)
         .map_err(DirectoryEnumerationError::into_io_error)
-        .map(|entries| {
-            entries
+        .map(|enumeration| {
+            enumeration
+                .entries
                 .into_iter()
                 .map(|entry| String::from_utf8_lossy(entry.as_bytes()).into_owned())
                 .collect()
@@ -972,7 +1057,31 @@ pub fn read_dir_entry_names_bounded_owned_until<F>(
 where
     F: FnMut() -> io::Result<bool>,
 {
-    let reopened = open_directory(dir_fd, ".").map_err(DirectoryEnumerationError::Io)?;
+    read_dir_entry_names_bounded_owned_until_with_progress(
+        dir_fd,
+        max_entries,
+        max_name_bytes,
+        should_stop,
+    )
+    .map(|enumeration| enumeration.entries)
+    .map_err(DirectoryEnumerationProgressError::into_legacy)
+}
+
+/// Read bounded byte-preserving entries and retain exact partial progress.
+pub fn read_dir_entry_names_bounded_owned_until_with_progress<F>(
+    dir_fd: RawFd,
+    max_entries: usize,
+    max_name_bytes: usize,
+    should_stop: F,
+) -> Result<DirectoryEnumeration, DirectoryEnumerationProgressError>
+where
+    F: FnMut() -> io::Result<bool>,
+{
+    let reopened =
+        open_directory(dir_fd, ".").map_err(|error| DirectoryEnumerationProgressError::Io {
+            error,
+            progress: DirectoryEnumerationProgress::default(),
+        })?;
     read_dir_entry_names_impl(
         reopened.into_raw_fd(),
         max_entries,
@@ -1615,7 +1724,7 @@ mod tests {
         let dir = std::fs::File::open(&dir_path).unwrap();
         let mut checks = 0;
 
-        let error = read_dir_entry_names_bounded_owned_until(
+        let error = read_dir_entry_names_bounded_owned_until_with_progress(
             dir.as_raw_fd(),
             usize::MAX,
             usize::MAX,
@@ -1626,8 +1735,74 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, DirectoryEnumerationError::Cancelled));
+        assert!(matches!(
+            error,
+            DirectoryEnumerationProgressError::Cancelled(DirectoryEnumerationProgress {
+                entries_read: 0,
+                name_bytes_read: 0,
+            })
+        ));
         assert_eq!(checks, 1);
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn legacy_cancellable_directory_api_retains_its_result_shape() {
+        let dir_path = unique_test_dir("bounded-directory-legacy-result");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("alpha"), b"a").unwrap();
+        let dir = std::fs::File::open(&dir_path).unwrap();
+
+        let entries = read_dir_entry_names_bounded_owned_until(
+            dir.as_raw_fd(),
+            usize::MAX,
+            usize::MAX,
+            || Ok(false),
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].as_bytes(), b"alpha");
+
+        let error = read_dir_entry_names_bounded_owned_until(
+            dir.as_raw_fd(),
+            usize::MAX,
+            usize::MAX,
+            || Ok(true),
+        )
+        .unwrap_err();
+        assert!(matches!(error, DirectoryEnumerationError::Cancelled));
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn cancelled_directory_read_reports_partial_progress() {
+        let dir_path = unique_test_dir("bounded-directory-partial-progress");
+        std::fs::create_dir(&dir_path).unwrap();
+        for index in 0..32 {
+            std::fs::write(dir_path.join(format!("entry-{index:02}")), b"x").unwrap();
+        }
+        let dir = std::fs::File::open(&dir_path).unwrap();
+        let mut checks = 0;
+
+        let error = read_dir_entry_names_bounded_owned_until_with_progress(
+            dir.as_raw_fd(),
+            usize::MAX,
+            usize::MAX,
+            || {
+                checks += 1;
+                Ok(checks == 10)
+            },
+        )
+        .unwrap_err();
+
+        let progress = error.progress();
+        assert!(matches!(
+            error,
+            DirectoryEnumerationProgressError::Cancelled(_)
+        ));
+        assert!(progress.entries_read > 0);
+        assert!(progress.entries_read < 10);
+        assert_eq!(progress.name_bytes_read, progress.entries_read * 8);
         std::fs::remove_dir_all(dir_path).unwrap();
     }
 
@@ -1637,7 +1812,7 @@ mod tests {
         std::fs::create_dir(&dir_path).unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let error = read_dir_entry_names_bounded_owned_until(
+        let error = read_dir_entry_names_bounded_owned_until_with_progress(
             dir.as_raw_fd(),
             usize::MAX,
             usize::MAX,
@@ -1647,8 +1822,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            DirectoryEnumerationError::CancellationCheck(ref source)
-                if source.raw_os_error() == Some(libc::ETIMEDOUT)
+            DirectoryEnumerationProgressError::CancellationCheck {
+                ref error,
+                progress: DirectoryEnumerationProgress {
+                    entries_read: 0,
+                    name_bytes_read: 0,
+                },
+            } if error.raw_os_error() == Some(libc::ETIMEDOUT)
         ));
         std::fs::remove_dir_all(dir_path).unwrap();
     }
@@ -1683,6 +1863,56 @@ mod tests {
                 .and_then(io::Error::raw_os_error),
             Some(libc::EIO)
         );
+
+        let progress = DirectoryEnumerationProgress {
+            entries_read: 2,
+            name_bytes_read: 7,
+        };
+        let progress_error = DirectoryEnumerationProgressError::Io {
+            error: io::Error::from_raw_os_error(libc::EIO),
+            progress,
+        };
+        assert_eq!(
+            progress_error.to_string(),
+            io::Error::from_raw_os_error(libc::EIO).to_string()
+        );
+        assert_eq!(
+            progress_error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .and_then(io::Error::raw_os_error),
+            Some(libc::EIO)
+        );
+        assert_eq!(progress_error.progress(), progress);
+    }
+
+    #[test]
+    fn bounded_directory_read_reports_the_overflow_sentinel() {
+        let dir_path = unique_test_dir("bounded-directory-progress");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("a"), b"a").unwrap();
+        std::fs::write(dir_path.join("bb"), b"b").unwrap();
+        let dir = std::fs::File::open(&dir_path).unwrap();
+
+        let error = read_dir_entry_names_bounded_owned_until_with_progress(
+            dir.as_raw_fd(),
+            1,
+            usize::MAX,
+            || Ok(false),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DirectoryEnumerationProgressError::Io {
+                ref error,
+                progress: DirectoryEnumerationProgress {
+                    entries_read: 2,
+                    name_bytes_read: 3,
+                },
+            } if error.kind() == io::ErrorKind::FileTooLarge
+        ));
+        std::fs::remove_dir_all(dir_path).unwrap();
     }
 
     #[test]

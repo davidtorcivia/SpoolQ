@@ -21,6 +21,8 @@ const RECOVERY_CURSOR_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW;
 const RECOVERY_LOCK_OPEN_FLAGS: i32 = libc::O_CLOEXEC + libc::O_NOFOLLOW + libc::O_RDWR;
 const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES * 255;
+const MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_ENTRIES as u64 + 1;
+const MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_NAME_BYTES as u64 + 255;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,20 +45,47 @@ fn cursor_component_is_valid(component: &[u8]) -> bool {
 fn read_recovery_directory(
     dir_fd: std::os::unix::io::RawFd,
     deadline_mono: u64,
+    budget: &RecoveryScanBudget,
+    stats: &mut RecoveryScanStats,
 ) -> Result<Vec<fs::DirEntryName>, RecoveryDirectoryError> {
-    fs::read_dir_entry_names_bounded_owned_until(
+    let remaining_entries = budget.max_entries_read.saturating_sub(stats.entries_read);
+    let remaining_name_bytes = budget
+        .max_name_bytes_read
+        .saturating_sub(stats.name_bytes_read);
+    if remaining_entries < MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE
+        || remaining_name_bytes < MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE
+    {
+        return Err(RecoveryDirectoryError::BudgetExhausted);
+    }
+
+    let result = fs::read_dir_entry_names_bounded_owned_until_with_progress(
         dir_fd,
         MAX_RECOVERY_DIRECTORY_ENTRIES,
         MAX_RECOVERY_DIRECTORY_NAME_BYTES,
         || Queue::budget_time_exceeded(deadline_mono),
-    )
-    .map_err(|error| match error {
-        fs::DirectoryEnumerationError::Cancelled => RecoveryDirectoryError::BudgetExhausted,
-        fs::DirectoryEnumerationError::CancellationCheck(error) => {
-            RecoveryDirectoryError::Clock(error)
-        }
-        fs::DirectoryEnumerationError::Io(error) => RecoveryDirectoryError::Io(error),
-    })
+    );
+    let progress = match &result {
+        Ok(enumeration) => enumeration.progress,
+        Err(error) => error.progress(),
+    };
+    let entries_read = u64::try_from(progress.entries_read).unwrap_or(u64::MAX);
+    let name_bytes_read = u64::try_from(progress.name_bytes_read).unwrap_or(u64::MAX);
+    stats.entries_read = stats.entries_read.saturating_add(entries_read);
+    stats.name_bytes_read = stats.name_bytes_read.saturating_add(name_bytes_read);
+
+    result
+        .map(|enumeration| enumeration.entries)
+        .map_err(|error| match error {
+            fs::DirectoryEnumerationProgressError::Cancelled(_) => {
+                RecoveryDirectoryError::BudgetExhausted
+            }
+            fs::DirectoryEnumerationProgressError::CancellationCheck { error, .. } => {
+                RecoveryDirectoryError::Clock(error)
+            }
+            fs::DirectoryEnumerationProgressError::Io { error, .. } => {
+                RecoveryDirectoryError::Io(error)
+            }
+        })
 }
 
 #[derive(Debug)]
@@ -192,11 +221,37 @@ pub struct WorkBudget {
     pub max_duration_ms: u64,
 }
 
+/// Recovery directory-enumeration budget.
+#[derive(Clone, Debug)]
+pub struct RecoveryScanBudget {
+    /// Maximum protocol-visible directory entries returned by `readdir`.
+    ///
+    /// Enumeration starts only when the remaining budget can cover one
+    /// complete bounded directory plus the sentinel entry needed to prove
+    /// overflow.
+    pub max_entries_read: u64,
+    /// Maximum raw filename bytes across protocol-visible directory entries.
+    ///
+    /// Enumeration starts only when the remaining budget can cover one
+    /// complete bounded directory plus the sentinel name needed to prove
+    /// overflow.
+    pub max_name_bytes_read: u64,
+}
+
 impl Default for WorkBudget {
     fn default() -> Self {
         Self {
             max_operations: 1000,
             max_duration_ms: 100,
+        }
+    }
+}
+
+impl Default for RecoveryScanBudget {
+    fn default() -> Self {
+        Self {
+            max_entries_read: MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE * 5,
+            max_name_bytes_read: MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE * 5,
         }
     }
 }
@@ -216,6 +271,25 @@ pub struct RecoveryStats {
     pub phase_blocked: bool,
     pub errors: Vec<RecoveryError>,
     pub scan_skips: u32,
+}
+
+/// Exact directory-enumeration work completed by a recovery pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryScanStats {
+    pub entries_read: u64,
+    pub name_bytes_read: u64,
+}
+
+/// Recovery results including scan accounting from the extended API.
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryReport {
+    pub stats: RecoveryStats,
+    pub scan: RecoveryScanStats,
+}
+
+struct RecoveryScanContext<'a> {
+    budget: &'a RecoveryScanBudget,
+    stats: &'a mut RecoveryScanStats,
 }
 
 #[derive(Clone, Debug)]
@@ -296,7 +370,18 @@ impl Queue {
 
     /// Run one bounded recovery pass.
     pub fn recover(&mut self, budget: &WorkBudget) -> RecoveryStats {
+        self.recover_with_scan_budget(budget, &RecoveryScanBudget::default())
+            .stats
+    }
+
+    /// Run one bounded recovery pass with explicit directory scan limits.
+    pub fn recover_with_scan_budget(
+        &mut self,
+        budget: &WorkBudget,
+        scan_budget: &RecoveryScanBudget,
+    ) -> RecoveryReport {
         let mut stats = RecoveryStats::default();
+        let mut scan_stats = RecoveryScanStats::default();
         let _recovery_lock = match self.acquire_recovery_lock() {
             Ok(lock) => lock,
             Err(error) => {
@@ -305,7 +390,10 @@ impl Queue {
                     relative_path: "control/recovery.lock".into(),
                     error: error.to_string(),
                 });
-                return stats;
+                return RecoveryReport {
+                    stats,
+                    scan: scan_stats,
+                };
             }
         };
         self.recovery_cursor = match load_recovery_cursor(self.root_fd(), &self.format.queue_id) {
@@ -316,19 +404,24 @@ impl Queue {
                     relative_path: format!("control/{RECOVERY_CURSOR_FILE}"),
                     error: error.to_string(),
                 });
-                return stats;
+                return RecoveryReport {
+                    stats,
+                    scan: scan_stats,
+                };
             }
         };
         let boottime_now = match fs::clock_boottime_ns() {
             Ok(t) => t,
             Err(e) => {
-                let mut s = RecoveryStats::default();
-                s.errors.push(RecoveryError {
+                stats.errors.push(RecoveryError {
                     operation: "clock_boottime".into(),
                     relative_path: "/".into(),
                     error: e.to_string(),
                 });
-                return s;
+                return RecoveryReport {
+                    stats,
+                    scan: scan_stats,
+                };
             }
         };
         // P1-12: Use checked wall floor. If unavailable, record error and
@@ -348,17 +441,23 @@ impl Queue {
         let start_mono = match fs::clock_monotonic_ns() {
             Ok(t) => t,
             Err(e) => {
-                let mut s = RecoveryStats::default();
-                s.errors.push(RecoveryError {
+                stats.errors.push(RecoveryError {
                     operation: "clock_monotonic".into(),
                     relative_path: "/".into(),
                     error: e.to_string(),
                 });
-                return s;
+                return RecoveryReport {
+                    stats,
+                    scan: scan_stats,
+                };
             }
         };
         let deadline_mono =
             start_mono.saturating_add(budget.max_duration_ms.saturating_mul(1_000_000));
+        let mut scan = RecoveryScanContext {
+            budget: scan_budget,
+            stats: &mut scan_stats,
+        };
 
         loop {
             if !Self::has_recovery_budget(&stats) {
@@ -371,6 +470,7 @@ impl Queue {
                         boottime_now,
                         wall_floor,
                         budget,
+                        &mut scan,
                         &mut stats,
                         deadline_mono,
                     );
@@ -378,16 +478,33 @@ impl Queue {
                 }
                 RecoveryPhase::PromoteDelayed => {
                     if let Some(wall_floor) = wall_floor {
-                        self.promote_delayed(wall_floor, budget, &mut stats, deadline_mono);
+                        self.promote_delayed(
+                            wall_floor,
+                            budget,
+                            &mut scan,
+                            &mut stats,
+                            deadline_mono,
+                        );
                     }
                     RecoveryPhase::CleanupTemp
                 }
                 RecoveryPhase::CleanupTemp => {
-                    self.cleanup_temp_files(boottime_now, budget, &mut stats, deadline_mono);
+                    self.cleanup_temp_files(
+                        boottime_now,
+                        budget,
+                        &mut scan,
+                        &mut stats,
+                        deadline_mono,
+                    );
                     RecoveryPhase::CompactReceipts
                 }
                 RecoveryPhase::CompactReceipts => {
-                    self.compact_receipts(budget, &mut stats, deadline_mono);
+                    self.compact_receipts_with_scan_budget(
+                        budget,
+                        &mut scan,
+                        &mut stats,
+                        deadline_mono,
+                    );
                     RecoveryPhase::DeleteReceipts
                 }
                 RecoveryPhase::DeleteReceipts => {
@@ -396,6 +513,7 @@ impl Queue {
                             wall_floor,
                             self.options.receipt_retention_ns,
                             budget,
+                            &mut scan,
                             &mut stats,
                             deadline_mono,
                         );
@@ -406,7 +524,7 @@ impl Queue {
             if Self::has_recovery_budget(&stats) {
                 self.recovery_cursor.phase = next_phase;
             }
-            if Self::budget_exhausted(&mut stats, budget, deadline_mono) {
+            if Self::budget_exhausted(&mut stats, scan.stats, budget, scan.budget, deadline_mono) {
                 stats.budget_exhausted = true;
             }
             if phase == RecoveryPhase::DeleteReceipts {
@@ -422,7 +540,10 @@ impl Queue {
             });
         }
 
-        stats
+        RecoveryReport {
+            stats,
+            scan: scan_stats,
+        }
     }
 
     /// B1: Quarantine an object during recovery.
@@ -449,13 +570,20 @@ impl Queue {
         fs::clock_monotonic_ns().map(|now| now >= deadline_mono)
     }
 
-    /// Check if either operations or time budget is exhausted.
+    /// Check whether any configured recovery budget is exhausted.
     fn budget_exhausted(
         stats: &mut RecoveryStats,
+        scan: &RecoveryScanStats,
         budget: &WorkBudget,
+        scan_budget: &RecoveryScanBudget,
         deadline_mono: u64,
     ) -> bool {
         if stats.operations_attempted >= budget.max_operations {
+            return true;
+        }
+        if scan.entries_read >= scan_budget.max_entries_read
+            || scan.name_bytes_read >= scan_budget.max_name_bytes_read
+        {
             return true;
         }
         match Self::budget_time_exceeded(deadline_mono) {
@@ -516,6 +644,7 @@ impl Queue {
         boottime_now: u64,
         wall_floor: Option<WallFloor>,
         budget: &WorkBudget,
+        scan: &mut RecoveryScanContext<'_>,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
@@ -530,7 +659,12 @@ impl Queue {
             }
         };
 
-        let mut boot_dirs = match read_recovery_directory(leased_fd.as_raw_fd(), deadline_mono) {
+        let mut boot_dirs = match read_recovery_directory(
+            leased_fd.as_raw_fd(),
+            deadline_mono,
+            scan.budget,
+            scan.stats,
+        ) {
             Ok(e) => e,
             Err(e) => {
                 Self::stop_for_directory_error(stats, "read_leased_dirs", "leased", &e);
@@ -545,7 +679,7 @@ impl Queue {
                     continue;
                 }
             }
-            if Self::budget_exhausted(stats, budget, deadline_mono) {
+            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -579,20 +713,24 @@ impl Queue {
                 }
             };
 
-            let mut bucket_dirs =
-                match read_recovery_directory(boot_dir_fd.as_raw_fd(), deadline_mono) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
-                            stats,
-                            "reap_bucket_read",
-                            boot_dir_name,
-                            &error,
-                        );
-                        return;
-                    }
-                };
+            let mut bucket_dirs = match read_recovery_directory(
+                boot_dir_fd.as_raw_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
+                Ok(e) => e,
+                Err(error) => {
+                    stats.scan_skips += 1;
+                    Self::stop_for_directory_error(
+                        stats,
+                        "reap_bucket_read",
+                        boot_dir_name,
+                        &error,
+                    );
+                    return;
+                }
+            };
             bucket_dirs.sort();
 
             for bucket_entry in &bucket_dirs {
@@ -603,7 +741,7 @@ impl Queue {
                         continue;
                     }
                 }
-                if Self::budget_exhausted(stats, budget, deadline_mono) {
+                if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
                     stats.budget_exhausted = true;
                     return;
                 }
@@ -658,20 +796,24 @@ impl Queue {
                     }
                 };
 
-                let mut shard_dirs =
-                    match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono) {
-                        Ok(e) => e,
-                        Err(error) => {
-                            stats.scan_skips += 1;
-                            Self::stop_for_directory_error(
-                                stats,
-                                "reap_shard_read",
-                                &format!("leased/{boot_dir_name}/{bucket_name}"),
-                                &error,
-                            );
-                            return;
-                        }
-                    };
+                let mut shard_dirs = match read_recovery_directory(
+                    bucket_fd.as_raw_fd(),
+                    deadline_mono,
+                    scan.budget,
+                    scan.stats,
+                ) {
+                    Ok(e) => e,
+                    Err(error) => {
+                        stats.scan_skips += 1;
+                        Self::stop_for_directory_error(
+                            stats,
+                            "reap_shard_read",
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                            &error,
+                        );
+                        return;
+                    }
+                };
                 shard_dirs.sort();
 
                 for shard_entry in &shard_dirs {
@@ -724,20 +866,24 @@ impl Queue {
                         }
                     };
 
-                    let mut entries =
-                        match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono) {
-                            Ok(e) => e,
-                            Err(error) => {
-                                stats.scan_skips += 1;
-                                Self::stop_for_directory_error(
-                                    stats,
-                                    "reap_entry_read",
-                                    &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
-                                    &error,
-                                );
-                                return;
-                            }
-                        };
+                    let mut entries = match read_recovery_directory(
+                        shard_fd.as_raw_fd(),
+                        deadline_mono,
+                        scan.budget,
+                        scan.stats,
+                    ) {
+                        Ok(e) => e,
+                        Err(error) => {
+                            stats.scan_skips += 1;
+                            Self::stop_for_directory_error(
+                                stats,
+                                "reap_entry_read",
+                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                                &error,
+                            );
+                            return;
+                        }
+                    };
                     entries.sort();
 
                     for raw_entry in &entries {
@@ -751,7 +897,13 @@ impl Queue {
                                 continue;
                             }
                         }
-                        if Self::budget_exhausted(stats, budget, deadline_mono) {
+                        if Self::budget_exhausted(
+                            stats,
+                            scan.stats,
+                            budget,
+                            scan.budget,
+                            deadline_mono,
+                        ) {
                             stats.budget_exhausted = true;
                             return;
                         }
@@ -1018,6 +1170,7 @@ impl Queue {
         &mut self,
         wall_floor: WallFloor,
         budget: &WorkBudget,
+        scan: &mut RecoveryScanContext<'_>,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
@@ -1030,7 +1183,12 @@ impl Queue {
             }
         };
 
-        let mut bucket_dirs = match read_recovery_directory(delayed_fd.as_raw_fd(), deadline_mono) {
+        let mut bucket_dirs = match read_recovery_directory(
+            delayed_fd.as_raw_fd(),
+            deadline_mono,
+            scan.budget,
+            scan.stats,
+        ) {
             Ok(e) => e,
             Err(error) => {
                 Self::stop_for_directory_error(stats, "promote_bucket_read", "delayed", &error);
@@ -1047,7 +1205,7 @@ impl Queue {
                 }
             }
 
-            if Self::budget_exhausted(stats, budget, deadline_mono) {
+            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -1102,8 +1260,12 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono)
-            {
+            let mut shard_dirs = match read_recovery_directory(
+                bucket_fd.as_raw_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -1167,8 +1329,12 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
-                {
+                let mut entries = match read_recovery_directory(
+                    shard_fd.as_raw_fd(),
+                    deadline_mono,
+                    scan.budget,
+                    scan.stats,
+                ) {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -1194,7 +1360,8 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, budget, deadline_mono) {
+                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
+                    {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -1316,6 +1483,7 @@ impl Queue {
         &mut self,
         boottime_now: u64,
         budget: &WorkBudget,
+        scan: &mut RecoveryScanContext<'_>,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
@@ -1328,7 +1496,12 @@ impl Queue {
             }
         };
 
-        let mut boot_dirs = match read_recovery_directory(tmp_fd.as_raw_fd(), deadline_mono) {
+        let mut boot_dirs = match read_recovery_directory(
+            tmp_fd.as_raw_fd(),
+            deadline_mono,
+            scan.budget,
+            scan.stats,
+        ) {
             Ok(e) => e,
             Err(error) => {
                 Self::stop_for_directory_error(stats, "temp_boot_read", "tmp", &error);
@@ -1343,7 +1516,7 @@ impl Queue {
                     continue;
                 }
             }
-            if Self::budget_exhausted(stats, budget, deadline_mono) {
+            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -1377,20 +1550,19 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs =
-                match read_recovery_directory(boot_dir_fd.as_raw_fd(), deadline_mono) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
-                            stats,
-                            "temp_shard_read",
-                            boot_dir_name,
-                            &error,
-                        );
-                        return;
-                    }
-                };
+            let mut shard_dirs = match read_recovery_directory(
+                boot_dir_fd.as_raw_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
+                Ok(e) => e,
+                Err(error) => {
+                    stats.scan_skips += 1;
+                    Self::stop_for_directory_error(stats, "temp_shard_read", boot_dir_name, &error);
+                    return;
+                }
+            };
             shard_dirs.sort();
 
             for shard_entry in &shard_dirs {
@@ -1442,8 +1614,12 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
-                {
+                let mut entries = match read_recovery_directory(
+                    shard_fd.as_raw_fd(),
+                    deadline_mono,
+                    scan.budget,
+                    scan.stats,
+                ) {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -1468,7 +1644,8 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, budget, deadline_mono) {
+                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
+                    {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -1525,6 +1702,22 @@ impl Queue {
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        self.compact_receipts_with_scan_budget(budget, &mut scan, stats, deadline_mono);
+    }
+
+    fn compact_receipts_with_scan_budget(
+        &mut self,
+        budget: &WorkBudget,
+        scan: &mut RecoveryScanContext<'_>,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) {
         let root_fd = self.root_fd();
         let receipts_fd = match fs::open_directory(root_fd, "receipts") {
             Ok(fd) => fd,
@@ -1534,8 +1727,12 @@ impl Queue {
             }
         };
 
-        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd(), deadline_mono)
-        {
+        let mut bucket_dirs = match read_recovery_directory(
+            receipts_fd.as_raw_fd(),
+            deadline_mono,
+            scan.budget,
+            scan.stats,
+        ) {
             Ok(e) => e,
             Err(error) => {
                 Self::stop_for_directory_error(stats, "compact_bucket_read", "receipts", &error);
@@ -1552,7 +1749,7 @@ impl Queue {
                 }
             }
 
-            if Self::budget_exhausted(stats, budget, deadline_mono) {
+            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -1589,8 +1786,12 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono)
-            {
+            let mut shard_dirs = match read_recovery_directory(
+                bucket_fd.as_raw_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -1655,8 +1856,12 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
-                {
+                let mut entries = match read_recovery_directory(
+                    shard_fd.as_raw_fd(),
+                    deadline_mono,
+                    scan.budget,
+                    scan.stats,
+                ) {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -1682,7 +1887,8 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, budget, deadline_mono) {
+                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
+                    {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -1846,6 +2052,7 @@ impl Queue {
         wall_floor: WallFloor,
         retention_ns: u64,
         budget: &WorkBudget,
+        scan: &mut RecoveryScanContext<'_>,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
     ) {
@@ -1860,8 +2067,12 @@ impl Queue {
             }
         };
 
-        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd(), deadline_mono)
-        {
+        let mut bucket_dirs = match read_recovery_directory(
+            receipts_fd.as_raw_fd(),
+            deadline_mono,
+            scan.budget,
+            scan.stats,
+        ) {
             Ok(e) => e,
             Err(error) => {
                 Self::stop_for_directory_error(stats, "delete_bucket_read", "receipts", &error);
@@ -1878,7 +2089,7 @@ impl Queue {
                 }
             }
 
-            if Self::budget_exhausted(stats, budget, deadline_mono) {
+            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -1938,8 +2149,12 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono)
-            {
+            let mut shard_dirs = match read_recovery_directory(
+                bucket_fd.as_raw_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -2004,8 +2219,12 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
-                {
+                let mut entries = match read_recovery_directory(
+                    shard_fd.as_raw_fd(),
+                    deadline_mono,
+                    scan.budget,
+                    scan.stats,
+                ) {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -2031,7 +2250,8 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, budget, deadline_mono) {
+                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
+                    {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -2262,6 +2482,8 @@ mod tests {
     fn recovery_scan_bounds_are_fixed_and_finite() {
         assert_eq!(MAX_RECOVERY_DIRECTORY_ENTRIES, 65_536);
         assert_eq!(MAX_RECOVERY_DIRECTORY_NAME_BYTES, 16_711_680);
+        assert_eq!(MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE, 65_537);
+        assert_eq!(MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE, 16_711_935);
     }
 
     #[test]
@@ -2275,14 +2497,59 @@ mod tests {
             max_duration_ms: u64::MAX,
         };
         let mut stats = RecoveryStats::default();
-        assert!(!Queue::budget_exhausted(&mut stats, &budget, u64::MAX));
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan = RecoveryScanStats::default();
+        assert!(!Queue::budget_exhausted(
+            &mut stats,
+            &scan,
+            &budget,
+            &scan_budget,
+            u64::MAX,
+        ));
         stats.operations_attempted = 1;
-        assert!(Queue::budget_exhausted(&mut stats, &budget, u64::MAX));
+        assert!(Queue::budget_exhausted(
+            &mut stats,
+            &scan,
+            &budget,
+            &scan_budget,
+            u64::MAX,
+        ));
         stats.operations_attempted = 0;
-        assert!(Queue::budget_exhausted(&mut stats, &budget, 0));
+        assert!(Queue::budget_exhausted(
+            &mut stats,
+            &scan,
+            &budget,
+            &scan_budget,
+            0,
+        ));
+
+        scan.entries_read = scan_budget.max_entries_read;
+        assert!(Queue::budget_exhausted(
+            &mut stats,
+            &scan,
+            &budget,
+            &scan_budget,
+            u64::MAX,
+        ));
+        scan.entries_read = 0;
+        scan.name_bytes_read = scan_budget.max_name_bytes_read;
+        assert!(Queue::budget_exhausted(
+            &mut stats,
+            &scan,
+            &budget,
+            &scan_budget,
+            u64::MAX,
+        ));
+        scan.name_bytes_read = 0;
 
         fs::fault::inject("clock_monotonic_ns", 1);
-        assert!(Queue::budget_exhausted(&mut stats, &budget, u64::MAX));
+        assert!(Queue::budget_exhausted(
+            &mut stats,
+            &scan,
+            &budget,
+            &scan_budget,
+            u64::MAX,
+        ));
         fs::fault::reset();
         assert!(stats.phase_blocked);
         assert!(stats
@@ -2654,8 +2921,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(OsStr::from_bytes(b"bad-\x80")), b"x").unwrap();
         let dir = std::fs::File::open(tmp.path()).unwrap();
-        let entries = read_recovery_directory(dir.as_raw_fd(), u64::MAX).unwrap();
+        let mut stats = RecoveryScanStats::default();
+        let entries = read_recovery_directory(
+            dir.as_raw_fd(),
+            u64::MAX,
+            &RecoveryScanBudget::default(),
+            &mut stats,
+        )
+        .unwrap();
         assert_eq!(entries.len(), 1);
+        assert_eq!(stats.entries_read, 1);
+        assert_eq!(stats.name_bytes_read, 5);
         assert_eq!(raw_name_for_error(&entries[0]), "b\"bad-\\x80\"");
     }
 
@@ -2664,20 +2940,73 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("entry"), b"x").unwrap();
         let dir = std::fs::File::open(tmp.path()).unwrap();
+        let mut stats = RecoveryScanStats::default();
 
-        let error = read_recovery_directory(dir.as_raw_fd(), 0).unwrap_err();
+        let error = read_recovery_directory(
+            dir.as_raw_fd(),
+            0,
+            &RecoveryScanBudget::default(),
+            &mut stats,
+        )
+        .unwrap_err();
 
         assert!(matches!(error, RecoveryDirectoryError::BudgetExhausted));
+        assert_eq!(stats.entries_read, 0);
+        assert_eq!(stats.name_bytes_read, 0);
+    }
+
+    #[test]
+    fn recovery_directory_read_requires_budget_for_the_overflow_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("entry"), b"x").unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+
+        for budget in [
+            RecoveryScanBudget {
+                max_entries_read: MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE - 1,
+                ..RecoveryScanBudget::default()
+            },
+            RecoveryScanBudget {
+                max_name_bytes_read: MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE - 1,
+                ..RecoveryScanBudget::default()
+            },
+        ] {
+            let mut stats = RecoveryScanStats::default();
+            let error = read_recovery_directory(dir.as_raw_fd(), u64::MAX, &budget, &mut stats)
+                .unwrap_err();
+
+            assert!(matches!(error, RecoveryDirectoryError::BudgetExhausted));
+            assert_eq!(stats.entries_read, 0);
+            assert_eq!(stats.name_bytes_read, 0);
+        }
+
+        let exact_budget = RecoveryScanBudget {
+            max_entries_read: MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE,
+            max_name_bytes_read: MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE,
+        };
+        let mut stats = RecoveryScanStats::default();
+        let entries =
+            read_recovery_directory(dir.as_raw_fd(), u64::MAX, &exact_budget, &mut stats).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(stats.entries_read, 1);
+        assert_eq!(stats.name_bytes_read, 5);
     }
 
     #[test]
     fn recovery_directory_read_propagates_clock_failure() {
         let tmp = TempDir::new().unwrap();
         let dir = std::fs::File::open(tmp.path()).unwrap();
+        let mut stats = RecoveryScanStats::default();
         fs::fault::reset();
         fs::fault::inject_errno("clock_monotonic_ns", 1, libc::EIO);
 
-        let error = read_recovery_directory(dir.as_raw_fd(), u64::MAX).unwrap_err();
+        let error = read_recovery_directory(
+            dir.as_raw_fd(),
+            u64::MAX,
+            &RecoveryScanBudget::default(),
+            &mut stats,
+        )
+        .unwrap_err();
 
         fs::fault::reset();
         assert!(matches!(
@@ -3087,6 +3416,11 @@ mod tests {
     #[test]
     fn recovery_empty_queue() {
         let (_tmp, mut queue) = create_test_queue();
+        let report =
+            queue.recover_with_scan_budget(&WorkBudget::default(), &RecoveryScanBudget::default());
+        assert_eq!(report.stats.operations_attempted, 0);
+        assert_eq!(report.scan, RecoveryScanStats::default());
+
         let stats = queue.recover(&WorkBudget::default());
         assert_eq!(stats.operations_attempted, 0);
         assert!(!stats.budget_exhausted);
@@ -3321,7 +3655,20 @@ mod tests {
             outcome => panic!("lease failed: {outcome:?}"),
         };
         let mut stats = RecoveryStats::default();
-        queue.reap_expired_leases(u64::MAX, None, &WorkBudget::default(), &mut stats, u64::MAX);
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        queue.reap_expired_leases(
+            u64::MAX,
+            None,
+            &WorkBudget::default(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
 
         assert_eq!(stats.leases_to_dead, 0);
         assert!(stats

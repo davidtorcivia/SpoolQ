@@ -23,7 +23,9 @@ pub use quarantine::{
     QuarantineEntry,
 };
 pub use queue::*;
-pub use recovery::{RecoveryStats, WorkBudget};
+pub use recovery::{
+    RecoveryReport, RecoveryScanBudget, RecoveryScanStats, RecoveryStats, WorkBudget,
+};
 
 /// Re-export RetryPolicy from steadq_math so callers don't need two types.
 pub use steadq_math::RetryPolicy;
