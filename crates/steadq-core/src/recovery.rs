@@ -403,11 +403,11 @@ impl Queue {
                     RecoveryPhase::ReapLeases
                 }
             };
-            if Self::budget_exhausted(&mut stats, budget, deadline_mono) {
-                stats.budget_exhausted = true;
-            }
             if Self::has_recovery_budget(&stats) {
                 self.recovery_cursor.phase = next_phase;
+            }
+            if Self::budget_exhausted(&mut stats, budget, deadline_mono) {
+                stats.budget_exhausted = true;
             }
             if phase == RecoveryPhase::DeleteReceipts {
                 break;
@@ -2359,7 +2359,7 @@ mod tests {
         assert_eq!(first.operations_attempted, 1, "errors: {:?}", first.errors);
         assert_eq!(first.leases_reaped, 0, "errors: {:?}", first.errors);
         assert!(first.budget_exhausted);
-        assert_eq!(queue.recovery_cursor.phase, RecoveryPhase::CompactReceipts);
+        assert_eq!(queue.recovery_cursor.phase, RecoveryPhase::DeleteReceipts);
         drop(queue);
 
         let mut reopened = Queue::open(
@@ -2372,7 +2372,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reopened.recovery_cursor.phase,
-            RecoveryPhase::CompactReceipts
+            RecoveryPhase::DeleteReceipts
         );
 
         let second = reopened.recover(&budget);
@@ -2384,7 +2384,8 @@ mod tests {
         assert!(second
             .errors
             .iter()
-            .any(|error| error.operation == "receipt_compact_invalid"));
+            .any(|error| error.operation == "receipt_delete_parse"));
+        assert_eq!(reopened.recovery_cursor.phase, RecoveryPhase::ReapLeases);
     }
 
     #[test]
