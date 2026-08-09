@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: 51784a8a723ff47b4cdc878dd1eecb55dd23ed71b2111ebfa661768a8e96b478
+// Source SHA-256: bb0a2f768044b96e8346939974403c6bc484aeab3bffee2c6cc647a32eada641
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -68,6 +68,14 @@ pub enum ClockRequirement {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum TransitionQualification {
+    None,
+    AttemptsRemaining,
+    AttemptsExhausted,
+    RawBytesPreserved,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum SyncStep {
     File,
     DestinationDirectory,
@@ -125,8 +133,7 @@ pub struct TransitionDef {
     pub after_linearization_failure: FailureOutcome,
     /// Human-readable resolver documentation, not an executable rule.
     pub resolution_behavior: &'static str,
-    /// Human-readable qualification, not an executable precondition.
-    pub notes: Option<&'static str>,
+    pub qualification: TransitionQualification,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +171,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe destination: observed = committed, absent = not committed",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::EnqueueDelayed,
@@ -180,7 +187,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe destination: observed = committed, absent = not committed",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::Promote,
@@ -197,7 +204,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior:
             "probe both: destination observed = committed, source only = not committed",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::Claim,
@@ -213,7 +220,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both directories",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::ExhaustedReadyCleanup,
@@ -229,7 +236,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::Renew,
@@ -246,7 +253,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior:
             "probe destination: new generation observed = renewed, old gen observed = lease lost",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::Acknowledge,
@@ -262,7 +269,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe receipt buckets by exact name",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::RetryNow,
@@ -278,7 +285,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::RetryLater,
@@ -294,7 +301,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::Bury,
@@ -310,7 +317,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
-        notes: None,
+        qualification: TransitionQualification::None,
     },
     TransitionDef {
         operation: Operation::ReapExpiredToReady,
@@ -326,7 +333,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
-        notes: Some("attempt < maximum_attempts"),
+        qualification: TransitionQualification::AttemptsRemaining,
     },
     TransitionDef {
         operation: Operation::ReapExpiredToDead,
@@ -342,7 +349,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
-        notes: Some("attempt >= maximum_attempts"),
+        qualification: TransitionQualification::AttemptsExhausted,
     },
     TransitionDef {
         operation: Operation::Quarantine,
@@ -358,7 +365,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
-        notes: Some("raw bytes preserved"),
+        qualification: TransitionQualification::RawBytesPreserved,
     },
 ];
 
@@ -496,7 +503,7 @@ mod tests {
             FailureOutcome::OutcomeUnknown
         );
         assert!(claim.resolution_behavior.contains("both"));
-        assert_eq!(claim.notes, None);
+        assert_eq!(claim.qualification, TransitionQualification::None);
     }
 
     #[test]
@@ -518,7 +525,10 @@ mod tests {
             .find(|transition| transition.operation == Operation::ReapExpiredToDead)
             .unwrap();
         assert_eq!(reap.reason_class, Some(ReasonClass::AttemptsExhausted));
-        assert_eq!(reap.notes, Some("attempt >= maximum_attempts"));
+        assert_eq!(
+            reap.qualification,
+            TransitionQualification::AttemptsExhausted
+        );
         assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);
         assert_eq!(EXCEPTIONS[0].clock_requirement, ClockRequirement::None);
         assert_eq!(

@@ -29,7 +29,7 @@
           "before_linearization_failure",
           "after_linearization_failure",
           "resolution_behavior",
-          "notes"
+          "qualification"
         ],
         "properties": {
           "operation": {
@@ -154,15 +154,13 @@
             "type": "string",
             "minLength": 1
           },
-          "notes": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "type": "string",
-                "minLength": 1
-              }
+          "qualification": {
+            "type": "string",
+            "enum": [
+              "none",
+              "attempts_remaining",
+              "attempts_exhausted",
+              "raw_bytes_preserved"
             ]
           }
         }

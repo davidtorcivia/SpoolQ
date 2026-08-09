@@ -192,7 +192,7 @@ fn rejects_duplicate_operation() {
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both".into(),
-        notes: Nullable::Null,
+        qualification: TransitionQualification::None,
     });
     assert_eq!(
         validate_spec(&spec).unwrap_err(),
@@ -253,6 +253,23 @@ fn rejects_wrong_clock_requirements() {
     assert_eq!(
         validate_spec(&spec).unwrap_err(),
         "exception receipt_compaction has clock requirement authenticated_wall_floor; expected none"
+    );
+}
+
+#[test]
+fn rejects_wrong_transition_qualifications() {
+    let mut spec = fixture();
+    spec.transitions[10].qualification = TransitionQualification::AttemptsExhausted;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition reap_expired_to_ready has qualification attempts_exhausted; expected attempts_remaining"
+    );
+
+    let mut spec = fixture();
+    spec.transitions[12].qualification = TransitionQualification::None;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition quarantine has qualification none; expected raw_bytes_preserved"
     );
 }
 
@@ -334,7 +351,6 @@ fn generated_rust_wraps_the_exact_width_boundary() {
 fn generated_rust_compiles_schema_valid_control_characters() {
     let mut spec = fixture();
     spec.transitions[0].resolution_behavior = "resolver\u{8}behavior".into();
-    spec.transitions[0].notes = Nullable::Value("note\nwith\tcontrols".into());
     spec.exceptions[0].description = "exception\u{0}description".into();
     spec.reentry[0].description = "reentry\rdescription".into();
 
@@ -411,7 +427,7 @@ fn every_transition_field_affects_every_projection() {
         spec.transitions[0].resolution_behavior = "different resolver documentation".into();
     });
     assert_every_projection_changes(|spec| {
-        spec.transitions[0].notes = Nullable::Value("different qualification".into());
+        spec.transitions[0].qualification = TransitionQualification::AttemptsRemaining;
     });
 }
 
@@ -491,6 +507,7 @@ fn rejects_unknown_protocol_domains() {
         ("/transitions/0/source", "invented_state"),
         ("/transitions/0/reason_class", "invented_reason"),
         ("/transitions/0/clock_requirement", "invented_clock"),
+        ("/transitions/0/qualification", "invented_qualification"),
         ("/transitions/0/required_syncs/0", "invented_sync"),
         ("/transitions/0/linearization", "invented_linearization"),
         (
@@ -528,7 +545,7 @@ fn rejects_omitted_semantic_fields() {
         "before_linearization_failure",
         "after_linearization_failure",
         "resolution_behavior",
-        "notes",
+        "qualification",
     ] {
         let mut input = fixture_value();
         input["transitions"][0]
@@ -618,6 +635,10 @@ fn rejects_each_cross_field_transition_mutation() {
         (
             "/transitions/3/clock_requirement",
             serde_json::json!("authenticated_wall_floor"),
+        ),
+        (
+            "/transitions/3/qualification",
+            serde_json::json!("attempts_remaining"),
         ),
         (
             "/transitions/3/reason_class",
