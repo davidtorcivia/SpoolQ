@@ -1027,6 +1027,23 @@ impl Queue {
     }
 
     pub(crate) fn stabilized_wall_floor(&self) -> Result<WallFloor, Error> {
+        self.with_wall_watermark_write_lock(|control_fd| {
+            let observed = self.authenticated_wall_floor()?;
+            let observed_bucket =
+                steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
+                    .ok_or(Error::StateExhausted)?;
+            if !watermark_should_advance(observed_bucket, observed.watermark_bucket) {
+                return Ok(observed);
+            }
+
+            self.advance_wall_watermark_locked(observed, control_fd)
+        })
+    }
+
+    fn with_wall_watermark_write_lock<T>(
+        &self,
+        action: impl FnOnce(RawFd) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
             .map_err(|error| Error::IoFailure(error.to_string()))?;
         let lock_fd = fs::openat(
@@ -1036,22 +1053,13 @@ impl Queue {
             0o600,
         )
         .map_err(|error| Error::IoFailure(error.to_string()))?;
-        let locked = fs::try_ofd_read_lock(lock_fd.as_raw_fd())
+        let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())
             .map_err(|error| Error::IoFailure(error.to_string()))?;
         if !locked {
             return Err(Error::MaintenanceBusy);
         }
 
-        let observed = self.authenticated_wall_floor()?;
-        let observed_bucket =
-            steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
-                .ok_or(Error::StateExhausted)?;
-        if !watermark_should_advance(observed_bucket, observed.watermark_bucket) {
-            return Ok(observed);
-        }
-
-        drop(lock_fd);
-        self.advance_wall_watermark(observed)
+        action(control_fd.as_raw_fd())
     }
 
     /// Read the wall watermark record from control/wall-watermark.
@@ -1107,29 +1115,15 @@ impl Queue {
             .map_err(|e| WatermarkReadError::Corrupt(e.to_string()))
     }
 
-    /// B-05: Advance the wall watermark to max(stored, observed).
-    /// Re-reads under lock, computes max, writes atomically with sequence increment.
-    fn advance_wall_watermark(&self, observed: WallFloor) -> Result<WallFloor, Error> {
+    /// Requires the exclusive wall-watermark lock to remain held until return.
+    fn advance_wall_watermark_locked(
+        &self,
+        observed: WallFloor,
+        control_fd: RawFd,
+    ) -> Result<WallFloor, Error> {
         let observed_bucket =
             steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
                 .ok_or(Error::StateExhausted)?;
-
-        let control_fd = fs::open_directory(self.root_fd.as_raw_fd(), "control")
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-
-        // Acquire exclusive write lock on wall-watermark.lock
-        let lock_fd = fs::openat(
-            control_fd.as_raw_fd(),
-            "wall-watermark.lock",
-            libc::O_RDWR,
-            0o600,
-        )
-        .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        if !locked {
-            return Err(Error::MaintenanceBusy);
-        }
 
         // Re-read current watermark under lock
         let current = self.read_wall_watermark();
@@ -1174,19 +1168,14 @@ impl Queue {
                 &fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?
             )
         );
-        let tmp_fd = fs::create_exclusive(control_fd.as_raw_fd(), &tmp_name, 0o600)
+        let tmp_fd = fs::create_exclusive(control_fd, &tmp_name, 0o600)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::write_all(tmp_fd.as_raw_fd(), &wm_bytes)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::fsync(tmp_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::renameat(
-            control_fd.as_raw_fd(),
-            &tmp_name,
-            control_fd.as_raw_fd(),
-            "wall-watermark",
-        )
-        .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync_dir_fd(control_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::renameat(control_fd, &tmp_name, control_fd, "wall-watermark")
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync_dir_fd(control_fd).map_err(|e| Error::IoFailure(e.to_string()))?;
 
         Ok(WallFloor {
             unix_ns: observed.unix_ns(),
@@ -6742,7 +6731,9 @@ mod tests {
             watermark_sequence: wm_before.sequence,
         };
         let seq_before = wm_before.sequence;
-        let res = queue.advance_wall_watermark(observed);
+        let res = queue.with_wall_watermark_write_lock(|control_fd| {
+            queue.advance_wall_watermark_locked(observed, control_fd)
+        });
         assert!(
             res.is_ok(),
             "equal bucket advance should be Ok, got {res:?}"
@@ -6787,7 +6778,9 @@ mod tests {
             };
             fs::fault::reset();
             fs::fault::inject(syscall, at_count);
-            let result = queue.advance_wall_watermark(observed);
+            let result = queue.with_wall_watermark_write_lock(|control_fd| {
+                queue.advance_wall_watermark_locked(observed, control_fd)
+            });
             assert!(result.is_err(), "{syscall} fault #{at_count} was ignored");
             assert_eq!(fs::fault::call_count(syscall), at_count);
             fs::fault::reset();
@@ -6954,7 +6947,7 @@ mod tests {
 
     #[test]
     fn stabilized_wall_floor_lock_fault_matrix() {
-        for syscall in ["open_directory", "openat", "try_ofd_read_lock"] {
+        for syscall in ["open_directory", "openat", "try_ofd_write_lock"] {
             let (_tmp, queue) = create_test_queue();
             fs::fault::reset();
             fs::fault::inject(syscall, 1);
@@ -6966,6 +6959,45 @@ mod tests {
             assert_eq!(fs::fault::call_count(syscall), 1);
             fs::fault::reset();
         }
+    }
+
+    #[test]
+    fn wall_watermark_write_lock_excludes_new_readers_through_action() {
+        let (_tmp, queue) = create_test_queue();
+        let result = queue.with_wall_watermark_write_lock(|_| {
+            let control_fd = fs::open_directory(queue.root_fd(), "control")
+                .map_err(|error| Error::IoFailure(error.to_string()))?;
+            let competing_fd = fs::openat(
+                control_fd.as_raw_fd(),
+                "wall-watermark.lock",
+                libc::O_RDWR,
+                0o600,
+            )
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+            let competing_reader = fs::try_ofd_read_lock(competing_fd.as_raw_fd())
+                .map_err(|error| Error::IoFailure(error.to_string()))?;
+            assert!(!competing_reader, "new readers must wait behind the writer");
+            Ok(())
+        });
+        assert!(result.is_ok(), "exclusive action failed: {result:?}");
+    }
+
+    #[test]
+    fn stabilized_wall_floor_advances_under_one_exclusive_lock() {
+        let (tmp, queue) = create_test_queue();
+        write_wall_watermark(&tmp, 0, 1);
+        fs::fault::reset();
+        fs::fault::inject("try_ofd_write_lock", u64::MAX);
+        fs::fault::inject("try_ofd_read_lock", u64::MAX);
+
+        let floor = queue
+            .stabilized_wall_floor()
+            .expect("watermark advance should complete");
+
+        assert!(floor.watermark_bucket() > 0);
+        assert_eq!(fs::fault::call_count("try_ofd_write_lock"), 1);
+        assert_eq!(fs::fault::call_count("try_ofd_read_lock"), 0);
+        fs::fault::reset();
     }
 
     #[test]
