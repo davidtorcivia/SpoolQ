@@ -24,6 +24,7 @@ EvidenceClasses == {
     CompactUnverified,
     CompactVerified
 }
+VerifiedEvidenceClasses == {FullVerified, CompactVerified}
 ReceiptClasses == EvidenceClasses \cup {NoReceipt, Deleted}
 InitialReceiptClasses == {
     NoReceipt,
@@ -32,25 +33,50 @@ InitialReceiptClasses == {
     CompactUnverified
 }
 
-EventInit == "init"
-EventWallAuthorityAcquired == "wall-authority-acquired"
-EventWallAuthorityReleased == "wall-authority-released"
-EventWallAuthorityFailure == "wall-authority-failure"
-EventAcknowledged == "acknowledged"
+EventNeutral == "neutral"
 EventDuplicateAcknowledged == "duplicate-acknowledged"
-EventCompacted == "compacted"
-EventDeleted == "deleted"
-EventOperationFailure == "operation-failure"
+EventAcknowledgeNotCommitted == "acknowledge-not-committed"
+EventAcknowledgeCommitted == "acknowledge-committed"
+EventAcknowledgeOutcomeUnknown == "acknowledge-outcome-unknown"
+EventCompactionNotCommitted == "compaction-not-committed"
+EventCompactionCommitted == "compaction-committed"
+EventCompactionOutcomeUnknown == "compaction-outcome-unknown"
+EventDeletionNotCommitted == "deletion-not-committed"
+EventDeletionCommitted == "deletion-committed"
+EventDeletionOutcomeUnknown == "deletion-outcome-unknown"
 Events == {
-    EventInit,
-    EventWallAuthorityAcquired,
-    EventWallAuthorityReleased,
-    EventWallAuthorityFailure,
-    EventAcknowledged,
+    EventNeutral,
     EventDuplicateAcknowledged,
-    EventCompacted,
-    EventDeleted,
-    EventOperationFailure
+    EventAcknowledgeNotCommitted,
+    EventAcknowledgeCommitted,
+    EventAcknowledgeOutcomeUnknown,
+    EventCompactionNotCommitted,
+    EventCompactionCommitted,
+    EventCompactionOutcomeUnknown,
+    EventDeletionNotCommitted,
+    EventDeletionCommitted,
+    EventDeletionOutcomeUnknown
+}
+
+AcknowledgeLinearizedEvents == {
+    EventAcknowledgeCommitted,
+    EventAcknowledgeOutcomeUnknown
+}
+
+CompactionLinearizedEvents == {
+    EventCompactionCommitted,
+    EventCompactionOutcomeUnknown
+}
+
+DeletionLinearizedEvents == {
+    EventDeletionCommitted,
+    EventDeletionOutcomeUnknown
+}
+
+NotCommittedEvents == {
+    EventAcknowledgeNotCommitted,
+    EventCompactionNotCommitted,
+    EventDeletionNotCommitted
 }
 
 TransitionIndicesFor(operationValue) == {
@@ -138,13 +164,13 @@ VARIABLES
     wallFloor,
     wallAuthority,
     duplicateEvidenceClass,
-    failureInputClass,
+    operationInputClass,
     deletionFloor,
     deletionAuthenticated,
     lastEvent
 
 Vars == <<receiptClass, verifiedFullSeen, terminalSeen, wallFloor,
-          wallAuthority, duplicateEvidenceClass, failureInputClass,
+          wallAuthority, duplicateEvidenceClass, operationInputClass,
           deletionFloor, deletionAuthenticated, lastEvent>>
 
 TypeInvariant ==
@@ -157,7 +183,7 @@ TypeInvariant ==
     /\ wallFloor \in Times
     /\ wallAuthority \in BOOLEAN
     /\ duplicateEvidenceClass \in ReceiptClasses
-    /\ failureInputClass \in ReceiptClasses
+    /\ operationInputClass \in ReceiptClasses
     /\ deletionFloor \in OptionalTimes
     /\ deletionAuthenticated \in BOOLEAN
     /\ lastEvent \in Events
@@ -169,76 +195,96 @@ Init ==
     /\ wallFloor = 0
     /\ wallAuthority = FALSE
     /\ duplicateEvidenceClass = NoReceipt
-    /\ failureInputClass = NoReceipt
+    /\ operationInputClass = NoReceipt
     /\ deletionFloor = NoTime
     /\ deletionAuthenticated = FALSE
-    /\ lastEvent = EventInit
+    /\ lastEvent = EventNeutral
 
 AcquireWallAuthority(newFloor) ==
     /\ ~wallAuthority
     /\ newFloor \in Times
     /\ wallFloor' = newFloor
     /\ wallAuthority' = TRUE
-    /\ lastEvent' = EventWallAuthorityAcquired
+    /\ lastEvent' = EventNeutral
     /\ UNCHANGED <<receiptClass, verifiedFullSeen, terminalSeen,
-                    duplicateEvidenceClass, failureInputClass, deletionFloor,
+                    duplicateEvidenceClass, operationInputClass, deletionFloor,
                     deletionAuthenticated>>
 
 ReleaseWallAuthority ==
     /\ wallAuthority
     /\ wallAuthority' = FALSE
-    /\ lastEvent' = EventWallAuthorityReleased
+    /\ lastEvent' = EventNeutral
     /\ UNCHANGED <<receiptClass, verifiedFullSeen, terminalSeen, wallFloor,
-                    duplicateEvidenceClass, failureInputClass, deletionFloor,
+                    duplicateEvidenceClass, operationInputClass, deletionFloor,
                     deletionAuthenticated>>
 
-WallAuthorityFailure ==
-    /\ ~wallAuthority
-    /\ lastEvent' = EventWallAuthorityFailure
-    /\ UNCHANGED <<receiptClass, verifiedFullSeen, terminalSeen, wallFloor,
-                    wallAuthority, duplicateEvidenceClass, failureInputClass,
-                    deletionFloor, deletionAuthenticated>>
-
-AcknowledgeVerified ==
+AcknowledgeLinearized(event) ==
     /\ receiptClass = NoReceipt
     /\ wallAuthority
+    /\ event \in AcknowledgeLinearizedEvents
+    /\ operationInputClass' = receiptClass
     /\ receiptClass' = FullVerified
     /\ verifiedFullSeen' = TRUE
     /\ terminalSeen' = TRUE
-    /\ lastEvent' = EventAcknowledged
+    /\ lastEvent' = event
     /\ UNCHANGED <<wallFloor, wallAuthority, duplicateEvidenceClass,
-                    failureInputClass, deletionFloor, deletionAuthenticated>>
+                    deletionFloor, deletionAuthenticated>>
+
+AcknowledgeNotCommitted ==
+    /\ receiptClass = NoReceipt
+    /\ wallAuthority
+    /\ operationInputClass' = receiptClass
+    /\ lastEvent' = EventAcknowledgeNotCommitted
+    /\ UNCHANGED <<receiptClass, verifiedFullSeen, terminalSeen, wallFloor,
+                    wallAuthority, duplicateEvidenceClass, deletionFloor,
+                    deletionAuthenticated>>
 
 DuplicateAcknowledge ==
-    /\ receiptClass \in EvidenceClasses
+    /\ receiptClass \in VerifiedEvidenceClasses
+    /\ wallAuthority
     /\ duplicateEvidenceClass' = receiptClass
     /\ lastEvent' = EventDuplicateAcknowledged
     /\ UNCHANGED <<receiptClass, verifiedFullSeen, terminalSeen, wallFloor,
-                    wallAuthority, failureInputClass, deletionFloor,
+                    wallAuthority, operationInputClass, deletionFloor,
                     deletionAuthenticated>>
 
-CompactVerifiedReceipt ==
+CompactVerifiedReceipt(event) ==
     /\ receiptClass = FullVerified
+    /\ event \in CompactionLinearizedEvents
+    /\ operationInputClass' = receiptClass
     /\ receiptClass' = CompactVerified
-    /\ lastEvent' = EventCompacted
+    /\ lastEvent' = event
     /\ UNCHANGED <<verifiedFullSeen, terminalSeen, wallFloor, wallAuthority,
-                    duplicateEvidenceClass, failureInputClass, deletionFloor,
+                    duplicateEvidenceClass, deletionFloor,
                     deletionAuthenticated>>
 
-DeleteRetainedReceipt ==
+CompactionNotCommitted ==
+    /\ receiptClass = FullVerified
+    /\ operationInputClass' = receiptClass
+    /\ lastEvent' = EventCompactionNotCommitted
+    /\ UNCHANGED <<receiptClass, verifiedFullSeen, terminalSeen, wallFloor,
+                    wallAuthority, duplicateEvidenceClass, deletionFloor,
+                    deletionAuthenticated>>
+
+DeleteRetainedReceipt(event) ==
     /\ receiptClass \in EvidenceClasses
     /\ wallAuthority
     /\ wallFloor >= RetentionDeadline
+    /\ event \in DeletionLinearizedEvents
+    /\ operationInputClass' = receiptClass
     /\ receiptClass' = Deleted
     /\ deletionFloor' = wallFloor
     /\ deletionAuthenticated' = wallAuthority
-    /\ lastEvent' = EventDeleted
+    /\ lastEvent' = event
     /\ UNCHANGED <<verifiedFullSeen, terminalSeen, wallFloor, wallAuthority,
-                    duplicateEvidenceClass, failureInputClass>>
+                    duplicateEvidenceClass>>
 
-OperationFailure ==
-    /\ failureInputClass' = receiptClass
-    /\ lastEvent' = EventOperationFailure
+DeletionNotCommitted ==
+    /\ receiptClass \in EvidenceClasses
+    /\ wallAuthority
+    /\ wallFloor >= RetentionDeadline
+    /\ operationInputClass' = receiptClass
+    /\ lastEvent' = EventDeletionNotCommitted
     /\ UNCHANGED <<receiptClass, verifiedFullSeen, terminalSeen, wallFloor,
                     wallAuthority, duplicateEvidenceClass, deletionFloor,
                     deletionAuthenticated>>
@@ -246,12 +292,16 @@ OperationFailure ==
 Next ==
     \/ \E newFloor \in Times : AcquireWallAuthority(newFloor)
     \/ ReleaseWallAuthority
-    \/ WallAuthorityFailure
-    \/ AcknowledgeVerified
+    \/ \E event \in AcknowledgeLinearizedEvents :
+        AcknowledgeLinearized(event)
+    \/ AcknowledgeNotCommitted
     \/ DuplicateAcknowledge
-    \/ CompactVerifiedReceipt
-    \/ DeleteRetainedReceipt
-    \/ OperationFailure
+    \/ \E event \in CompactionLinearizedEvents :
+        CompactVerifiedReceipt(event)
+    \/ CompactionNotCommitted
+    \/ \E event \in DeletionLinearizedEvents :
+        DeleteRetainedReceipt(event)
+    \/ DeletionNotCommitted
 
 Spec == Init /\ [][Next]_Vars
 
@@ -265,7 +315,9 @@ ReceiptStateRemainsTerminal ==
 
 DuplicateAckPreservesEvidence ==
     lastEvent = EventDuplicateAcknowledged =>
-        receiptClass = duplicateEvidenceClass
+        /\ receiptClass = duplicateEvidenceClass
+        /\ receiptClass \in VerifiedEvidenceClasses
+        /\ wallAuthority
 
 RetentionDeletionUsesAuthenticatedEligibility ==
     receiptClass = Deleted =>
@@ -273,11 +325,29 @@ RetentionDeletionUsesAuthenticatedEligibility ==
         /\ deletionFloor \in Times
         /\ deletionFloor >= RetentionDeadline
 
-FailurePreservesReceiptEvidence ==
-    lastEvent = EventOperationFailure => receiptClass = failureInputClass
+LinearizationOutcomeMatchesEvidence ==
+    /\ lastEvent \in AcknowledgeLinearizedEvents =>
+        /\ operationInputClass = NoReceipt
+        /\ receiptClass = FullVerified
+    /\ lastEvent \in CompactionLinearizedEvents =>
+        /\ operationInputClass = FullVerified
+        /\ receiptClass = CompactVerified
+    /\ lastEvent \in DeletionLinearizedEvents =>
+        /\ operationInputClass \in EvidenceClasses
+        /\ receiptClass = Deleted
+
+NotCommittedPreservesReceiptEvidence ==
+    lastEvent \in NotCommittedEvents =>
+        receiptClass = operationInputClass
+
+UnverifiedEvidenceCannotSatisfyDuplicateAck ==
+    receiptClass \in {FullUnverified, CompactUnverified} =>
+        ~ENABLED DuplicateAcknowledge
 
 UnverifiedEvidenceCannotBeCompacted ==
-    receiptClass = FullUnverified => ~ENABLED CompactVerifiedReceipt
+    receiptClass = FullUnverified =>
+        ~ENABLED \E event \in CompactionLinearizedEvents :
+            CompactVerifiedReceipt(event)
 
 (* ---- End invariants ---- *)
 
