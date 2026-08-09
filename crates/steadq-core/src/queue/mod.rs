@@ -1392,38 +1392,33 @@ impl Queue {
                     .map_err(PublishError::classify_write)?;
                 fs::write_all(tmp_fd.as_fd(), ext_bytes).map_err(PublishError::classify_write)?;
                 fs::write_all(tmp_fd.as_fd(), payload).map_err(PublishError::classify_write)?;
-                // C-13: No redundant pwrite - header was already written correctly above.
-                // fsync file (before publication: NotCommitted on failure)
-                fs::fsync(tmp_fd.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
-
-                // Publish via linkat - C-09: capture errors for capability classification
-                let link1 = fs::linkat_empty_path(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name);
-                if link1.is_ok() {
-                    fs::fsync_dir_fd(dest_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
-                    return Ok(());
+                match engine::publish_tmpfile_noreplace(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name)
+                {
+                    Ok(engine::TmpfilePublishOutcome::Published) => Ok(()),
+                    Ok(engine::TmpfilePublishOutcome::Unsupported) => self.named_fallback(
+                        dest_dir_relative,
+                        dest_fd.as_fd(),
+                        dest_name,
+                        header,
+                        ext_bytes,
+                        payload,
+                    ),
+                    Err(failure) => Err(PublishError::classify_tmpfile(failure)),
                 }
-                let link2 = fs::linkat_proc_self_fd(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name);
-                if link2.is_ok() {
-                    fs::fsync_dir_fd(dest_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
-                    return Ok(());
-                }
-
-                // C-09: Fall back to named temp file only for capability errors.
-                // Propagate I/O, resource, and permission errors.
-                let last_err = link2.err();
-                if let Some(ref e) = last_err {
-                    if fs::should_propagate_on_fallback(e) {
-                        return Err(PublishError::NotCommitted(Error::IoFailure(e.to_string())));
-                    }
-                }
-                self.named_fallback(dest_dir_relative, dest_name, header, ext_bytes, payload)
             }
             Err(e) => {
-                // C-09: Only fall back on capability errors (ENOENT, ENOSYS, EOPNOTSUPP)
-                if fs::should_propagate_on_fallback(&e) {
-                    return Err(PublishError::NotCommitted(Error::IoFailure(e.to_string())));
+                if engine::is_tmpfile_open_unsupported(&e) {
+                    self.named_fallback(
+                        dest_dir_relative,
+                        dest_fd.as_fd(),
+                        dest_name,
+                        header,
+                        ext_bytes,
+                        payload,
+                    )
+                } else {
+                    Err(PublishError::classify_write(e))
                 }
-                self.named_fallback(dest_dir_relative, dest_name, header, ext_bytes, payload)
             }
         }
     }
@@ -1432,6 +1427,7 @@ impl Queue {
     fn named_fallback(
         &self,
         dest_dir_relative: &str,
+        dest_fd: BorrowedFd<'_>,
         dest_name: &str,
         header: &FixedHeader,
         ext_bytes: &[u8],
@@ -1488,15 +1484,11 @@ impl Queue {
         // fsync file (before publication: NotCommitted on failure)
         fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
-        // Open destination directory for rename
-        let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-
         let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
         match engine::move_witnessed_noreplace_io(
             tmp_dir_fd.as_fd(),
             &temp_name,
-            dest_fd.as_fd(),
+            dest_fd,
             dest_name,
             engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
             engine::MoveActor::Producer,
@@ -4035,6 +4027,29 @@ enum PublishError {
 }
 
 impl PublishError {
+    fn classify_tmpfile(failure: engine::TmpfilePublishFailure) -> Self {
+        match failure {
+            engine::TmpfilePublishFailure::AlreadyExists => {
+                PublishError::NotCommitted(Error::IdentityCollision)
+            }
+            engine::TmpfilePublishFailure::NotCommitted { phase, source } => {
+                match source.raw_os_error() {
+                    Some(libc::ENOSPC) | Some(libc::EDQUOT) => {
+                        PublishError::NotCommitted(Error::ResourceExhausted)
+                    }
+                    _ => PublishError::NotCommitted(Error::IoFailure(format!(
+                        "temporary-file publication failed at {phase:?}: {source}"
+                    ))),
+                }
+            }
+            engine::TmpfilePublishFailure::OutcomeUnknown { phase, source } => {
+                PublishError::OutcomeUnknown(Error::IoFailure(format!(
+                    "temporary-file publication failed at {phase:?}: {source}"
+                )))
+            }
+        }
+    }
+
     fn classify_move(failure: engine::MoveFailureWith<io::Error>) -> Self {
         match failure {
             engine::MoveFailureWith::AlreadyExists => {
@@ -4066,12 +4081,6 @@ impl PublishError {
     /// link/rename. Per spec section 7.8, this is NotCommitted.
     fn classify_pre_pub_fsync(e: io::Error) -> Self {
         PublishError::NotCommitted(Error::IoFailure(e.to_string()))
-    }
-
-    /// Classify a directory fsync failure that occurs AFTER the linearizing
-    /// link/rename. Per spec section 7.8, this is OutcomeUnknown.
-    fn classify_post_fsync(e: io::Error) -> Self {
-        PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
     }
 }
 
@@ -4210,6 +4219,11 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn tmpfile_supported(queue: &Queue) -> bool {
+        let ready = open_relative(queue.root_fd(), "ready/0000").unwrap();
+        fs::open_tmpfile(ready.as_fd()).is_ok()
     }
 
     fn add_hard_link(tmp: &tempfile::TempDir, relative_path: &str, label: &str) {
@@ -4464,6 +4478,172 @@ mod tests {
             .unwrap();
         assert_eq!(read, payload.len());
         assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn tmpfile_publish_failure_classification_preserves_phase_and_errno() {
+        for (failure, expected) in [
+            (engine::TmpfilePublishFailure::AlreadyExists, "collision"),
+            (
+                engine::TmpfilePublishFailure::NotCommitted {
+                    phase: engine::TmpfilePublishPhase::Link,
+                    source: io::Error::from_raw_os_error(libc::ENOSPC),
+                },
+                "resource",
+            ),
+            (
+                engine::TmpfilePublishFailure::NotCommitted {
+                    phase: engine::TmpfilePublishPhase::SourceIdentity,
+                    source: io::Error::from_raw_os_error(libc::EIO),
+                },
+                "source identity",
+            ),
+            (
+                engine::TmpfilePublishFailure::OutcomeUnknown {
+                    phase: engine::TmpfilePublishPhase::DestinationFsync,
+                    source: io::Error::from_raw_os_error(libc::EIO),
+                },
+                "destination fsync",
+            ),
+        ] {
+            let classified = PublishError::classify_tmpfile(failure);
+            match expected {
+                "collision" => assert!(matches!(
+                    classified,
+                    PublishError::NotCommitted(Error::IdentityCollision)
+                )),
+                "resource" => assert!(matches!(
+                    classified,
+                    PublishError::NotCommitted(Error::ResourceExhausted)
+                )),
+                "source identity" => {
+                    let PublishError::NotCommitted(Error::IoFailure(message)) = classified else {
+                        panic!("expected not-committed I/O failure");
+                    };
+                    assert!(message.contains("SourceIdentity"));
+                }
+                "destination fsync" => {
+                    let PublishError::OutcomeUnknown(Error::IoFailure(message)) = classified else {
+                        panic!("expected outcome-unknown I/O failure");
+                    };
+                    assert!(message.contains("DestinationFsync"));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn tmpfile_publication_uses_proc_then_named_fallback() {
+        for named_fallback in [false, true] {
+            let (_tmp, mut queue) = create_test_queue();
+            if !tmpfile_supported(&queue) {
+                return;
+            }
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            fs::fault::inject_errno("linkat_empty_path", 1, libc::ENOENT);
+            if named_fallback {
+                fs::fault::inject_errno("linkat_proc_self_fd", 1, libc::ENOENT);
+            } else {
+                fs::fault::inject("linkat_proc_self_fd", u64::MAX);
+            }
+            fs::fault::inject("renameat2_noreplace", u64::MAX);
+
+            let outcome = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"publication fallback".to_vec(),
+                ..Default::default()
+            });
+            let proc_calls = fs::fault::call_count("linkat_proc_self_fd");
+            let rename_calls = fs::fault::call_count("renameat2_noreplace");
+            fs::fault::reset();
+
+            assert!(matches!(outcome, EnqueueOutcome::Committed(_)));
+            assert_eq!(proc_calls, 1);
+            assert_eq!(rename_calls, u64::from(named_fallback));
+            assert!(!queue.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn tmpfile_publication_does_not_weaken_fatal_link_failures() {
+        for (errno, expected) in [
+            (libc::EEXIST, "collision"),
+            (libc::ENOSPC, "resource"),
+            (libc::EIO, "io"),
+            (libc::EPERM, "io"),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            if !tmpfile_supported(&queue) {
+                return;
+            }
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            fs::fault::inject_errno("linkat_empty_path", 1, errno);
+            fs::fault::inject("linkat_proc_self_fd", u64::MAX);
+
+            let outcome = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"fatal publication failure".to_vec(),
+                ..Default::default()
+            });
+            let proc_calls = fs::fault::call_count("linkat_proc_self_fd");
+            fs::fault::reset();
+
+            match expected {
+                "collision" => assert!(matches!(
+                    outcome,
+                    EnqueueOutcome::NotCommitted(_, Error::IdentityCollision)
+                )),
+                "resource" => assert!(matches!(
+                    outcome,
+                    EnqueueOutcome::NotCommitted(_, Error::ResourceExhausted)
+                )),
+                "io" => assert!(matches!(
+                    outcome,
+                    EnqueueOutcome::NotCommitted(_, Error::IoFailure(_))
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(proc_calls, 0);
+            assert!(!queue.is_poisoned());
+            assert!(find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_none());
+        }
+    }
+
+    #[test]
+    fn tmpfile_publication_preserves_postlinearization_failures() {
+        for fault in ["fstatat", "fsync_dir_fd"] {
+            let (tmp, mut queue) = create_test_queue();
+            if !tmpfile_supported(&queue) {
+                return;
+            }
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            fs::fault::inject_errno(fault, 1, libc::EIO);
+
+            let outcome = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"indeterminate publication".to_vec(),
+                ..Default::default()
+            });
+            fs::fault::reset();
+
+            let EnqueueOutcome::OutcomeUnknown(ticket, Error::IoFailure(message)) = outcome else {
+                panic!("expected outcome unknown");
+            };
+            assert!(queue.is_poisoned());
+            assert!(tmp.path().join(ticket.expected_relative_path).exists());
+            assert!(message.contains(if fault == "fstatat" {
+                "DestinationIdentity"
+            } else {
+                "DestinationFsync"
+            }));
+        }
     }
 
     #[test]

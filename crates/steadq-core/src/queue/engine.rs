@@ -96,6 +96,34 @@ pub(super) enum MoveFailureWith<E> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TmpfilePublishPhase {
+    SourceIdentity,
+    FileFsync,
+    Link,
+    DestinationIdentity,
+    DestinationFsync,
+}
+
+#[derive(Debug)]
+pub(super) enum TmpfilePublishOutcome {
+    Published,
+    Unsupported,
+}
+
+#[derive(Debug)]
+pub(super) enum TmpfilePublishFailure {
+    NotCommitted {
+        phase: TmpfilePublishPhase,
+        source: std::io::Error,
+    },
+    OutcomeUnknown {
+        phase: TmpfilePublishPhase,
+        source: std::io::Error,
+    },
+    AlreadyExists,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnlinkPhase {
     Unlink,
     DirectoryFsync,
@@ -225,6 +253,21 @@ impl<E> MoveFailureWith<E> {
         match self {
             Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
             Self::AlreadyExists | Self::SourceMissing => None,
+        }
+    }
+}
+
+impl TmpfilePublishFailure {
+    #[cfg(test)]
+    fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown { .. })
+    }
+
+    #[cfg(test)]
+    fn phase(&self) -> Option<TmpfilePublishPhase> {
+        match self {
+            Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
+            Self::AlreadyExists => None,
         }
     }
 }
@@ -411,6 +454,144 @@ fn move_noreplace<T, E>(
     Ok(output)
 }
 
+pub(super) fn is_tmpfile_open_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EISDIR) | Some(libc::ENOENT) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+fn is_direct_link_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::ENOENT) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+fn is_proc_link_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+fn unnamed_file_identity(stat: &libc::stat) -> std::io::Result<MoveIdentity> {
+    if stat.st_mode & libc::S_IFMT == libc::S_IFREG && stat.st_nlink == 0 && stat.st_size >= 0 {
+        Ok(MoveIdentity::new(stat.st_dev, stat.st_ino))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "temporary publication source is not an unnamed regular file",
+        ))
+    }
+}
+
+fn authenticate_published_identity(
+    source: MoveIdentity,
+    destination: &libc::stat,
+) -> std::io::Result<()> {
+    if source.matches(destination) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "destination identity changed after temporary-file publication",
+        ))
+    }
+}
+
+pub(super) fn publish_tmpfile_noreplace(
+    tmpfile_fd: BorrowedFd<'_>,
+    destination_directory_fd: BorrowedFd<'_>,
+    destination_name: &str,
+) -> Result<TmpfilePublishOutcome, TmpfilePublishFailure> {
+    let source_stat =
+        fs::fstat(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
+            phase: TmpfilePublishPhase::SourceIdentity,
+            source,
+        })?;
+    let source_identity = unnamed_file_identity(&source_stat).map_err(|source| {
+        TmpfilePublishFailure::NotCommitted {
+            phase: TmpfilePublishPhase::SourceIdentity,
+            source,
+        }
+    })?;
+
+    fs::fsync(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
+        phase: TmpfilePublishPhase::FileFsync,
+        source,
+    })?;
+
+    match fs::linkat_empty_path(tmpfile_fd, destination_directory_fd, destination_name) {
+        Ok(()) => {}
+        Err(error) if is_already_exists_io_kind(error.kind()) => {
+            return Err(TmpfilePublishFailure::AlreadyExists);
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+            return Ok(TmpfilePublishOutcome::Unsupported);
+        }
+        Err(error) if is_direct_link_unsupported(&error) => {
+            match fs::linkat_proc_self_fd(tmpfile_fd, destination_directory_fd, destination_name) {
+                Ok(()) => {}
+                Err(error) if is_already_exists_io_kind(error.kind()) => {
+                    return Err(TmpfilePublishFailure::AlreadyExists);
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    let destination = fs::fstat(destination_directory_fd).map_err(|source| {
+                        TmpfilePublishFailure::NotCommitted {
+                            phase: TmpfilePublishPhase::Link,
+                            source,
+                        }
+                    })?;
+                    if destination.st_nlink == 0 {
+                        return Err(TmpfilePublishFailure::NotCommitted {
+                            phase: TmpfilePublishPhase::Link,
+                            source: error,
+                        });
+                    }
+                    return Ok(TmpfilePublishOutcome::Unsupported);
+                }
+                Err(error) if is_proc_link_unsupported(&error) => {
+                    return Ok(TmpfilePublishOutcome::Unsupported);
+                }
+                Err(source) => {
+                    return Err(TmpfilePublishFailure::NotCommitted {
+                        phase: TmpfilePublishPhase::Link,
+                        source,
+                    });
+                }
+            }
+        }
+        Err(source) => {
+            return Err(TmpfilePublishFailure::NotCommitted {
+                phase: TmpfilePublishPhase::Link,
+                source,
+            });
+        }
+    }
+
+    let destination =
+        fs::fstatat(destination_directory_fd, destination_name).map_err(|source| {
+            TmpfilePublishFailure::OutcomeUnknown {
+                phase: TmpfilePublishPhase::DestinationIdentity,
+                source,
+            }
+        })?;
+    authenticate_published_identity(source_identity, &destination).map_err(|source| {
+        TmpfilePublishFailure::OutcomeUnknown {
+            phase: TmpfilePublishPhase::DestinationIdentity,
+            source,
+        }
+    })?;
+
+    fs::fsync_dir_fd(destination_directory_fd).map_err(|source| {
+        TmpfilePublishFailure::OutcomeUnknown {
+            phase: TmpfilePublishPhase::DestinationFsync,
+            source,
+        }
+    })?;
+    Ok(TmpfilePublishOutcome::Published)
+}
+
 fn same_directory(source: BorrowedFd<'_>, destination: BorrowedFd<'_>) -> bool {
     if source.as_raw_fd() == destination.as_raw_fd() {
         return true;
@@ -584,6 +765,251 @@ pub fn is_not_committed_phase(phase: MovePhase) -> bool {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    fn open_unnamed_file(directory: BorrowedFd<'_>) -> Option<std::os::fd::OwnedFd> {
+        let file = fs::open_tmpfile(directory).ok()?;
+        fs::write_all(file.as_fd(), b"published").unwrap();
+        Some(file)
+    }
+
+    #[test]
+    fn tmpfile_open_fallback_errors_are_exact() {
+        for (errno, expected) in [
+            (libc::EISDIR, true),
+            (libc::ENOENT, true),
+            (libc::EOPNOTSUPP, true),
+            (libc::EINVAL, false),
+            (libc::EIO, false),
+            (libc::ENOSPC, false),
+            (libc::EPERM, false),
+        ] {
+            assert_eq!(
+                is_tmpfile_open_unsupported(&std::io::Error::from_raw_os_error(errno)),
+                expected,
+                "errno {errno}",
+            );
+        }
+    }
+
+    #[test]
+    fn tmpfile_identity_requires_an_unnamed_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let Some(tmpfile) = open_unnamed_file(directory.as_fd()) else {
+            return;
+        };
+        let valid = fs::fstat(tmpfile.as_fd()).unwrap();
+        let identity = unnamed_file_identity(&valid).unwrap();
+        assert_eq!(identity.device, valid.st_dev);
+        assert_eq!(identity.inode, valid.st_ino);
+
+        let mut wrong_type = valid;
+        wrong_type.st_mode = libc::S_IFDIR | 0o700;
+        assert!(unnamed_file_identity(&wrong_type).is_err());
+
+        let mut linked = valid;
+        linked.st_nlink = 1;
+        assert!(unnamed_file_identity(&linked).is_err());
+
+        let mut negative_size = valid;
+        negative_size.st_size = -1;
+        assert!(unnamed_file_identity(&negative_size).is_err());
+    }
+
+    #[test]
+    fn published_identity_requires_the_exact_linked_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("published.raw");
+        std::fs::write(&path, b"published").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let valid = fs::fstat(file.as_fd()).unwrap();
+        let identity = MoveIdentity::new(valid.st_dev, valid.st_ino);
+        authenticate_published_identity(identity, &valid).unwrap();
+
+        let mut wrong_inode = valid;
+        wrong_inode.st_ino = wrong_inode.st_ino.wrapping_add(1);
+        assert!(authenticate_published_identity(identity, &wrong_inode).is_err());
+    }
+
+    #[test]
+    fn tmpfile_publication_uses_each_supported_link_strategy() {
+        for force_proc in [false, true] {
+            fs::fault::reset();
+            let root = tempfile::tempdir().unwrap();
+            let directory = std::fs::File::open(root.path()).unwrap();
+            let Some(tmpfile) = open_unnamed_file(directory.as_fd()) else {
+                return;
+            };
+            let source = fs::fstat(tmpfile.as_fd()).unwrap();
+            if force_proc {
+                fs::fault::inject_errno("linkat_empty_path", 1, libc::ENOENT);
+                fs::fault::inject("linkat_proc_self_fd", u64::MAX);
+            }
+
+            let outcome =
+                publish_tmpfile_noreplace(tmpfile.as_fd(), directory.as_fd(), "published.raw")
+                    .unwrap();
+            let empty_path_calls = fs::fault::call_count("linkat_empty_path");
+            let proc_calls = fs::fault::call_count("linkat_proc_self_fd");
+            fs::fault::reset();
+
+            assert!(matches!(outcome, TmpfilePublishOutcome::Published));
+            let destination = fs::fstatat(directory.as_fd(), "published.raw").unwrap();
+            assert_eq!(destination.st_dev, source.st_dev);
+            assert_eq!(destination.st_ino, source.st_ino);
+            if force_proc {
+                assert_eq!(empty_path_calls, 1);
+                assert_eq!(proc_calls, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn tmpfile_publication_falls_back_only_for_unsupported_strategies() {
+        for (first_errno, second_errno, proc_calls) in [
+            (libc::ENOSYS, None, 0),
+            (libc::ENOENT, Some(libc::ENOENT), 1),
+            (libc::EINVAL, Some(libc::EOPNOTSUPP), 1),
+        ] {
+            fs::fault::reset();
+            let root = tempfile::tempdir().unwrap();
+            let directory = std::fs::File::open(root.path()).unwrap();
+            let Some(tmpfile) = open_unnamed_file(directory.as_fd()) else {
+                return;
+            };
+            fs::fault::inject_errno("linkat_empty_path", 1, first_errno);
+            if let Some(errno) = second_errno {
+                fs::fault::inject_errno("linkat_proc_self_fd", 1, errno);
+            }
+
+            let outcome =
+                publish_tmpfile_noreplace(tmpfile.as_fd(), directory.as_fd(), "published.raw")
+                    .unwrap();
+            assert!(matches!(outcome, TmpfilePublishOutcome::Unsupported));
+            assert_eq!(fs::fault::call_count("linkat_proc_self_fd"), proc_calls);
+            assert!(!root.path().join("published.raw").exists());
+            fs::fault::reset();
+        }
+    }
+
+    #[test]
+    fn tmpfile_publication_does_not_treat_a_deleted_destination_as_unsupported() {
+        fs::fault::reset();
+        let root = tempfile::tempdir().unwrap();
+        let destination_path = root.path().join("destination");
+        std::fs::create_dir(&destination_path).unwrap();
+        let directory = std::fs::File::open(&destination_path).unwrap();
+        let Some(tmpfile) = open_unnamed_file(directory.as_fd()) else {
+            return;
+        };
+        std::fs::remove_dir(&destination_path).unwrap();
+        fs::fault::inject_errno("linkat_empty_path", 1, libc::ENOENT);
+        fs::fault::inject_errno("linkat_proc_self_fd", 1, libc::ENOENT);
+
+        let failure =
+            publish_tmpfile_noreplace(tmpfile.as_fd(), directory.as_fd(), "published.raw")
+                .unwrap_err();
+        fs::fault::reset();
+
+        assert!(matches!(
+            failure,
+            TmpfilePublishFailure::NotCommitted {
+                phase: TmpfilePublishPhase::Link,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tmpfile_publication_preserves_every_failure_phase() {
+        for (first_fault, second_fault, expected_phase, outcome_unknown) in [
+            (
+                ("fstat", libc::EIO),
+                None,
+                TmpfilePublishPhase::SourceIdentity,
+                false,
+            ),
+            (
+                ("fsync", libc::EIO),
+                None,
+                TmpfilePublishPhase::FileFsync,
+                false,
+            ),
+            (
+                ("linkat_empty_path", libc::ENOSPC),
+                None,
+                TmpfilePublishPhase::Link,
+                false,
+            ),
+            (
+                ("linkat_empty_path", libc::ENOENT),
+                Some(("linkat_proc_self_fd", libc::ENOSPC)),
+                TmpfilePublishPhase::Link,
+                false,
+            ),
+            (
+                ("fstatat", libc::EIO),
+                None,
+                TmpfilePublishPhase::DestinationIdentity,
+                true,
+            ),
+            (
+                ("fsync_dir_fd", libc::EIO),
+                None,
+                TmpfilePublishPhase::DestinationFsync,
+                true,
+            ),
+        ] {
+            fs::fault::reset();
+            let root = tempfile::tempdir().unwrap();
+            let directory = std::fs::File::open(root.path()).unwrap();
+            let Some(tmpfile) = open_unnamed_file(directory.as_fd()) else {
+                return;
+            };
+            fs::fault::inject_errno(first_fault.0, 1, first_fault.1);
+            if let Some((fault, errno)) = second_fault {
+                fs::fault::inject_errno(fault, 1, errno);
+            }
+
+            let failure =
+                publish_tmpfile_noreplace(tmpfile.as_fd(), directory.as_fd(), "published.raw")
+                    .unwrap_err();
+            fs::fault::reset();
+
+            assert_eq!(failure.phase(), Some(expected_phase));
+            assert_eq!(failure.is_outcome_unknown(), outcome_unknown);
+            assert_eq!(root.path().join("published.raw").exists(), outcome_unknown);
+        }
+    }
+
+    #[test]
+    fn tmpfile_publication_collision_does_not_try_a_weaker_strategy() {
+        for force_proc in [false, true] {
+            fs::fault::reset();
+            let root = tempfile::tempdir().unwrap();
+            let directory = std::fs::File::open(root.path()).unwrap();
+            let Some(tmpfile) = open_unnamed_file(directory.as_fd()) else {
+                return;
+            };
+            if force_proc {
+                fs::fault::inject_errno("linkat_empty_path", 1, libc::ENOENT);
+                fs::fault::inject_errno("linkat_proc_self_fd", 1, libc::EEXIST);
+            } else {
+                fs::fault::inject_errno("linkat_empty_path", 1, libc::EEXIST);
+                fs::fault::inject("linkat_proc_self_fd", u64::MAX);
+            }
+
+            let failure =
+                publish_tmpfile_noreplace(tmpfile.as_fd(), directory.as_fd(), "published.raw")
+                    .unwrap_err();
+            let proc_calls = fs::fault::call_count("linkat_proc_self_fd");
+            fs::fault::reset();
+
+            assert!(matches!(failure, TmpfilePublishFailure::AlreadyExists));
+            assert_eq!(proc_calls, u64::from(force_proc));
+            assert!(!root.path().join("published.raw").exists());
+        }
+    }
 
     #[test]
     fn is_already_exists_table() {
