@@ -25,11 +25,11 @@ pub(crate) enum QuarantinePreparePhase {
     SourceIdentity,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum QuarantinePublishFailure {
     Preparation {
         phase: QuarantinePreparePhase,
-        source: String,
+        source: std::io::Error,
         attempts_consumed: usize,
     },
     Move {
@@ -1056,21 +1056,21 @@ impl Queue {
         if attempt_limit == 0 {
             return Err(QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::AttemptBudget,
-                source: "no quarantine move attempt budget remains".into(),
+                source: std::io::Error::other("no quarantine move attempt budget remains"),
                 attempts_consumed: 0,
             });
         }
         self.ensure_dir("quarantine")
             .map_err(|error| QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::EnsureDirectory,
-                source: error.to_string(),
+                source: error,
                 attempts_consumed: 0,
             })?;
         let quarantine_dir =
             crate::queue::open_relative(self.root_fd(), "quarantine").map_err(|error| {
                 QuarantinePublishFailure::Preparation {
                     phase: QuarantinePreparePhase::OpenDirectory,
-                    source: error.to_string(),
+                    source: error,
                     attempts_consumed: 0,
                 }
             })?;
@@ -1079,7 +1079,7 @@ impl Queue {
             let quarantine_id =
                 next_id().map_err(|error| QuarantinePublishFailure::Preparation {
                     phase: QuarantinePreparePhase::RandomName,
-                    source: error.to_string(),
+                    source: error,
                     attempts_consumed: attempts - 1,
                 })?;
             let quarantine_name = steadq_names::quarantine_filename(&quarantine_id, reason as u16);
@@ -1191,7 +1191,7 @@ impl Queue {
                 ),
                 Err(error) => Err(QuarantinePublishFailure::Preparation {
                     phase: QuarantinePreparePhase::SourceIdentity,
-                    source: error.to_string(),
+                    source: error,
                     attempts_consumed: 0,
                 }),
             }
@@ -1221,28 +1221,28 @@ impl Queue {
         let locked = steadq_fs_linux::try_ofd_write_lock(opened.as_fd()).map_err(|error| {
             QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::SourceLock,
-                source: error.to_string(),
+                source: error,
                 attempts_consumed: 0,
             }
         })?;
         if !locked {
             return Err(QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::SourceLock,
-                source: "receipt is busy".into(),
+                source: std::io::Error::other("receipt is busy"),
                 attempts_consumed: 0,
             });
         }
         let opened_stat = steadq_fs_linux::fstat(opened.as_fd()).map_err(|error| {
             QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::SourceIdentity,
-                source: error.to_string(),
+                source: error,
                 attempts_consumed: 0,
             }
         })?;
         let current_stat = steadq_fs_linux::fstatat(src_dir_fd, filename).map_err(|error| {
             QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::SourceIdentity,
-                source: error.to_string(),
+                source: error,
                 attempts_consumed: 0,
             }
         })?;
@@ -1253,7 +1253,7 @@ impl Queue {
         ) {
             return Err(QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::SourceIdentity,
-                source: "receipt path no longer names the verified inode".into(),
+                source: std::io::Error::other("receipt path no longer names the verified inode"),
                 attempts_consumed: 0,
             });
         }
@@ -1405,13 +1405,13 @@ mod tests {
         assert!(!quarantine_destination_collision(
             &MoveFailure::NotCommitted {
                 phase: crate::queue::engine::MovePhase::Rename,
-                source: "io".into(),
+                source: std::io::Error::other("io"),
             }
         ));
         assert!(!quarantine_destination_collision(
             &MoveFailure::OutcomeUnknown {
                 phase: crate::queue::engine::MovePhase::DestFsync,
-                source: "io".into(),
+                source: std::io::Error::other("io"),
             }
         ));
     }

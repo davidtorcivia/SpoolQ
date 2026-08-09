@@ -1846,7 +1846,7 @@ impl Queue {
         let leased_bucket =
             steadq_names::bucket_from_hex(bucket).ok_or_else(|| MoveFailure::NotCommitted {
                 phase: MovePhase::PreRename,
-                source: format!("invalid bucket: {bucket}"),
+                source: std::io::Error::other(format!("invalid bucket: {bucket}")),
             })?;
         let shard_num = u32::from_str_radix(shard, 16).unwrap_or(0);
         let src_dir = self
@@ -1860,7 +1860,7 @@ impl Queue {
                 .checked_add(1)
                 .ok_or_else(|| MoveFailure::NotCommitted {
                     phase: MovePhase::PreRename,
-                    source: "generation overflow".into(),
+                    source: std::io::Error::other("generation overflow"),
                 })?;
         let ready_common = steadq_names::CommonFields {
             job_id: common.job_id,
@@ -1875,12 +1875,12 @@ impl Queue {
         let src_fd =
             open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
                 phase: MovePhase::PreRename,
-                source: error.to_string(),
+                source: error,
             })?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
             MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
-                source: error.to_string(),
+                source: error,
             }
         })?;
 
@@ -1907,7 +1907,7 @@ impl Queue {
         let leased_bucket =
             steadq_names::bucket_from_hex(bucket).ok_or_else(|| MoveFailure::NotCommitted {
                 phase: MovePhase::PreRename,
-                source: format!("invalid bucket: {bucket}"),
+                source: std::io::Error::other(format!("invalid bucket: {bucket}")),
             })?;
         let shard_num = u32::from_str_radix(shard, 16).unwrap_or(0);
         let src_dir = self
@@ -1919,7 +1919,7 @@ impl Queue {
         )
         .ok_or_else(|| MoveFailure::NotCommitted {
             phase: MovePhase::PreRename,
-            source: "terminal bucket overflow".into(),
+            source: std::io::Error::other("terminal bucket overflow"),
         })?;
 
         let new_gen =
@@ -1928,7 +1928,7 @@ impl Queue {
                 .checked_add(1)
                 .ok_or_else(|| MoveFailure::NotCommitted {
                     phase: MovePhase::PreRename,
-                    source: "generation overflow".into(),
+                    source: std::io::Error::other("generation overflow"),
                 })?;
         let dead_common = steadq_names::CommonFields {
             job_id: common.job_id,
@@ -1946,17 +1946,17 @@ impl Queue {
         self.ensure_dir_pub(&dest_dir)
             .map_err(|error| MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
-                source: error.to_string(),
+                source: error,
             })?;
         let src_fd =
             open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
                 phase: MovePhase::PreRename,
-                source: error.to_string(),
+                source: error,
             })?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
             MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
-                source: error.to_string(),
+                source: error,
             }
         })?;
 
@@ -2312,7 +2312,7 @@ impl Queue {
                 .checked_add(1)
                 .ok_or_else(|| MoveFailure::NotCommitted {
                     phase: MovePhase::PreRename,
-                    source: "generation overflow".into(),
+                    source: std::io::Error::other("generation overflow"),
                 })?;
         let ready_common = steadq_names::CommonFields {
             job_id: common.job_id,
@@ -2327,12 +2327,12 @@ impl Queue {
         let src_fd =
             open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
                 phase: MovePhase::PreRename,
-                source: error.to_string(),
+                source: error,
             })?;
         let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
             MoveFailure::NotCommitted {
                 phase: MovePhase::EnsureDest,
-                source: error.to_string(),
+                source: error,
             }
         })?;
 
@@ -6775,7 +6775,7 @@ mod tests {
             (
                 MoveFailure::NotCommitted {
                     phase: MovePhase::Rename,
-                    source: "rename failed".into(),
+                    source: std::io::Error::other("rename failed"),
                 },
                 "move_not_committed",
                 "phase=Rename",
@@ -6783,7 +6783,7 @@ mod tests {
             (
                 MoveFailure::OutcomeUnknown {
                     phase: MovePhase::DestFsync,
-                    source: "sync failed".into(),
+                    source: std::io::Error::other("sync failed"),
                 },
                 "move_outcome_unknown",
                 "phase=DestFsync",
@@ -7747,7 +7747,7 @@ mod tests {
             (
                 UnlinkFailure::NotCommitted {
                     phase: UnlinkPhase::Unlink,
-                    source: "unlink failed".into(),
+                    source: std::io::Error::other("unlink failed"),
                 },
                 "delete_not_committed",
                 "phase=Unlink",
@@ -7755,7 +7755,7 @@ mod tests {
             (
                 UnlinkFailure::OutcomeUnknown {
                     phase: UnlinkPhase::DirectoryFsync,
-                    source: "sync failed".into(),
+                    source: std::io::Error::other("sync failed"),
                 },
                 "delete_outcome_unknown",
                 "phase=DirectoryFsync",
@@ -7781,7 +7781,7 @@ mod tests {
             (
                 ReplaceFailure::NotCommitted {
                     phase: ReplacePhase::Rename,
-                    source: "rename failed".into(),
+                    source: std::io::Error::other("rename failed"),
                 },
                 "replace_not_committed",
                 "phase=Rename",
@@ -7789,7 +7789,7 @@ mod tests {
             (
                 ReplaceFailure::OutcomeUnknown {
                     phase: ReplacePhase::DestinationFsync,
-                    source: "sync failed".into(),
+                    source: std::io::Error::other("sync failed"),
                 },
                 "replace_outcome_unknown",
                 "phase=DestinationFsync",
