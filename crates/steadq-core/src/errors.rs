@@ -621,6 +621,7 @@ pub enum ResolutionOutcome {
     SourceObserved,
     SourceStabilized,
     BothObserved,
+    BothStabilized,
     NeitherObserved,
     ConflictingObject,
     ResolutionFailed(Error),
