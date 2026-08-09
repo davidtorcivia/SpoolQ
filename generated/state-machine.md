@@ -1,6 +1,8 @@
-<!-- Source: spec/state-machine.json; SHA-256: 454b8dbb183e68d24608501f888bdecc6e9910ae43b675ee1d38af9fb859d3eb -->
+<!-- Source: spec/state-machine.json; SHA-256: 0a1a4a12c42e8bdb74478372dd4e34a983a144e17c8714d332a75dabd582df0b -->
 
 # SteadQ/1 State Machine (Generated)
+
+Protocol IR: `steadq-state-machine`, version `1`.
 
 ## Transitions
 

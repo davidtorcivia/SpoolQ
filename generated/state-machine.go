@@ -1,7 +1,10 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: 454b8dbb183e68d24608501f888bdecc6e9910ae43b675ee1d38af9fb859d3eb
+// Source SHA-256: 0a1a4a12c42e8bdb74478372dd4e34a983a144e17c8714d332a75dabd582df0b
 
 package steadq
+
+const ProtocolIRIdentity = "steadq-state-machine"
+const ProtocolIRVersion uint32 = 1
 
 type OptionalString struct {
 	Value   string

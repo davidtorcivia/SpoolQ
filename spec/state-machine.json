@@ -1,4 +1,6 @@
 {
+  "protocol": "steadq-state-machine",
+  "version": 1,
   "transitions": [
     {
       "operation": "enqueue_immediate",

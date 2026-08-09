@@ -8,10 +8,14 @@ pub(crate) mod render;
 mod schema;
 
 const SPEC: &str = "spec/state-machine.json";
+const PROTOCOL_IR_IDENTITY: &str = "steadq-state-machine";
+const PROTOCOL_IR_VERSION: u32 = 1;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateMachineSpec {
+    protocol: String,
+    version: u32,
     transitions: Vec<Transition>,
     exceptions: Vec<Exception>,
     reentry: Vec<Reentry>,
@@ -254,6 +258,18 @@ fn load_spec(root: &Path) -> Result<(StateMachineSpec, String), String> {
 }
 
 fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
+    if spec.protocol != PROTOCOL_IR_IDENTITY {
+        return Err(format!(
+            "unsupported protocol IR identity: expected {PROTOCOL_IR_IDENTITY}, got {}",
+            spec.protocol
+        ));
+    }
+    if spec.version != PROTOCOL_IR_VERSION {
+        return Err(format!(
+            "unsupported protocol IR version: expected {PROTOCOL_IR_VERSION}, got {}",
+            spec.version
+        ));
+    }
     if spec.transitions.is_empty() {
         return Err("state-machine spec has no transitions".into());
     }
