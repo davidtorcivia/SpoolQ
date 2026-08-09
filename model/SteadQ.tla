@@ -3,7 +3,7 @@
 (* SteadQ/1 formal model. Models the queue state machine, crash        *)
 (* semantics, durability barriers, and recovery.                       *)
 (*                                                                      *)
-(* Bounded configuration: 2 jobs, 2 workers, and MaxAttempts = 2.      *)
+(* Bounded configuration: 2 jobs, 1 worker, 2 tokens, attempts/generation. *)
 (* Crash remains available whenever its action predicate is enabled.    *)
 (************************************************************************)
 
@@ -13,7 +13,9 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC, SteadQProtocol
 CONSTANTS 
     Jobs,            (* set of job ids *)
     Workers,         (* set of worker ids *)
+    LeaseTokens,     (* finite set of lease capability ids *)
     MaxAttempts,     (* maximum attempts per job *)
+    MaxGeneration,   (* maximum generation explored per job *)
     Nil
 
 VARIABLES
@@ -24,22 +26,24 @@ VARIABLES
     destSynced,      (* [job -> Bool] destination dir synced *)
     srcSynced,       (* [job -> Bool] source dir synced *)
     poisoned,        (* set of poisoned handles *)
-    token,           (* [job -> Workers \cup {Nil}] *)
+    token,           (* [job -> LeaseTokens \cup {Nil}] *)
+    issuedTokens,    (* lease capabilities issued by completed claims *)
     receiptSeen      (* set of jobs that reached receipt *)
 
 Vars == <<state, generation, attempt, fileSynced, destSynced, srcSynced,
-          poisoned, token, receiptSeen>>
+          poisoned, token, issuedTokens, receiptSeen>>
 
 TypeInvariant ==
     /\ state \in [Jobs -> {StateHidden, StateReady, StateLeased, StateDelayed,
                             StateDead, StateReceipt, StateQuarantine}]
-    /\ generation \in [Jobs -> Nat]
+    /\ generation \in [Jobs -> 0..MaxGeneration]
     /\ attempt \in [Jobs -> Nat]
     /\ fileSynced \in [Jobs -> BOOLEAN]
     /\ destSynced \in [Jobs -> BOOLEAN]
     /\ srcSynced \in [Jobs -> BOOLEAN]
     /\ poisoned \in SUBSET (Workers \cup {<<"reaper">>})
-    /\ token \in [Jobs -> (Workers \cup {Nil})]
+    /\ token \in [Jobs -> (LeaseTokens \cup {Nil})]
+    /\ issuedTokens \in SUBSET LeaseTokens
     /\ receiptSeen \in SUBSET Jobs
 
 (* Initial state: all jobs hidden, not synced *)
@@ -52,6 +56,7 @@ Init ==
     /\ srcSynced = [j \in Jobs |-> FALSE]
     /\ poisoned = {}
     /\ token = [j \in Jobs |-> Nil]
+    /\ issuedTokens = {}
     /\ receiptSeen = {}
 
 (* ---- Actions ---- *)
@@ -67,86 +72,111 @@ Enqueue(j) ==
     /\ srcSynced' = srcSynced
     /\ poisoned' = poisoned
     /\ token' = [token EXCEPT ![j] = Nil]
-    /\ receiptSeen' = receiptSeen
+    /\ UNCHANGED <<issuedTokens, receiptSeen>>
 
 (* File sync: make file content durable *)
 FileSync(j) ==
     /\ state[j] \in {StateReady, StateLeased, StateDelayed, StateDead, StateReceipt}
     /\ fileSynced' = [fileSynced EXCEPT ![j] = TRUE]
     /\ UNCHANGED <<state, generation, attempt, destSynced, srcSynced,
-                    poisoned, token, receiptSeen>>
+                    poisoned, token, issuedTokens, receiptSeen>>
 
 (* Destination dir sync *)
 DestDirSync(j) ==
     /\ destSynced' = [destSynced EXCEPT ![j] = TRUE]
     /\ UNCHANGED <<state, generation, attempt, fileSynced, srcSynced,
-                    poisoned, token, receiptSeen>>
+                    poisoned, token, issuedTokens, receiptSeen>>
 
 (* Source dir sync *)
 SrcDirSync(j) ==
     /\ srcSynced' = [srcSynced EXCEPT ![j] = TRUE]
     /\ UNCHANGED <<state, generation, attempt, fileSynced, destSynced,
-                    poisoned, token, receiptSeen>>
+                    poisoned, token, issuedTokens, receiptSeen>>
 
-(* Claim: ready -> leased, issues per-worker token *)
-Claim(w, j) ==
+(* Claim: ready -> leased, issues a fresh capability independent of worker id. *)
+Claim(w, t, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
+    /\ t \in LeaseTokens
+    /\ t \notin issuedTokens
     /\ state[j] = StateReady
     /\ attempt[j] < MaxAttempts
+    /\ generation[j] < MaxGeneration
     /\ state' = [state EXCEPT ![j] = StateLeased]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ attempt' = [attempt EXCEPT ![j] = attempt[j] + 1]
     /\ fileSynced' = [fileSynced EXCEPT ![j] = TRUE]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
-    /\ token' = [token EXCEPT ![j] = w]
+    /\ token' = [token EXCEPT ![j] = t]
+    /\ issuedTokens' = issuedTokens \cup {t}
     /\ poisoned' = poisoned
     /\ receiptSeen' = receiptSeen
 
-(* Acknowledge: leased -> receipt, requires matching token *)
-Ack(w, j) ==
+(* Renew: leased -> leased, preserving the exact capability. *)
+Renew(w, t, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
+    /\ t \in LeaseTokens
     /\ state[j] = StateLeased
-    /\ token[j] = w
+    /\ token[j] = t
+    /\ generation[j] < MaxGeneration
+    /\ state' = state
+    /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
+    /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
+    /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, token, issuedTokens, receiptSeen>>
+
+(* Acknowledge: leased -> receipt, requires the exact capability. *)
+Ack(w, t, j) ==
+    /\ w \in Workers
+    /\ w \notin poisoned
+    /\ t \in LeaseTokens
+    /\ state[j] = StateLeased
+    /\ token[j] = t
+    /\ generation[j] < MaxGeneration
     /\ state' = [state EXCEPT ![j] = StateReceipt]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
     /\ receiptSeen' = receiptSeen \cup {j}
-    /\ UNCHANGED <<attempt, fileSynced, poisoned>>
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, issuedTokens>>
 
-(* Retry: leased -> ready, requires matching token *)
-RetryNow(w, j) ==
+(* Retry: leased -> ready, requires the exact capability. *)
+RetryNow(w, t, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
+    /\ t \in LeaseTokens
     /\ state[j] = StateLeased
-    /\ token[j] = w
+    /\ token[j] = t
+    /\ generation[j] < MaxGeneration
     /\ state' = [state EXCEPT ![j] = StateReady]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
-    /\ UNCHANGED <<attempt, fileSynced, poisoned, receiptSeen>>
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, issuedTokens, receiptSeen>>
 
-(* Bury: leased -> dead, requires matching token *)
-Bury(w, j) ==
+(* Bury: leased -> dead, requires the exact capability. *)
+Bury(w, t, j) ==
     /\ w \in Workers
     /\ w \notin poisoned
+    /\ t \in LeaseTokens
     /\ state[j] = StateLeased
-    /\ token[j] = w
+    /\ token[j] = t
+    /\ generation[j] < MaxGeneration
     /\ state' = [state EXCEPT ![j] = StateDead]
     /\ generation' = [generation EXCEPT ![j] = generation[j] + 1]
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
-    /\ UNCHANGED <<attempt, fileSynced, poisoned, receiptSeen>>
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, issuedTokens, receiptSeen>>
 
 (* Reap expired: leased -> ready or dead *)
 ReapExpired(j) ==
     /\ state[j] = StateLeased
+    /\ generation[j] < MaxGeneration
     /\ IF attempt[j] >= MaxAttempts
        THEN /\ state' = [state EXCEPT ![j] = StateDead]
        ELSE /\ state' = [state EXCEPT ![j] = StateReady]
@@ -154,13 +184,13 @@ ReapExpired(j) ==
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
-    /\ UNCHANGED <<attempt, fileSynced, poisoned, receiptSeen>>
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, issuedTokens, receiptSeen>>
 
 (* Poison handle *)
 PoisonHandle(h) ==
     /\ poisoned' = poisoned \cup {h}
     /\ UNCHANGED <<state, generation, attempt, fileSynced, destSynced,
-                    srcSynced, token, receiptSeen>>
+                    srcSynced, token, issuedTokens, receiptSeen>>
 
 (* Crash: reset volatile sync states, preserve file durability, clear stale lease token if claim never completed *)
 Crash ==
@@ -182,7 +212,7 @@ Crash ==
          IF state[j] = StateLeased /\ ~fileSynced[j]
          THEN Nil
          ELSE token[j]]
-    /\ UNCHANGED <<generation, attempt, receiptSeen>>
+    /\ UNCHANGED <<generation, attempt, issuedTokens, receiptSeen>>
 
 (* Next-state relation *)
 Next ==
@@ -190,13 +220,22 @@ Next ==
     \/ \E j \in Jobs : FileSync(j)
     \/ \E j \in Jobs : DestDirSync(j)
     \/ \E j \in Jobs : SrcDirSync(j)
-    \/ \E w \in Workers, j \in Jobs : Claim(w, j)
-    \/ \E w \in Workers, j \in Jobs : Ack(w, j)
-    \/ \E w \in Workers, j \in Jobs : RetryNow(w, j)
-    \/ \E w \in Workers, j \in Jobs : Bury(w, j)
+    \/ \E w \in Workers, t \in LeaseTokens, j \in Jobs : Claim(w, t, j)
+    \/ \E w \in Workers, t \in LeaseTokens, j \in Jobs : Renew(w, t, j)
+    \/ \E w \in Workers, t \in LeaseTokens, j \in Jobs : Ack(w, t, j)
+    \/ \E w \in Workers, t \in LeaseTokens, j \in Jobs : RetryNow(w, t, j)
+    \/ \E w \in Workers, t \in LeaseTokens, j \in Jobs : Bury(w, t, j)
     \/ \E j \in Jobs : ReapExpired(j)
     \/ \E h \in (Workers \cup {<<"reaper">>}) : PoisonHandle(h)
     \/ Crash
+
+LeaseMutation(w, t, j) ==
+    \/ Renew(w, t, j)
+    \/ Ack(w, t, j)
+    \/ RetryNow(w, t, j)
+    \/ Bury(w, t, j)
+
+RetiredTokens == issuedTokens \ {token[j] : j \in Jobs}
 
 Spec == Init /\ [][Next]_Vars
 
@@ -208,10 +247,35 @@ CompleteVisibleEnvelope ==
         state[j] \in {StateReady, StateLeased, StateDelayed, StateDead, StateReceipt}
         => fileSynced[j]
 
-(* The worker-valued token abstraction is present for every modeled lease. *)
+(* Every modeled lease carries an issued capability. *)
 LeaseHasToken ==
     \A j \in Jobs :
-        state[j] = StateLeased => token[j] # Nil
+        state[j] = StateLeased => token[j] \in issuedTokens
+
+(* A non-null capability exists only while its job is leased. *)
+TokenAuthorityRequiresLease ==
+    \A j \in Jobs : token[j] # Nil => state[j] = StateLeased
+
+(* Two active leases never share one capability. *)
+ActiveLeaseTokensAreUnique ==
+    \A left, right \in Jobs :
+        /\ state[left] = StateLeased
+        /\ state[right] = StateLeased
+        /\ token[left] = token[right]
+        => left = right
+
+(* A retired capability cannot mutate any job. *)
+RetiredTokenCannotMutate ==
+    \A t \in RetiredTokens, w \in Workers, j \in Jobs :
+        ~ENABLED LeaseMutation(w, t, j)
+
+(* A capability current for one job cannot mutate another leased job. *)
+OtherJobTokenCannotMutate ==
+    \A source, target \in Jobs, w \in Workers :
+        /\ source # target
+        /\ state[source] = StateLeased
+        /\ state[target] = StateLeased
+        => ~ENABLED LeaseMutation(w, token[source], target)
 
 (* Modeled attempts never exceed the configured bound. *)
 AttemptWithinLimit ==
@@ -230,8 +294,5 @@ DeliveredAttemptIsPositive ==
 (* ---- End invariants ---- *)
 
 (* No liveness property is encoded in this model. *)
-
-(* Worker identity stands in for a token. This abstraction cannot establish
-   stale-capability exclusion when one worker can hold multiple lease tokens. *)
 
 =============================================================================
