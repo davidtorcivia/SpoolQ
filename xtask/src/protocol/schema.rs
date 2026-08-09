@@ -3,13 +3,14 @@ use std::fs;
 use std::path::Path;
 
 use super::{
-    AttemptChange, ExceptionName, FailureOutcome, GenerationChange, LinearizationPrimitive,
-    MutationClass, Operation, ReasonClass, ReentryName, State, SyncStep, TokenChange,
+    AttemptChange, ClockRequirement, ExceptionName, FailureOutcome, GenerationChange,
+    LinearizationPrimitive, MutationClass, Operation, ReasonClass, ReentryName, State, SyncStep,
+    TokenChange,
 };
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "d371771461cf6331bc1ac335340dc788631e5e585b10dde2601c161e69532924";
+    "d562a8ac8a4a3f4b8ad7d66fa1f8de6cbd19af060616cbe3e31745af7ef8e3fb";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =
@@ -62,6 +63,11 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     )?;
     validate_schema_domain(
         &schema,
+        "/properties/transitions/items/properties/clock_requirement/enum",
+        &ClockRequirement::ALL.map(ClockRequirement::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
         "/properties/transitions/items/properties/required_syncs/items/enum",
         &SyncStep::ALL.map(SyncStep::as_str),
     )?;
@@ -84,6 +90,11 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
         &schema,
         "/properties/exceptions/items/properties/name/enum",
         &ExceptionName::ALL.map(ExceptionName::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/exceptions/items/properties/clock_requirement/enum",
+        &ClockRequirement::ALL.map(ClockRequirement::as_str),
     )?;
     validate_schema_domain(
         &schema,

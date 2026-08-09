@@ -186,6 +186,7 @@ fn rejects_duplicate_operation() {
         attempt_change: AttemptChange::Increment,
         token_change: TokenChange::New,
         reason_class: Nullable::Null,
+        clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor,
         required_syncs: vec![SyncStep::DestinationDir],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -235,6 +236,23 @@ fn rejects_wrong_linearization_failure_outcomes() {
     assert_eq!(
         validate_spec(&spec).unwrap_err(),
         "transition enqueue_immediate must classify post-linearization failure as outcome_unknown"
+    );
+}
+
+#[test]
+fn rejects_wrong_clock_requirements() {
+    let mut spec = fixture();
+    spec.transitions[3].clock_requirement = ClockRequirement::AuthenticatedWallFloor;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition claim has clock requirement authenticated_wall_floor; expected boottime_and_authenticated_wall_floor"
+    );
+
+    let mut spec = fixture();
+    spec.exceptions[0].clock_requirement = ClockRequirement::AuthenticatedWallFloor;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "exception receipt_compaction has clock requirement authenticated_wall_floor; expected none"
     );
 }
 
@@ -297,6 +315,9 @@ fn generated_rust_contains_source_transition() {
         .contains("required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]"));
     assert!(output.contains("pub const EXCEPTIONS: &[ExceptionDef]"));
     assert!(output.contains("linearization: LinearizationPrimitive::RenameReplace"));
+    assert!(
+        output.contains("clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor")
+    );
     assert!(output.contains("pub const REENTRY: &[ReentryDef]"));
 }
 
@@ -372,6 +393,9 @@ fn every_transition_field_affects_every_projection() {
         spec.transitions[0].reason_class = Nullable::Value(ReasonClass::Corruption);
     });
     assert_every_projection_changes(|spec| {
+        spec.transitions[0].clock_requirement = ClockRequirement::None;
+    });
+    assert_every_projection_changes(|spec| {
         spec.transitions[0].required_syncs = vec![SyncStep::SourceDir];
     });
     assert_every_projection_changes(|spec| {
@@ -398,6 +422,9 @@ fn every_exception_field_affects_every_projection() {
     });
     assert_every_projection_changes(|spec| {
         spec.exceptions[0].description = "different exception documentation".into();
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].clock_requirement = ClockRequirement::AuthenticatedWallFloor;
     });
     assert_every_projection_changes(|spec| {
         spec.exceptions[0].mutation_class = MutationClass::Unlink;
@@ -463,6 +490,7 @@ fn rejects_unknown_protocol_domains() {
         ("/transitions/0/operation", "invented_operation"),
         ("/transitions/0/source", "invented_state"),
         ("/transitions/0/reason_class", "invented_reason"),
+        ("/transitions/0/clock_requirement", "invented_clock"),
         ("/transitions/0/required_syncs/0", "invented_sync"),
         ("/transitions/0/linearization", "invented_linearization"),
         (
@@ -470,6 +498,7 @@ fn rejects_unknown_protocol_domains() {
             "invented_outcome",
         ),
         ("/exceptions/0/name", "invented_exception"),
+        ("/exceptions/0/clock_requirement", "invented_clock"),
         ("/exceptions/0/mutation_class", "invented_mutation_class"),
         ("/exceptions/0/linearization", "invented_linearization"),
         ("/reentry/0/name", "invented_reentry"),
@@ -493,6 +522,7 @@ fn rejects_omitted_semantic_fields() {
         "attempt_change",
         "token_change",
         "reason_class",
+        "clock_requirement",
         "required_syncs",
         "linearization",
         "before_linearization_failure",
@@ -514,6 +544,7 @@ fn rejects_omitted_semantic_fields() {
     for field in [
         "name",
         "description",
+        "clock_requirement",
         "mutation_class",
         "linearization",
         "required_syncs",
@@ -584,6 +615,10 @@ fn rejects_each_cross_field_transition_mutation() {
             serde_json::json!("unchanged"),
         ),
         ("/transitions/3/token_change", serde_json::json!("none")),
+        (
+            "/transitions/3/clock_requirement",
+            serde_json::json!("authenticated_wall_floor"),
+        ),
         (
             "/transitions/3/reason_class",
             serde_json::json!("attempts_exhausted"),

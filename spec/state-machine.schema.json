@@ -23,6 +23,7 @@
           "attempt_change",
           "token_change",
           "reason_class",
+          "clock_requirement",
           "required_syncs",
           "linearization",
           "before_linearization_failure",
@@ -112,6 +113,16 @@
               }
             ]
           },
+          "clock_requirement": {
+            "type": "string",
+            "enum": [
+              "none",
+              "authenticated_wall_floor",
+              "boottime_and_authenticated_wall_floor",
+              "lease_expiration_evidence",
+              "lease_expiration_evidence_and_authenticated_wall_floor"
+            ]
+          },
           "required_syncs": {
             "type": "array",
             "minItems": 1,
@@ -166,6 +177,7 @@
         "required": [
           "name",
           "description",
+          "clock_requirement",
           "mutation_class",
           "linearization",
           "required_syncs",
@@ -183,6 +195,16 @@
           "description": {
             "type": "string",
             "minLength": 1
+          },
+          "clock_requirement": {
+            "type": "string",
+            "enum": [
+              "none",
+              "authenticated_wall_floor",
+              "boottime_and_authenticated_wall_floor",
+              "lease_expiration_evidence",
+              "lease_expiration_evidence_and_authenticated_wall_floor"
+            ]
           },
           "mutation_class": {
             "type": "string",
