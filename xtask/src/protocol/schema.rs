@@ -11,7 +11,7 @@ use super::{
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "feb03547b7ab04a30c0e18cbf9384c316989c6c59c2fe202ac134e79752b37e4";
+    "254f56e4f53b70389edea9725ccc12b4443efcdd9a1040106723d6ad6b57fe3e";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =

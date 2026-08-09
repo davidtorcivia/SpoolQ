@@ -1,8 +1,8 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: 0a1a4a12c42e8bdb74478372dd4e34a983a144e17c8714d332a75dabd582df0b
+// Source SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008
 
 pub const PROTOCOL_IR_IDENTITY: &str = "steadq-state-machine";
-pub const PROTOCOL_IR_VERSION: u32 = 1;
+pub const PROTOCOL_IR_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -100,6 +100,7 @@ pub enum SyncStep {
     DestinationDirectory,
     SourceDirectory,
     SameOrDestinationDirectory,
+    SourceDirectoryIfDistinct,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -280,7 +281,10 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::Same,
         reason_class: None,
         clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor,
-        required_syncs: &[SyncStep::SameOrDestinationDirectory],
+        required_syncs: &[
+            SyncStep::SameOrDestinationDirectory,
+            SyncStep::SourceDirectoryIfDistinct,
+        ],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
@@ -575,6 +579,14 @@ mod tests {
             ResolverProbeTopology::SourceAndDestination
         );
         assert_eq!(claim.qualification, TransitionQualification::None);
+        let renew = transition(Operation::Renew);
+        assert_eq!(
+            renew.required_syncs,
+            &[
+                SyncStep::SameOrDestinationDirectory,
+                SyncStep::SourceDirectoryIfDistinct,
+            ]
+        );
     }
 
     #[test]

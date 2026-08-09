@@ -9,7 +9,7 @@ mod schema;
 
 const SPEC: &str = "spec/state-machine.json";
 const PROTOCOL_IR_IDENTITY: &str = "steadq-state-machine";
-const PROTOCOL_IR_VERSION: u32 = 1;
+const PROTOCOL_IR_VERSION: u32 = 2;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +160,8 @@ enum SyncStep {
     SourceDir,
     #[serde(rename = "same_or_destination_dir_fsync")]
     SameOrDestinationDir,
+    #[serde(rename = "source_dir_fsync_if_distinct")]
+    SourceDirIfDistinct,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -750,7 +752,9 @@ impl Operation {
         use ObjectKind::{FullJob, FullReceipt, RawObject};
         use ReasonClass::{ApplicationDefined, AttemptsExhausted, Corruption};
         use State::{Active, Dead, Delayed, Hidden, Leased, Quarantine, Ready, Receipt};
-        use SyncStep::{DestinationDir, File, SameOrDestinationDir, SourceDir};
+        use SyncStep::{
+            DestinationDir, File, SameOrDestinationDir, SourceDir, SourceDirIfDistinct,
+        };
         use TokenChange::{New, None as NoToken, Same};
 
         match self {
@@ -818,7 +822,7 @@ impl Operation {
                 attempt_change: Unchanged,
                 token_change: Same,
                 reason_class: None,
-                required_syncs: &[SameOrDestinationDir],
+                required_syncs: &[SameOrDestinationDir, SourceDirIfDistinct],
             },
             Self::Acknowledge => TransitionInvariant {
                 source: Leased,
@@ -1141,11 +1145,12 @@ impl ResolverProbeTopology {
 }
 
 impl SyncStep {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::File,
         Self::DestinationDir,
         Self::SourceDir,
         Self::SameOrDestinationDir,
+        Self::SourceDirIfDistinct,
     ];
 
     fn as_str(self) -> &'static str {
@@ -1154,6 +1159,7 @@ impl SyncStep {
             Self::DestinationDir => "destination_dir_fsync",
             Self::SourceDir => "source_dir_fsync",
             Self::SameOrDestinationDir => "same_or_destination_dir_fsync",
+            Self::SourceDirIfDistinct => "source_dir_fsync_if_distinct",
         }
     }
 
@@ -1163,6 +1169,7 @@ impl SyncStep {
             Self::DestinationDir => "DestinationDirectory",
             Self::SourceDir => "SourceDirectory",
             Self::SameOrDestinationDir => "SameOrDestinationDirectory",
+            Self::SourceDirIfDistinct => "SourceDirectoryIfDistinct",
         }
     }
 }

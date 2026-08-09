@@ -1,6 +1,6 @@
 {
   "protocol": "steadq-state-machine",
-  "version": 1,
+  "version": 2,
   "transitions": [
     {
       "operation": "enqueue_immediate",
@@ -119,7 +119,8 @@
       "reason_class": null,
       "clock_requirement": "boottime_and_authenticated_wall_floor",
       "required_syncs": [
-        "same_or_destination_dir_fsync"
+        "same_or_destination_dir_fsync",
+        "source_dir_fsync_if_distinct"
       ],
       "linearization": "rename_noreplace",
       "before_linearization_failure": "not_committed",

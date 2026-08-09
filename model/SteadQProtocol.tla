@@ -1,9 +1,9 @@
 -------------------------- MODULE SteadQProtocol --------------------------
 (* Auto-generated from spec/state-machine.json. Do not edit by hand. *)
-(* Source SHA-256: 0a1a4a12c42e8bdb74478372dd4e34a983a144e17c8714d332a75dabd582df0b *)
+(* Source SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008 *)
 
 ProtocolIRIdentity == "steadq-state-machine"
-ProtocolIRVersion == 1
+ProtocolIRVersion == 2
 
 OperationEnqueueImmediate == "enqueue_immediate"
 OperationEnqueueDelayed == "enqueue_delayed"
@@ -70,7 +70,8 @@ SyncStepFile == "file_fsync"
 SyncStepDestinationDirectory == "destination_dir_fsync"
 SyncStepSourceDirectory == "source_dir_fsync"
 SyncStepSameOrDestinationDirectory == "same_or_destination_dir_fsync"
-ProtocolSyncSteps == {SyncStepFile, SyncStepDestinationDirectory, SyncStepSourceDirectory, SyncStepSameOrDestinationDirectory}
+SyncStepSourceDirectoryIfDistinct == "source_dir_fsync_if_distinct"
+ProtocolSyncSteps == {SyncStepFile, SyncStepDestinationDirectory, SyncStepSourceDirectory, SyncStepSameOrDestinationDirectory, SyncStepSourceDirectoryIfDistinct}
 
 LinearizationPublishNoreplace == "publish_noreplace"
 LinearizationRenameNoreplace == "rename_noreplace"
@@ -198,7 +199,7 @@ ProtocolTransitions == <<
      tokenChange |-> TokenChangeSame,
      reasonClass |-> NoReasonClass,
      clockRequirement |-> ClockRequirementBoottimeAndAuthenticatedWallFloor,
-     requiredSyncs |-> <<SyncStepSameOrDestinationDirectory>>,
+     requiredSyncs |-> <<SyncStepSameOrDestinationDirectory, SyncStepSourceDirectoryIfDistinct>>,
      linearization |-> LinearizationRenameNoreplace,
      beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
      afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown,

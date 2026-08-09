@@ -17,8 +17,8 @@
     },
     "version": {
       "type": "integer",
-      "minimum": 1,
-      "const": 1
+      "minimum": 2,
+      "const": 2
     },
     "transitions": {
       "type": "array",
@@ -166,7 +166,8 @@
                 "file_fsync",
                 "destination_dir_fsync",
                 "source_dir_fsync",
-                "same_or_destination_dir_fsync"
+                "same_or_destination_dir_fsync",
+                "source_dir_fsync_if_distinct"
               ]
             }
           },
@@ -286,7 +287,8 @@
                 "file_fsync",
                 "destination_dir_fsync",
                 "source_dir_fsync",
-                "same_or_destination_dir_fsync"
+                "same_or_destination_dir_fsync",
+                "source_dir_fsync_if_distinct"
               ]
             }
           },

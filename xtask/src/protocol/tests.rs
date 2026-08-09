@@ -132,12 +132,17 @@ fn rejects_unsupported_protocol_ir_identity_and_version() {
         "unsupported protocol IR identity: expected steadq-state-machine, got another-protocol"
     );
 
-    for version in [0, PROTOCOL_IR_VERSION + 1, u32::MAX] {
+    for version in [
+        0,
+        PROTOCOL_IR_VERSION - 1,
+        PROTOCOL_IR_VERSION + 1,
+        u32::MAX,
+    ] {
         let mut spec = fixture();
         spec.version = version;
         assert_eq!(
             validate_spec(&spec).unwrap_err(),
-            format!("unsupported protocol IR version: expected 1, got {version}")
+            format!("unsupported protocol IR version: expected 2, got {version}")
         );
     }
 }
@@ -435,6 +440,43 @@ fn rejects_duplicate_exception_sync() {
 }
 
 #[test]
+fn renew_requires_conditional_source_directory_barrier_in_order() {
+    for (syncs, expected) in [
+        (
+            vec![SyncStep::SameOrDestinationDir],
+            "transition renew has syncs [\"same_or_destination_dir_fsync\"]; expected [\"same_or_destination_dir_fsync\", \"source_dir_fsync_if_distinct\"]",
+        ),
+        (
+            vec![
+                SyncStep::SourceDirIfDistinct,
+                SyncStep::SameOrDestinationDir,
+            ],
+            "transition renew has syncs [\"source_dir_fsync_if_distinct\", \"same_or_destination_dir_fsync\"]; expected [\"same_or_destination_dir_fsync\", \"source_dir_fsync_if_distinct\"]",
+        ),
+    ] {
+        let mut spec = fixture();
+        spec.transitions
+            .iter_mut()
+            .find(|transition| transition.operation == Operation::Renew)
+            .unwrap()
+            .required_syncs = syncs;
+        assert_eq!(validate_spec(&spec).unwrap_err(), expected);
+    }
+
+    let mut spec = fixture();
+    spec.transitions
+        .iter_mut()
+        .find(|transition| transition.operation == Operation::Renew)
+        .unwrap()
+        .required_syncs
+        .push(SyncStep::SourceDirIfDistinct);
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition renew contains duplicate sync source_dir_fsync_if_distinct"
+    );
+}
+
+#[test]
 fn generated_rust_contains_source_transition() {
     let output = render_rust(&fixture(), "fixture-digest");
     assert!(output.contains("operation: Operation::Claim"));
@@ -457,7 +499,7 @@ fn generated_tla_contains_complete_protocol_metadata() {
     assert!(output.contains("MODULE SteadQProtocol"));
     assert!(output.contains("Source SHA-256: fixture-digest"));
     assert!(output.contains("ProtocolIRIdentity == \"steadq-state-machine\""));
-    assert!(output.contains("ProtocolIRVersion == 1"));
+    assert!(output.contains("ProtocolIRVersion == 2"));
     assert!(output.contains("ProtocolOperations =="));
     assert!(output.contains("ProtocolStates =="));
     let operations = Operation::ALL
@@ -589,7 +631,7 @@ fn protocol_ir_identity_and_version_affect_every_projection() {
         spec.protocol = "different-protocol".into();
     });
     assert_every_projection_changes(|spec| {
-        spec.version = 2;
+        spec.version = PROTOCOL_IR_VERSION + 1;
     });
 }
 

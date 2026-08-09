@@ -5045,6 +5045,63 @@ mod tests {
     }
 
     #[test]
+    fn renew_syncs_source_directory_only_when_distinct() {
+        fn sync_count(distinct_destination: bool) -> u64 {
+            let (_tmp, mut queue) = create_test_queue();
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: b"data".to_vec(),
+                ..Default::default()
+            });
+            let lease = match queue.lease(0, 30_000_000_000) {
+                LeaseOutcome::Leased(lease) => lease,
+                other => panic!("lease failed: {other:?}"),
+            };
+            let source_directory = lease
+                .exact_source_path
+                .rsplit_once('/')
+                .unwrap()
+                .0
+                .to_string();
+            let destination_directory = if distinct_destination {
+                let directory = format!("leased/{}/ffffffffffffffff/0000", queue.boot_id);
+                queue.ensure_dir(&directory).unwrap();
+                directory
+            } else {
+                source_directory
+            };
+            let ticket = queue
+                .transition_ticket_for_lease(
+                    &lease,
+                    TransitionOperation::Renew,
+                    TicketDestination::Leased {
+                        boot_id: queue.boot_id.clone(),
+                        boottime_deadline_ns: lease.expires_boottime_ns,
+                        wall_deadline_ns: lease.expires_wall_ns,
+                    },
+                )
+                .unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject("fsync_dir_fd", u64::MAX);
+            let outcome = queue.move_leased_renew(
+                &lease,
+                &destination_directory,
+                "renew-barrier-test.sqj",
+                &ticket,
+            );
+            let count = fs::fault::call_count("fsync_dir_fd");
+            fs::fault::reset();
+            assert!(matches!(outcome, TransitionOutcome::Committed));
+            count
+        }
+
+        assert_eq!(sync_count(false), 1);
+        assert_eq!(sync_count(true), 2);
+    }
+
+    #[test]
     fn ack_already_lost_returns_lease_lost() {
         let (_tmp, mut queue) = create_test_queue();
         let input = EnqueueInput {

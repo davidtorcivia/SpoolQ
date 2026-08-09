@@ -18,5 +18,6 @@ The development toolchain and minimum supported Rust version are both Rust 1.97.
 - Recovery cursors: cursor schema version.
 - Quarantine manifests: manifest schema version.
 - Filesystem evidence: certification-profile version.
+- Protocol IR and generated projections: protocol IR version.
 
 No compatibility between unknown minor disk-format versions is promised until feature-bit and decoder policy is written and tested.
