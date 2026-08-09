@@ -8,7 +8,7 @@ Status: Phase 0 skeleton. A-007 will generate or mechanically validate this matr
 | No overwrite of distinct active job | I2 / moves | `queue`, Linux rename wrapper | Pending A-002 | Not comprehensively configured | Selected fault tests | Partial |
 | Committed enqueue remains represented | I3 / enqueue | `queue` | Pending A-003 | Abstract crash action, no checked namespace-representation predicate | Observation harness only | Partial |
 | Lease authority uniqueness | I4 / claim | `queue` | Operation-bound source identity | Bounded `LeaseHasToken`, `TokenAuthorityRequiresLease`, and `ActiveLeaseTokensAreUnique` capability model | Concurrency unit tests | Partial |
-| Stale-token exclusion | I5 | `queue` | Operation-bound source identity | Bounded `StaleTokenCannotMutate` for retired and other-job capabilities | Unit tests | Partial |
+| Stale-token exclusion | I5 | `queue` | Operation-bound source identity | Bounded `RetiredTokenCannotMutate` and `OtherJobTokenCannotMutate` capability checks | Unit tests | Partial |
 | Generation monotonicity | I6 | Duplicated production logic | Pending A-007 | Partial | Unit tests | Partial |
 | Attempt discipline | I7 | Generated transition metadata and production queue logic | Operation-bound attempt derivation | Bounded `AttemptWithinLimit` and `DeliveredAttemptIsPositive` | Unit tests | Partial |
 | Terminal monotonicity | I8 | Recovery and queue | Operation-bound terminal verification | Bounded `ReceiptRemainsTerminal` covers modeled acknowledgment history | Partial | Open |

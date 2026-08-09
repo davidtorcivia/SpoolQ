@@ -229,6 +229,14 @@ Next ==
     \/ \E h \in (Workers \cup {<<"reaper">>}) : PoisonHandle(h)
     \/ Crash
 
+LeaseMutation(w, t, j) ==
+    \/ Renew(w, t, j)
+    \/ Ack(w, t, j)
+    \/ RetryNow(w, t, j)
+    \/ Bury(w, t, j)
+
+RetiredTokens == issuedTokens \ {token[j] : j \in Jobs}
+
 Spec == Init /\ [][Next]_Vars
 
 (* ---- Invariants ---- *)
@@ -256,16 +264,18 @@ ActiveLeaseTokensAreUnique ==
         /\ token[left] = token[right]
         => left = right
 
-LeaseMutation(w, t, j) ==
-    \/ Renew(w, t, j)
-    \/ Ack(w, t, j)
-    \/ RetryNow(w, t, j)
-    \/ Bury(w, t, j)
+(* A retired capability cannot mutate any job. *)
+RetiredTokenCannotMutate ==
+    \A t \in RetiredTokens, w \in Workers, j \in Jobs :
+        ~ENABLED LeaseMutation(w, t, j)
 
-(* An issued capability cannot mutate a job for which it is not current. *)
-StaleTokenCannotMutate ==
-    \A t \in issuedTokens, w \in Workers, j \in Jobs :
-        t # token[j] => ~ENABLED LeaseMutation(w, t, j)
+(* A capability current for one job cannot mutate another leased job. *)
+OtherJobTokenCannotMutate ==
+    \A source, target \in Jobs, w \in Workers :
+        /\ source # target
+        /\ state[source] = StateLeased
+        /\ state[target] = StateLeased
+        => ~ENABLED LeaseMutation(w, token[source], target)
 
 (* Modeled attempts never exceed the configured bound. *)
 AttemptWithinLimit ==

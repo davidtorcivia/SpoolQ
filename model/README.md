@@ -22,9 +22,9 @@ CI runs the same command in the `tla` job.
 
 ## Model scope
 
-Bounded configuration: 2 jobs, 1 worker, 2 lease tokens, MaxAttempts=2, and MaxGeneration=3. The generation bound makes repeated renewal finite. The `Crash` action is not count-bounded.
+Bounded configuration: 2 jobs, 1 worker, 2 lease tokens, MaxAttempts=2, and MaxGeneration=4. The generation bound makes repeated renewal finite while permitting a retired capability to be presented against a later lease on the same job. The `Crash` action is not count-bounded.
 
-TLC 2026.07.31 with `-workers auto` completes this configuration with 139,521 generated states, 13,440 distinct states, no queued states, and no errors. Exploration depth is omitted because parallel worker scheduling changes the reported value without changing the reachable state set.
+TLC 2026.07.31 with `-workers auto` completes this configuration with 264,897 generated states, 25,152 distinct states, no queued states, and no errors. Exploration depth is omitted because parallel worker scheduling changes the reported value without changing the reachable state set.
 
 `model/SteadQProtocol.tla` is generated from the versioned protocol IR. It supplies the model's state values and complete transition, exceptional mutation, and re-entry metadata. The current actions still model only the bounded abstract behavior described below; generating the metadata does not make those actions implementation-complete.
 
@@ -40,7 +40,9 @@ TLC 2026.07.31 with `-workers auto` completes this configuration with 139,521 ge
 
 - `ActiveLeaseTokensAreUnique`: two active leases cannot share a capability.
 
-- `StaleTokenCannotMutate`: an issued capability cannot mutate a job for which it is not current. This covers retired capabilities and a capability current for another job.
+- `RetiredTokenCannotMutate`: a retired capability cannot mutate any job.
+
+- `OtherJobTokenCannotMutate`: a capability current for one job cannot mutate another leased job.
 
 - `AttemptWithinLimit`: modeled attempts do not exceed `MaxAttempts`.
 
