@@ -1,6 +1,6 @@
 -------------------------- MODULE SteadQProtocol --------------------------
 (* Auto-generated from spec/state-machine.json. Do not edit by hand. *)
-(* Source SHA-256: f3bb2bfbe1bff8c37f8c4a3f684ed41a55ddee8546defd1a69c7d53488094d63 *)
+(* Source SHA-256: 8eba1a6b7a3d72aca483b07f52bbb1c97bee9828a0b338cdbdaf02dbfdf1ba92 *)
 
 ProtocolIRIdentity == "steadq-state-machine"
 ProtocolIRVersion == 3
@@ -86,13 +86,15 @@ ProtocolFailureOutcomes == {FailureOutcomeNotCommitted, FailureOutcomeOutcomeUnk
 ResolverProbeTopologyDestinationOnly == "destination_only"
 ResolverProbeTopologySourceAndDestination == "source_and_destination"
 ResolverProbeTopologyReceiptCandidatesAndSource == "receipt_candidates_and_source"
-ProtocolResolverProbeTopologies == {ResolverProbeTopologyDestinationOnly, ResolverProbeTopologySourceAndDestination, ResolverProbeTopologyReceiptCandidatesAndSource}
+ResolverProbeTopologySourcePresence == "source_presence"
+ProtocolResolverProbeTopologies == {ResolverProbeTopologyDestinationOnly, ResolverProbeTopologySourceAndDestination, ResolverProbeTopologyReceiptCandidatesAndSource, ResolverProbeTopologySourcePresence}
 
 TransitionQualificationNone == "none"
 TransitionQualificationAttemptsRemaining == "attempts_remaining"
 TransitionQualificationAttemptsExhausted == "attempts_exhausted"
 TransitionQualificationRawBytesPreserved == "raw_bytes_preserved"
-ProtocolTransitionQualifications == {TransitionQualificationNone, TransitionQualificationAttemptsRemaining, TransitionQualificationAttemptsExhausted, TransitionQualificationRawBytesPreserved}
+TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor == "receipt_bucket_end_plus_retention_not_after_wall_floor"
+ProtocolTransitionQualifications == {TransitionQualificationNone, TransitionQualificationAttemptsRemaining, TransitionQualificationAttemptsExhausted, TransitionQualificationRawBytesPreserved, TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor}
 
 MutationClassNoOverwriteMove == "no_overwrite_move"
 MutationClassReplacingMove == "replacing_move"
@@ -108,6 +110,10 @@ ProtocolExceptionNames == {ExceptionReceiptCompaction, ExceptionWallWatermarkAdv
 UnlinkFullReceiptRetentionDeletion == "full_receipt_retention_deletion"
 UnlinkCompactReceiptRetentionDeletion == "compact_receipt_retention_deletion"
 ProtocolUnlinkNames == {UnlinkFullReceiptRetentionDeletion, UnlinkCompactReceiptRetentionDeletion}
+
+SourceAuthenticationNone == "none"
+SourceAuthenticationStrictReceipt == "strict_receipt"
+ProtocolSourceAuthentications == {SourceAuthenticationNone, SourceAuthenticationStrictReceipt}
 
 ReentryRequeueDead == "requeue_dead"
 ReentryRequeueQuarantine == "requeue_quarantine"
@@ -351,22 +357,30 @@ ProtocolExceptions == <<
 ProtocolUnlinks == <<
     [name |-> UnlinkFullReceiptRetentionDeletion,
      descriptionUtf8Hex |-> "41757468656e7469636174656420726574656e74696f6e2064656c6574696f6e206f6620616e20656c696769626c652066756c6c2072656365697074",
+     source |-> StateReceipt,
      sourceObjectKind |-> ObjectKindFullReceipt,
+     sourceAuthentication |-> SourceAuthenticationStrictReceipt,
      clockRequirement |-> ClockRequirementAuthenticatedWallFloor,
+     qualification |-> TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor,
      mutationClass |-> MutationClassUnlink,
      linearization |-> LinearizationUnlink,
      requiredSyncs |-> <<SyncStepSourceDirectory>>,
      beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
-     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown],
+     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown,
+     resolverProbeTopology |-> ResolverProbeTopologySourcePresence],
     [name |-> UnlinkCompactReceiptRetentionDeletion,
      descriptionUtf8Hex |-> "41757468656e7469636174656420726574656e74696f6e2064656c6574696f6e206f6620616e20656c696769626c6520636f6d706163742072656365697074",
+     source |-> StateReceipt,
      sourceObjectKind |-> ObjectKindCompactReceipt,
+     sourceAuthentication |-> SourceAuthenticationStrictReceipt,
      clockRequirement |-> ClockRequirementAuthenticatedWallFloor,
+     qualification |-> TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor,
      mutationClass |-> MutationClassUnlink,
      linearization |-> LinearizationUnlink,
      requiredSyncs |-> <<SyncStepSourceDirectory>>,
      beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
-     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown]
+     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown,
+     resolverProbeTopology |-> ResolverProbeTopologySourcePresence]
 >>
 
 ProtocolReentry == <<

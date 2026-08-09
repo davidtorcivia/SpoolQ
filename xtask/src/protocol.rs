@@ -140,6 +140,7 @@ enum TransitionQualification {
     AttemptsRemaining,
     AttemptsExhausted,
     RawBytesPreserved,
+    ReceiptBucketEndPlusRetentionNotAfterWallFloor,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -148,6 +149,14 @@ enum ResolverProbeTopology {
     DestinationOnly,
     SourceAndDestination,
     ReceiptCandidatesAndSource,
+    SourcePresence,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SourceAuthentication {
+    None,
+    StrictReceipt,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -218,13 +227,17 @@ enum ExceptionName {
 struct Unlink {
     name: UnlinkName,
     description: String,
+    source: State,
     source_object_kind: ObjectKind,
+    source_authentication: SourceAuthentication,
     clock_requirement: ClockRequirement,
+    qualification: TransitionQualification,
     mutation_class: MutationClass,
     linearization: LinearizationPrimitive,
     required_syncs: Vec<SyncStep>,
     before_linearization_failure: FailureOutcome,
     after_linearization_failure: FailureOutcome,
+    resolver_probe_topology: ResolverProbeTopology,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -272,9 +285,13 @@ struct ExceptionInvariant {
 }
 
 struct UnlinkInvariant {
+    source: State,
     source_object_kind: ObjectKind,
+    source_authentication: SourceAuthentication,
     clock_requirement: ClockRequirement,
+    qualification: TransitionQualification,
     required_syncs: &'static [SyncStep],
+    resolver_probe_topology: ResolverProbeTopology,
 }
 
 fn load_spec(root: &Path) -> Result<(StateMachineSpec, String), String> {
@@ -450,6 +467,14 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
 
 fn validate_unlink_invariant(unlink: &Unlink) -> Result<(), String> {
     let expected = unlink.name.invariant();
+    if unlink.source != expected.source {
+        return Err(format!(
+            "unlink {} has source state {}; expected {}",
+            unlink.name.as_str(),
+            unlink.source.as_str(),
+            expected.source.as_str()
+        ));
+    }
     if unlink.source_object_kind != expected.source_object_kind {
         return Err(format!(
             "unlink {} has source object kind {}; expected {}",
@@ -458,12 +483,28 @@ fn validate_unlink_invariant(unlink: &Unlink) -> Result<(), String> {
             expected.source_object_kind.as_str()
         ));
     }
+    if unlink.source_authentication != expected.source_authentication {
+        return Err(format!(
+            "unlink {} has source authentication {}; expected {}",
+            unlink.name.as_str(),
+            unlink.source_authentication.as_str(),
+            expected.source_authentication.as_str()
+        ));
+    }
     if unlink.clock_requirement != expected.clock_requirement {
         return Err(format!(
             "unlink {} has clock requirement {}; expected {}",
             unlink.name.as_str(),
             unlink.clock_requirement.as_str(),
             expected.clock_requirement.as_str()
+        ));
+    }
+    if unlink.qualification != expected.qualification {
+        return Err(format!(
+            "unlink {} has qualification {}; expected {}",
+            unlink.name.as_str(),
+            unlink.qualification.as_str(),
+            expected.qualification.as_str()
         ));
     }
     if unlink.mutation_class != MutationClass::Unlink {
@@ -490,6 +531,14 @@ fn validate_unlink_invariant(unlink: &Unlink) -> Result<(), String> {
         return Err(format!(
             "unlink {} must classify post-linearization failure as outcome_unknown",
             unlink.name.as_str()
+        ));
+    }
+    if unlink.resolver_probe_topology != expected.resolver_probe_topology {
+        return Err(format!(
+            "unlink {} has resolver probe topology {}; expected {}",
+            unlink.name.as_str(),
+            unlink.resolver_probe_topology.as_str(),
+            expected.resolver_probe_topology.as_str()
         ));
     }
     if unlink.required_syncs != expected.required_syncs {
@@ -1220,7 +1269,14 @@ impl ClockRequirement {
 }
 
 impl TransitionQualification {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
+        Self::None,
+        Self::AttemptsRemaining,
+        Self::AttemptsExhausted,
+        Self::RawBytesPreserved,
+        Self::ReceiptBucketEndPlusRetentionNotAfterWallFloor,
+    ];
+    const TRANSITIONS: [Self; 4] = [
         Self::None,
         Self::AttemptsRemaining,
         Self::AttemptsExhausted,
@@ -1233,6 +1289,9 @@ impl TransitionQualification {
             Self::AttemptsRemaining => "attempts_remaining",
             Self::AttemptsExhausted => "attempts_exhausted",
             Self::RawBytesPreserved => "raw_bytes_preserved",
+            Self::ReceiptBucketEndPlusRetentionNotAfterWallFloor => {
+                "receipt_bucket_end_plus_retention_not_after_wall_floor"
+            }
         }
     }
 
@@ -1242,12 +1301,21 @@ impl TransitionQualification {
             Self::AttemptsRemaining => "AttemptsRemaining",
             Self::AttemptsExhausted => "AttemptsExhausted",
             Self::RawBytesPreserved => "RawBytesPreserved",
+            Self::ReceiptBucketEndPlusRetentionNotAfterWallFloor => {
+                "ReceiptBucketEndPlusRetentionNotAfterWallFloor"
+            }
         }
     }
 }
 
 impl ResolverProbeTopology {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
+        Self::DestinationOnly,
+        Self::SourceAndDestination,
+        Self::ReceiptCandidatesAndSource,
+        Self::SourcePresence,
+    ];
+    const TRANSITIONS: [Self; 3] = [
         Self::DestinationOnly,
         Self::SourceAndDestination,
         Self::ReceiptCandidatesAndSource,
@@ -1258,6 +1326,7 @@ impl ResolverProbeTopology {
             Self::DestinationOnly => "destination_only",
             Self::SourceAndDestination => "source_and_destination",
             Self::ReceiptCandidatesAndSource => "receipt_candidates_and_source",
+            Self::SourcePresence => "source_presence",
         }
     }
 
@@ -1266,6 +1335,25 @@ impl ResolverProbeTopology {
             Self::DestinationOnly => "DestinationOnly",
             Self::SourceAndDestination => "SourceAndDestination",
             Self::ReceiptCandidatesAndSource => "ReceiptCandidatesAndSource",
+            Self::SourcePresence => "SourcePresence",
+        }
+    }
+}
+
+impl SourceAuthentication {
+    const ALL: [Self; 2] = [Self::None, Self::StrictReceipt];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::StrictReceipt => "strict_receipt",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::StrictReceipt => "StrictReceipt",
         }
     }
 }
@@ -1436,12 +1524,16 @@ impl UnlinkName {
 
     fn invariant(self) -> UnlinkInvariant {
         UnlinkInvariant {
+            source: State::Receipt,
             source_object_kind: match self {
                 Self::FullReceiptRetentionDeletion => ObjectKind::FullReceipt,
                 Self::CompactReceiptRetentionDeletion => ObjectKind::CompactReceipt,
             },
+            source_authentication: SourceAuthentication::StrictReceipt,
             clock_requirement: ClockRequirement::AuthenticatedWallFloor,
+            qualification: TransitionQualification::ReceiptBucketEndPlusRetentionNotAfterWallFloor,
             required_syncs: &[SyncStep::SourceDir],
+            resolver_probe_topology: ResolverProbeTopology::SourcePresence,
         }
     }
 }

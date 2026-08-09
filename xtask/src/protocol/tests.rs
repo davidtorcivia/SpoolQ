@@ -472,6 +472,13 @@ fn rejects_duplicate_exception_sync() {
 #[test]
 fn rejects_wrong_receipt_retention_unlink_semantics() {
     let mut spec = fixture();
+    spec.unlinks[0].source = State::Dead;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has source state dead; expected receipt"
+    );
+
+    let mut spec = fixture();
     spec.unlinks[0].source_object_kind = ObjectKind::CompactReceipt;
     assert_eq!(
         validate_spec(&spec).unwrap_err(),
@@ -479,10 +486,24 @@ fn rejects_wrong_receipt_retention_unlink_semantics() {
     );
 
     let mut spec = fixture();
+    spec.unlinks[0].source_authentication = SourceAuthentication::None;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has source authentication none; expected strict_receipt"
+    );
+
+    let mut spec = fixture();
     spec.unlinks[0].clock_requirement = ClockRequirement::None;
     assert_eq!(
         validate_spec(&spec).unwrap_err(),
         "unlink full_receipt_retention_deletion has clock requirement none; expected authenticated_wall_floor"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].qualification = TransitionQualification::None;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has qualification none; expected receipt_bucket_end_plus_retention_not_after_wall_floor"
     );
 
     let mut spec = fixture();
@@ -518,6 +539,13 @@ fn rejects_wrong_receipt_retention_unlink_semantics() {
     assert_eq!(
         validate_spec(&spec).unwrap_err(),
         "unlink full_receipt_retention_deletion must classify post-linearization failure as outcome_unknown"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].resolver_probe_topology = ResolverProbeTopology::SourceAndDestination;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has resolver probe topology source_and_destination; expected source_presence"
     );
 }
 
@@ -582,6 +610,12 @@ fn generated_rust_contains_source_transition() {
     assert!(output.contains("pub const UNLINKS: &[UnlinkDef]"));
     assert!(output.contains("name: UnlinkName::FullReceiptRetentionDeletion"));
     assert!(output.contains("linearization: LinearizationPrimitive::Unlink"));
+    assert!(output.contains("source: State::Receipt"));
+    assert!(output.contains("source_authentication: SourceAuthentication::StrictReceipt"));
+    assert!(output.contains(
+        "qualification: TransitionQualification::ReceiptBucketEndPlusRetentionNotAfterWallFloor"
+    ));
+    assert!(output.contains("resolver_probe_topology: ResolverProbeTopology::SourcePresence"));
     assert!(
         output.contains("clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor")
     );
@@ -618,6 +652,11 @@ fn generated_tla_contains_complete_protocol_metadata() {
         UnlinkName::ALL.len()
     );
     assert!(output.contains("ProtocolUnlinks == <<"));
+    assert!(output.contains("SourceAuthenticationStrictReceipt"));
+    assert!(
+        output.contains("TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor")
+    );
+    assert!(output.contains("ResolverProbeTopologySourcePresence"));
     assert_eq!(
         output.matches("    [name |-> Reentry").count(),
         ReentryName::ALL.len()
@@ -778,10 +817,19 @@ fn every_unlink_field_affects_every_projection() {
         spec.unlinks[0].description = "different unlink documentation".into();
     });
     assert_every_projection_changes(|spec| {
+        spec.unlinks[0].source = State::Dead;
+    });
+    assert_every_projection_changes(|spec| {
         spec.unlinks[0].source_object_kind = ObjectKind::CompactReceipt;
     });
     assert_every_projection_changes(|spec| {
+        spec.unlinks[0].source_authentication = SourceAuthentication::None;
+    });
+    assert_every_projection_changes(|spec| {
         spec.unlinks[0].clock_requirement = ClockRequirement::None;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].qualification = TransitionQualification::None;
     });
     assert_every_projection_changes(|spec| {
         spec.unlinks[0].mutation_class = MutationClass::ReplacingMove;
@@ -797,6 +845,9 @@ fn every_unlink_field_affects_every_projection() {
     });
     assert_every_projection_changes(|spec| {
         spec.unlinks[0].after_linearization_failure = FailureOutcome::NotCommitted;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.unlinks[0].resolver_probe_topology = ResolverProbeTopology::SourceAndDestination;
     });
 }
 
@@ -880,11 +931,18 @@ fn rejects_unknown_protocol_domains() {
         ("/exceptions/0/mutation_class", "invented_mutation_class"),
         ("/exceptions/0/linearization", "invented_linearization"),
         ("/unlinks/0/name", "invented_unlink"),
+        ("/unlinks/0/source", "invented_state"),
         ("/unlinks/0/source_object_kind", "invented_object_kind"),
+        (
+            "/unlinks/0/source_authentication",
+            "invented_authentication",
+        ),
         ("/unlinks/0/clock_requirement", "invented_clock"),
+        ("/unlinks/0/qualification", "invented_qualification"),
         ("/unlinks/0/mutation_class", "invented_mutation_class"),
         ("/unlinks/0/linearization", "invented_linearization"),
         ("/unlinks/0/required_syncs/0", "invented_sync"),
+        ("/unlinks/0/resolver_probe_topology", "invented_resolver"),
         ("/reentry/0/name", "invented_reentry"),
     ] {
         let mut input = fixture_value();
@@ -953,13 +1011,17 @@ fn rejects_omitted_semantic_fields() {
     for field in [
         "name",
         "description",
+        "source",
         "source_object_kind",
+        "source_authentication",
         "clock_requirement",
+        "qualification",
         "mutation_class",
         "linearization",
         "required_syncs",
         "before_linearization_failure",
         "after_linearization_failure",
+        "resolver_probe_topology",
     ] {
         let mut input = fixture_value();
         input["unlinks"][0].as_object_mut().unwrap().remove(field);

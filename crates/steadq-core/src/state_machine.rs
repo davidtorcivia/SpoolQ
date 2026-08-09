@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: f3bb2bfbe1bff8c37f8c4a3f684ed41a55ddee8546defd1a69c7d53488094d63
+// Source SHA-256: 8eba1a6b7a3d72aca483b07f52bbb1c97bee9828a0b338cdbdaf02dbfdf1ba92
 
 pub const PROTOCOL_IR_IDENTITY: &str = "steadq-state-machine";
 pub const PROTOCOL_IR_VERSION: u32 = 3;
@@ -85,6 +85,7 @@ pub enum TransitionQualification {
     AttemptsRemaining,
     AttemptsExhausted,
     RawBytesPreserved,
+    ReceiptBucketEndPlusRetentionNotAfterWallFloor,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -92,6 +93,7 @@ pub enum ResolverProbeTopology {
     DestinationOnly,
     SourceAndDestination,
     ReceiptCandidatesAndSource,
+    SourcePresence,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -139,6 +141,12 @@ pub enum UnlinkName {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum SourceAuthentication {
+    None,
+    StrictReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ReentryName {
     RequeueDead,
     RequeueQuarantine,
@@ -182,13 +190,17 @@ pub struct ExceptionDef {
 pub struct UnlinkDef {
     pub name: UnlinkName,
     pub description: &'static str,
+    pub source: State,
     pub source_object_kind: ObjectKind,
+    pub source_authentication: SourceAuthentication,
     pub clock_requirement: ClockRequirement,
+    pub qualification: TransitionQualification,
     pub mutation_class: MutationClass,
     pub linearization: LinearizationPrimitive,
     pub required_syncs: &'static [SyncStep],
     pub before_linearization_failure: FailureOutcome,
     pub after_linearization_failure: FailureOutcome,
+    pub resolver_probe_topology: ResolverProbeTopology,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,24 +482,32 @@ pub const UNLINKS: &[UnlinkDef] = &[
     UnlinkDef {
         name: UnlinkName::FullReceiptRetentionDeletion,
         description: "Authenticated retention deletion of an eligible full receipt",
+        source: State::Receipt,
         source_object_kind: ObjectKind::FullReceipt,
+        source_authentication: SourceAuthentication::StrictReceipt,
         clock_requirement: ClockRequirement::AuthenticatedWallFloor,
+        qualification: TransitionQualification::ReceiptBucketEndPlusRetentionNotAfterWallFloor,
         mutation_class: MutationClass::Unlink,
         linearization: LinearizationPrimitive::Unlink,
         required_syncs: &[SyncStep::SourceDirectory],
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
+        resolver_probe_topology: ResolverProbeTopology::SourcePresence,
     },
     UnlinkDef {
         name: UnlinkName::CompactReceiptRetentionDeletion,
         description: "Authenticated retention deletion of an eligible compact receipt",
+        source: State::Receipt,
         source_object_kind: ObjectKind::CompactReceipt,
+        source_authentication: SourceAuthentication::StrictReceipt,
         clock_requirement: ClockRequirement::AuthenticatedWallFloor,
+        qualification: TransitionQualification::ReceiptBucketEndPlusRetentionNotAfterWallFloor,
         mutation_class: MutationClass::Unlink,
         linearization: LinearizationPrimitive::Unlink,
         required_syncs: &[SyncStep::SourceDirectory],
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
+        resolver_probe_topology: ResolverProbeTopology::SourcePresence,
     },
 ];
 
@@ -706,9 +726,18 @@ mod unlink_tests {
             .unwrap();
         assert_eq!(compact.source_object_kind, ObjectKind::CompactReceipt);
         for unlink in UNLINKS {
+            assert_eq!(unlink.source, State::Receipt);
+            assert_eq!(
+                unlink.source_authentication,
+                SourceAuthentication::StrictReceipt
+            );
             assert_eq!(
                 unlink.clock_requirement,
                 ClockRequirement::AuthenticatedWallFloor
+            );
+            assert_eq!(
+                unlink.qualification,
+                TransitionQualification::ReceiptBucketEndPlusRetentionNotAfterWallFloor
             );
             assert_eq!(unlink.mutation_class, MutationClass::Unlink);
             assert_eq!(unlink.linearization, LinearizationPrimitive::Unlink);
@@ -720,6 +749,10 @@ mod unlink_tests {
             assert_eq!(
                 unlink.after_linearization_failure,
                 FailureOutcome::OutcomeUnknown
+            );
+            assert_eq!(
+                unlink.resolver_probe_topology,
+                ResolverProbeTopology::SourcePresence
             );
         }
     }

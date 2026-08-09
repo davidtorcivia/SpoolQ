@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: f3bb2bfbe1bff8c37f8c4a3f684ed41a55ddee8546defd1a69c7d53488094d63
+// Source SHA-256: 8eba1a6b7a3d72aca483b07f52bbb1c97bee9828a0b338cdbdaf02dbfdf1ba92
 
 package steadq
 
@@ -46,13 +46,17 @@ type ExceptionDef struct {
 type UnlinkDef struct {
 	Name                       string
 	Description                string
+	Source                     string
 	SourceObjectKind           string
+	SourceAuthentication       string
 	ClockRequirement           string
+	Qualification              string
 	MutationClass              string
 	Linearization              string
 	RequiredSyncs              []string
 	BeforeLinearizationFailure string
 	AfterLinearizationFailure  string
+	ResolverProbeTopology      string
 }
 
 type ReentryDef struct {
@@ -84,8 +88,8 @@ var Exceptions = []ExceptionDef{
 }
 
 var Unlinks = []UnlinkDef{
-	{Name: "full_receipt_retention_deletion", Description: "Authenticated retention deletion of an eligible full receipt", SourceObjectKind: "full_receipt", ClockRequirement: "authenticated_wall_floor", MutationClass: "unlink", Linearization: "unlink", RequiredSyncs: []string{"source_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown"},
-	{Name: "compact_receipt_retention_deletion", Description: "Authenticated retention deletion of an eligible compact receipt", SourceObjectKind: "compact_receipt", ClockRequirement: "authenticated_wall_floor", MutationClass: "unlink", Linearization: "unlink", RequiredSyncs: []string{"source_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown"},
+	{Name: "full_receipt_retention_deletion", Description: "Authenticated retention deletion of an eligible full receipt", Source: "receipt", SourceObjectKind: "full_receipt", SourceAuthentication: "strict_receipt", ClockRequirement: "authenticated_wall_floor", Qualification: "receipt_bucket_end_plus_retention_not_after_wall_floor", MutationClass: "unlink", Linearization: "unlink", RequiredSyncs: []string{"source_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolverProbeTopology: "source_presence"},
+	{Name: "compact_receipt_retention_deletion", Description: "Authenticated retention deletion of an eligible compact receipt", Source: "receipt", SourceObjectKind: "compact_receipt", SourceAuthentication: "strict_receipt", ClockRequirement: "authenticated_wall_floor", Qualification: "receipt_bucket_end_plus_retention_not_after_wall_floor", MutationClass: "unlink", Linearization: "unlink", RequiredSyncs: []string{"source_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolverProbeTopology: "source_presence"},
 }
 
 var Reentry = []ReentryDef{

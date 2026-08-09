@@ -1,4 +1,4 @@
-<!-- Source: spec/state-machine.json; SHA-256: f3bb2bfbe1bff8c37f8c4a3f684ed41a55ddee8546defd1a69c7d53488094d63 -->
+<!-- Source: spec/state-machine.json; SHA-256: 8eba1a6b7a3d72aca483b07f52bbb1c97bee9828a0b338cdbdaf02dbfdf1ba92 -->
 
 # SteadQ/1 State Machine (Generated)
 
@@ -31,10 +31,10 @@ Protocol IR: `steadq-state-machine`, version `3`.
 
 ## Unlink mutations
 
-| Operation | Source kind | Clock requirement | Class | Linearization | Required syncs | Before failure | After failure | Description |
-|-----------|-------------|-------------------|-------|---------------|----------------|----------------|---------------|-------------|
-| full_receipt_retention_deletion | full_receipt | authenticated_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | Authenticated retention deletion of an eligible full receipt |
-| compact_receipt_retention_deletion | compact_receipt | authenticated_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | Authenticated retention deletion of an eligible compact receipt |
+| Operation | Source | Source kind | Authentication | Clock requirement | Qualification | Class | Linearization | Required syncs | Before failure | After failure | Resolver probes | Description |
+|-----------|--------|-------------|----------------|-------------------|---------------|-------|---------------|----------------|----------------|---------------|-----------------|-------------|
+| full_receipt_retention_deletion | receipt | full_receipt | strict_receipt | authenticated_wall_floor | receipt_bucket_end_plus_retention_not_after_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | source_presence | Authenticated retention deletion of an eligible full receipt |
+| compact_receipt_retention_deletion | receipt | compact_receipt | strict_receipt | authenticated_wall_floor | receipt_bucket_end_plus_retention_not_after_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | source_presence | Authenticated retention deletion of an eligible compact receipt |
 
 ## Administrative re-entry (creates new identity)
 

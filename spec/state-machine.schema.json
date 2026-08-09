@@ -311,13 +311,17 @@
         "required": [
           "name",
           "description",
+          "source",
           "source_object_kind",
+          "source_authentication",
           "clock_requirement",
+          "qualification",
           "mutation_class",
           "linearization",
           "required_syncs",
           "before_linearization_failure",
-          "after_linearization_failure"
+          "after_linearization_failure",
+          "resolver_probe_topology"
         ],
         "properties": {
           "name": {
@@ -331,6 +335,9 @@
             "type": "string",
             "minLength": 1
           },
+          "source": {
+            "const": "receipt"
+          },
           "source_object_kind": {
             "type": "string",
             "enum": [
@@ -341,6 +348,9 @@
               "watermark_record"
             ]
           },
+          "source_authentication": {
+            "const": "strict_receipt"
+          },
           "clock_requirement": {
             "type": "string",
             "enum": [
@@ -350,6 +360,9 @@
               "lease_expiration_evidence",
               "lease_expiration_evidence_and_authenticated_wall_floor"
             ]
+          },
+          "qualification": {
+            "const": "receipt_bucket_end_plus_retention_not_after_wall_floor"
           },
           "mutation_class": {
             "const": "unlink"
@@ -377,6 +390,9 @@
           },
           "after_linearization_failure": {
             "const": "outcome_unknown"
+          },
+          "resolver_probe_topology": {
+            "const": "source_presence"
           }
         }
       }
