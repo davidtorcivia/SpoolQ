@@ -23,8 +23,8 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | --- | --- | --- |
 | [SQ-P1-001 Public raw structs](https://github.com/davidtorcivia/SteadQ/issues/61) | A-010 | Complete in [#180](https://github.com/davidtorcivia/SteadQ/pull/180): FormatRecord and RetryPolicy fields private with checked constructors |
 | [SQ-P1-002 Incomplete typed layout](https://github.com/davidtorcivia/SteadQ/issues/62) | A-009/A-010 | Complete in [#181](https://github.com/davidtorcivia/SteadQ/pull/181): move_to_dead, claim scan, and recovery reap functions use typed Layout helpers; directory-only constructors added |
-| [SQ-P1-003 Verification witness](https://github.com/davidtorcivia/SteadQ/issues/63) | A-011 | Open |
-| [SQ-P1-004 Bounds and conversions](https://github.com/davidtorcivia/SteadQ/issues/64) | A-009/A-010 | Open |
+| [SQ-P1-003 Verification witness](https://github.com/davidtorcivia/SteadQ/issues/63) | A-011 | Complete in [#182](https://github.com/davidtorcivia/SteadQ/pull/182): VerifiedJob fields private with identity evidence (device, inode, size, identity_matches) |
+| [SQ-P1-004 Bounds and conversions](https://github.com/davidtorcivia/SteadQ/issues/64) | A-009/A-010 | Complete in [#183](https://github.com/davidtorcivia/SteadQ/pull/183): checked file_size() helper and checked_total_size() at all verification boundaries |
 | [SQ-P1-005 Lossy directory names](https://github.com/davidtorcivia/SteadQ/issues/65) | A-009 | Open |
 | [SQ-P1-006 Raw-FD ownership](https://github.com/davidtorcivia/SteadQ/issues/66) | A-009 | Open |
 | [SQ-P1-007 Init/open protocol](https://github.com/davidtorcivia/SteadQ/issues/67) | A-008 | Open |
