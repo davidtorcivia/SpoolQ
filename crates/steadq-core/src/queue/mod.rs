@@ -5,7 +5,7 @@ pub mod layout;
 pub mod verified;
 
 use std::io;
-use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use steadq_format::cbor::ExtensionHeader;
@@ -1642,7 +1642,7 @@ impl Queue {
             };
 
             // List entries
-            let entries = match fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+            let entries = match fs::read_dir_entries(shard_fd.as_fd()) {
                 Ok(e) => e,
                 Err(_) => {
                     scan_had_error = true;
@@ -3264,7 +3264,7 @@ impl Queue {
         // Check ready
         let ready_dir = format!("ready/{shard_str}");
         if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
-            if let Ok(entries) = fs::read_dir_entries_owned(dir_fd.as_raw_fd()) {
+            if let Ok(entries) = fs::read_dir_entries(dir_fd.as_fd()) {
                 for entry in entries {
                     let Some(entry) = entry.as_ascii_str() else {
                         continue;
@@ -3289,14 +3289,14 @@ impl Queue {
 
         // Check leased (scan boot dirs)
         if let Ok(leased_root) = fs::open_directory(self.root_fd.as_raw_fd(), "leased") {
-            if let Ok(boot_dirs) = fs::read_dir_entries_owned(leased_root.as_raw_fd()) {
+            if let Ok(boot_dirs) = fs::read_dir_entries(leased_root.as_fd()) {
                 for boot_dir in boot_dirs {
                     let Some(boot_dir) = boot_dir.as_ascii_str() else {
                         continue;
                     };
                     let boot_path = format!("leased/{boot_dir}");
                     if let Ok(boot_fd) = open_relative(self.root_fd.as_raw_fd(), &boot_path) {
-                        if let Ok(bucket_dirs) = fs::read_dir_entries_owned(boot_fd.as_raw_fd()) {
+                        if let Ok(bucket_dirs) = fs::read_dir_entries(boot_fd.as_fd()) {
                             for bucket_dir in bucket_dirs {
                                 let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
                                     continue;
@@ -3305,9 +3305,7 @@ impl Queue {
                                 if let Ok(shard_fd) =
                                     open_relative(self.root_fd.as_raw_fd(), &shard_path)
                                 {
-                                    if let Ok(entries) =
-                                        fs::read_dir_entries_owned(shard_fd.as_raw_fd())
-                                    {
+                                    if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                                         for entry in entries {
                                             let Some(entry) = entry.as_ascii_str() else {
                                                 continue;
@@ -3342,14 +3340,14 @@ impl Queue {
 
         // Check delayed
         if let Ok(delayed_root) = fs::open_directory(self.root_fd.as_raw_fd(), "delayed") {
-            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(delayed_root.as_raw_fd()) {
+            if let Ok(bucket_dirs) = fs::read_dir_entries(delayed_root.as_fd()) {
                 for bucket_dir in bucket_dirs {
                     let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
                         continue;
                     };
                     let shard_path = format!("delayed/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
-                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                        if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                             for entry in entries {
                                 let Some(entry) = entry.as_ascii_str() else {
                                     continue;
@@ -3377,14 +3375,14 @@ impl Queue {
 
         // Check dead
         if let Ok(dead_root) = fs::open_directory(self.root_fd.as_raw_fd(), "dead") {
-            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(dead_root.as_raw_fd()) {
+            if let Ok(bucket_dirs) = fs::read_dir_entries(dead_root.as_fd()) {
                 for bucket_dir in bucket_dirs {
                     let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
                         continue;
                     };
                     let shard_path = format!("dead/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
-                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                        if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                             for entry in entries {
                                 let Some(entry) = entry.as_ascii_str() else {
                                     continue;
@@ -3412,14 +3410,14 @@ impl Queue {
 
         // Check receipts
         if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
-            if let Ok(bucket_dirs) = fs::read_dir_entries_owned(receipts_root.as_raw_fd()) {
+            if let Ok(bucket_dirs) = fs::read_dir_entries(receipts_root.as_fd()) {
                 for bucket_dir in bucket_dirs {
                     let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
                         continue;
                     };
                     let shard_path = format!("receipts/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
-                        if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
+                        if let Ok(entries) = fs::read_dir_entries(shard_fd.as_fd()) {
                             for entry in entries {
                                 let Some(entry) = entry.as_ascii_str() else {
                                     continue;

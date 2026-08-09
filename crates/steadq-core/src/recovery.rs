@@ -1,7 +1,7 @@
 // SteadQ/1 cooperative recovery operations.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use steadq_fs_linux as fs;
 use steadq_math;
@@ -58,7 +58,7 @@ fn cursor_component_is_valid(component: &[u8]) -> bool {
 }
 
 fn read_recovery_directory(
-    dir_fd: std::os::unix::io::RawFd,
+    dir_fd: BorrowedFd<'_>,
     deadline_mono: u64,
     budget: &RecoveryScanBudget,
     stats: &mut RecoveryScanStats,
@@ -77,7 +77,7 @@ fn read_recovery_directory(
     }
     stats.directories_read = stats.directories_read.saturating_add(1);
 
-    let result = fs::read_dir_entry_names_bounded_owned_until_with_progress(
+    let result = fs::read_dir_entries_bounded_until_with_progress(
         dir_fd,
         MAX_RECOVERY_DIRECTORY_ENTRIES,
         MAX_RECOVERY_DIRECTORY_NAME_BYTES,
@@ -1266,12 +1266,9 @@ impl Queue {
             let directory = current
                 .as_ref()
                 .expect("validated retry paths contain at least one component");
-            if let Err(error) = read_recovery_directory(
-                directory.as_raw_fd(),
-                deadline_mono,
-                scan.budget,
-                scan.stats,
-            ) {
+            if let Err(error) =
+                read_recovery_directory(directory.as_fd(), deadline_mono, scan.budget, scan.stats)
+            {
                 if Self::record_directory_error(
                     stats,
                     "hierarchy_retry_read",
@@ -1342,7 +1339,7 @@ impl Queue {
         }
 
         let mut boot_dirs = match read_recovery_directory(
-            leased_fd.as_raw_fd(),
+            leased_fd.as_fd(),
             deadline_mono,
             scan.budget,
             scan.stats,
@@ -1405,7 +1402,7 @@ impl Queue {
             };
 
             let mut bucket_dirs = match read_recovery_directory(
-                boot_dir_fd.as_raw_fd(),
+                boot_dir_fd.as_fd(),
                 deadline_mono,
                 scan.budget,
                 scan.stats,
@@ -1508,7 +1505,7 @@ impl Queue {
                 };
 
                 let mut shard_dirs = match read_recovery_directory(
-                    bucket_fd.as_raw_fd(),
+                    bucket_fd.as_fd(),
                     deadline_mono,
                     scan.budget,
                     scan.stats,
@@ -1602,7 +1599,7 @@ impl Queue {
                     };
 
                     let mut entries = match read_recovery_directory(
-                        shard_fd.as_raw_fd(),
+                        shard_fd.as_fd(),
                         deadline_mono,
                         scan.budget,
                         scan.stats,
@@ -1986,7 +1983,7 @@ impl Queue {
         }
 
         let mut bucket_dirs = match read_recovery_directory(
-            delayed_fd.as_raw_fd(),
+            delayed_fd.as_fd(),
             deadline_mono,
             scan.budget,
             scan.stats,
@@ -2072,7 +2069,7 @@ impl Queue {
             };
 
             let mut shard_dirs = match read_recovery_directory(
-                bucket_fd.as_raw_fd(),
+                bucket_fd.as_fd(),
                 deadline_mono,
                 scan.budget,
                 scan.stats,
@@ -2162,7 +2159,7 @@ impl Queue {
                 };
 
                 let mut entries = match read_recovery_directory(
-                    shard_fd.as_raw_fd(),
+                    shard_fd.as_fd(),
                     deadline_mono,
                     scan.budget,
                     scan.stats,
@@ -2360,18 +2357,14 @@ impl Queue {
             return;
         }
 
-        let mut boot_dirs = match read_recovery_directory(
-            tmp_fd.as_raw_fd(),
-            deadline_mono,
-            scan.budget,
-            scan.stats,
-        ) {
-            Ok(e) => e,
-            Err(error) => {
-                Self::record_directory_error(stats, "temp_boot_read", "tmp", &error);
-                return;
-            }
-        };
+        let mut boot_dirs =
+            match read_recovery_directory(tmp_fd.as_fd(), deadline_mono, scan.budget, scan.stats) {
+                Ok(e) => e,
+                Err(error) => {
+                    Self::record_directory_error(stats, "temp_boot_read", "tmp", &error);
+                    return;
+                }
+            };
         boot_dirs.sort();
 
         for boot_entry in &boot_dirs {
@@ -2424,7 +2417,7 @@ impl Queue {
             };
 
             let mut shard_dirs = match read_recovery_directory(
-                boot_dir_fd.as_raw_fd(),
+                boot_dir_fd.as_fd(),
                 deadline_mono,
                 scan.budget,
                 scan.stats,
@@ -2509,7 +2502,7 @@ impl Queue {
                 };
 
                 let mut entries = match read_recovery_directory(
-                    shard_fd.as_raw_fd(),
+                    shard_fd.as_fd(),
                     deadline_mono,
                     scan.budget,
                     scan.stats,
@@ -2651,7 +2644,7 @@ impl Queue {
         }
 
         let mut bucket_dirs = match read_recovery_directory(
-            receipts_fd.as_raw_fd(),
+            receipts_fd.as_fd(),
             deadline_mono,
             scan.budget,
             scan.stats,
@@ -2719,7 +2712,7 @@ impl Queue {
             };
 
             let mut shard_dirs = match read_recovery_directory(
-                bucket_fd.as_raw_fd(),
+                bucket_fd.as_fd(),
                 deadline_mono,
                 scan.budget,
                 scan.stats,
@@ -2809,7 +2802,7 @@ impl Queue {
                 };
 
                 let mut entries = match read_recovery_directory(
-                    shard_fd.as_raw_fd(),
+                    shard_fd.as_fd(),
                     deadline_mono,
                     scan.budget,
                     scan.stats,
@@ -3099,7 +3092,7 @@ impl Queue {
         }
 
         let mut bucket_dirs = match read_recovery_directory(
-            receipts_fd.as_raw_fd(),
+            receipts_fd.as_fd(),
             deadline_mono,
             scan.budget,
             scan.stats,
@@ -3190,7 +3183,7 @@ impl Queue {
             };
 
             let mut shard_dirs = match read_recovery_directory(
-                bucket_fd.as_raw_fd(),
+                bucket_fd.as_fd(),
                 deadline_mono,
                 scan.budget,
                 scan.stats,
@@ -3281,7 +3274,7 @@ impl Queue {
                 };
 
                 let mut entries = match read_recovery_directory(
-                    shard_fd.as_raw_fd(),
+                    shard_fd.as_fd(),
                     deadline_mono,
                     scan.budget,
                     scan.stats,
@@ -6035,7 +6028,7 @@ mod tests {
         let dir = std::fs::File::open(tmp.path()).unwrap();
         let mut stats = RecoveryScanStats::default();
         let entries = read_recovery_directory(
-            dir.as_raw_fd(),
+            dir.as_fd(),
             u64::MAX,
             &RecoveryScanBudget::default(),
             &mut stats,
@@ -6054,13 +6047,9 @@ mod tests {
         let dir = std::fs::File::open(tmp.path()).unwrap();
         let mut stats = RecoveryScanStats::default();
 
-        let error = read_recovery_directory(
-            dir.as_raw_fd(),
-            0,
-            &RecoveryScanBudget::default(),
-            &mut stats,
-        )
-        .unwrap_err();
+        let error =
+            read_recovery_directory(dir.as_fd(), 0, &RecoveryScanBudget::default(), &mut stats)
+                .unwrap_err();
 
         assert!(matches!(error, RecoveryDirectoryError::BudgetExhausted));
         assert_eq!(stats.entries_read, 0);
@@ -6084,8 +6073,8 @@ mod tests {
             },
         ] {
             let mut stats = RecoveryScanStats::default();
-            let error = read_recovery_directory(dir.as_raw_fd(), u64::MAX, &budget, &mut stats)
-                .unwrap_err();
+            let error =
+                read_recovery_directory(dir.as_fd(), u64::MAX, &budget, &mut stats).unwrap_err();
 
             assert!(matches!(error, RecoveryDirectoryError::BudgetExhausted));
             assert_eq!(stats.directories_read, 0);
@@ -6100,7 +6089,7 @@ mod tests {
         };
         let mut stats = RecoveryScanStats::default();
         let entries =
-            read_recovery_directory(dir.as_raw_fd(), u64::MAX, &exact_budget, &mut stats).unwrap();
+            read_recovery_directory(dir.as_fd(), u64::MAX, &exact_budget, &mut stats).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(stats.directories_read, 1);
         assert_eq!(stats.entries_read, 1);
@@ -6116,7 +6105,7 @@ mod tests {
         fs::fault::inject_errno("clock_monotonic_ns", 1, libc::EIO);
 
         let error = read_recovery_directory(
-            dir.as_raw_fd(),
+            dir.as_fd(),
             u64::MAX,
             &RecoveryScanBudget::default(),
             &mut stats,
