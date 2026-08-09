@@ -14,6 +14,27 @@ use steadq_names::{CommonFields, ReceiptName};
 
 use crate::errors::Error;
 
+/// Convert a libc stat st_size (i64) to u64, rejecting negative sizes.
+fn file_size(stat: &libc::stat) -> Result<u64, VerificationError> {
+    if stat.st_size < 0 {
+        return Err(VerificationError::Corrupt(format!(
+            "negative file size: {}",
+            stat.st_size
+        )));
+    }
+    Ok(stat.st_size as u64)
+}
+
+/// Checked total size: 128 + ext_len + payload_length without overflow.
+fn checked_total_size(ext_len: usize, payload_length: u64) -> Result<u64, VerificationError> {
+    let header_ext = 128u64
+        .checked_add(ext_len as u64)
+        .ok_or_else(|| VerificationError::Corrupt("size overflow".into()))?;
+    header_ext
+        .checked_add(payload_length)
+        .ok_or_else(|| VerificationError::Corrupt("size overflow".into()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
     Io(String),
@@ -328,7 +349,7 @@ pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationE
         extension: ext,
         device: stat.st_dev,
         inode: stat.st_ino,
-        size: stat.st_size as u64,
+        size: file_size(&stat)?,
     })
 }
 
@@ -349,7 +370,7 @@ pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, Verifica
         extension: ext,
         device: stat.st_dev,
         inode: stat.st_ino,
-        size: stat.st_size as u64,
+        size: file_size(&stat)?,
     })
 }
 
@@ -381,8 +402,9 @@ fn verify_size(
     ext_len: usize,
 ) -> Result<(), VerificationError> {
     let file_stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
-    let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
-    if is_size_mismatch(expected_size, file_stat.st_size as u64) {
+    let actual_size = file_size(&file_stat)?;
+    let expected_size = checked_total_size(ext_len, header.payload_length)?;
+    if is_size_mismatch(expected_size, actual_size) {
         return Err(VerificationError::Corrupt(format!(
             "file size mismatch: expected {}, got {}",
             expected_size, file_stat.st_size
@@ -445,6 +467,29 @@ mod tests {
     use std::os::fd::AsFd;
 
     use super::*;
+
+    #[test]
+    fn file_size_rejects_negative_and_accepts_zero() {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(file_size(&stat).unwrap(), 0);
+
+        stat.st_size = 1024;
+        assert_eq!(file_size(&stat).unwrap(), 1024);
+
+        stat.st_size = -1;
+        assert!(file_size(&stat).is_err());
+
+        stat.st_size = i64::MIN;
+        assert!(file_size(&stat).is_err());
+    }
+
+    #[test]
+    fn checked_total_size_rejects_overflow() {
+        assert_eq!(checked_total_size(0, 0).unwrap(), 128);
+        assert_eq!(checked_total_size(100, 200).unwrap(), 428);
+        assert!(checked_total_size(usize::MAX, 0).is_err());
+        assert!(checked_total_size(0, u64::MAX).is_err());
+    }
 
     #[test]
     fn is_extension_too_large_table() {

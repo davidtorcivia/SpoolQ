@@ -727,7 +727,19 @@ impl Queue {
         }
 
         // R4-H16: Verify file size matches expected.
-        let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
+        if stat.st_size < 0 {
+            report.findings.push(CorruptionFinding {
+                relative_path: full_path.to_string(),
+                finding_type: "negative_file_size".into(),
+                severity: FindingSeverity::Error,
+                details: format!("negative file size: {}", stat.st_size),
+            });
+            return;
+        }
+        let expected_size = 128u64
+            .checked_add(ext_len as u64)
+            .and_then(|s| s.checked_add(header.payload_length))
+            .unwrap_or(u64::MAX);
         if stat.st_size as u64 != expected_size {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),

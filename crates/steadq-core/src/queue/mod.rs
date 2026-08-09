@@ -2656,7 +2656,13 @@ impl Queue {
         }
 
         // R2-B02: Verify exact file size (no trailing data)
-        let expected_size = (128 + ext_len + header.payload_length as usize) as u64;
+        if opened_stat.st_size < 0 {
+            return Err(Error::QueueCorrupt("negative file size".into()));
+        }
+        let expected_size = 128u64
+            .checked_add(ext_len as u64)
+            .and_then(|s| s.checked_add(header.payload_length))
+            .ok_or_else(|| Error::QueueCorrupt("size overflow".into()))?;
         if opened_stat.st_size as u64 != expected_size {
             return Err(Error::QueueCorrupt(format!(
                 "source file size mismatch: expected {}, got {}",
