@@ -21,6 +21,8 @@ exclude_re = [
     # hard-linked pairs as Conflict. The function wires fsync, identity checks,
     # and unlink_verified, each independently tested.
     "stabilize_both",
+    # Trivial field accessor on Location enum; tested by directory projection tests.
+    "Target::shard",
     # Thin TLS fault-check branches and idle paths.
     "fault::check",
     "fault::reset",

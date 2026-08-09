@@ -1569,7 +1569,7 @@ impl Queue {
             let shard_str = shard_hex(shard);
 
             // Open the ready shard directory
-            let ready_dir = format!("ready/{shard_str}");
+            let ready_dir = self.layout().ready_shard_dir(shard);
             let shard_fd = match open_relative(self.root_fd.as_fd(), &ready_dir) {
                 Ok(fd) => fd,
                 Err(_) => {
@@ -1673,14 +1673,6 @@ impl Queue {
                     Some(d) => d,
                     None => continue,
                 };
-                let lease_bucket = match steadq_math::lease_bucket(
-                    boottime_deadline,
-                    self.format.lease_bucket_width_ns(),
-                ) {
-                    Some(bucket) => bucket,
-                    None => return LeaseOutcome::NotCommitted(Error::StateExhausted),
-                };
-                let bucket_str = bucket_hex(lease_bucket);
 
                 // Checked generation increment: a source at u64::MAX cannot transition.
                 let new_generation = match parsed.common.generation.checked_add(1) {
@@ -1700,19 +1692,20 @@ impl Queue {
                     maximum_attempts: parsed.common.maximum_attempts,
                 };
 
-                let leased_name = steadq_names::make_leased_name(
-                    self.format.queue_id(),
-                    &self.boot_id,
-                    &bucket_str,
-                    &shard_str,
+                let lease_target = match self.layout().leased_for_boot(
                     &leased_common,
+                    &self.boot_id,
                     boottime_deadline,
                     wall_deadline,
                     &lease_token,
-                );
-
-                // Ensure lease directory exists
-                let leased_dir = format!("leased/{}/{}/{}", self.boot_id, bucket_str, shard_str);
+                ) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        scan_had_error = true;
+                        continue;
+                    }
+                };
+                let leased_dir = lease_target.directory();
                 if let Err(e) = self.ensure_dir(&leased_dir) {
                     // R4-B04: Propagate real errors, don't mask as scan miss
                     scan_had_error = true;
@@ -1773,7 +1766,7 @@ impl Queue {
                     shard_fd.as_fd(),
                     entry,
                     leased_dir_fd.as_fd(),
-                    &leased_name,
+                    &lease_target.filename,
                     engine::MoveIdentity::new(claim_source.device, claim_source.inode),
                     engine::MoveActor::Consumer,
                     |_| {
@@ -1928,7 +1921,7 @@ impl Queue {
                                 Error::PayloadCorrupt => {
                                     if let Err(failure) = self.quarantine_corrupt_lease(
                                         leased_dir_fd.as_fd(),
-                                        &leased_name,
+                                        &lease_target.filename,
                                         leased_file.as_fd(),
                                     ) {
                                         if failure.is_outcome_unknown() {
@@ -1969,7 +1962,7 @@ impl Queue {
                             payload_digest: header.payload_digest,
                             expected_dev: leased_object.device(),
                             expected_inode: leased_object.inode(),
-                            exact_source_path: format!("{leased_dir}/{leased_name}"),
+                            exact_source_path: format!("{leased_dir}/{}", lease_target.filename),
                         };
 
                         return LeaseOutcome::Leased(lease_info);
@@ -2890,7 +2883,6 @@ impl Queue {
         reason: DeadReason,
         wall_floor: WallFloor,
     ) -> Result<(), Error> {
-        let shard_str = ready_dir.rsplit('/').next().unwrap_or("0000");
         let terminal_bucket = match steadq_math::bucket_number(
             wall_floor.unix_ns(),
             self.format.terminal_bucket_width_ns(),
@@ -2898,7 +2890,6 @@ impl Queue {
             Some(bucket) => bucket,
             None => return Err(Error::StateExhausted),
         };
-        let bucket_str = bucket_hex(terminal_bucket);
 
         let new_gen = common
             .generation
@@ -2911,14 +2902,10 @@ impl Queue {
             maximum_attempts: common.maximum_attempts,
         };
 
-        let dead_name = steadq_names::make_dead_name(
-            self.format.queue_id(),
-            &bucket_str,
-            shard_str,
-            &dead_common,
-            reason as u16,
-        );
-        let dead_dir = format!("dead/{bucket_str}/{shard_str}");
+        let target = self
+            .layout()
+            .dead_in_bucket(&dead_common, reason as u16, terminal_bucket);
+        let dead_dir = target.directory();
 
         self.ensure_dir(&dead_dir)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -2931,7 +2918,7 @@ impl Queue {
             ready_dir_fd.as_fd(),
             ready_name,
             dead_dir_fd.as_fd(),
-            &dead_name,
+            &target.filename,
             engine::MoveActor::Consumer,
         ) {
             Ok(()) => Ok(()),

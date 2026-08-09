@@ -68,6 +68,16 @@ impl Target {
         format!("{}/{}", self.directory(), self.filename)
     }
 
+    pub fn shard(&self) -> u32 {
+        match self.location {
+            Location::Ready { shard }
+            | Location::Leased { shard, .. }
+            | Location::Delayed { shard, .. }
+            | Location::Receipt { shard, .. }
+            | Location::Dead { shard, .. } => shard,
+        }
+    }
+
     pub fn state(&self) -> steadq_names::State {
         match self.location {
             Location::Ready { .. } => steadq_names::State::Ready,
@@ -110,6 +120,36 @@ impl<'a> Layout<'a> {
 
     fn shard_for(&self, job_id: &[u8; 16]) -> u32 {
         steadq_names::compute_shard(self.queue_id, job_id, self.shard_count)
+    }
+
+    /// Directory path for a ready shard.
+    pub fn ready_shard_dir(&self, shard: u32) -> String {
+        format!("ready/{}", shard_hex(shard))
+    }
+
+    /// Directory path for a leased shard under a given boot and bucket.
+    pub fn leased_shard_dir(&self, boot_id: &str, bucket: u64, shard: u32) -> String {
+        format!(
+            "leased/{}/{}/{}",
+            boot_id,
+            bucket_hex(bucket),
+            shard_hex(shard)
+        )
+    }
+
+    /// Directory path for a delayed shard.
+    pub fn delayed_shard_dir(&self, bucket: u64, shard: u32) -> String {
+        format!("delayed/{}/{}", bucket_hex(bucket), shard_hex(shard))
+    }
+
+    /// Directory path for a dead shard.
+    pub fn dead_shard_dir(&self, bucket: u64, shard: u32) -> String {
+        format!("dead/{}/{}", bucket_hex(bucket), shard_hex(shard))
+    }
+
+    /// Directory path for a receipt shard.
+    pub fn receipt_shard_dir(&self, bucket: u64, shard: u32) -> String {
+        format!("receipts/{}/{}", bucket_hex(bucket), shard_hex(shard))
     }
 
     pub fn ready(&self, common: &CommonFields) -> Target {
@@ -351,6 +391,42 @@ mod tests {
         assert!(!Layout::is_valid_leased_path_parts(6, "leased"));
         assert!(!Layout::is_valid_leased_path_parts(5, "Leased"));
         assert!(!Layout::is_valid_leased_path_parts(0, ""));
+    }
+
+    #[test]
+    fn directory_helpers_match_target_projections() {
+        let layout = Layout::new(
+            &[0xAB; 16],
+            64,
+            1_000_000_000,
+            5_000_000_000,
+            60_000_000_000,
+            "abcd0123-abcd-0123-abcd-0123456789ab",
+        );
+        let common = CommonFields {
+            job_id: [1; 16],
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+
+        let ready = layout.ready(&common);
+        let ready_shard = ready.shard();
+        assert_eq!(layout.ready_shard_dir(ready_shard), ready.directory());
+
+        let dead = layout.dead_in_bucket(&common, 1, 42);
+        assert_eq!(layout.dead_shard_dir(42, dead.shard()), dead.directory());
+
+        let delayed = layout.delayed(&common, 99_999_999_999).unwrap();
+        if let Location::Delayed { bucket, shard } = delayed.location {
+            assert_eq!(layout.delayed_shard_dir(bucket, shard), delayed.directory());
+        }
+
+        let receipt = layout.receipt_in_bucket(&common, &[0; 16], 42);
+        assert_eq!(
+            layout.receipt_shard_dir(42, receipt.shard()),
+            receipt.directory()
+        );
     }
 
     #[test]
