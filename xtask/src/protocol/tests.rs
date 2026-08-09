@@ -560,6 +560,23 @@ fn rejects_duplicate_unlink_sync() {
 }
 
 #[test]
+fn rejects_duplicate_unlink_and_blank_description() {
+    let mut spec = fixture();
+    spec.unlinks.push(spec.unlinks[0].clone());
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "duplicate unlink: full_receipt_retention_deletion"
+    );
+
+    let mut spec = fixture();
+    spec.unlinks[0].description = " \t".into();
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unlink full_receipt_retention_deletion has no description"
+    );
+}
+
+#[test]
 fn renew_requires_conditional_source_directory_barrier_in_order() {
     for (syncs, expected) in [
         (
