@@ -90,6 +90,11 @@ pub(super) fn render_rust(spec: &StateMachineSpec, digest: &str) -> String {
     );
     write_rust_enum(
         &mut output,
+        "ResolverProbeTopology",
+        &ResolverProbeTopology::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
         "SyncStep",
         &SyncStep::ALL.map(|value| (value.rust_name(), value.as_str())),
     );
@@ -133,8 +138,7 @@ pub struct TransitionDef {
     pub linearization: LinearizationPrimitive,
     pub before_linearization_failure: FailureOutcome,
     pub after_linearization_failure: FailureOutcome,
-    /// Human-readable resolver documentation, not an executable rule.
-    pub resolution_behavior: &'static str,
+    pub resolver_probe_topology: ResolverProbeTopology,
     pub qualification: TransitionQualification,
 }
 
@@ -172,16 +176,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
             Nullable::Value(reason) => format!("Some(ReasonClass::{})", reason.rust_name()),
             Nullable::Null => "None".into(),
         };
-        let resolution_behavior = rust_literal(&transition.resolution_behavior);
-        let resolution_field =
-            if 8 + "resolution_behavior: ".len() + resolution_behavior.len() < 100 {
-                format!("resolution_behavior: {resolution_behavior}")
-            } else {
-                format!("resolution_behavior:\n            {resolution_behavior}")
-            };
         writeln!(
             output,
-            "    TransitionDef {{\n        operation: Operation::{},\n        source: State::{},\n        destination: State::{},\n        generation_change: GenerationChange::{},\n        attempt_change: AttemptChange::{},\n        token_change: TokenChange::{},\n        reason_class: {},\n        clock_requirement: ClockRequirement::{},\n        required_syncs: &[{}],\n        linearization: LinearizationPrimitive::{},\n        before_linearization_failure: FailureOutcome::{},\n        after_linearization_failure: FailureOutcome::{},\n        {},\n        qualification: TransitionQualification::{},\n    }},",
+            "    TransitionDef {{\n        operation: Operation::{},\n        source: State::{},\n        destination: State::{},\n        generation_change: GenerationChange::{},\n        attempt_change: AttemptChange::{},\n        token_change: TokenChange::{},\n        reason_class: {},\n        clock_requirement: ClockRequirement::{},\n        required_syncs: &[{}],\n        linearization: LinearizationPrimitive::{},\n        before_linearization_failure: FailureOutcome::{},\n        after_linearization_failure: FailureOutcome::{},\n        resolver_probe_topology: ResolverProbeTopology::{},\n        qualification: TransitionQualification::{},\n    }},",
             transition.operation.rust_name(),
             transition.source.rust_name(),
             transition.destination.rust_name(),
@@ -194,7 +191,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
             transition.linearization.rust_name(),
             transition.before_linearization_failure.rust_name(),
             transition.after_linearization_failure.rust_name(),
-            resolution_field,
+            transition.resolver_probe_topology.rust_name(),
             transition.qualification.rust_name(),
         )
         .expect("writing to String cannot fail");
@@ -262,12 +259,43 @@ mod tests {
     }
     writeln!(
         output,
-        "    }}\n\n    #[test]\n    fn illegal_transitions() {{\n        for (source, destination) in [\n            (State::Receipt, State::Ready),\n            (State::Dead, State::Ready),\n            (State::Quarantine, State::Ready),\n            (State::Ready, State::Ready),\n            (State::Hidden, State::Leased),\n            (State::Ready, State::Receipt),\n        ] {{\n            assert!(!is_legal_transition(source, destination));\n        }}\n    }}\n\n    #[test]\n    fn generated_collections_are_complete() {{\n        assert_eq!(TRANSITIONS.len(), {});\n        assert_eq!(EXCEPTIONS.len(), {});\n        assert_eq!(REENTRY.len(), {});\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.required_syncs.is_empty()));\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.resolution_behavior.is_empty()));\n        assert!(TRANSITIONS.iter().all(|transition| {{\n            transition.before_linearization_failure == FailureOutcome::NotCommitted\n                && transition.after_linearization_failure == FailureOutcome::OutcomeUnknown\n        }}));\n        assert!(EXCEPTIONS.iter().all(|exception| exception.mutation_class\n            == MutationClass::ReplacingMove\n            && exception.linearization == LinearizationPrimitive::RenameReplace\n            && exception.required_syncs == [SyncStep::File, SyncStep::SameOrDestinationDirectory]\n            && exception.before_linearization_failure == FailureOutcome::NotCommitted\n            && exception.after_linearization_failure == FailureOutcome::OutcomeUnknown));\n        assert!(REENTRY.iter().all(|reentry| reentry.creates_new_identity));\n    }}\n\n    #[test]\n    fn claim_projects_complete_semantics() {{\n        let claim = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::Claim)\n            .unwrap();\n        assert_eq!(claim.source, State::Ready);\n        assert_eq!(claim.destination, State::Leased);\n        assert_eq!(claim.attempt_change, AttemptChange::Increment);\n        assert_eq!(claim.generation_change, GenerationChange::Increment);\n        assert_eq!(claim.token_change, TokenChange::New);\n        assert_eq!(claim.reason_class, None);\n        assert_eq!(\n            claim.clock_requirement,\n            ClockRequirement::BoottimeAndAuthenticatedWallFloor\n        );\n        assert_eq!(\n            claim.required_syncs,\n            &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]\n        );\n        assert_eq!(claim.linearization, LinearizationPrimitive::RenameNoreplace);\n        assert_eq!(\n            claim.before_linearization_failure,\n            FailureOutcome::NotCommitted\n        );\n        assert_eq!(\n            claim.after_linearization_failure,\n            FailureOutcome::OutcomeUnknown\n        );\n        assert!(claim.resolution_behavior.contains(\"both\"));\n        assert_eq!(claim.qualification, TransitionQualification::None);\n    }}\n\n    #[test]\n    fn enqueue_uses_no_overwrite_publication() {{\n        let enqueue = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::EnqueueImmediate)\n            .unwrap();\n        assert_eq!(\n            enqueue.linearization,\n            LinearizationPrimitive::PublishNoreplace\n        );\n    }}\n\n    #[test]\n    fn terminal_and_exception_metadata_are_projected() {{\n        let reap = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::ReapExpiredToDead)\n            .unwrap();\n        assert_eq!(reap.reason_class, Some(ReasonClass::AttemptsExhausted));\n        assert_eq!(\n            reap.qualification,\n            TransitionQualification::AttemptsExhausted\n        );\n        assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);\n        assert_eq!(EXCEPTIONS[0].clock_requirement, ClockRequirement::None);\n        assert_eq!(\n            EXCEPTIONS[1].clock_requirement,\n            ClockRequirement::AuthenticatedWallFloor\n        );\n        assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);\n        assert_eq!(REENTRY[0].source, State::Dead);\n    }}\n}}",
+        "    }}\n\n    #[test]\n    fn illegal_transitions() {{\n        for (source, destination) in [\n            (State::Receipt, State::Ready),\n            (State::Dead, State::Ready),\n            (State::Quarantine, State::Ready),\n            (State::Ready, State::Ready),\n            (State::Hidden, State::Leased),\n            (State::Ready, State::Receipt),\n        ] {{\n            assert!(!is_legal_transition(source, destination));\n        }}\n    }}\n\n    #[test]\n    fn generated_collections_are_complete() {{\n        assert_eq!(TRANSITIONS.len(), {});\n        assert_eq!(EXCEPTIONS.len(), {});\n        assert_eq!(REENTRY.len(), {});\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.required_syncs.is_empty()));\n        assert!(TRANSITIONS.iter().all(|transition| {{\n            transition.before_linearization_failure == FailureOutcome::NotCommitted\n                && transition.after_linearization_failure == FailureOutcome::OutcomeUnknown\n        }}));\n        assert!(EXCEPTIONS.iter().all(|exception| exception.mutation_class\n            == MutationClass::ReplacingMove\n            && exception.linearization == LinearizationPrimitive::RenameReplace\n            && exception.required_syncs == [SyncStep::File, SyncStep::SameOrDestinationDirectory]\n            && exception.before_linearization_failure == FailureOutcome::NotCommitted\n            && exception.after_linearization_failure == FailureOutcome::OutcomeUnknown));\n        assert!(REENTRY.iter().all(|reentry| reentry.creates_new_identity));\n    }}\n\n    #[test]\n    fn claim_projects_complete_semantics() {{\n        let claim = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::Claim)\n            .unwrap();\n        assert_eq!(claim.source, State::Ready);\n        assert_eq!(claim.destination, State::Leased);\n        assert_eq!(claim.attempt_change, AttemptChange::Increment);\n        assert_eq!(claim.generation_change, GenerationChange::Increment);\n        assert_eq!(claim.token_change, TokenChange::New);\n        assert_eq!(claim.reason_class, None);\n        assert_eq!(\n            claim.clock_requirement,\n            ClockRequirement::BoottimeAndAuthenticatedWallFloor\n        );\n        assert_eq!(\n            claim.required_syncs,\n            &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]\n        );\n        assert_eq!(claim.linearization, LinearizationPrimitive::RenameNoreplace);\n        assert_eq!(\n            claim.before_linearization_failure,\n            FailureOutcome::NotCommitted\n        );\n        assert_eq!(\n            claim.after_linearization_failure,\n            FailureOutcome::OutcomeUnknown\n        );\n        assert_eq!(\n            claim.resolver_probe_topology,\n            ResolverProbeTopology::SourceAndDestination\n        );\n        assert_eq!(claim.qualification, TransitionQualification::None);\n    }}\n\n    #[test]\n    fn enqueue_uses_no_overwrite_publication() {{\n        let enqueue = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::EnqueueImmediate)\n            .unwrap();\n        assert_eq!(\n            enqueue.linearization,\n            LinearizationPrimitive::PublishNoreplace\n        );\n    }}\n\n    #[test]\n    fn terminal_and_exception_metadata_are_projected() {{\n        let reap = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::ReapExpiredToDead)\n            .unwrap();\n        assert_eq!(reap.reason_class, Some(ReasonClass::AttemptsExhausted));\n        assert_eq!(\n            reap.qualification,\n            TransitionQualification::AttemptsExhausted\n        );\n        assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);\n        assert_eq!(EXCEPTIONS[0].clock_requirement, ClockRequirement::None);\n        assert_eq!(\n            EXCEPTIONS[1].clock_requirement,\n            ClockRequirement::AuthenticatedWallFloor\n        );\n        assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);\n        assert_eq!(REENTRY[0].source, State::Dead);\n    }}\n}}",
         spec.transitions.len(),
         spec.exceptions.len(),
         spec.reentry.len(),
     )
     .expect("writing to String cannot fail");
+    output.push_str(
+        r#"
+#[cfg(test)]
+mod resolver_probe_tests {
+    use super::*;
+
+    fn transition(operation: Operation) -> &'static TransitionDef {
+        TRANSITIONS
+            .iter()
+            .find(|transition| transition.operation == operation)
+            .unwrap()
+    }
+
+    #[test]
+    fn resolver_probe_topology_matrix() {
+        assert_eq!(
+            transition(Operation::EnqueueImmediate).resolver_probe_topology,
+            ResolverProbeTopology::DestinationOnly
+        );
+        assert_eq!(
+            transition(Operation::Claim).resolver_probe_topology,
+            ResolverProbeTopology::SourceAndDestination
+        );
+        assert_eq!(
+            transition(Operation::Acknowledge).resolver_probe_topology,
+            ResolverProbeTopology::ReceiptCandidatesAndSource
+        );
+    }
+}
+"#,
+    );
     output
 }
 
@@ -306,7 +334,7 @@ type TransitionDef struct {\n\
 \tLinearization              string\n\
 \tBeforeLinearizationFailure string\n\
 \tAfterLinearizationFailure  string\n\
-\tResolutionBehavior         string\n\
+\tResolverProbeTopology      string\n\
 \tQualification              string\n\
 }\n\n\
 type ExceptionDef struct {\n\
@@ -343,7 +371,7 @@ var Transitions = []TransitionDef{\n",
             .join(", ");
         writeln!(
             output,
-            "\t{{Operation: {}, Source: {}, Destination: {}, GenerationChange: {}, AttemptChange: {}, TokenChange: {}, ReasonClass: {}, ClockRequirement: {}, RequiredSyncs: []string{{{}}}, Linearization: {}, BeforeLinearizationFailure: {}, AfterLinearizationFailure: {}, ResolutionBehavior: {}, Qualification: {}}},",
+            "\t{{Operation: {}, Source: {}, Destination: {}, GenerationChange: {}, AttemptChange: {}, TokenChange: {}, ReasonClass: {}, ClockRequirement: {}, RequiredSyncs: []string{{{}}}, Linearization: {}, BeforeLinearizationFailure: {}, AfterLinearizationFailure: {}, ResolverProbeTopology: {}, Qualification: {}}},",
             json_string(transition.operation.as_str()),
             json_string(transition.source.as_str()),
             json_string(transition.destination.as_str()),
@@ -356,7 +384,7 @@ var Transitions = []TransitionDef{\n",
             json_string(transition.linearization.as_str()),
             json_string(transition.before_linearization_failure.as_str()),
             json_string(transition.after_linearization_failure.as_str()),
-            json_string(&transition.resolution_behavior),
+            json_string(transition.resolver_probe_topology.as_str()),
             json_string(transition.qualification.as_str()),
         )
         .expect("writing to String cannot fail");
@@ -414,7 +442,7 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
         "<!-- Source: spec/state-machine.json; SHA-256: {digest} -->\n\n\
 # SteadQ/1 State Machine (Generated)\n\n\
 ## Transitions\n\n\
-| Operation | Source | Destination | Gen | Attempt | Token | Reason | Clock requirement | Required syncs | Linearization | Before failure | After failure | Resolution | Qualification |\n\
+| Operation | Source | Destination | Gen | Attempt | Token | Reason | Clock requirement | Required syncs | Linearization | Before failure | After failure | Resolver probes | Qualification |\n\
 |-----------|--------|-------------|-----|---------|-------|--------|-------------------|----------------|---------------|----------------|---------------|------------|-------|\n",
     );
     for transition in &spec.transitions {
@@ -442,7 +470,7 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
             transition.linearization.as_str(),
             transition.before_linearization_failure.as_str(),
             transition.after_linearization_failure.as_str(),
-            markdown(&transition.resolution_behavior),
+            transition.resolver_probe_topology.as_str(),
             transition.qualification.as_str(),
         )
         .expect("writing to String cannot fail");

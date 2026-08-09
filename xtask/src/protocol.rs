@@ -32,7 +32,7 @@ struct Transition {
     linearization: LinearizationPrimitive,
     before_linearization_failure: FailureOutcome,
     after_linearization_failure: FailureOutcome,
-    resolution_behavior: String,
+    resolver_probe_topology: ResolverProbeTopology,
     qualification: TransitionQualification,
 }
 
@@ -123,6 +123,14 @@ enum TransitionQualification {
     AttemptsRemaining,
     AttemptsExhausted,
     RawBytesPreserved,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ResolverProbeTopology {
+    DestinationOnly,
+    SourceAndDestination,
+    ReceiptCandidatesAndSource,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -262,12 +270,6 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
                     sync.as_str()
                 ));
             }
-        }
-        if transition.resolution_behavior.trim().is_empty() {
-            return Err(format!(
-                "transition {} has empty resolution behavior",
-                transition.operation.as_str()
-            ));
         }
         validate_transition_invariant(transition)?;
     }
@@ -426,6 +428,15 @@ fn validate_transition_invariant(transition: &Transition) -> Result<(), String> 
             transition.operation.as_str(),
             transition.qualification.as_str(),
             expected_qualification.as_str()
+        ));
+    }
+    let expected_resolver_probe_topology = transition.operation.resolver_probe_topology();
+    if transition.resolver_probe_topology != expected_resolver_probe_topology {
+        return Err(format!(
+            "transition {} has resolver probe topology {}; expected {}",
+            transition.operation.as_str(),
+            transition.resolver_probe_topology.as_str(),
+            expected_resolver_probe_topology.as_str()
         ));
     }
     let expected_linearization = transition.operation.linearization();
@@ -647,6 +658,23 @@ impl Operation {
             | Self::RetryNow
             | Self::RetryLater
             | Self::Bury => TransitionQualification::None,
+        }
+    }
+
+    fn resolver_probe_topology(self) -> ResolverProbeTopology {
+        match self {
+            Self::EnqueueImmediate | Self::EnqueueDelayed => ResolverProbeTopology::DestinationOnly,
+            Self::Acknowledge => ResolverProbeTopology::ReceiptCandidatesAndSource,
+            Self::Promote
+            | Self::Claim
+            | Self::ExhaustedReadyCleanup
+            | Self::Renew
+            | Self::RetryNow
+            | Self::RetryLater
+            | Self::Bury
+            | Self::ReapExpiredToReady
+            | Self::ReapExpiredToDead
+            | Self::Quarantine => ResolverProbeTopology::SourceAndDestination,
         }
     }
 
@@ -961,6 +989,30 @@ impl TransitionQualification {
             Self::AttemptsRemaining => "AttemptsRemaining",
             Self::AttemptsExhausted => "AttemptsExhausted",
             Self::RawBytesPreserved => "RawBytesPreserved",
+        }
+    }
+}
+
+impl ResolverProbeTopology {
+    const ALL: [Self; 3] = [
+        Self::DestinationOnly,
+        Self::SourceAndDestination,
+        Self::ReceiptCandidatesAndSource,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DestinationOnly => "destination_only",
+            Self::SourceAndDestination => "source_and_destination",
+            Self::ReceiptCandidatesAndSource => "receipt_candidates_and_source",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::DestinationOnly => "DestinationOnly",
+            Self::SourceAndDestination => "SourceAndDestination",
+            Self::ReceiptCandidatesAndSource => "ReceiptCandidatesAndSource",
         }
     }
 }

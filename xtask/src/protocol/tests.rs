@@ -191,7 +191,7 @@ fn rejects_duplicate_operation() {
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both".into(),
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     });
     assert_eq!(
@@ -274,6 +274,23 @@ fn rejects_wrong_transition_qualifications() {
 }
 
 #[test]
+fn rejects_wrong_resolver_probe_topology() {
+    let mut spec = fixture();
+    spec.transitions[0].resolver_probe_topology = ResolverProbeTopology::SourceAndDestination;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition enqueue_immediate has resolver probe topology source_and_destination; expected destination_only"
+    );
+
+    let mut spec = fixture();
+    spec.transitions[6].resolver_probe_topology = ResolverProbeTopology::SourceAndDestination;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition acknowledge has resolver probe topology source_and_destination; expected receipt_candidates_and_source"
+    );
+}
+
+#[test]
 fn rejects_wrong_exception_mutation_semantics() {
     let mut spec = fixture();
     spec.exceptions[0].mutation_class = MutationClass::Unlink;
@@ -339,18 +356,8 @@ fn generated_rust_contains_source_transition() {
 }
 
 #[test]
-fn generated_rust_wraps_the_exact_width_boundary() {
-    let mut spec = fixture();
-    let boundary = "x".repeat(69);
-    spec.transitions[0].resolution_behavior = boundary.clone();
-    let output = render_rust(&spec, "fixture-digest");
-    assert!(output.contains(&format!("resolution_behavior:\n            {boundary:?}")));
-}
-
-#[test]
 fn generated_rust_compiles_schema_valid_control_characters() {
     let mut spec = fixture();
-    spec.transitions[0].resolution_behavior = "resolver\u{8}behavior".into();
     spec.exceptions[0].description = "exception\u{0}description".into();
     spec.reentry[0].description = "reentry\rdescription".into();
 
@@ -424,7 +431,7 @@ fn every_transition_field_affects_every_projection() {
         spec.transitions[0].after_linearization_failure = FailureOutcome::NotCommitted;
     });
     assert_every_projection_changes(|spec| {
-        spec.transitions[0].resolution_behavior = "different resolver documentation".into();
+        spec.transitions[0].resolver_probe_topology = ResolverProbeTopology::SourceAndDestination;
     });
     assert_every_projection_changes(|spec| {
         spec.transitions[0].qualification = TransitionQualification::AttemptsRemaining;
@@ -508,6 +515,10 @@ fn rejects_unknown_protocol_domains() {
         ("/transitions/0/reason_class", "invented_reason"),
         ("/transitions/0/clock_requirement", "invented_clock"),
         ("/transitions/0/qualification", "invented_qualification"),
+        (
+            "/transitions/0/resolver_probe_topology",
+            "invented_probe_topology",
+        ),
         ("/transitions/0/required_syncs/0", "invented_sync"),
         ("/transitions/0/linearization", "invented_linearization"),
         (
@@ -544,7 +555,7 @@ fn rejects_omitted_semantic_fields() {
         "linearization",
         "before_linearization_failure",
         "after_linearization_failure",
-        "resolution_behavior",
+        "resolver_probe_topology",
         "qualification",
     ] {
         let mut input = fixture_value();
@@ -639,6 +650,10 @@ fn rejects_each_cross_field_transition_mutation() {
         (
             "/transitions/3/qualification",
             serde_json::json!("attempts_remaining"),
+        ),
+        (
+            "/transitions/3/resolver_probe_topology",
+            serde_json::json!("destination_only"),
         ),
         (
             "/transitions/3/reason_class",

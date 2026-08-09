@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: bb0a2f768044b96e8346939974403c6bc484aeab3bffee2c6cc647a32eada641
+// Source SHA-256: edbcbf72a8e4ed58b488516f6300f2e7795a8d3c304b74ade0c5c4794d98ad07
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -76,6 +76,13 @@ pub enum TransitionQualification {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ResolverProbeTopology {
+    DestinationOnly,
+    SourceAndDestination,
+    ReceiptCandidatesAndSource,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum SyncStep {
     File,
     DestinationDirectory,
@@ -131,8 +138,7 @@ pub struct TransitionDef {
     pub linearization: LinearizationPrimitive,
     pub before_linearization_failure: FailureOutcome,
     pub after_linearization_failure: FailureOutcome,
-    /// Human-readable resolver documentation, not an executable rule.
-    pub resolution_behavior: &'static str,
+    pub resolver_probe_topology: ResolverProbeTopology,
     pub qualification: TransitionQualification,
 }
 
@@ -170,7 +176,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::PublishNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe destination: observed = committed, absent = not committed",
+        resolver_probe_topology: ResolverProbeTopology::DestinationOnly,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -186,7 +192,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::PublishNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe destination: observed = committed, absent = not committed",
+        resolver_probe_topology: ResolverProbeTopology::DestinationOnly,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -202,8 +208,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior:
-            "probe both: destination observed = committed, source only = not committed",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -219,7 +224,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both directories",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -235,7 +240,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -251,8 +256,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior:
-            "probe destination: new generation observed = renewed, old gen observed = lease lost",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -268,7 +272,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe receipt buckets by exact name",
+        resolver_probe_topology: ResolverProbeTopology::ReceiptCandidatesAndSource,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -284,7 +288,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -300,7 +304,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -316,7 +320,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::None,
     },
     TransitionDef {
@@ -332,7 +336,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::AttemptsRemaining,
     },
     TransitionDef {
@@ -348,7 +352,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::AttemptsExhausted,
     },
     TransitionDef {
@@ -364,7 +368,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
         after_linearization_failure: FailureOutcome::OutcomeUnknown,
-        resolution_behavior: "probe both",
+        resolver_probe_topology: ResolverProbeTopology::SourceAndDestination,
         qualification: TransitionQualification::RawBytesPreserved,
     },
 ];
@@ -457,9 +461,6 @@ mod tests {
         assert!(TRANSITIONS
             .iter()
             .all(|transition| !transition.required_syncs.is_empty()));
-        assert!(TRANSITIONS
-            .iter()
-            .all(|transition| !transition.resolution_behavior.is_empty()));
         assert!(TRANSITIONS.iter().all(|transition| {
             transition.before_linearization_failure == FailureOutcome::NotCommitted
                 && transition.after_linearization_failure == FailureOutcome::OutcomeUnknown
@@ -502,7 +503,10 @@ mod tests {
             claim.after_linearization_failure,
             FailureOutcome::OutcomeUnknown
         );
-        assert!(claim.resolution_behavior.contains("both"));
+        assert_eq!(
+            claim.resolver_probe_topology,
+            ResolverProbeTopology::SourceAndDestination
+        );
         assert_eq!(claim.qualification, TransitionQualification::None);
     }
 
@@ -537,5 +541,33 @@ mod tests {
         );
         assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);
         assert_eq!(REENTRY[0].source, State::Dead);
+    }
+}
+
+#[cfg(test)]
+mod resolver_probe_tests {
+    use super::*;
+
+    fn transition(operation: Operation) -> &'static TransitionDef {
+        TRANSITIONS
+            .iter()
+            .find(|transition| transition.operation == operation)
+            .unwrap()
+    }
+
+    #[test]
+    fn resolver_probe_topology_matrix() {
+        assert_eq!(
+            transition(Operation::EnqueueImmediate).resolver_probe_topology,
+            ResolverProbeTopology::DestinationOnly
+        );
+        assert_eq!(
+            transition(Operation::Claim).resolver_probe_topology,
+            ResolverProbeTopology::SourceAndDestination
+        );
+        assert_eq!(
+            transition(Operation::Acknowledge).resolver_probe_topology,
+            ResolverProbeTopology::ReceiptCandidatesAndSource
+        );
     }
 }

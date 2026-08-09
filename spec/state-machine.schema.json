@@ -28,7 +28,7 @@
           "linearization",
           "before_linearization_failure",
           "after_linearization_failure",
-          "resolution_behavior",
+          "resolver_probe_topology",
           "qualification"
         ],
         "properties": {
@@ -150,9 +150,13 @@
           "after_linearization_failure": {
             "const": "outcome_unknown"
           },
-          "resolution_behavior": {
+          "resolver_probe_topology": {
             "type": "string",
-            "minLength": 1
+            "enum": [
+              "destination_only",
+              "source_and_destination",
+              "receipt_candidates_and_source"
+            ]
           },
           "qualification": {
             "type": "string",

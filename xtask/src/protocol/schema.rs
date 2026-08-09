@@ -4,13 +4,13 @@ use std::path::Path;
 
 use super::{
     AttemptChange, ClockRequirement, ExceptionName, FailureOutcome, GenerationChange,
-    LinearizationPrimitive, MutationClass, Operation, ReasonClass, ReentryName, State, SyncStep,
-    TokenChange, TransitionQualification,
+    LinearizationPrimitive, MutationClass, Operation, ReasonClass, ReentryName,
+    ResolverProbeTopology, State, SyncStep, TokenChange, TransitionQualification,
 };
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "7c8e7112e25b0332dcda5e28a86202d4bd2bd687df8d24ffc51ae88d840eadb4";
+    "d4e082c794187eece39f8df781f96f3e2ef80c26d6f0f17151441da0b6bbf358";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =
@@ -85,6 +85,11 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
         &schema,
         "/properties/transitions/items/properties/qualification/enum",
         &TransitionQualification::ALL.map(TransitionQualification::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/transitions/items/properties/resolver_probe_topology/enum",
+        &ResolverProbeTopology::ALL.map(ResolverProbeTopology::as_str),
     )?;
     validate_schema_const(
         &schema,
