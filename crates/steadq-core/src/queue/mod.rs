@@ -18,6 +18,7 @@ use steadq_math::{self, bucket_number, ceiling_bucket, eligibility_bucket_and_ns
 use steadq_names::{self, bucket_hex, compute_shard, shard_hex, temp_filename, CommonFields};
 
 use crate::errors::*;
+use crate::state_machine::ObjectKind;
 
 /// Configuration for creating a new queue.
 #[derive(Clone, Debug)]
@@ -257,6 +258,12 @@ enum ResolveObj {
     Error(Error),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolverObjectVerifier {
+    Job,
+    Receipt,
+}
+
 struct ResolvedObject {
     directory_fd: OwnedFd,
     directory_device: u64,
@@ -394,6 +401,27 @@ fn classify_presence_failure(error: &io::Error) -> PresenceFailure {
     match error.raw_os_error() {
         Some(libc::ENOENT) => PresenceFailure::Absent,
         _ => PresenceFailure::Io,
+    }
+}
+
+fn resolver_object_verifier(
+    object_kind: ObjectKind,
+    state_directory: &str,
+) -> Option<ResolverObjectVerifier> {
+    match object_kind {
+        ObjectKind::FullJob
+            if matches!(state_directory, "ready" | "leased" | "delayed" | "dead") =>
+        {
+            Some(ResolverObjectVerifier::Job)
+        }
+        ObjectKind::FullReceipt | ObjectKind::CompactReceipt if state_directory == "receipts" => {
+            Some(ResolverObjectVerifier::Receipt)
+        }
+        ObjectKind::FullJob
+        | ObjectKind::FullReceipt
+        | ObjectKind::CompactReceipt
+        | ObjectKind::RawObject
+        | ObjectKind::WatermarkRecord => None,
     }
 }
 
@@ -3755,9 +3783,16 @@ impl Queue {
             Ok(common) => common,
             Err(error) => return ResolutionOutcome::ResolutionFailed(error),
         };
+        let (source_object_kind, destination_object_kind) = ticket.object_kinds();
 
-        let src_result = self.resolve_check_object(&source_path, ticket, &source_common);
-        let dest_result = self.resolve_check_object(&destination_path, ticket, &destination_common);
+        let src_result =
+            self.resolve_check_object(&source_path, ticket, &source_common, source_object_kind);
+        let dest_result = self.resolve_check_object(
+            &destination_path,
+            ticket,
+            &destination_common,
+            destination_object_kind,
+        );
 
         match (src_result, dest_result) {
             // Source exists but destination doesn't
@@ -3853,9 +3888,14 @@ impl Queue {
         path: &ResolvePath<'_>,
         ticket: &TransitionTicket,
         expected_common: &CommonFields,
+        object_kind: ObjectKind,
     ) -> ResolveObj {
         let parts = &path.parts;
         let name = path.name;
+        let verifier = match resolver_object_verifier(object_kind, parts[0]) {
+            Some(verifier) => verifier,
+            None => return ResolveObj::Conflict,
+        };
 
         let dir_fd = match fs::open_directory_beneath(self.root_fd.as_raw_fd(), path.directory) {
             Ok(fd) => fd,
@@ -3902,10 +3942,7 @@ impl Queue {
 
         let state = parts[0];
 
-        if state == "receipts" {
-            if ticket.operation() != TransitionOperation::Acknowledge {
-                return ResolveObj::Conflict;
-            }
+        if verifier == ResolverObjectVerifier::Receipt {
             if parts.len() != 4 {
                 return ResolveObj::Conflict;
             }
@@ -4400,6 +4437,35 @@ mod tests {
                 classify_resolver_object_open_failure(&io::Error::from_raw_os_error(errno)),
                 expected,
             );
+        }
+    }
+
+    #[test]
+    fn resolver_object_verifier_matrix() {
+        for state in ["ready", "leased", "delayed", "dead"] {
+            assert_eq!(
+                resolver_object_verifier(ObjectKind::FullJob, state),
+                Some(ResolverObjectVerifier::Job)
+            );
+        }
+        for state in ["receipts", "quarantine", "control", "hidden"] {
+            assert_eq!(resolver_object_verifier(ObjectKind::FullJob, state), None);
+        }
+
+        for kind in [ObjectKind::FullReceipt, ObjectKind::CompactReceipt] {
+            assert_eq!(
+                resolver_object_verifier(kind, "receipts"),
+                Some(ResolverObjectVerifier::Receipt)
+            );
+            for state in ["ready", "leased", "delayed", "dead", "quarantine"] {
+                assert_eq!(resolver_object_verifier(kind, state), None);
+            }
+        }
+
+        for kind in [ObjectKind::RawObject, ObjectKind::WatermarkRecord] {
+            for state in ["ready", "leased", "delayed", "dead", "receipts"] {
+                assert_eq!(resolver_object_verifier(kind, state), None);
+            }
         }
     }
 
@@ -5955,11 +6021,15 @@ mod tests {
         );
         let (source_relative_path, _) = queue.transition_ticket_paths(&ticket).unwrap();
         let source_path = ResolvePath::new(&source_relative_path).unwrap();
-        let object =
-            match queue.resolve_check_object(&source_path, &ticket, &ticket.source_common()) {
-                ResolveObj::Match(object) => object,
-                _ => panic!("source object did not authenticate"),
-            };
+        let object = match queue.resolve_check_object(
+            &source_path,
+            &ticket,
+            &ticket.source_common(),
+            ObjectKind::FullJob,
+        ) {
+            ResolveObj::Match(object) => object,
+            _ => panic!("source object did not authenticate"),
+        };
 
         let source = tmp.path().join(&source_relative_path);
         let displaced = tmp.path().join("tmp/displaced.sqj");
@@ -6011,11 +6081,15 @@ mod tests {
         );
         let (source_relative_path, _) = queue.transition_ticket_paths(&ticket).unwrap();
         let source_path = ResolvePath::new(&source_relative_path).unwrap();
-        let object =
-            match queue.resolve_check_object(&source_path, &ticket, &ticket.source_common()) {
-                ResolveObj::Match(object) => object,
-                _ => panic!("source object did not authenticate"),
-            };
+        let object = match queue.resolve_check_object(
+            &source_path,
+            &ticket,
+            &ticket.source_common(),
+            ObjectKind::FullJob,
+        ) {
+            ResolveObj::Match(object) => object,
+            _ => panic!("source object did not authenticate"),
+        };
 
         let parent = tmp.path().join(source_path.directory.as_str());
         let displaced = tmp.path().join("tmp/displaced-shard");
