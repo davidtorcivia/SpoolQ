@@ -411,6 +411,25 @@ pub const REENTRY: &[ReentryDef] = &[
     },
 ];
 
+/// Return the complete protocol definition for an operation.
+pub fn transition(operation: Operation) -> &'static TransitionDef {
+    match operation {
+        Operation::EnqueueImmediate => &TRANSITIONS[0],
+        Operation::EnqueueDelayed => &TRANSITIONS[1],
+        Operation::Promote => &TRANSITIONS[2],
+        Operation::Claim => &TRANSITIONS[3],
+        Operation::ExhaustedReadyCleanup => &TRANSITIONS[4],
+        Operation::Renew => &TRANSITIONS[5],
+        Operation::Acknowledge => &TRANSITIONS[6],
+        Operation::RetryNow => &TRANSITIONS[7],
+        Operation::RetryLater => &TRANSITIONS[8],
+        Operation::Bury => &TRANSITIONS[9],
+        Operation::ReapExpiredToReady => &TRANSITIONS[10],
+        Operation::ReapExpiredToDead => &TRANSITIONS[11],
+        Operation::Quarantine => &TRANSITIONS[12],
+    }
+}
+
 /// Check if a transition from source to destination is legal.
 pub fn is_legal_transition(source: State, destination: State) -> bool {
     TRANSITIONS
@@ -548,11 +567,11 @@ mod tests {
 mod resolver_probe_tests {
     use super::*;
 
-    fn transition(operation: Operation) -> &'static TransitionDef {
-        TRANSITIONS
-            .iter()
-            .find(|transition| transition.operation == operation)
-            .unwrap()
+    #[test]
+    fn transition_lookup_is_total() {
+        for definition in TRANSITIONS {
+            assert_eq!(transition(definition.operation), definition);
+        }
     }
 
     #[test]
