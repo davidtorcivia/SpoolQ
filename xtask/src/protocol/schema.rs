@@ -4,13 +4,13 @@ use std::path::Path;
 
 use super::{
     AttemptChange, ClockRequirement, ExceptionName, FailureOutcome, GenerationChange,
-    LinearizationPrimitive, MutationClass, Operation, ReasonClass, ReentryName,
+    LinearizationPrimitive, MutationClass, ObjectKind, Operation, ReasonClass, ReentryName,
     ResolverProbeTopology, State, SyncStep, TokenChange, TransitionQualification,
 };
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "d4e082c794187eece39f8df781f96f3e2ef80c26d6f0f17151441da0b6bbf358";
+    "7f1ce3181c6bd5bb876ebb0528129d4ca70d491561958c7e2f1a9ada424b8517";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =
@@ -38,8 +38,18 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     )?;
     validate_schema_domain(
         &schema,
+        "/properties/transitions/items/properties/source_object_kind/enum",
+        &ObjectKind::ALL.map(ObjectKind::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
         "/properties/transitions/items/properties/destination/enum",
         &State::DESTINATIONS.map(State::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/transitions/items/properties/destination_object_kind/enum",
+        &ObjectKind::ALL.map(ObjectKind::as_str),
     )?;
     validate_schema_domain(
         &schema,
@@ -100,6 +110,16 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
         &schema,
         "/properties/exceptions/items/properties/name/enum",
         &ExceptionName::ALL.map(ExceptionName::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/exceptions/items/properties/source_object_kind/enum",
+        &ObjectKind::ALL.map(ObjectKind::as_str),
+    )?;
+    validate_schema_domain(
+        &schema,
+        "/properties/exceptions/items/properties/destination_object_kind/enum",
+        &ObjectKind::ALL.map(ObjectKind::as_str),
     )?;
     validate_schema_domain(
         &schema,

@@ -3,7 +3,9 @@
     {
       "operation": "enqueue_immediate",
       "source": "hidden",
+      "source_object_kind": "full_job",
       "destination": "ready",
+      "destination_object_kind": "full_job",
       "generation_change": "zero",
       "attempt_change": "zero",
       "token_change": "none",
@@ -22,7 +24,9 @@
     {
       "operation": "enqueue_delayed",
       "source": "hidden",
+      "source_object_kind": "full_job",
       "destination": "delayed",
+      "destination_object_kind": "full_job",
       "generation_change": "zero",
       "attempt_change": "zero",
       "token_change": "none",
@@ -41,7 +45,9 @@
     {
       "operation": "promote",
       "source": "delayed",
+      "source_object_kind": "full_job",
       "destination": "ready",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -60,7 +66,9 @@
     {
       "operation": "claim",
       "source": "ready",
+      "source_object_kind": "full_job",
       "destination": "leased",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "increment",
       "token_change": "new",
@@ -79,7 +87,9 @@
     {
       "operation": "exhausted_ready_cleanup",
       "source": "ready",
+      "source_object_kind": "full_job",
       "destination": "dead",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -98,7 +108,9 @@
     {
       "operation": "renew",
       "source": "leased",
+      "source_object_kind": "full_job",
       "destination": "leased",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "same",
@@ -116,7 +128,9 @@
     {
       "operation": "acknowledge",
       "source": "leased",
+      "source_object_kind": "full_job",
       "destination": "receipt",
+      "destination_object_kind": "full_receipt",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "same",
@@ -135,7 +149,9 @@
     {
       "operation": "retry_now",
       "source": "leased",
+      "source_object_kind": "full_job",
       "destination": "ready",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -154,7 +170,9 @@
     {
       "operation": "retry_later",
       "source": "leased",
+      "source_object_kind": "full_job",
       "destination": "delayed",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -173,7 +191,9 @@
     {
       "operation": "bury",
       "source": "leased",
+      "source_object_kind": "full_job",
       "destination": "dead",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -192,7 +212,9 @@
     {
       "operation": "reap_expired_to_ready",
       "source": "leased",
+      "source_object_kind": "full_job",
       "destination": "ready",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -211,7 +233,9 @@
     {
       "operation": "reap_expired_to_dead",
       "source": "leased",
+      "source_object_kind": "full_job",
       "destination": "dead",
+      "destination_object_kind": "full_job",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -230,7 +254,9 @@
     {
       "operation": "quarantine",
       "source": "active",
+      "source_object_kind": "raw_object",
       "destination": "quarantine",
+      "destination_object_kind": "raw_object",
       "generation_change": "increment",
       "attempt_change": "unchanged",
       "token_change": "none",
@@ -251,6 +277,8 @@
     {
       "name": "receipt_compaction",
       "description": "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname",
+      "source_object_kind": "full_receipt",
+      "destination_object_kind": "compact_receipt",
       "clock_requirement": "none",
       "mutation_class": "replacing_move",
       "linearization": "rename_replace",
@@ -264,6 +292,8 @@
     {
       "name": "wall_watermark_advancement",
       "description": "Monotone wall-watermark record replaced under exclusive OFD lock",
+      "source_object_kind": "watermark_record",
+      "destination_object_kind": "watermark_record",
       "clock_requirement": "authenticated_wall_floor",
       "mutation_class": "replacing_move",
       "linearization": "rename_replace",

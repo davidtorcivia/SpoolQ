@@ -18,7 +18,9 @@
         "required": [
           "operation",
           "source",
+          "source_object_kind",
           "destination",
+          "destination_object_kind",
           "generation_change",
           "attempt_change",
           "token_change",
@@ -63,6 +65,16 @@
               "active"
             ]
           },
+          "source_object_kind": {
+            "type": "string",
+            "enum": [
+              "full_job",
+              "full_receipt",
+              "compact_receipt",
+              "raw_object",
+              "watermark_record"
+            ]
+          },
           "destination": {
             "type": "string",
             "enum": [
@@ -72,6 +84,16 @@
               "dead",
               "receipt",
               "quarantine"
+            ]
+          },
+          "destination_object_kind": {
+            "type": "string",
+            "enum": [
+              "full_job",
+              "full_receipt",
+              "compact_receipt",
+              "raw_object",
+              "watermark_record"
             ]
           },
           "generation_change": {
@@ -179,6 +201,8 @@
         "required": [
           "name",
           "description",
+          "source_object_kind",
+          "destination_object_kind",
           "clock_requirement",
           "mutation_class",
           "linearization",
@@ -197,6 +221,26 @@
           "description": {
             "type": "string",
             "minLength": 1
+          },
+          "source_object_kind": {
+            "type": "string",
+            "enum": [
+              "full_job",
+              "full_receipt",
+              "compact_receipt",
+              "raw_object",
+              "watermark_record"
+            ]
+          },
+          "destination_object_kind": {
+            "type": "string",
+            "enum": [
+              "full_job",
+              "full_receipt",
+              "compact_receipt",
+              "raw_object",
+              "watermark_record"
+            ]
           },
           "clock_requirement": {
             "type": "string",
