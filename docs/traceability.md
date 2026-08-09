@@ -15,7 +15,7 @@ Status: Evolving evidence matrix. Transition metadata is generated from the clos
 | Strict receipt evidence | I9 | Strict ack and central receipt verifier | Operation-bound receipt verification | Not modeled | Payload corruption, legacy receipt, resolver, fsck, recovery, and mutation tests | Partial |
 | Resolver soundness | I10 | Resolver | Handwritten | Bounded both-same stabilization and both-different refusal for one abstract cross-directory move | Observation harness | Partial |
 | Recovery idempotence/progress | I11/I12 | Recovery | N/A | Not modeled | Partial | Open |
-| Wall rollback safety | I13 | Watermark/recovery | N/A | Not modeled | Partial | Open |
+| Wall rollback safety | I13 | Watermark/recovery | N/A | Bounded authenticated-wall scheduling and rollback model, not implementation equivalence | Clock, watermark, and recovery fault tests | Partial |
 | Queue containment | I14 | Resolver/Linux paths | N/A | Not modeled | Partial | Open |
 
 “Partial” means evidence exists but does not yet justify the full contract claim. “Open” means a release-blocking evidence gap remains.

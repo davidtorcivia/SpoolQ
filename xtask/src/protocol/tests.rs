@@ -56,6 +56,7 @@ fn temporary_workspace() -> TempDir {
         "docs",
         "model",
         "model/namespace",
+        "model/scheduling",
     ] {
         fs::create_dir_all(temp.path().join(directory)).unwrap();
     }
@@ -105,6 +106,18 @@ fn temporary_workspace() -> TempDir {
         (
             "model/namespace/README.md",
             include_str!("../../../model/namespace/README.md"),
+        ),
+        (
+            "model/SteadQScheduling.tla",
+            include_str!("../../../model/SteadQScheduling.tla"),
+        ),
+        (
+            "model/scheduling/SteadQScheduling.cfg",
+            include_str!("../../../model/scheduling/SteadQScheduling.cfg"),
+        ),
+        (
+            "model/scheduling/README.md",
+            include_str!("../../../model/scheduling/README.md"),
         ),
         (
             CORE_RUST,
