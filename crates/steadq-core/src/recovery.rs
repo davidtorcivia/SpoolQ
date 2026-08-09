@@ -761,7 +761,7 @@ impl Queue {
             if Self::has_recovery_budget(&stats) {
                 self.recovery_cursor.phase = next_phase;
             }
-            if Self::budget_exhausted(&mut stats, scan.stats, budget, scan.budget, deadline_mono) {
+            if Self::work_budget_exhausted(&mut stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
             }
             if phase == RecoveryPhase::DeleteReceipts {
@@ -860,21 +860,16 @@ impl Queue {
         fs::clock_monotonic_ns().map(|now| now >= deadline_mono)
     }
 
-    /// Check whether any configured recovery budget is exhausted.
-    fn budget_exhausted(
+    /// Check whether classification or mutation work must stop.
+    ///
+    /// Directory enumeration limits are enforced before starting the next
+    /// read. Reaching a scan limit must not discard entries already returned.
+    fn work_budget_exhausted(
         stats: &mut RecoveryStats,
-        scan: &RecoveryScanStats,
         budget: &WorkBudget,
-        scan_budget: &RecoveryScanBudget,
         deadline_mono: u64,
     ) -> bool {
         if stats.operations_attempted >= budget.max_operations {
-            return true;
-        }
-        if scan.entries_read >= scan_budget.max_entries_read
-            || scan.directories_read >= scan_budget.max_directories_read
-            || scan.name_bytes_read >= scan_budget.max_name_bytes_read
-        {
             return true;
         }
         match Self::budget_time_exceeded(deadline_mono) {
@@ -1366,7 +1361,7 @@ impl Queue {
                     continue;
                 }
             }
-            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -1448,7 +1443,7 @@ impl Queue {
                         continue;
                     }
                 }
-                if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+                if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                     stats.budget_exhausted = true;
                     return;
                 }
@@ -1652,13 +1647,7 @@ impl Queue {
                                 continue;
                             }
                         }
-                        if Self::budget_exhausted(
-                            stats,
-                            scan.stats,
-                            budget,
-                            scan.budget,
-                            deadline_mono,
-                        ) {
+                        if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                             stats.budget_exhausted = true;
                             return;
                         }
@@ -2018,7 +2007,7 @@ impl Queue {
                 }
             }
 
-            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -2214,8 +2203,7 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
-                    {
+                    if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -2392,7 +2380,7 @@ impl Queue {
                     continue;
                 }
             }
-            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -2561,8 +2549,7 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
-                    {
+                    if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -2685,7 +2672,7 @@ impl Queue {
                 }
             }
 
-            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -2863,8 +2850,7 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
-                    {
+                    if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -3134,7 +3120,7 @@ impl Queue {
                 }
             }
 
-            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -3337,8 +3323,7 @@ impl Queue {
                             continue;
                         }
                     }
-                    if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono)
-                    {
+                    if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                         stats.budget_exhausted = true;
                         return;
                     }
@@ -3456,7 +3441,7 @@ impl Queue {
                 if !all_observed_children_absent(absent_entries, entries.len()) {
                     continue;
                 }
-                if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+                if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                     stats.budget_exhausted = true;
                     return;
                 }
@@ -3485,7 +3470,7 @@ impl Queue {
             if !all_observed_children_absent(absent_shards, shard_dirs.len()) {
                 continue;
             }
-            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
                 stats.budget_exhausted = true;
                 return;
             }
@@ -4370,9 +4355,17 @@ mod tests {
         let retry_boot = "00000000-0000-0000-0000-000000000003";
         let bucket = "0000000000000000";
         let shard = "0000";
+        let leaf_entry = "z-classified-after-retry";
         std::fs::create_dir_all(
             tmp.path()
                 .join(format!("leased/{cursor_boot}/{bucket}/{shard}")),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(format!(
+                "leased/{cursor_boot}/{bucket}/{shard}/{leaf_entry}"
+            )),
+            b"not a protocol object",
         )
         .unwrap();
         std::fs::create_dir_all(tmp.path().join(format!("leased/{later_boot}"))).unwrap();
@@ -4411,6 +4404,16 @@ mod tests {
         assert!(report.stats.budget_exhausted);
         assert_eq!(report.scan.directories_read, MIN_RECOVERY_PROGRESS_READS);
         assert!(reopened.recovery_cursor.hierarchy_retries.is_empty());
+        let expected_cursor = FourLevelCursor::new(
+            cursor_boot.as_bytes(),
+            bucket.as_bytes(),
+            shard.as_bytes(),
+            leaf_entry.as_bytes(),
+        );
+        assert_eq!(
+            reopened.recovery_cursor.reap_leases,
+            Some(expected_cursor.clone())
+        );
         drop(reopened);
 
         let reopened = Queue::open(
@@ -4422,10 +4425,11 @@ mod tests {
         )
         .unwrap();
         assert!(reopened.recovery_cursor.hierarchy_retries.is_empty());
+        assert_eq!(reopened.recovery_cursor.reap_leases, Some(expected_cursor));
     }
 
     #[test]
-    fn recovery_budget_predicates_cover_operation_time_and_clock_failure() {
+    fn recovery_work_budget_predicate_covers_operation_time_and_clock_failure() {
         fs::fault::reset();
         assert!(Queue::budget_time_exceeded(0).unwrap());
         assert!(!Queue::budget_time_exceeded(u64::MAX).unwrap());
@@ -4435,59 +4439,14 @@ mod tests {
             max_duration_ms: u64::MAX,
         };
         let mut stats = RecoveryStats::default();
-        let scan_budget = RecoveryScanBudget::default();
-        let mut scan = RecoveryScanStats::default();
-        assert!(!Queue::budget_exhausted(
-            &mut stats,
-            &scan,
-            &budget,
-            &scan_budget,
-            u64::MAX,
-        ));
+        assert!(!Queue::work_budget_exhausted(&mut stats, &budget, u64::MAX));
         stats.operations_attempted = 1;
-        assert!(Queue::budget_exhausted(
-            &mut stats,
-            &scan,
-            &budget,
-            &scan_budget,
-            u64::MAX,
-        ));
+        assert!(Queue::work_budget_exhausted(&mut stats, &budget, u64::MAX));
         stats.operations_attempted = 0;
-        assert!(Queue::budget_exhausted(
-            &mut stats,
-            &scan,
-            &budget,
-            &scan_budget,
-            0,
-        ));
-
-        scan.entries_read = scan_budget.max_entries_read;
-        assert!(Queue::budget_exhausted(
-            &mut stats,
-            &scan,
-            &budget,
-            &scan_budget,
-            u64::MAX,
-        ));
-        scan.entries_read = 0;
-        scan.name_bytes_read = scan_budget.max_name_bytes_read;
-        assert!(Queue::budget_exhausted(
-            &mut stats,
-            &scan,
-            &budget,
-            &scan_budget,
-            u64::MAX,
-        ));
-        scan.name_bytes_read = 0;
+        assert!(Queue::work_budget_exhausted(&mut stats, &budget, 0));
 
         fs::fault::inject("clock_monotonic_ns", 1);
-        assert!(Queue::budget_exhausted(
-            &mut stats,
-            &scan,
-            &budget,
-            &scan_budget,
-            u64::MAX,
-        ));
+        assert!(Queue::work_budget_exhausted(&mut stats, &budget, u64::MAX));
         fs::fault::reset();
         assert!(stats.phase_blocked);
         assert!(stats
