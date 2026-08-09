@@ -746,30 +746,55 @@ impl Queue {
         let fmt_tmp = fs::create_exclusive(root_fd.as_fd(), &fmt_tmp_name, 0o600)?;
         fs::write_all(fmt_tmp.as_fd(), &format_bytes)?;
         fs::fsync(fmt_tmp.as_fd())?;
-        // R2-B01: Publish FORMAT with RENAME_NOREPLACE so two concurrent
-        // initializers cannot overwrite each other.
-        match fs::renameat2_noreplace(root_fd.as_fd(), &fmt_tmp_name, root_fd.as_fd(), "FORMAT") {
+        // Publish FORMAT through the phase-aware executor so post-linearization
+        // failures are classified correctly.
+        match engine::move_verified_noreplace(
+            root_fd.as_fd(),
+            &fmt_tmp_name,
+            root_fd.as_fd(),
+            "FORMAT",
+            engine::MoveActor::Producer,
+        ) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // Another initializer won the race. Clean up our temp and bail.
+            Err(engine::MoveFailure::AlreadyExists) => {
                 let _ = fs::unlinkat(root_fd.as_fd(), &fmt_tmp_name);
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "another initializer published FORMAT first",
                 ));
             }
+            Err(engine::MoveFailure::NotCommitted { phase, source }) => {
+                let _ = fs::unlinkat(root_fd.as_fd(), &fmt_tmp_name);
+                return Err(io::Error::other(format!(
+                    "FORMAT publication failed at {phase:?}: {source}"
+                )));
+            }
+            Err(engine::MoveFailure::OutcomeUnknown { phase, source }) => {
+                // FORMAT may or may not be durable. The init marker stays so
+                // a reopening process can detect the indeterminate state.
+                return Err(io::Error::other(format!(
+                    "FORMAT publication indeterminate at {phase:?}: {source}"
+                )));
+            }
+            Err(engine::MoveFailure::SourceMissing) => {
+                return Err(io::Error::other(
+                    "FORMAT temp file vanished during publication",
+                ));
+            }
+        }
+        // C-02: Set FORMAT to read-only.
+        fs::fchmodat(root_fd.as_fd(), "FORMAT", 0o400)?;
+
+        // FORMAT is now the linearization point. The executor has synced the
+        // root directory. Remove the init marker and sync once more. These are
+        // post-commit operations: FORMAT is published and the queue is usable.
+        init_guard.armed = false;
+        match fs::unlinkat(root_fd.as_fd(), ".initializing") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
             Err(e) => return Err(e),
         }
-        // C-02: Set FORMAT to read-only before final dir fsync.
-        fs::fchmodat(root_fd.as_fd(), "FORMAT", 0o400)?;
         fs::fsync_dir_fd(root_fd.as_fd())?;
-
-        // P1-09: FORMAT is now durably published. All subsequent operations are
-        // post-commit cleanup. Their failure does NOT mean init failed - the
-        // queue exists and is usable. Log errors but don't fail the API call.
-        init_guard.armed = false;
-        let _ = fs::unlinkat(root_fd.as_fd(), ".initializing");
-        let _ = fs::fsync_dir_fd(root_fd.as_fd());
 
         Ok(format_rec)
     }
@@ -785,9 +810,21 @@ impl Queue {
             return Err(Error::QueueCorrupt("root path is not a directory".into()));
         }
 
-        // B-11: Read FORMAT through descriptor-relative open, not pathname
-        let format_fd = fs::openat(root_fd.as_fd(), "FORMAT", libc::O_RDONLY, 0)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        // B-11: Read FORMAT through descriptor-relative open, not pathname.
+        // If FORMAT is absent, check whether an initialization was interrupted.
+        let format_fd = match fs::openat(root_fd.as_fd(), "FORMAT", libc::O_RDONLY, 0) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                if fs::fstatat(root_fd.as_fd(), ".initializing").is_ok() {
+                    return Err(Error::QueueCorrupt(
+                        "queue initialization was interrupted; remove .initializing and retry init"
+                            .into(),
+                    ));
+                }
+                return Err(Error::QueueCorrupt("FORMAT file is missing".into()));
+            }
+            Err(e) => return Err(Error::IoFailure(e.to_string())),
+        };
         let mut format_bytes = Vec::new();
         {
             let mut buf = [0u8; 4096];
@@ -7835,6 +7872,77 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(outcome, EnqueueOutcome::NotCommitted(_, _)));
+    }
+
+    #[test]
+    fn open_propagates_non_enoent_format_open_errors() {
+        let (_tmp, queue) = create_test_queue();
+        fs::fault::reset();
+        fs::fault::inject_errno("openat", 1, libc::EIO);
+        let result = Queue::open(
+            _tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        );
+        fs::fault::reset();
+        match result {
+            Err(Error::IoFailure(msg)) => {
+                assert!(!msg.is_empty(), "error message should not be empty")
+            }
+            _other => panic!("expected IoFailure for FORMAT open EIO, got Ok or wrong error"),
+        }
+        drop(queue);
+    }
+
+    #[test]
+    fn open_detects_interrupted_initialization() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("control")).unwrap();
+        std::fs::write(tmp.path().join(".initializing"), b"").unwrap();
+
+        let result = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(Error::QueueCorrupt(msg)) => {
+                assert!(
+                    msg.contains("interrupted"),
+                    "expected 'interrupted' in: {msg}"
+                );
+            }
+            _ => {
+                panic!("expected interrupted init QueueCorrupt error, got Ok or different error")
+            }
+        }
+    }
+
+    #[test]
+    fn open_reports_missing_format_without_init_marker() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("control")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ready")).unwrap();
+
+        let result = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(Error::QueueCorrupt(msg)) => {
+                assert!(msg.contains("FORMAT"), "expected 'FORMAT' in: {msg}");
+            }
+            _ => {
+                panic!("expected missing FORMAT QueueCorrupt error, got Ok or different error")
+            }
+        }
     }
 
     #[test]
