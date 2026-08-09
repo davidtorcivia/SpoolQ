@@ -29,6 +29,14 @@ const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES 
 const MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_ENTRIES as u64 + 1;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_NAME_BYTES as u64 + 255;
 const MAX_RECOVERY_HIERARCHY_RETRIES: usize = 64;
+const MAX_RECOVERY_RESUMED_TRAVERSAL_READS: u64 = 4;
+const RECOVERY_RETRY_READS: u64 = 1;
+const MIN_RECOVERY_PROGRESS_READS: u64 =
+    MAX_RECOVERY_RESUMED_TRAVERSAL_READS + RECOVERY_RETRY_READS;
+const MIN_RECOVERY_PROGRESS_ENTRIES: u64 =
+    MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE * MIN_RECOVERY_PROGRESS_READS;
+const MIN_RECOVERY_PROGRESS_NAME_BYTES: u64 =
+    MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE * MIN_RECOVERY_PROGRESS_READS;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,19 +325,21 @@ pub struct WorkBudget {
 }
 
 /// Recovery directory-enumeration budget.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryScanBudget {
     /// Maximum protocol-visible directory entries returned by `readdir`.
     ///
     /// Enumeration starts only when the remaining budget can cover one
     /// complete bounded directory plus the sentinel entry needed to prove
-    /// overflow.
+    /// overflow. Public recovery requires enough capacity for the deepest
+    /// resumed traversal plus one hierarchy retry.
     pub max_entries_read: u64,
     /// Maximum raw filename bytes across protocol-visible directory entries.
     ///
     /// Enumeration starts only when the remaining budget can cover one
     /// complete bounded directory plus the sentinel name needed to prove
-    /// overflow.
+    /// overflow. Public recovery requires enough capacity for the deepest
+    /// resumed traversal plus one hierarchy retry.
     pub max_name_bytes_read: u64,
 }
 
@@ -344,10 +354,33 @@ impl Default for WorkBudget {
 
 impl Default for RecoveryScanBudget {
     fn default() -> Self {
+        Self::minimum_for_progress()
+    }
+}
+
+impl RecoveryScanBudget {
+    /// Smallest scan budget that can resume the deepest hierarchy and retry
+    /// one deferred directory in the same pass.
+    pub fn minimum_for_progress() -> Self {
         Self {
-            max_entries_read: MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE * 5,
-            max_name_bytes_read: MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE * 5,
+            max_entries_read: MIN_RECOVERY_PROGRESS_ENTRIES,
+            max_name_bytes_read: MIN_RECOVERY_PROGRESS_NAME_BYTES,
         }
+    }
+
+    /// Validate that this budget can make bounded recovery progress.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.max_entries_read < MIN_RECOVERY_PROGRESS_ENTRIES {
+            return Err(Error::InvalidInput(format!(
+                "recovery max_entries_read must be at least {MIN_RECOVERY_PROGRESS_ENTRIES}"
+            )));
+        }
+        if self.max_name_bytes_read < MIN_RECOVERY_PROGRESS_NAME_BYTES {
+            return Err(Error::InvalidInput(format!(
+                "recovery max_name_bytes_read must be at least {MIN_RECOVERY_PROGRESS_NAME_BYTES}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -554,6 +587,18 @@ impl Queue {
     ) -> RecoveryReport {
         let mut stats = RecoveryStats::default();
         let mut scan_stats = RecoveryScanStats::default();
+        if let Err(error) = scan_budget.validate() {
+            stats.phase_blocked = true;
+            stats.errors.push(RecoveryError {
+                operation: "recovery_scan_budget".into(),
+                relative_path: "/".into(),
+                error: error.to_string(),
+            });
+            return RecoveryReport {
+                stats,
+                scan: scan_stats,
+            };
+        }
         let _recovery_lock = match self.acquire_recovery_lock() {
             Ok(lock) => lock,
             Err(error) => {
@@ -4222,6 +4267,56 @@ mod tests {
         assert_eq!(MAX_RECOVERY_DIRECTORY_NAME_BYTES, 16_711_680);
         assert_eq!(MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE, 65_537);
         assert_eq!(MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE, 16_711_935);
+        assert_eq!(MAX_RECOVERY_RESUMED_TRAVERSAL_READS, 4);
+        assert_eq!(RECOVERY_RETRY_READS, 1);
+        assert_eq!(MIN_RECOVERY_PROGRESS_READS, 5);
+        assert_eq!(MIN_RECOVERY_PROGRESS_ENTRIES, 327_685);
+        assert_eq!(MIN_RECOVERY_PROGRESS_NAME_BYTES, 83_559_675);
+        assert_eq!(
+            RecoveryScanBudget::default(),
+            RecoveryScanBudget::minimum_for_progress()
+        );
+    }
+
+    #[test]
+    fn recovery_public_budget_validation_requires_progress_headroom() {
+        assert!(RecoveryScanBudget::minimum_for_progress()
+            .validate()
+            .is_ok());
+
+        for budget in [
+            RecoveryScanBudget {
+                max_entries_read: MIN_RECOVERY_PROGRESS_ENTRIES - 1,
+                ..RecoveryScanBudget::minimum_for_progress()
+            },
+            RecoveryScanBudget {
+                max_name_bytes_read: MIN_RECOVERY_PROGRESS_NAME_BYTES - 1,
+                ..RecoveryScanBudget::minimum_for_progress()
+            },
+        ] {
+            assert!(matches!(budget.validate(), Err(Error::InvalidInput(_))));
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_budget_before_filesystem_work() {
+        let (_tmp, mut queue) = create_test_queue();
+        fs::fault::reset();
+
+        let report = queue.recover_with_scan_budget(
+            &WorkBudget::default(),
+            &RecoveryScanBudget {
+                max_entries_read: MIN_RECOVERY_PROGRESS_ENTRIES - 1,
+                ..RecoveryScanBudget::minimum_for_progress()
+            },
+        );
+
+        assert!(report.stats.phase_blocked);
+        assert_eq!(report.stats.errors.len(), 1);
+        assert_eq!(report.stats.errors[0].operation, "recovery_scan_budget");
+        assert_eq!(report.scan.entries_read, 0);
+        assert_eq!(report.scan.name_bytes_read, 0);
+        assert_eq!(fs::fault::call_count("open_directory"), 0);
     }
 
     #[test]
@@ -5555,6 +5650,18 @@ mod tests {
             .iter()
             .any(|error| error.operation == "clock_monotonic"));
         assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+
+        let mut stats = RecoveryStats::default();
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert!(!stats.budget_exhausted);
+        assert!(queue.recovery_cursor.hierarchy_retries.is_empty());
     }
 
     #[test]

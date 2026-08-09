@@ -4,7 +4,7 @@
 
 The retry ledger contains directory open or enumeration work, not leaf jobs. Resolving a directory retry removes it and clears the phase cursor so a later pass rescans the leaf. A completed retry with a non-budget failure advances the rotating retry frontier and also clears the phase cursor. Budget exhaustion preserves both for replay. A crash restores only the last persisted cursor, ledger, and frontier, while already applied leaf work remains safe to replay.
 
-The configuration starts with one permanently blocked directory retry and one transient directory retry. Every pass spends two of its three work units reaching the saved cursor, leaving one unit for leaf work or retry. One retry attempt loses its remaining budget without advancing the retry frontier, modeling a directory read or deadline that exhausts the pass. The failure bound makes later retry headroom explicit.
+The configuration starts with one permanently blocked directory retry and one transient directory retry. Every pass spends four of its five work units reaching the saved cursor, matching `RecoveryScanBudget::minimum_for_progress` and leaving one unit for leaf work or retry. One retry attempt loses its remaining budget without advancing the retry frontier, modeling a directory read or deadline that exhausts the pass. The failure bound makes later retry headroom explicit.
 
 ## Invariants checked
 
@@ -38,13 +38,13 @@ The configuration starts with one permanently blocked directory retry and one tr
 
 - `ActivePassEventuallyCloses`: every active pass eventually publishes progress or is interrupted by a bounded crash.
 
-The configuration checks every invariant and temporal property separately. The checksum-pinned TLA+ tools 1.7.4 artifact used by CI completes with 742 generated states and 474 distinct states, leaves no queued states, and reports no errors.
+The configuration checks every invariant and temporal property separately. The checksum-pinned TLA+ tools 1.7.4 artifact used by CI completes with 1,018 generated states and 660 distinct states, leaves no queued states, and reports no errors.
 
 ## Fairness and bounds
 
-Weak fairness applies to pass start, recurring hierarchy traversal, canonical leaf scanning, post-scan retry, retry-budget exhaustion, no-retry completion, and end-of-pass publication. Crashes are finite rather than fair. The model uses three leaf entries, two separate directory retries, two recurring traversal units, three shared work units per pass, one retry-budget failure, one transient retry failure, and at most one crash. No new leaf entries or retry targets arrive.
+Weak fairness applies to pass start, recurring hierarchy traversal, canonical leaf scanning, post-scan retry, retry-budget exhaustion, no-retry completion, and end-of-pass publication. Crashes are finite rather than fair. The model uses three leaf entries, two separate directory retries, four recurring traversal units, five shared work units per pass, one retry-budget failure, one transient retry failure, and at most one crash. No new leaf entries or retry targets arrive.
 
-The liveness properties require each pass budget to exceed the recurring traversal cost and require retry budget or deadline exhaustion to be finite. This is an explicit configuration and environment assumption, not a guarantee for every allowed production budget. The model does not claim progress for an undersized caller-supplied scan budget or an environment that consumes every deadline before retry execution.
+The liveness properties require each pass budget to exceed the recurring traversal cost and require retry budget or deadline exhaustion to be finite. Production rejects a scan budget below this bound before filesystem work. Deadline availability remains an explicit environment assumption: the model does not claim progress when every pass deadline expires before retry execution.
 
 ## Not modeled
 
