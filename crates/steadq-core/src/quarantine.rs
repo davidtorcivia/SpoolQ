@@ -1,6 +1,6 @@
 // SteadQ/1 quarantine and fsck operations.
 
-use std::os::unix::io::{AsFd, AsRawFd};
+use std::os::unix::io::{AsFd, BorrowedFd};
 
 use sha2::Digest;
 use steadq_fs_linux as fs;
@@ -243,7 +243,7 @@ impl Queue {
             let Some(entry) = fsck_protocol_name(state_name, raw_entry, report) else {
                 continue;
             };
-            let sub_fd = match fs::open_directory(state_fd.as_raw_fd(), entry) {
+            let sub_fd = match fs::open_directory(state_fd.as_fd(), entry) {
                 Ok(fd) => fd,
                 Err(_) => continue,
             };
@@ -263,7 +263,7 @@ impl Queue {
                     report.total_objects += 1;
                     let full_path = format!("{state_name}/{entry}/{sub_entry}");
                     self.fsck_file(
-                        sub_fd.as_raw_fd(),
+                        sub_fd.as_fd(),
                         state_name,
                         &full_path,
                         sub_entry,
@@ -272,7 +272,7 @@ impl Queue {
                     );
                 } else {
                     // Another directory level (shard under bucket)
-                    let shard_fd = match fs::open_directory(sub_fd.as_raw_fd(), sub_entry) {
+                    let shard_fd = match fs::open_directory(sub_fd.as_fd(), sub_entry) {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
@@ -290,7 +290,7 @@ impl Queue {
                             // C-41: Full path includes all directory levels
                             let full_path = format!("{state_name}/{entry}/{sub_entry}/{file}");
                             self.fsck_file(
-                                shard_fd.as_raw_fd(),
+                                shard_fd.as_fd(),
                                 state_name,
                                 &full_path,
                                 file,
@@ -320,7 +320,7 @@ impl Queue {
             let Some(boot_dir) = fsck_protocol_name("leased", raw_boot_dir, report) else {
                 continue;
             };
-            let boot_fd = match fs::open_directory(leased_fd.as_raw_fd(), boot_dir) {
+            let boot_fd = match fs::open_directory(leased_fd.as_fd(), boot_dir) {
                 Ok(fd) => fd,
                 Err(_) => continue,
             };
@@ -334,7 +334,7 @@ impl Queue {
                 else {
                     continue;
                 };
-                let bucket_fd = match fs::open_directory(boot_fd.as_raw_fd(), bucket_dir) {
+                let bucket_fd = match fs::open_directory(boot_fd.as_fd(), bucket_dir) {
                     Ok(fd) => fd,
                     Err(_) => continue,
                 };
@@ -348,7 +348,7 @@ impl Queue {
                     else {
                         continue;
                     };
-                    let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_dir) {
+                    let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_dir) {
                         Ok(fd) => fd,
                         Err(_) => continue,
                     };
@@ -366,7 +366,7 @@ impl Queue {
                             let full_path =
                                 format!("leased/{boot_dir}/{bucket_dir}/{shard_dir}/{file}");
                             self.fsck_file(
-                                shard_fd.as_raw_fd(),
+                                shard_fd.as_fd(),
                                 "leased",
                                 &full_path,
                                 file,
@@ -388,7 +388,7 @@ impl Queue {
     #[allow(clippy::too_many_arguments)]
     fn fsck_file(
         &self,
-        shard_fd: std::os::unix::io::RawFd,
+        shard_fd: BorrowedFd<'_>,
         state_name: &str,
         full_path: &str,
         filename: &str,
@@ -990,7 +990,7 @@ impl Queue {
 
     pub(crate) fn publish_quarantine_object(
         &self,
-        src_dir_fd: std::os::unix::io::RawFd,
+        src_dir_fd: BorrowedFd<'_>,
         filename: &str,
         reason: crate::QuarantineReason,
     ) -> Result<QuarantinePublication, QuarantinePublishFailure> {
@@ -1005,7 +1005,7 @@ impl Queue {
 
     pub(crate) fn publish_quarantine_object_with_ids<F>(
         &self,
-        src_dir_fd: std::os::unix::io::RawFd,
+        src_dir_fd: BorrowedFd<'_>,
         filename: &str,
         reason: crate::QuarantineReason,
         max_move_attempts: usize,
@@ -1048,7 +1048,7 @@ impl Queue {
             match move_verified_noreplace(
                 src_dir_fd,
                 filename,
-                quarantine_dir.as_raw_fd(),
+                quarantine_dir.as_fd(),
                 &quarantine_name,
                 MoveActor::Recovery,
             ) {
@@ -1092,7 +1092,7 @@ impl Queue {
     /// B-10: Move a corrupt object to quarantine via durable no-overwrite transition.
     fn quarantine_object(
         &self,
-        src_dir_fd: std::os::unix::io::RawFd,
+        src_dir_fd: BorrowedFd<'_>,
         filename: &str,
         full_path: &str,
         reason: crate::QuarantineReason,
@@ -1115,7 +1115,7 @@ impl Queue {
 
     fn quarantine_object_or_record(
         &self,
-        src_dir_fd: std::os::unix::io::RawFd,
+        src_dir_fd: BorrowedFd<'_>,
         filename: &str,
         full_path: &str,
         reason: crate::QuarantineReason,
@@ -1135,7 +1135,7 @@ impl Queue {
     fn repair_quarantine_candidate(
         &self,
         state_name: &str,
-        src_dir_fd: std::os::unix::io::RawFd,
+        src_dir_fd: BorrowedFd<'_>,
         filename: &str,
         full_path: &str,
         reason: crate::QuarantineReason,
@@ -1173,7 +1173,7 @@ impl Queue {
 
     fn quarantine_opened_object(
         &self,
-        src_dir_fd: std::os::unix::io::RawFd,
+        src_dir_fd: BorrowedFd<'_>,
         filename: &str,
         full_path: &str,
         opened: &std::os::fd::OwnedFd,
@@ -1194,7 +1194,7 @@ impl Queue {
                 attempts_consumed: 0,
             });
         }
-        let opened_stat = steadq_fs_linux::fstat(opened.as_raw_fd()).map_err(|error| {
+        let opened_stat = steadq_fs_linux::fstat(opened.as_fd()).map_err(|error| {
             QuarantinePublishFailure::Preparation {
                 phase: QuarantinePreparePhase::SourceIdentity,
                 source: error.to_string(),

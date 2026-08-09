@@ -9,7 +9,7 @@
 // observations: source-only, destination-only, both, neither, conflict.
 
 use std::collections::HashSet;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 #[allow(unused_imports)]
 use std::path::Path;
 
@@ -479,12 +479,12 @@ impl PowerLossHarness {
         }
         if let Some(parent) = dest_path.parent() {
             if let Ok(fd) = fs::open_dir_absolute(parent) {
-                let _ = fs::fsync_dir_fd(fd.as_raw_fd());
+                let _ = fs::fsync_dir_fd(fd.as_fd());
             }
         }
         if let Some(parent) = src_path.parent() {
             if let Ok(fd) = fs::open_dir_absolute(parent) {
-                let _ = fs::fsync_dir_fd(fd.as_raw_fd());
+                let _ = fs::fsync_dir_fd(fd.as_fd());
             }
         }
     }

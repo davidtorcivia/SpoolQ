@@ -1,7 +1,7 @@
 // SteadQ command-line interface.
 
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -446,7 +446,7 @@ fn main() -> ExitCode {
                 if probe_dir.exists() {
                     match steadq_fs_linux::open_dir_absolute(&probe_dir) {
                         Ok(dir_fd) => {
-                            match steadq_fs_linux::probe_publication_mode(dir_fd.as_raw_fd()) {
+                            match steadq_fs_linux::probe_publication_mode(dir_fd.as_fd()) {
                                 Ok(mode) => {
                                     let mode_str = match mode {
                                         steadq_fs_linux::PublicationMode::DirectAtEmptyPath => {
@@ -464,7 +464,7 @@ fn main() -> ExitCode {
                                 Err(e) => results.push(("publication_mode", e.to_string(), false)),
                             }
                             // rename probe
-                            match steadq_fs_linux::probe_rename_noreplace(dir_fd.as_raw_fd()) {
+                            match steadq_fs_linux::probe_rename_noreplace(dir_fd.as_fd()) {
                                 Ok(supported) => results.push((
                                     "rename_noreplace",
                                     if supported {
@@ -477,7 +477,7 @@ fn main() -> ExitCode {
                                 Err(e) => results.push(("rename_noreplace", e.to_string(), false)),
                             }
                             // dir fsync probe
-                            match steadq_fs_linux::probe_dir_fsync(dir_fd.as_raw_fd()) {
+                            match steadq_fs_linux::probe_dir_fsync(dir_fd.as_fd()) {
                                 Ok(supported) => results.push((
                                     "dir_fsync",
                                     if supported {

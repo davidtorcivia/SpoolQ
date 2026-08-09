@@ -1,7 +1,7 @@
 // SteadQ/1 cooperative recovery operations.
 
 use std::io;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 
 use steadq_fs_linux as fs;
 use steadq_math;
@@ -115,7 +115,7 @@ enum RecoveryDirectoryError {
 }
 
 struct RecoveryQuarantineCandidate<'a> {
-    source_directory_fd: std::os::unix::io::RawFd,
+    source_directory_fd: BorrowedFd<'a>,
     filename: &'a str,
     relative_path: &'a str,
     reason: crate::QuarantineReason,
@@ -261,13 +261,13 @@ fn recovery_lock_exists(error: &io::Error) -> bool {
 }
 
 pub(crate) fn load_recovery_cursor(
-    root_fd: std::os::unix::io::RawFd,
+    root_fd: BorrowedFd<'_>,
     queue_id: &[u8; 16],
 ) -> Result<RecoveryCursor, Error> {
     let control_fd = fs::open_directory(root_fd, "control")
         .map_err(|error| Error::IoFailure(error.to_string()))?;
     let cursor_fd = match fs::openat(
-        control_fd.as_raw_fd(),
+        control_fd.as_fd(),
         RECOVERY_CURSOR_FILE,
         RECOVERY_CURSOR_OPEN_FLAGS,
         0,
@@ -278,8 +278,7 @@ pub(crate) fn load_recovery_cursor(
         }
         Err(error) => return Err(Error::IoFailure(error.to_string())),
     };
-    let stat =
-        fs::fstat(cursor_fd.as_raw_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
+    let stat = fs::fstat(cursor_fd.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
     if !cursor_file_metadata_is_valid(stat.st_mode, stat.st_nlink) {
         return Err(Error::QueueCorrupt(
             "recovery cursor is not a singly linked regular file".into(),
@@ -461,15 +460,15 @@ impl Queue {
     fn acquire_recovery_lock(&self) -> Result<OwnedFd, Error> {
         let control_fd = fs::open_directory(self.root_fd(), "control")
             .map_err(|error| Error::IoFailure(error.to_string()))?;
-        let lock_fd = match fs::create_exclusive(control_fd.as_raw_fd(), "recovery.lock", 0o600) {
+        let lock_fd = match fs::create_exclusive(control_fd.as_fd(), "recovery.lock", 0o600) {
             Ok(fd) => {
                 fs::fsync(fd.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
-                fs::fsync_dir_fd(control_fd.as_raw_fd())
+                fs::fsync_dir_fd(control_fd.as_fd())
                     .map_err(|error| Error::IoFailure(error.to_string()))?;
                 fd
             }
             Err(error) if recovery_lock_exists(&error) => fs::openat(
-                control_fd.as_raw_fd(),
+                control_fd.as_fd(),
                 "recovery.lock",
                 RECOVERY_LOCK_OPEN_FLAGS,
                 0,
@@ -513,30 +512,30 @@ impl Queue {
             })?)
         );
         let temp_fd =
-            fs::create_exclusive(control_fd.as_raw_fd(), &temp_name, 0o600).map_err(|error| {
+            fs::create_exclusive(control_fd.as_fd(), &temp_name, 0o600).map_err(|error| {
                 Error::IoFailure(format!(
                     "recovery cursor publication not committed at phase=TempCreate: {error}"
                 ))
             })?;
         if let Err(error) = fs::write_all(temp_fd.as_fd(), &bytes) {
             return Err(Self::cleanup_cursor_temporary_file(
-                control_fd.as_raw_fd(),
+                control_fd.as_fd(),
                 &temp_name,
                 format!("recovery cursor publication not committed at phase=TempWrite: {error}"),
             ));
         }
         if let Err(error) = fs::fsync(temp_fd.as_fd()) {
             return Err(Self::cleanup_cursor_temporary_file(
-                control_fd.as_raw_fd(),
+                control_fd.as_fd(),
                 &temp_name,
                 format!("recovery cursor publication not committed at phase=TempFsync: {error}"),
             ));
         }
 
         match replace_verified(
-            control_fd.as_raw_fd(),
+            control_fd.as_fd(),
             &temp_name,
-            control_fd.as_raw_fd(),
+            control_fd.as_fd(),
             RECOVERY_CURSOR_FILE,
             None,
             MoveActor::Recovery,
@@ -549,7 +548,7 @@ impl Queue {
                     Err(Error::IoFailure(failure))
                 } else {
                     Err(Self::cleanup_cursor_temporary_file(
-                        control_fd.as_raw_fd(),
+                        control_fd.as_fd(),
                         &temp_name,
                         failure,
                     ))
@@ -578,7 +577,7 @@ impl Queue {
     }
 
     fn cleanup_cursor_temporary_file(
-        control_fd: std::os::unix::io::RawFd,
+        control_fd: BorrowedFd<'_>,
         temp_name: &str,
         primary_failure: String,
     ) -> Error {
@@ -994,7 +993,7 @@ impl Queue {
 
     fn cleanup_compaction_temp(
         stats: &mut RecoveryStats,
-        directory_fd: std::os::unix::io::RawFd,
+        directory_fd: BorrowedFd<'_>,
         name: &str,
         relative_path: &str,
     ) {
@@ -1181,7 +1180,7 @@ impl Queue {
         &mut self,
         phase: RecoveryPhase,
         retry: Option<RecoveryHierarchyRetry>,
-        phase_root_fd: std::os::unix::io::RawFd,
+        phase_root_fd: BorrowedFd<'_>,
         scan: &mut RecoveryScanContext<'_>,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
@@ -1232,7 +1231,7 @@ impl Queue {
             }
             let parent_fd = current
                 .as_ref()
-                .map_or(phase_root_fd, std::os::fd::AsRawFd::as_raw_fd);
+                .map_or(phase_root_fd, |directory| directory.as_fd());
             match fs::open_directory(parent_fd, component) {
                 Ok(directory) => current = Some(directory),
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
@@ -1330,7 +1329,7 @@ impl Queue {
         if self.retry_one_hierarchy_directory(
             RecoveryPhase::ReapLeases,
             hierarchy_retry,
-            leased_fd.as_raw_fd(),
+            leased_fd.as_fd(),
             scan,
             stats,
             deadline_mono,
@@ -1383,7 +1382,7 @@ impl Queue {
 
             let is_current_boot = boot_dir_name == self.boot_id;
 
-            let boot_dir_fd = match fs::open_directory(leased_fd.as_raw_fd(), boot_dir_name) {
+            let boot_dir_fd = match fs::open_directory(leased_fd.as_fd(), boot_dir_name) {
                 Ok(fd) => fd,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -1481,7 +1480,7 @@ impl Queue {
                     }
                 }
 
-                let bucket_fd = match fs::open_directory(boot_dir_fd.as_raw_fd(), bucket_name) {
+                let bucket_fd = match fs::open_directory(boot_dir_fd.as_fd(), bucket_name) {
                     Ok(fd) => fd,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -1571,7 +1570,7 @@ impl Queue {
                         );
                         continue;
                     }
-                    let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
+                    let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
                         Ok(fd) => fd,
                         Err(error) => {
                             stats.scan_skips += 1;
@@ -1697,7 +1696,7 @@ impl Queue {
                             shard: shard_name.to_string(),
                         };
                         if let Err(e) =
-                            self.validate_active_object(shard_fd.as_raw_fd(), entry, &leased_ctx)
+                            self.validate_active_object(shard_fd.as_fd(), entry, &leased_ctx)
                         {
                             Self::record_error(
                                 stats,
@@ -1711,7 +1710,7 @@ impl Queue {
                             if matches!(e, Error::QueueCorrupt(_))
                                 && !self.quarantine_recovery_object(
                                     RecoveryQuarantineCandidate {
-                                        source_directory_fd: shard_fd.as_raw_fd(),
+                                        source_directory_fd: shard_fd.as_fd(),
                                         filename: entry,
                                         relative_path: &format!(
                                             "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
@@ -1876,9 +1875,9 @@ impl Queue {
         })?;
 
         move_verified_noreplace(
-            src_fd.as_raw_fd(),
+            src_fd.as_fd(),
             leased_name,
-            dest_fd.as_raw_fd(),
+            dest_fd.as_fd(),
             &ready_name,
             MoveActor::Recovery,
         )
@@ -1946,9 +1945,9 @@ impl Queue {
         })?;
 
         move_verified_noreplace(
-            src_fd.as_raw_fd(),
+            src_fd.as_fd(),
             leased_name,
-            dest_fd.as_raw_fd(),
+            dest_fd.as_fd(),
             &dead_name,
             MoveActor::Recovery,
         )
@@ -1974,7 +1973,7 @@ impl Queue {
         if self.retry_one_hierarchy_directory(
             RecoveryPhase::PromoteDelayed,
             hierarchy_retry,
-            delayed_fd.as_raw_fd(),
+            delayed_fd.as_fd(),
             scan,
             stats,
             deadline_mono,
@@ -2045,7 +2044,7 @@ impl Queue {
                 continue;
             }
 
-            let bucket_fd = match fs::open_directory(delayed_fd.as_raw_fd(), bucket_name) {
+            let bucket_fd = match fs::open_directory(delayed_fd.as_fd(), bucket_name) {
                 Ok(fd) => fd,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -2135,7 +2134,7 @@ impl Queue {
                     );
                     continue;
                 }
-                let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
+                let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -2236,7 +2235,7 @@ impl Queue {
                             shard: shard_name.to_string(),
                         };
                         if let Err(e) =
-                            self.validate_active_object(shard_fd.as_raw_fd(), entry, &delayed_ctx)
+                            self.validate_active_object(shard_fd.as_fd(), entry, &delayed_ctx)
                         {
                             Self::record_error(
                                 stats,
@@ -2247,7 +2246,7 @@ impl Queue {
                             if matches!(e, Error::QueueCorrupt(_))
                                 && !self.quarantine_recovery_object(
                                     RecoveryQuarantineCandidate {
-                                        source_directory_fd: shard_fd.as_raw_fd(),
+                                        source_directory_fd: shard_fd.as_fd(),
                                         filename: entry,
                                         relative_path: &format!(
                                             "delayed/{bucket_name}/{shard_name}/{entry}"
@@ -2321,9 +2320,9 @@ impl Queue {
         })?;
 
         move_verified_noreplace(
-            src_fd.as_raw_fd(),
+            src_fd.as_fd(),
             delayed_name,
-            dest_fd.as_raw_fd(),
+            dest_fd.as_fd(),
             &ready_name,
             MoveActor::Recovery,
         )
@@ -2349,7 +2348,7 @@ impl Queue {
         if self.retry_one_hierarchy_directory(
             RecoveryPhase::CleanupTemp,
             hierarchy_retry,
-            tmp_fd.as_raw_fd(),
+            tmp_fd.as_fd(),
             scan,
             stats,
             deadline_mono,
@@ -2398,7 +2397,7 @@ impl Queue {
 
             let is_current_boot = boot_dir_name == self.boot_id;
 
-            let boot_dir_fd = match fs::open_directory(tmp_fd.as_raw_fd(), boot_dir_name) {
+            let boot_dir_fd = match fs::open_directory(tmp_fd.as_fd(), boot_dir_name) {
                 Ok(fd) => fd,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -2478,7 +2477,7 @@ impl Queue {
                     );
                     continue;
                 }
-                let shard_fd = match fs::open_directory(boot_dir_fd.as_raw_fd(), shard_name) {
+                let shard_fd = match fs::open_directory(boot_dir_fd.as_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -2577,7 +2576,7 @@ impl Queue {
                     if should_delete {
                         let relative_path = format!("tmp/{boot_dir_name}/{shard_name}/{entry}");
                         stats.operations_attempted += 1;
-                        match unlink_verified(shard_fd.as_raw_fd(), entry, MoveActor::Recovery) {
+                        match unlink_verified(shard_fd.as_fd(), entry, MoveActor::Recovery) {
                             Ok(()) => stats.temp_files_deleted += 1,
                             Err(failure) => Self::record_unlink_failure(
                                 stats,
@@ -2635,7 +2634,7 @@ impl Queue {
         if self.retry_one_hierarchy_directory(
             RecoveryPhase::CompactReceipts,
             hierarchy_retry,
-            receipts_fd.as_raw_fd(),
+            receipts_fd.as_fd(),
             scan,
             stats,
             deadline_mono,
@@ -2688,7 +2687,7 @@ impl Queue {
                 continue;
             }
 
-            let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
+            let bucket_fd = match fs::open_directory(receipts_fd.as_fd(), bucket_name) {
                 Ok(fd) => fd,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -2778,7 +2777,7 @@ impl Queue {
                     );
                     continue;
                 }
-                let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
+                let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -2866,7 +2865,7 @@ impl Queue {
                         let temp_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
                         stats.operations_attempted += 1;
                         if let Err(failure) =
-                            unlink_verified(shard_fd.as_raw_fd(), entry, MoveActor::Recovery)
+                            unlink_verified(shard_fd.as_fd(), entry, MoveActor::Recovery)
                         {
                             Self::record_unlink_failure(
                                 stats,
@@ -2884,7 +2883,7 @@ impl Queue {
 
                     // C-35: Open with write-capable mode for OFD write lock
                     let receipt_fd = match fs::openat(
-                        shard_fd.as_raw_fd(),
+                        shard_fd.as_fd(),
                         entry,
                         crate::queue::verified::receipt_write_open_flags(),
                         0,
@@ -2977,8 +2976,7 @@ impl Queue {
 
                     let temp_path = format!("receipts/{bucket_name}/{shard_name}/{tmp_name}");
 
-                    let tmp_fd = match fs::create_exclusive(shard_fd.as_raw_fd(), &tmp_name, 0o600)
-                    {
+                    let tmp_fd = match fs::create_exclusive(shard_fd.as_fd(), &tmp_name, 0o600) {
                         Ok(fd) => fd,
                         Err(error) => {
                             Self::record_error(
@@ -3000,7 +2998,7 @@ impl Queue {
                         );
                         Self::cleanup_compaction_temp(
                             stats,
-                            shard_fd.as_raw_fd(),
+                            shard_fd.as_fd(),
                             &tmp_name,
                             &temp_path,
                         );
@@ -3015,7 +3013,7 @@ impl Queue {
                         );
                         Self::cleanup_compaction_temp(
                             stats,
-                            shard_fd.as_raw_fd(),
+                            shard_fd.as_fd(),
                             &tmp_name,
                             &temp_path,
                         );
@@ -3024,9 +3022,9 @@ impl Queue {
 
                     // Replace the original with the compact version
                     match replace_verified(
-                        shard_fd.as_raw_fd(),
+                        shard_fd.as_fd(),
                         &tmp_name,
-                        shard_fd.as_raw_fd(),
+                        shard_fd.as_fd(),
                         entry,
                         Some(ReplaceIdentity::new(device, inode)),
                         MoveActor::Recovery,
@@ -3044,7 +3042,7 @@ impl Queue {
                             if !outcome_unknown || source_missing {
                                 Self::cleanup_compaction_temp(
                                     stats,
-                                    shard_fd.as_raw_fd(),
+                                    shard_fd.as_fd(),
                                     &tmp_name,
                                     &temp_path,
                                 );
@@ -3083,7 +3081,7 @@ impl Queue {
         if self.retry_one_hierarchy_directory(
             RecoveryPhase::DeleteReceipts,
             hierarchy_retry,
-            receipts_fd.as_raw_fd(),
+            receipts_fd.as_fd(),
             scan,
             stats,
             deadline_mono,
@@ -3159,7 +3157,7 @@ impl Queue {
                 continue;
             }
 
-            let bucket_fd = match fs::open_directory(receipts_fd.as_raw_fd(), bucket_name) {
+            let bucket_fd = match fs::open_directory(receipts_fd.as_fd(), bucket_name) {
                 Ok(fd) => fd,
                 Err(error) => {
                     stats.scan_skips += 1;
@@ -3250,7 +3248,7 @@ impl Queue {
                     );
                     continue;
                 }
-                let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
+                let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(error) => {
                         stats.scan_skips += 1;
@@ -3351,7 +3349,7 @@ impl Queue {
 
                     // C-35: Open with write-capable mode for lock
                     let receipt_fd = match fs::openat(
-                        shard_fd.as_raw_fd(),
+                        shard_fd.as_fd(),
                         entry,
                         crate::queue::verified::receipt_write_open_flags(),
                         0,
@@ -3388,7 +3386,7 @@ impl Queue {
                             continue;
                         }
                     };
-                    let current = match fs::fstatat(shard_fd.as_raw_fd(), entry) {
+                    let current = match fs::fstatat(shard_fd.as_fd(), entry) {
                         Ok(stat) => stat,
                         Err(_) => continue,
                     };
@@ -3408,7 +3406,7 @@ impl Queue {
 
                     stats.operations_attempted += 1;
                     let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
-                    match unlink_verified(shard_fd.as_raw_fd(), entry, MoveActor::Recovery) {
+                    match unlink_verified(shard_fd.as_fd(), entry, MoveActor::Recovery) {
                         Ok(()) => {
                             stats.receipts_expired += 1;
                             absent_entries += 1;
@@ -3441,7 +3439,7 @@ impl Queue {
                 stats.operations_attempted += 1;
                 let shard_path = format!("receipts/{bucket_name}/{shard_name}");
                 match remove_empty_directory_verified(
-                    bucket_fd.as_raw_fd(),
+                    bucket_fd.as_fd(),
                     shard_name,
                     MoveActor::Recovery,
                 ) {
@@ -3470,7 +3468,7 @@ impl Queue {
             stats.operations_attempted += 1;
             let bucket_path = format!("receipts/{bucket_name}");
             match remove_empty_directory_verified(
-                receipts_fd.as_raw_fd(),
+                receipts_fd.as_fd(),
                 bucket_name,
                 MoveActor::Recovery,
             ) {
@@ -4160,7 +4158,7 @@ mod tests {
     fn retry_next_hierarchy_directory(
         queue: &mut Queue,
         phase: RecoveryPhase,
-        phase_root_fd: std::os::unix::io::RawFd,
+        phase_root_fd: BorrowedFd<'_>,
         scan: &mut RecoveryScanContext<'_>,
         stats: &mut RecoveryStats,
         deadline_mono: u64,
@@ -5575,7 +5573,7 @@ mod tests {
         assert!(!retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5593,7 +5591,7 @@ mod tests {
         assert!(!retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5639,7 +5637,7 @@ mod tests {
         assert!(!retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5647,7 +5645,7 @@ mod tests {
         assert!(!retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5681,7 +5679,7 @@ mod tests {
         assert!(retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             0,
@@ -5695,7 +5693,7 @@ mod tests {
         assert!(retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5714,7 +5712,7 @@ mod tests {
         assert!(!retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5755,7 +5753,7 @@ mod tests {
         assert!(!retry_next_hierarchy_directory(
             &mut queue,
             RecoveryPhase::CompactReceipts,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5782,7 +5780,7 @@ mod tests {
             assert!(!retry_next_hierarchy_directory(
                 &mut reopened,
                 RecoveryPhase::CompactReceipts,
-                receipts.as_raw_fd(),
+                receipts.as_fd(),
                 &mut scan,
                 &mut stats,
                 u64::MAX,
@@ -5821,7 +5819,7 @@ mod tests {
         assert!(!queue.retry_one_hierarchy_directory(
             RecoveryPhase::CompactReceipts,
             None,
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5845,7 +5843,7 @@ mod tests {
         assert!(!queue.retry_one_hierarchy_directory(
             RecoveryPhase::CompactReceipts,
             Some(first.clone()),
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5864,7 +5862,7 @@ mod tests {
         assert!(!queue.retry_one_hierarchy_directory(
             RecoveryPhase::CompactReceipts,
             Some(second),
-            receipts.as_raw_fd(),
+            receipts.as_fd(),
             &mut scan,
             &mut stats,
             u64::MAX,
