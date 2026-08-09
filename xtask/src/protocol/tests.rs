@@ -81,6 +81,15 @@ fn temporary_workspace() -> TempDir {
             include_str!("../../../model/SteadQProtocol.tla"),
         ),
         (
+            "model/SteadQ.tla",
+            include_str!("../../../model/SteadQ.tla"),
+        ),
+        (
+            "model/SteadQ.cfg",
+            include_str!("../../../model/SteadQ.cfg"),
+        ),
+        ("model/README.md", include_str!("../../../model/README.md")),
+        (
             CORE_RUST,
             include_str!("../../../crates/steadq-core/src/state_machine.rs"),
         ),

@@ -5,7 +5,7 @@ SteadQ is not formally verified, crash-certified, or production-certified.
 ## Current evidence
 
 - The TLA+ model uses a bounded configuration of two jobs, two workers, and `MaxAttempts=2`. The `Crash` action is not count-bounded.
-- Its configured invariant is the conjunction currently documented in `model/README.md`; it is an abstract model and is not production-code equivalence evidence.
+- TLC checks `TypeInvariant`, `CompleteVisibleEnvelope`, `LeaseHasToken`, `AttemptWithinLimit`, `ReceiptRemainsTerminal`, and `DeliveredAttemptIsPositive` separately. Their exact bounded meanings and omissions are documented in `model/README.md`; they are abstract predicates, not production-code equivalence evidence.
 - The in-process resolver observation harness injects failures and manufactures namespace observations in a temporary directory. It is not a storage power-loss test.
 - The simulator models selected directory-entry durability behavior independently of the Linux executor.
 - Fuzz CI uses bounded parser smoke runs.
