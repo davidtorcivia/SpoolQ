@@ -166,7 +166,11 @@
         "required": [
           "name",
           "description",
-          "uses_replacing_rename"
+          "mutation_class",
+          "linearization",
+          "required_syncs",
+          "before_linearization_failure",
+          "after_linearization_failure"
         ],
         "properties": {
           "name": {
@@ -180,8 +184,38 @@
             "type": "string",
             "minLength": 1
           },
-          "uses_replacing_rename": {
-            "const": true
+          "mutation_class": {
+            "type": "string",
+            "enum": [
+              "no_overwrite_move",
+              "replacing_move",
+              "publication",
+              "unlink",
+              "in_place_read_only_barrier"
+            ]
+          },
+          "linearization": {
+            "const": "rename_replace"
+          },
+          "required_syncs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "file_fsync",
+                "destination_dir_fsync",
+                "source_dir_fsync",
+                "same_or_destination_dir_fsync"
+              ]
+            }
+          },
+          "before_linearization_failure": {
+            "const": "not_committed"
+          },
+          "after_linearization_failure": {
+            "const": "outcome_unknown"
           }
         }
       }

@@ -238,12 +238,26 @@
     {
       "name": "receipt_compaction",
       "description": "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname",
-      "uses_replacing_rename": true
+      "mutation_class": "replacing_move",
+      "linearization": "rename_replace",
+      "required_syncs": [
+        "file_fsync",
+        "same_or_destination_dir_fsync"
+      ],
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown"
     },
     {
       "name": "wall_watermark_advancement",
       "description": "Monotone wall-watermark record replaced under exclusive OFD lock",
-      "uses_replacing_rename": true
+      "mutation_class": "replacing_move",
+      "linearization": "rename_replace",
+      "required_syncs": [
+        "file_fsync",
+        "same_or_destination_dir_fsync"
+      ],
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown"
     }
   ],
   "reentry": [

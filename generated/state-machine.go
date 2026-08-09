@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: 98d2c334df4679cf27cbc45ce270590345f7dd1050305e46ce8fd1b960948e93
+// Source SHA-256: e83f85741adae71434408593f076b82bac478ee42b87a9abc5d59bd38ef053fc
 
 package steadq
 
@@ -25,9 +25,13 @@ type TransitionDef struct {
 }
 
 type ExceptionDef struct {
-	Name                string
-	Description         string
-	UsesReplacingRename bool
+	Name                       string
+	Description                string
+	MutationClass              string
+	Linearization              string
+	RequiredSyncs              []string
+	BeforeLinearizationFailure string
+	AfterLinearizationFailure  string
 }
 
 type ReentryDef struct {
@@ -54,8 +58,8 @@ var Transitions = []TransitionDef{
 }
 
 var Exceptions = []ExceptionDef{
-	{Name: "receipt_compaction", Description: "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname", UsesReplacingRename: true},
-	{Name: "wall_watermark_advancement", Description: "Monotone wall-watermark record replaced under exclusive OFD lock", UsesReplacingRename: true},
+	{Name: "receipt_compaction", Description: "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname", MutationClass: "replacing_move", Linearization: "rename_replace", RequiredSyncs: []string{"file_fsync", "same_or_destination_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown"},
+	{Name: "wall_watermark_advancement", Description: "Monotone wall-watermark record replaced under exclusive OFD lock", MutationClass: "replacing_move", Linearization: "rename_replace", RequiredSyncs: []string{"file_fsync", "same_or_destination_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown"},
 }
 
 var Reentry = []ReentryDef{
