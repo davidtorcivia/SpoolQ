@@ -419,6 +419,7 @@ fn ticket_phase_for_move_outcome_unknown(phase: engine::MovePhase) -> Transition
         | engine::MovePhase::PreRename
         | engine::MovePhase::Rename
         | engine::MovePhase::DestinationIdentity
+        | engine::MovePhase::PostLinearization
         | engine::MovePhase::DestFsync => TransitionPhase::Linearized,
     }
 }
@@ -1768,88 +1769,35 @@ impl Queue {
                     }
                 }
 
-                // Rename ready -> leased with NOREPLACE
-                match fs::renameat2_noreplace(
+                match engine::move_witnessed_noreplace_with(
                     shard_fd.as_fd(),
                     entry,
                     leased_dir_fd.as_fd(),
                     &leased_name,
-                ) {
-                    Ok(()) => {
-                        let leased_stat = match fs::fstatat(leased_dir_fd.as_fd(), &leased_name) {
-                            Ok(stat) => {
-                                match classify_claim_source_identity(&stat, &claim_source) {
-                                    ClaimSourceIdentity::Match => stat,
-                                    ClaimSourceIdentity::Mismatch => {
-                                        self.poison();
-                                        return LeaseOutcome::OutcomeUnknown(
-                                            claim_ticket.with_phase(TransitionPhase::Linearized),
-                                        );
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket.with_phase(TransitionPhase::Linearized),
-                                );
-                            }
-                        };
-                        let refreshed_evidence = match Self::read_claim_ticket_evidence(
+                    engine::MoveIdentity::new(claim_source.device, claim_source.inode),
+                    engine::MoveActor::Consumer,
+                    |_| {
+                        let refreshed_evidence = Self::read_claim_ticket_evidence(
                             claim_source.file_fd.as_fd(),
                             &parsed.common.job_id,
                             parsed.common.maximum_attempts,
-                        ) {
-                            Ok(evidence) => evidence,
-                            Err(_) => {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket.with_phase(TransitionPhase::Linearized),
-                                );
-                            }
-                        };
-                        claim_ticket = match self.claim_transition_ticket(
-                            &parsed.common,
-                            lease_token,
-                            refreshed_evidence,
-                            boottime_deadline,
-                            wall_deadline,
-                        ) {
-                            Ok(ticket) => ticket,
-                            Err(_) => {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket.with_phase(TransitionPhase::Linearized),
-                                );
-                            }
-                        };
-                        if fs::fsync_dir_fd(leased_dir_fd.as_fd()).is_err() {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::Linearized),
-                            );
-                        }
-                        if fs::fsync_dir_fd(shard_fd.as_fd()).is_err() {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket
-                                    .with_phase(TransitionPhase::DestinationDirectoryDurable),
-                            );
-                        }
-
+                        )
+                        .map_err(|error| error.to_string())?;
+                        claim_ticket = self
+                            .claim_transition_ticket(
+                                &parsed.common,
+                                lease_token,
+                                refreshed_evidence,
+                                boottime_deadline,
+                                wall_deadline,
+                            )
+                            .map_err(|error| error.to_string())?;
+                        Ok(())
+                    },
+                ) {
+                    Ok((leased_object, ())) => {
                         // B-03: Post-rename validation failures must NOT continue as Empty.
                         // The claim is committed; failures here are corruption or indeterminate.
-                        // Post-rename: open and verify the leased object
-                        // Verify link count is exactly 1 (rejects external hard links)
-                        if leased_stat.st_nlink != 1 {
-                            self.poison();
-                            return LeaseOutcome::OutcomeUnknown(
-                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
-                            );
-                        }
-
-                        // Read and validate the fixed header
-                        // R4-B06: Open with O_NOFOLLOW to reject symlinks
                         let leased_file = claim_source.file_fd;
 
                         let mut header_buf = [0u8; 128];
@@ -1910,7 +1858,7 @@ impl Queue {
                             // Verify exact file size
                             let expected_claim_size =
                                 (128 + ext_len_h + header.payload_length as usize) as u64;
-                            if leased_stat.st_size as u64 != expected_claim_size {
+                            if leased_object.size() != expected_claim_size {
                                 self.poison();
                                 return LeaseOutcome::OutcomeUnknown(
                                     claim_ticket
@@ -2008,15 +1956,24 @@ impl Queue {
                             content_type,
                             payload_length: header.payload_length,
                             payload_digest: header.payload_digest,
-                            expected_dev: leased_stat.st_dev as u64,
-                            expected_inode: leased_stat.st_ino as u64,
+                            expected_dev: leased_object.device(),
+                            expected_inode: leased_object.inode(),
                             exact_source_path: format!("{leased_dir}/{leased_name}"),
                         };
 
                         return LeaseOutcome::Leased(lease_info);
                     }
-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
-                    Err(_) => {
+                    Err(engine::MoveFailure::SourceMissing) => continue,
+                    Err(engine::MoveFailure::OutcomeUnknown { phase, .. }) => {
+                        self.poison();
+                        return LeaseOutcome::OutcomeUnknown(
+                            claim_ticket.with_phase(ticket_phase_for_move_outcome_unknown(phase)),
+                        );
+                    }
+                    Err(
+                        engine::MoveFailure::AlreadyExists
+                        | engine::MoveFailure::NotCommitted { .. },
+                    ) => {
                         scan_had_error = true;
                         continue;
                     }
@@ -4101,7 +4058,7 @@ impl PublishError {
 mod tests {
     use super::*;
     use crate::FsckOptions;
-    use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
 
     trait CommitOrPanic {
         fn commit_or_panic(&self);
@@ -4202,6 +4159,25 @@ mod tests {
         match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(lease) => lease,
             outcome => panic!("expected lease, got {outcome:?}"),
+        }
+    }
+
+    fn precreate_claim_destination_buckets(tmp: &TempDir, queue: &Queue, lease_duration_ns: u64) {
+        let deadline = fs::clock_boottime_ns()
+            .unwrap()
+            .checked_add(lease_duration_ns)
+            .unwrap();
+        let bucket = steadq_math::lease_bucket(deadline, queue.format.lease_bucket_width_ns)
+            .expect("test lease deadline has a bucket");
+        for bucket in bucket.saturating_sub(1)..=bucket.saturating_add(1) {
+            for shard in 0..queue.format.shard_count {
+                std::fs::create_dir_all(tmp.path().join(format!(
+                    "leased/{}/{}/{shard:04x}",
+                    queue.boot_id,
+                    bucket_hex(bucket)
+                )))
+                .unwrap();
+            }
         }
     }
 
@@ -4367,6 +4343,7 @@ mod tests {
             engine::MovePhase::PreRename,
             engine::MovePhase::Rename,
             engine::MovePhase::DestinationIdentity,
+            engine::MovePhase::PostLinearization,
             engine::MovePhase::DestFsync,
         ] {
             assert_eq!(
@@ -8498,6 +8475,69 @@ mod tests {
             panic!("expected OutcomeUnknown");
         };
         assert_eq!(ticket.phase(), TransitionPhase::Linearized);
+    }
+
+    #[test]
+    fn claim_move_records_each_directory_barrier() {
+        const LEASE_DURATION_NS: u64 = 30_000_000_000;
+        for (fsync_call, expected_phase) in [
+            (1, TransitionPhase::Linearized),
+            (2, TransitionPhase::DestinationDirectoryDurable),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            let enqueue = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"claim barrier".to_vec(),
+                ..Default::default()
+            });
+            assert!(matches!(enqueue, EnqueueOutcome::Committed(_)));
+            precreate_claim_destination_buckets(&tmp, &queue, LEASE_DURATION_NS);
+
+            fs::fault::reset();
+            fs::fault::inject_errno("fsync_dir_fd", fsync_call, libc::EIO);
+            let outcome = queue.lease(0, LEASE_DURATION_NS);
+            fs::fault::reset();
+
+            let LeaseOutcome::OutcomeUnknown(ticket) = outcome else {
+                panic!("expected outcome unknown");
+            };
+            assert_eq!(ticket.phase(), expected_phase);
+        }
+    }
+
+    #[test]
+    fn claim_move_keeps_prelinearization_failure_not_committed() {
+        const LEASE_DURATION_NS: u64 = 30_000_000_000;
+        let (tmp, mut queue) = create_test_queue();
+        let enqueue = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".into(),
+            payload: b"claim rename".to_vec(),
+            ..Default::default()
+        });
+        let EnqueueOutcome::Committed(ticket) = enqueue else {
+            panic!("expected committed enqueue");
+        };
+        precreate_claim_destination_buckets(&tmp, &queue, LEASE_DURATION_NS);
+
+        fs::fault::reset();
+        fs::fault::inject_errno("renameat2_noreplace", 1, libc::EIO);
+        let outcome = queue.lease(0, LEASE_DURATION_NS);
+        fs::fault::reset();
+
+        assert!(matches!(outcome, LeaseOutcome::NotCommitted(_)));
+        assert!(tmp.path().join(ticket.expected_relative_path).exists());
+    }
+
+    #[test]
+    fn claim_move_returns_the_authenticated_destination_identity() {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        let metadata = std::fs::metadata(tmp.path().join(&lease.exact_source_path)).unwrap();
+
+        assert_eq!(lease.expected_dev, metadata.dev());
+        assert_eq!(lease.expected_inode, metadata.ino());
     }
 
     #[test]
