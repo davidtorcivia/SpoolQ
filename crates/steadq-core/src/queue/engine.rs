@@ -71,14 +71,20 @@ impl MovedObject {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum MoveFailure {
     /// The rename did not happen. The destination still needs provisioning
     /// or the source vanished before linearizing.
-    NotCommitted { phase: MovePhase, source: String },
+    NotCommitted {
+        phase: MovePhase,
+        source: std::io::Error,
+    },
     /// The rename happened but the durability barrier failed.
     /// The queue must be poisoned and the caller must surface OutcomeUnknown.
-    OutcomeUnknown { phase: MovePhase, source: String },
+    OutcomeUnknown {
+        phase: MovePhase,
+        source: std::io::Error,
+    },
     /// The rename failed with EEXIST because the destination already exists.
     /// For ack-style exact-source moves this is LeaseLost under verified handles;
     /// for publication it is a retriable not-committed without poison.
@@ -129,10 +135,16 @@ pub enum UnlinkPhase {
     DirectoryFsync,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum UnlinkFailure {
-    NotCommitted { phase: UnlinkPhase, source: String },
-    OutcomeUnknown { phase: UnlinkPhase, source: String },
+    NotCommitted {
+        phase: UnlinkPhase,
+        source: std::io::Error,
+    },
+    OutcomeUnknown {
+        phase: UnlinkPhase,
+        source: std::io::Error,
+    },
     SourceMissing,
 }
 
@@ -142,15 +154,15 @@ pub enum RemoveDirectoryPhase {
     ParentFsync,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum RemoveDirectoryFailure {
     NotCommitted {
         phase: RemoveDirectoryPhase,
-        source: String,
+        source: std::io::Error,
     },
     OutcomeUnknown {
         phase: RemoveDirectoryPhase,
-        source: String,
+        source: std::io::Error,
     },
     SourceMissing,
     NotEmpty,
@@ -165,10 +177,16 @@ pub enum ReplacePhase {
     SourceFsync,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ReplaceFailure {
-    NotCommitted { phase: ReplacePhase, source: String },
-    OutcomeUnknown { phase: ReplacePhase, source: String },
+    NotCommitted {
+        phase: ReplacePhase,
+        source: std::io::Error,
+    },
+    OutcomeUnknown {
+        phase: ReplacePhase,
+        source: std::io::Error,
+    },
     SourceMissing,
     DestinationChanged,
 }
@@ -272,8 +290,8 @@ impl TmpfilePublishFailure {
     }
 }
 
-impl From<MoveFailureWith<String>> for MoveFailure {
-    fn from(failure: MoveFailureWith<String>) -> Self {
+impl From<MoveFailureWith<std::io::Error>> for MoveFailure {
+    fn from(failure: MoveFailureWith<std::io::Error>) -> Self {
         match failure {
             MoveFailureWith::NotCommitted { phase, source } => Self::NotCommitted { phase, source },
             MoveFailureWith::OutcomeUnknown { phase, source } => {
@@ -308,7 +326,7 @@ pub fn move_verified_noreplace(
         dest_dir_fd,
         dest_name,
         None,
-        |error| error.to_string(),
+        |error| error,
         |_| Ok(()),
     )
     .map_err(MoveFailure::from)
@@ -341,7 +359,7 @@ pub fn move_witnessed_noreplace_with<T>(
     dest_name: &str,
     source_identity: MoveIdentity,
     _actor: MoveActor,
-    after_linearization: impl FnOnce(MovedObject) -> Result<T, String>,
+    after_linearization: impl FnOnce(MovedObject) -> Result<T, std::io::Error>,
 ) -> Result<(MovedObject, T), MoveFailure> {
     move_noreplace(
         src_dir_fd,
@@ -349,7 +367,7 @@ pub fn move_witnessed_noreplace_with<T>(
         dest_dir_fd,
         dest_name,
         Some(source_identity),
-        |error| error.to_string(),
+        |error| error,
         move |moved| {
             let moved = moved.expect("witnessed move authenticates its destination");
             after_linearization(moved).map(|output| (moved, output))
@@ -617,13 +635,13 @@ pub fn unlink_verified(
         Err(error) => {
             return Err(UnlinkFailure::NotCommitted {
                 phase: UnlinkPhase::Unlink,
-                source: error.to_string(),
+                source: error,
             });
         }
     }
     fs::fsync_dir_fd(directory_fd).map_err(|error| UnlinkFailure::OutcomeUnknown {
         phase: UnlinkPhase::DirectoryFsync,
-        source: error.to_string(),
+        source: error,
     })
 }
 
@@ -650,13 +668,13 @@ pub fn remove_empty_directory_verified(
         Err(error) => {
             return Err(RemoveDirectoryFailure::NotCommitted {
                 phase: RemoveDirectoryPhase::Remove,
-                source: error.to_string(),
+                source: error,
             });
         }
     }
     fs::fsync_dir_fd(parent_directory_fd).map_err(|error| RemoveDirectoryFailure::OutcomeUnknown {
         phase: RemoveDirectoryPhase::ParentFsync,
-        source: error.to_string(),
+        source: error,
     })
 }
 
@@ -675,7 +693,7 @@ pub fn replace_verified(
         let destination =
             fs::fstatat(dest_dir_fd, dest_name).map_err(|error| ReplaceFailure::NotCommitted {
                 phase: ReplacePhase::DestinationIdentity,
-                source: error.to_string(),
+                source: error,
             })?;
         if !expected_destination.matches(&destination) {
             return Err(ReplaceFailure::DestinationChanged);
@@ -690,7 +708,7 @@ pub fn replace_verified(
         Err(error) => {
             return Err(ReplaceFailure::NotCommitted {
                 phase: ReplacePhase::Rename,
-                source: error.to_string(),
+                source: error,
             });
         }
     }
@@ -698,32 +716,32 @@ pub fn replace_verified(
     if src_dir_fd.as_raw_fd() == dest_dir_fd.as_raw_fd() {
         return fs::fsync_dir_fd(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
             phase: ReplacePhase::DestinationFsync,
-            source: error.to_string(),
+            source: error,
         });
     }
 
     let src_stat = fs::fstat(src_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
         phase: ReplacePhase::DirectoryIdentity,
-        source: error.to_string(),
+        source: error,
     })?;
     let dest_stat = fs::fstat(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
         phase: ReplacePhase::DirectoryIdentity,
-        source: error.to_string(),
+        source: error,
     })?;
     if src_stat.st_dev == dest_stat.st_dev && src_stat.st_ino == dest_stat.st_ino {
         return fs::fsync_dir_fd(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
             phase: ReplacePhase::DestinationFsync,
-            source: error.to_string(),
+            source: error,
         });
     }
 
     fs::fsync_dir_fd(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
         phase: ReplacePhase::DestinationFsync,
-        source: error.to_string(),
+        source: error,
     })?;
     fs::fsync_dir_fd(src_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
         phase: ReplacePhase::SourceFsync,
-        source: error.to_string(),
+        source: error,
     })
 }
 
@@ -733,8 +751,8 @@ pub fn map_move_failure(f: MoveFailure) -> Error {
     match f {
         MoveFailure::AlreadyExists => Error::QueueCorrupt("destination already exists".into()),
         MoveFailure::SourceMissing => Error::QueueCorrupt("source missing".into()),
-        MoveFailure::NotCommitted { source, .. } => Error::IoFailure(source),
-        MoveFailure::OutcomeUnknown { source, .. } => Error::IoFailure(source),
+        MoveFailure::NotCommitted { source, .. } => Error::IoFailure(source.to_string()),
+        MoveFailure::OutcomeUnknown { source, .. } => Error::IoFailure(source.to_string()),
     }
 }
 
@@ -1017,11 +1035,11 @@ mod tests {
         assert!(!is_already_exists(&MoveFailure::SourceMissing));
         assert!(!is_already_exists(&MoveFailure::NotCommitted {
             phase: MovePhase::Rename,
-            source: "x".into()
+            source: std::io::Error::other("x")
         }));
         assert!(!is_already_exists(&MoveFailure::OutcomeUnknown {
             phase: MovePhase::DestFsync,
-            source: "y".into()
+            source: std::io::Error::other("y")
         }));
     }
 
@@ -1031,7 +1049,7 @@ mod tests {
         assert!(!is_source_missing(&MoveFailure::AlreadyExists));
         assert!(!is_source_missing(&MoveFailure::NotCommitted {
             phase: MovePhase::PreRename,
-            source: "z".into()
+            source: std::io::Error::other("z")
         }));
     }
 
@@ -1061,7 +1079,7 @@ mod tests {
     fn move_failure_phase_extraction() {
         let f: MoveFailure = MoveFailure::NotCommitted {
             phase: MovePhase::Rename,
-            source: "a".into(),
+            source: std::io::Error::other("a"),
         };
         assert_eq!(f.phase(), Some(MovePhase::Rename));
         assert!(f.is_not_committed());
@@ -1069,7 +1087,7 @@ mod tests {
 
         let g: MoveFailure = MoveFailure::OutcomeUnknown {
             phase: MovePhase::SourceFsync,
-            source: "b".into(),
+            source: std::io::Error::other("b"),
         };
         assert_eq!(g.phase(), Some(MovePhase::SourceFsync));
         assert!(g.is_outcome_unknown());
@@ -1087,12 +1105,12 @@ mod tests {
         assert!(matches!(e, Error::QueueCorrupt(_)));
         let e = map_move_failure(MoveFailure::NotCommitted {
             phase: MovePhase::Rename,
-            source: "io".into(),
+            source: std::io::Error::other("io"),
         });
         assert!(matches!(e, Error::IoFailure(_)));
         let e = map_move_failure(MoveFailure::OutcomeUnknown {
             phase: MovePhase::DestFsync,
-            source: "fsync".into(),
+            source: std::io::Error::other("fsync"),
         });
         assert!(matches!(e, Error::IoFailure(_)));
     }
@@ -1144,7 +1162,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(r.clone().unwrap_err().is_not_committed());
+        assert!(r.as_ref().unwrap_err().is_not_committed());
         assert!(!matches!(&r, Ok(())));
         // Ensure it is not misclassified as SourceMissing when guard is true
         assert!(!matches!(&r, Err(MoveFailure::SourceMissing)));
@@ -1354,7 +1372,7 @@ mod tests {
                 assert_eq!(moved.device(), source_stat.st_dev);
                 assert_eq!(moved.inode(), source_stat.st_ino);
                 assert_eq!(moved.size(), contents.len() as u64);
-                Err::<(), _>("evidence refresh failed".to_string())
+                Err::<(), _>(std::io::Error::other("evidence refresh failed"))
             },
         )
         .unwrap_err();

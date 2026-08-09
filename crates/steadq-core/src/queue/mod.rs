@@ -1812,7 +1812,7 @@ impl Queue {
                             &parsed.common.job_id,
                             parsed.common.maximum_attempts,
                         )
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
                         claim_ticket = self
                             .claim_transition_ticket(
                                 &parsed.common,
@@ -1821,7 +1821,7 @@ impl Queue {
                                 boottime_deadline,
                                 wall_deadline,
                             )
-                            .map_err(|error| error.to_string())?;
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
                         Ok(())
                     },
                 ) {
@@ -2757,7 +2757,7 @@ impl Queue {
             Err(engine::MoveFailure::SourceMissing) => LeasedMoveOutcome::SourceGone,
             Err(engine::MoveFailure::AlreadyExists) => LeasedMoveOutcome::Collision,
             Err(engine::MoveFailure::NotCommitted { source, .. }) => {
-                LeasedMoveOutcome::Failed(Error::IoFailure(source))
+                LeasedMoveOutcome::Failed(Error::IoFailure(source.to_string()))
             }
             Err(engine::MoveFailure::OutcomeUnknown { phase, .. }) => {
                 LeasedMoveOutcome::OutcomeUnknown(ticket_phase_for_move_outcome_unknown(phase))
@@ -3011,12 +3011,12 @@ impl Queue {
     ) -> Result<(), engine::MoveFailure> {
         let held_stat = fs::fstat(held_fd).map_err(|source| engine::MoveFailure::NotCommitted {
             phase: engine::MovePhase::PreRename,
-            source: source.to_string(),
+            source,
         })?;
         let name_stat = fs::fstatat(leased_dir_fd, leased_name).map_err(|source| {
             engine::MoveFailure::NotCommitted {
                 phase: engine::MovePhase::PreRename,
-                source: source.to_string(),
+                source,
             }
         })?;
         if held_stat.st_dev != name_stat.st_dev || held_stat.st_ino != name_stat.st_ino {
@@ -3026,19 +3026,19 @@ impl Queue {
 
         let qid = fs::random_128bit().map_err(|source| engine::MoveFailure::NotCommitted {
             phase: engine::MovePhase::PreRename,
-            source: source.to_string(),
+            source,
         })?;
         let q_name =
             steadq_names::quarantine_filename(&qid, QuarantineReason::PayloadCorrupt as u16);
         self.ensure_dir("quarantine")
             .map_err(|source| engine::MoveFailure::NotCommitted {
                 phase: engine::MovePhase::PreRename,
-                source: source.to_string(),
+                source,
             })?;
         let q_dir_fd = open_relative(self.root_fd.as_fd(), "quarantine").map_err(|source| {
             engine::MoveFailure::NotCommitted {
                 phase: engine::MovePhase::PreRename,
-                source: source.to_string(),
+                source,
             }
         })?;
 
