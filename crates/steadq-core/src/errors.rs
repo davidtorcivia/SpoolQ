@@ -1,7 +1,8 @@
 // SteadQ/1 error and outcome types.
 
 use crate::state_machine::{
-    self, AttemptChange, GenerationChange, Operation as ProtocolOperation, State as ProtocolState,
+    self, AttemptChange, GenerationChange, ObjectKind, Operation as ProtocolOperation,
+    State as ProtocolState,
 };
 
 /// Error categories for all operations.
@@ -426,6 +427,14 @@ impl TransitionTicket {
             attempt: self.source_attempt,
             maximum_attempts: self.maximum_attempts,
         }
+    }
+
+    pub(crate) fn object_kinds(&self) -> (ObjectKind, ObjectKind) {
+        let definition = state_machine::transition(self.operation.protocol_operation());
+        (
+            definition.source_object_kind,
+            definition.destination_object_kind,
+        )
     }
 
     pub(crate) fn destination_common(&self) -> Result<steadq_names::CommonFields, Error> {
@@ -904,6 +913,63 @@ mod tests {
             (TransitionOperation::Bury, ProtocolOperation::Bury),
         ] {
             assert_eq!(ticket.protocol_operation(), protocol);
+        }
+    }
+
+    #[test]
+    fn ticket_operations_map_to_exact_object_kinds() {
+        let leased_source = || TicketSource::Leased {
+            boot_id: "00000000-0000-0000-0000-000000000000".into(),
+            boottime_deadline_ns: 10,
+            wall_deadline_ns: 20,
+        };
+        for (operation, destination_kind) in [
+            (TransitionOperation::Claim, ObjectKind::FullJob),
+            (TransitionOperation::Renew, ObjectKind::FullJob),
+            (TransitionOperation::Acknowledge, ObjectKind::FullReceipt),
+            (TransitionOperation::RetryNow, ObjectKind::FullJob),
+            (TransitionOperation::RetryLater, ObjectKind::FullJob),
+            (TransitionOperation::Bury, ObjectKind::FullJob),
+        ] {
+            let ticket = TransitionTicket::new(
+                [1; 16],
+                operation,
+                TransitionPhase::Linearized,
+                TicketIdentity::new([2; 16], 7, 1, 3, [3; 16], TicketEvidence::new([4; 32], 5)),
+                match operation {
+                    TransitionOperation::Claim => TicketSource::Ready {},
+                    TransitionOperation::Renew
+                    | TransitionOperation::Acknowledge
+                    | TransitionOperation::RetryNow
+                    | TransitionOperation::RetryLater
+                    | TransitionOperation::Bury => leased_source(),
+                },
+                match operation {
+                    TransitionOperation::Claim | TransitionOperation::Renew => {
+                        TicketDestination::Leased {
+                            boot_id: "00000000-0000-0000-0000-000000000000".into(),
+                            boottime_deadline_ns: 20,
+                            wall_deadline_ns: 30,
+                        }
+                    }
+                    TransitionOperation::Acknowledge => {
+                        TicketDestination::Receipt { terminal_bucket: 5 }
+                    }
+                    TransitionOperation::RetryNow => TicketDestination::Ready {},
+                    TransitionOperation::RetryLater => {
+                        TicketDestination::Delayed { not_before_ns: 50 }
+                    }
+                    TransitionOperation::Bury => TicketDestination::Dead {
+                        terminal_bucket: 5,
+                        reason: 3,
+                    },
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                ticket.object_kinds(),
+                (ObjectKind::FullJob, destination_kind)
+            );
         }
     }
 }
