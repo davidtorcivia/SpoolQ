@@ -2,30 +2,56 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+struct ModelEvidence {
+    model: &'static str,
+    configs: &'static [&'static str],
+    readme: &'static str,
+}
+
 const MODEL: &str = "model/SteadQ.tla";
 const CONFIG: &str = "model/SteadQ.cfg";
 const README: &str = "model/README.md";
+const MODEL_EVIDENCE: &[ModelEvidence] = &[
+    ModelEvidence {
+        model: MODEL,
+        configs: &[CONFIG],
+        readme: README,
+    },
+    ModelEvidence {
+        model: "model/SteadQNamespace.tla",
+        configs: &[
+            "model/namespace/SteadQNamespaceOrdered.cfg",
+            "model/namespace/SteadQNamespaceWeak.cfg",
+        ],
+        readme: "model/namespace/README.md",
+    },
+];
 const INVARIANT_START: &str = "(* ---- Invariants ---- *)";
 const INVARIANT_END: &str = "(* ---- End invariants ---- *)";
 const README_INVARIANT_START: &str = "## Invariants checked";
 
 pub(crate) fn check_invariant_evidence(root: &Path) -> Result<(), String> {
-    let model = read(root, MODEL)?;
-    let config = read(root, CONFIG)?;
-    let readme = read(root, README)?;
-
-    let claimed = claimed_invariants(&model)?;
-    let configured = configured_invariants(&config)?;
-    if configured != claimed {
-        return Err(format!(
-            "{CONFIG} invariant list differs from {MODEL}: expected {claimed:?}, got {configured:?}"
-        ));
-    }
-    let documented = documented_invariants(&readme)?;
-    if documented != claimed {
-        return Err(format!(
-            "{README} invariant list differs from {MODEL}: expected {claimed:?}, got {documented:?}"
-        ));
+    for evidence in MODEL_EVIDENCE {
+        let model = read(root, evidence.model)?;
+        let claimed = claimed_invariants(&model, evidence.model)?;
+        for config_path in evidence.configs {
+            let config = read(root, config_path)?;
+            let configured = configured_invariants(&config, config_path)?;
+            if configured != claimed {
+                return Err(format!(
+                    "{config_path} invariant list differs from {}: expected {claimed:?}, got {configured:?}",
+                    evidence.model
+                ));
+            }
+        }
+        let readme = read(root, evidence.readme)?;
+        let documented = documented_invariants(&readme, evidence.readme)?;
+        if documented != claimed {
+            return Err(format!(
+                "{} invariant list differs from {}: expected {claimed:?}, got {documented:?}",
+                evidence.readme, evidence.model
+            ));
+        }
     }
     Ok(())
 }
@@ -35,19 +61,19 @@ fn read(root: &Path, relative: &str) -> Result<String, String> {
         .map_err(|error| format!("cannot read {relative}: {error}"))
 }
 
-fn claimed_invariants(model: &str) -> Result<Vec<String>, String> {
+fn claimed_invariants(model: &str, source: &str) -> Result<Vec<String>, String> {
     let type_invariant = model
         .lines()
         .filter_map(top_level_operator_name)
         .find(|name| *name == "TypeInvariant")
-        .ok_or_else(|| format!("{MODEL} does not define TypeInvariant"))?;
+        .ok_or_else(|| format!("{source} does not define TypeInvariant"))?;
     let start = model
         .find(INVARIANT_START)
-        .ok_or_else(|| format!("{MODEL} is missing {INVARIANT_START}"))?;
+        .ok_or_else(|| format!("{source} is missing {INVARIANT_START}"))?;
     let body_start = start + INVARIANT_START.len();
     let relative_end = model[body_start..]
         .find(INVARIANT_END)
-        .ok_or_else(|| format!("{MODEL} is missing {INVARIANT_END}"))?;
+        .ok_or_else(|| format!("{source} is missing {INVARIANT_END}"))?;
     let body = &model[body_start..body_start + relative_end];
 
     let mut invariants = vec![type_invariant.to_owned()];
@@ -57,9 +83,9 @@ fn claimed_invariants(model: &str) -> Result<Vec<String>, String> {
             .map(str::to_owned),
     );
     if invariants.len() == 1 {
-        return Err(format!("{MODEL} invariant section is empty"));
+        return Err(format!("{source} invariant section is empty"));
     }
-    reject_duplicates(MODEL, &invariants)?;
+    reject_duplicates(source, &invariants)?;
     Ok(invariants)
 }
 
@@ -83,7 +109,7 @@ fn is_ascii_identifier(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn configured_invariants(config: &str) -> Result<Vec<String>, String> {
+fn configured_invariants(config: &str, source: &str) -> Result<Vec<String>, String> {
     let mut invariants = Vec::new();
     let mut collecting = false;
     let mut found = false;
@@ -96,7 +122,7 @@ fn configured_invariants(config: &str) -> Result<Vec<String>, String> {
         let first = words.next().expect("nonempty line has a first word");
         if matches!(first, "INVARIANT" | "INVARIANTS") {
             if found {
-                return Err(format!("{CONFIG} contains multiple invariant sections"));
+                return Err(format!("{source} contains multiple invariant sections"));
             }
             found = true;
             collecting = true;
@@ -112,19 +138,19 @@ fn configured_invariants(config: &str) -> Result<Vec<String>, String> {
         }
     }
     if !found {
-        return Err(format!("{CONFIG} has no INVARIANT section"));
+        return Err(format!("{source} has no INVARIANT section"));
     }
     if invariants.is_empty() {
-        return Err(format!("{CONFIG} INVARIANT section is empty"));
+        return Err(format!("{source} INVARIANT section is empty"));
     }
-    reject_duplicates(CONFIG, &invariants)?;
+    reject_duplicates(source, &invariants)?;
     Ok(invariants)
 }
 
-fn documented_invariants(readme: &str) -> Result<Vec<String>, String> {
+fn documented_invariants(readme: &str, source: &str) -> Result<Vec<String>, String> {
     let start = readme
         .find(README_INVARIANT_START)
-        .ok_or_else(|| format!("{README} is missing {README_INVARIANT_START}"))?;
+        .ok_or_else(|| format!("{source} is missing {README_INVARIANT_START}"))?;
     let body_start = start + README_INVARIANT_START.len();
     let body = &readme[body_start..];
     let body_end = body.find("\n## ").unwrap_or(body.len());
@@ -136,21 +162,21 @@ fn documented_invariants(readme: &str) -> Result<Vec<String>, String> {
         }
         let remainder = trimmed
             .strip_prefix("- `")
-            .ok_or_else(|| format!("{README} has a malformed invariant bullet: {trimmed}"))?;
+            .ok_or_else(|| format!("{source} has a malformed invariant bullet: {trimmed}"))?;
         let (name, _) = remainder
             .split_once("`:")
-            .ok_or_else(|| format!("{README} has a malformed invariant bullet: {trimmed}"))?;
+            .ok_or_else(|| format!("{source} has a malformed invariant bullet: {trimmed}"))?;
         if !is_ascii_identifier(name) {
             return Err(format!(
-                "{README} has an invalid invariant name in bullet: {trimmed}"
+                "{source} has an invalid invariant name in bullet: {trimmed}"
             ));
         }
         invariants.push(name.to_owned());
     }
     if invariants.is_empty() {
-        return Err(format!("{README} invariant section is empty"));
+        return Err(format!("{source} invariant section is empty"));
     }
-    reject_duplicates(README, &invariants)?;
+    reject_duplicates(source, &invariants)?;
     Ok(invariants)
 }
 
@@ -214,15 +240,15 @@ CONSTANTS
     #[test]
     fn parses_exact_claimed_and_configured_invariants() {
         assert_eq!(
-            claimed_invariants(VALID_MODEL).unwrap(),
+            claimed_invariants(VALID_MODEL, MODEL).unwrap(),
             ["TypeInvariant", "FirstInvariant", "SecondInvariant"]
         );
         assert_eq!(
-            configured_invariants(VALID_CONFIG).unwrap(),
+            configured_invariants(VALID_CONFIG, CONFIG).unwrap(),
             ["TypeInvariant", "FirstInvariant", "SecondInvariant"]
         );
         assert_eq!(
-            documented_invariants(VALID_README).unwrap(),
+            documented_invariants(VALID_README, README).unwrap(),
             ["TypeInvariant", "FirstInvariant", "SecondInvariant"]
         );
     }
@@ -244,23 +270,28 @@ CONSTANTS
 
     #[test]
     fn rejects_missing_empty_and_duplicate_invariant_sections() {
-        assert!(claimed_invariants("TypeInvariant == TRUE").is_err());
-        assert!(claimed_invariants(&format!(
-            "TypeInvariant == TRUE\n{INVARIANT_START}\n{INVARIANT_END}"
-        ))
+        assert!(claimed_invariants("TypeInvariant == TRUE", MODEL).is_err());
+        assert!(claimed_invariants(
+            &format!("TypeInvariant == TRUE\n{INVARIANT_START}\n{INVARIANT_END}"),
+            MODEL
+        )
         .is_err());
-        assert!(claimed_invariants(&format!(
-            "TypeInvariant == TRUE\n{INVARIANT_START}\nTypeInvariant == TRUE\n{INVARIANT_END}"
-        ))
+        assert!(claimed_invariants(
+            &format!(
+                "TypeInvariant == TRUE\n{INVARIANT_START}\nTypeInvariant == TRUE\n{INVARIANT_END}"
+            ),
+            MODEL
+        )
         .is_err());
-        assert!(configured_invariants("INIT Init").is_err());
-        assert!(configured_invariants("INVARIANT\nCONSTANTS").is_err());
-        assert!(configured_invariants("INVARIANT Same Same\nCONSTANTS").is_err());
-        assert!(documented_invariants("# Missing section").is_err());
-        assert!(documented_invariants("## Invariants checked\n\n## Next").is_err());
-        assert!(documented_invariants("## Invariants checked\n\n- malformed\n").is_err());
+        assert!(configured_invariants("INIT Init", CONFIG).is_err());
+        assert!(configured_invariants("INVARIANT\nCONSTANTS", CONFIG).is_err());
+        assert!(configured_invariants("INVARIANT Same Same\nCONSTANTS", CONFIG).is_err());
+        assert!(documented_invariants("# Missing section", README).is_err());
+        assert!(documented_invariants("## Invariants checked\n\n## Next", README).is_err());
+        assert!(documented_invariants("## Invariants checked\n\n- malformed\n", README).is_err());
         assert!(documented_invariants(
-            "## Invariants checked\n\n- `Duplicate`: one.\n- `Duplicate`: two.\n"
+            "## Invariants checked\n\n- `Duplicate`: one.\n- `Duplicate`: two.\n",
+            README,
         )
         .is_err());
     }
@@ -268,15 +299,27 @@ CONSTANTS
     #[test]
     fn repository_evidence_check_rejects_config_and_readme_drift() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir(temp.path().join("model")).unwrap();
-        for (path, contents) in [
-            (MODEL, VALID_MODEL),
-            (CONFIG, VALID_CONFIG),
-            (README, VALID_README),
-        ] {
-            fs::write(temp.path().join(path), contents).unwrap();
+        fs::create_dir_all(temp.path().join("model/namespace")).unwrap();
+        for evidence in MODEL_EVIDENCE {
+            fs::write(temp.path().join(evidence.model), VALID_MODEL).unwrap();
+            for config in evidence.configs {
+                fs::write(temp.path().join(config), VALID_CONFIG).unwrap();
+            }
+            fs::write(temp.path().join(evidence.readme), VALID_README).unwrap();
         }
         check_invariant_evidence(temp.path()).unwrap();
+
+        let namespace_weak = "model/namespace/SteadQNamespaceWeak.cfg";
+        fs::write(
+            temp.path().join(namespace_weak),
+            VALID_CONFIG.replace("  SecondInvariant\n", ""),
+        )
+        .unwrap();
+        assert_eq!(
+            check_invariant_evidence(temp.path()).unwrap_err(),
+            "model/namespace/SteadQNamespaceWeak.cfg invariant list differs from model/SteadQNamespace.tla: expected [\"TypeInvariant\", \"FirstInvariant\", \"SecondInvariant\"], got [\"TypeInvariant\", \"FirstInvariant\"]"
+        );
+        fs::write(temp.path().join(namespace_weak), VALID_CONFIG).unwrap();
 
         fs::write(
             temp.path().join(CONFIG),

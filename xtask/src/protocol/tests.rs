@@ -55,6 +55,7 @@ fn temporary_workspace() -> TempDir {
         ".github",
         "docs",
         "model",
+        "model/namespace",
     ] {
         fs::create_dir_all(temp.path().join(directory)).unwrap();
     }
@@ -89,6 +90,22 @@ fn temporary_workspace() -> TempDir {
             include_str!("../../../model/SteadQ.cfg"),
         ),
         ("model/README.md", include_str!("../../../model/README.md")),
+        (
+            "model/SteadQNamespace.tla",
+            include_str!("../../../model/SteadQNamespace.tla"),
+        ),
+        (
+            "model/namespace/SteadQNamespaceOrdered.cfg",
+            include_str!("../../../model/namespace/SteadQNamespaceOrdered.cfg"),
+        ),
+        (
+            "model/namespace/SteadQNamespaceWeak.cfg",
+            include_str!("../../../model/namespace/SteadQNamespaceWeak.cfg"),
+        ),
+        (
+            "model/namespace/README.md",
+            include_str!("../../../model/namespace/README.md"),
+        ),
         (
             CORE_RUST,
             include_str!("../../../crates/steadq-core/src/state_machine.rs"),
