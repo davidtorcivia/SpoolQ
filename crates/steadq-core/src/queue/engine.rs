@@ -59,6 +59,52 @@ pub enum UnlinkFailure {
     SourceMissing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplacePhase {
+    DestinationIdentity,
+    Rename,
+    DirectoryIdentity,
+    DestinationFsync,
+    SourceFsync,
+}
+
+#[derive(Clone, Debug)]
+pub enum ReplaceFailure {
+    NotCommitted { phase: ReplacePhase, source: String },
+    OutcomeUnknown { phase: ReplacePhase, source: String },
+    SourceMissing,
+    DestinationChanged,
+}
+
+impl ReplaceFailure {
+    pub fn phase(&self) -> Option<ReplacePhase> {
+        match self {
+            Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
+            Self::SourceMissing | Self::DestinationChanged => None,
+        }
+    }
+
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl ReplaceIdentity {
+    pub fn new(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+
+    fn matches(self, stat: &libc::stat) -> bool {
+        stat.st_dev == self.device && stat.st_ino == self.inode
+    }
+}
+
 impl UnlinkFailure {
     pub fn phase(&self) -> Option<UnlinkPhase> {
         match self {
@@ -154,6 +200,73 @@ pub fn unlink_verified(
     }
     fs::fsync_dir_fd(directory_fd).map_err(|error| UnlinkFailure::OutcomeUnknown {
         phase: UnlinkPhase::DirectoryFsync,
+        source: error.to_string(),
+    })
+}
+
+/// Atomically replace an authenticated destination and durably publish the
+/// replacement. The rename is the linearization point, so every later failure
+/// is outcome unknown.
+pub fn replace_verified(
+    src_dir_fd: std::os::unix::io::RawFd,
+    src_name: &str,
+    dest_dir_fd: std::os::unix::io::RawFd,
+    dest_name: &str,
+    expected_destination: Option<ReplaceIdentity>,
+    _actor: MoveActor,
+) -> Result<(), ReplaceFailure> {
+    if let Some(expected_destination) = expected_destination {
+        let destination =
+            fs::fstatat(dest_dir_fd, dest_name).map_err(|error| ReplaceFailure::NotCommitted {
+                phase: ReplacePhase::DestinationIdentity,
+                source: error.to_string(),
+            })?;
+        if !expected_destination.matches(&destination) {
+            return Err(ReplaceFailure::DestinationChanged);
+        }
+    }
+
+    match fs::renameat(src_dir_fd, src_name, dest_dir_fd, dest_name) {
+        Ok(()) => {}
+        Err(error) if is_not_found_io_kind(error.kind()) => {
+            return Err(ReplaceFailure::SourceMissing);
+        }
+        Err(error) => {
+            return Err(ReplaceFailure::NotCommitted {
+                phase: ReplacePhase::Rename,
+                source: error.to_string(),
+            });
+        }
+    }
+
+    if src_dir_fd == dest_dir_fd {
+        return fs::fsync_dir_fd(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
+            phase: ReplacePhase::DestinationFsync,
+            source: error.to_string(),
+        });
+    }
+
+    let src_stat = fs::fstat(src_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
+        phase: ReplacePhase::DirectoryIdentity,
+        source: error.to_string(),
+    })?;
+    let dest_stat = fs::fstat(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
+        phase: ReplacePhase::DirectoryIdentity,
+        source: error.to_string(),
+    })?;
+    if src_stat.st_dev == dest_stat.st_dev && src_stat.st_ino == dest_stat.st_ino {
+        return fs::fsync_dir_fd(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
+            phase: ReplacePhase::DestinationFsync,
+            source: error.to_string(),
+        });
+    }
+
+    fs::fsync_dir_fd(dest_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
+        phase: ReplacePhase::DestinationFsync,
+        source: error.to_string(),
+    })?;
+    fs::fsync_dir_fd(src_dir_fd).map_err(|error| ReplaceFailure::OutcomeUnknown {
+        phase: ReplacePhase::SourceFsync,
         source: error.to_string(),
     })
 }
@@ -414,5 +527,197 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn replace_verified_preserves_linearization_phase() {
+        for (fault, expected_phase, outcome_unknown, source_remains) in [
+            ("renameat", ReplacePhase::Rename, false, true),
+            ("fsync_dir_fd", ReplacePhase::DestinationFsync, true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("replacement.tmp");
+            let destination = dir.path().join("receipt.rct");
+            std::fs::write(&source, b"new").unwrap();
+            std::fs::write(&destination, b"old").unwrap();
+            let directory_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .open(dir.path())
+                .unwrap();
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, libc::EIO);
+            let result = replace_verified(
+                directory_fd.as_raw_fd(),
+                "replacement.tmp",
+                directory_fd.as_raw_fd(),
+                "receipt.rct",
+                None,
+                MoveActor::Recovery,
+            );
+            fs::fault::reset();
+            let failure = result.unwrap_err();
+            assert_eq!(failure.phase(), Some(expected_phase));
+            assert_eq!(failure.is_outcome_unknown(), outcome_unknown);
+            assert_eq!(source.exists(), source_remains);
+            assert_eq!(
+                std::fs::read(destination).unwrap(),
+                if source_remains { b"old" } else { b"new" }
+            );
+        }
+    }
+
+    #[test]
+    fn replace_verified_distinguishes_missing_source_and_io_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open(dir.path())
+            .unwrap();
+        assert!(matches!(
+            replace_verified(
+                directory_fd.as_raw_fd(),
+                "missing.tmp",
+                directory_fd.as_raw_fd(),
+                "receipt.rct",
+                None,
+                MoveActor::Recovery,
+            ),
+            Err(ReplaceFailure::SourceMissing)
+        ));
+        std::fs::write(dir.path().join("source.tmp"), b"new").unwrap();
+        assert!(matches!(
+            replace_verified(
+                -1,
+                "source.tmp",
+                directory_fd.as_raw_fd(),
+                "receipt.rct",
+                None,
+                MoveActor::Recovery,
+            ),
+            Err(ReplaceFailure::NotCommitted {
+                phase: ReplacePhase::Rename,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn replace_verified_classifies_cross_directory_post_rename_failures() {
+        for (fault, fault_count, expected_phase) in [
+            ("fstat", 1, ReplacePhase::DirectoryIdentity),
+            ("fstat", 2, ReplacePhase::DirectoryIdentity),
+            ("fsync_dir_fd", 1, ReplacePhase::DestinationFsync),
+            ("fsync_dir_fd", 2, ReplacePhase::SourceFsync),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let source_dir = root.path().join("source");
+            let destination_dir = root.path().join("destination");
+            std::fs::create_dir(&source_dir).unwrap();
+            std::fs::create_dir(&destination_dir).unwrap();
+            std::fs::write(source_dir.join("replacement.tmp"), b"new").unwrap();
+            std::fs::write(destination_dir.join("receipt.rct"), b"old").unwrap();
+            let source_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&source_dir)
+                .unwrap();
+            let destination_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&destination_dir)
+                .unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, fault_count, libc::EIO);
+            let failure = replace_verified(
+                source_fd.as_raw_fd(),
+                "replacement.tmp",
+                destination_fd.as_raw_fd(),
+                "receipt.rct",
+                None,
+                MoveActor::Recovery,
+            )
+            .unwrap_err();
+            fs::fault::reset();
+
+            assert_eq!(failure.phase(), Some(expected_phase));
+            assert!(failure.is_outcome_unknown());
+            assert!(!source_dir.join("replacement.tmp").exists());
+            assert_eq!(
+                std::fs::read(destination_dir.join("receipt.rct")).unwrap(),
+                b"new"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_verified_syncs_one_directory_for_distinct_fds_to_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("replacement.tmp"), b"new").unwrap();
+        std::fs::write(dir.path().join("receipt.rct"), b"old").unwrap();
+        let source_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open(dir.path())
+            .unwrap();
+        let destination_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open(dir.path())
+            .unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 2, libc::EIO);
+        replace_verified(
+            source_fd.as_raw_fd(),
+            "replacement.tmp",
+            destination_fd.as_raw_fd(),
+            "receipt.rct",
+            None,
+            MoveActor::Recovery,
+        )
+        .unwrap();
+        assert_eq!(fs::fault::call_count("fsync_dir_fd"), 1);
+        fs::fault::reset();
+    }
+
+    #[test]
+    fn replace_verified_revalidates_destination_immediately_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("replacement.tmp");
+        let destination = dir.path().join("receipt.rct");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"old").unwrap();
+        let directory_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open(dir.path())
+            .unwrap();
+        let destination_stat = fs::fstatat(directory_fd.as_raw_fd(), "receipt.rct").unwrap();
+
+        let changed = replace_verified(
+            directory_fd.as_raw_fd(),
+            "replacement.tmp",
+            directory_fd.as_raw_fd(),
+            "receipt.rct",
+            Some(ReplaceIdentity::new(
+                destination_stat.st_dev,
+                destination_stat.st_ino.wrapping_add(1),
+            )),
+            MoveActor::Recovery,
+        );
+        assert!(matches!(changed, Err(ReplaceFailure::DestinationChanged)));
+        assert!(source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+
+        replace_verified(
+            directory_fd.as_raw_fd(),
+            "replacement.tmp",
+            directory_fd.as_raw_fd(),
+            "receipt.rct",
+            Some(ReplaceIdentity::new(
+                destination_stat.st_dev,
+                destination_stat.st_ino,
+            )),
+            MoveActor::Recovery,
+        )
+        .unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(destination).unwrap(), b"new");
     }
 }

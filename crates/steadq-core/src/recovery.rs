@@ -9,7 +9,8 @@ use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
 use crate::queue::engine::{
-    move_verified_noreplace, unlink_verified, MoveActor, MoveFailure, MovePhase, UnlinkFailure,
+    move_verified_noreplace, replace_verified, unlink_verified, MoveActor, MoveFailure, MovePhase,
+    ReplaceFailure, ReplaceIdentity, UnlinkFailure,
 };
 use crate::queue::{
     open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryHierarchyRetry,
@@ -215,6 +216,19 @@ fn cursor_record_bytes_fit(size: usize) -> bool {
 
 fn cursor_file_is_absent(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ENOENT)
+}
+
+fn compaction_temporary_name(name: &str) -> bool {
+    let Some(random_hex) = name
+        .strip_prefix(".compact-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    random_hex.len() == 32
+        && random_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn recovery_lock_exists(error: &io::Error) -> bool {
@@ -740,6 +754,47 @@ impl Queue {
             }
         };
         Self::record_error(stats, &format!("{operation}_{category}"), path, &detail);
+    }
+
+    fn record_replace_failure(
+        stats: &mut RecoveryStats,
+        operation: &str,
+        path: &str,
+        failure: ReplaceFailure,
+    ) {
+        let (category, detail) = match failure {
+            ReplaceFailure::NotCommitted { phase, source } => {
+                ("not_committed", format!("phase={phase:?}: {source}"))
+            }
+            ReplaceFailure::OutcomeUnknown { phase, source } => {
+                ("outcome_unknown", format!("phase={phase:?}: {source}"))
+            }
+            ReplaceFailure::SourceMissing => {
+                ("source_missing", "phase=Rename: source is missing".into())
+            }
+            ReplaceFailure::DestinationChanged => (
+                "destination_changed",
+                "phase=DestinationIdentity: destination identity changed".into(),
+            ),
+        };
+        Self::record_error(stats, &format!("{operation}_{category}"), path, &detail);
+    }
+
+    fn cleanup_compaction_temp(
+        stats: &mut RecoveryStats,
+        directory_fd: std::os::unix::io::RawFd,
+        name: &str,
+        relative_path: &str,
+    ) {
+        match unlink_verified(directory_fd, name, MoveActor::Recovery) {
+            Ok(()) | Err(UnlinkFailure::SourceMissing) => {}
+            Err(failure) => Self::record_unlink_failure(
+                stats,
+                "receipt_compact_temp_cleanup",
+                relative_path,
+                failure,
+            ),
+        }
     }
 
     fn block_phase(stats: &mut RecoveryStats, op: &str, path: &str, err: &str) {
@@ -2583,6 +2638,22 @@ impl Queue {
                         continue;
                     };
 
+                    if compaction_temporary_name(entry) {
+                        let temp_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
+                        stats.operations_attempted += 1;
+                        if let Err(failure) =
+                            unlink_verified(shard_fd.as_raw_fd(), entry, MoveActor::Recovery)
+                        {
+                            Self::record_unlink_failure(
+                                stats,
+                                "receipt_compact_stale_temp_cleanup",
+                                &temp_path,
+                                failure,
+                            );
+                        }
+                        continue;
+                    }
+
                     if !entry.ends_with(".rct") {
                         continue;
                     }
@@ -2655,63 +2726,106 @@ impl Queue {
                     };
 
                     let compact_bytes = compact.encode();
+                    let receipt_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
+
+                    stats.operations_attempted += 1;
+                    let random = match steadq_fs_linux::random_128bit() {
+                        Ok(random) => random,
+                        Err(error) => {
+                            Self::record_error(
+                                stats,
+                                "receipt_compact_temp_name_not_committed",
+                                &receipt_path,
+                                &format!("phase=TempName: {error}"),
+                            );
+                            continue;
+                        }
+                    };
 
                     // Write to a temp file in the same directory
                     let tmp_name = format!(
                         ".compact-{}.tmp",
-                        match steadq_fs_linux::random_128bit() {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        }
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
+                        random
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
                     );
 
-                    stats.operations_attempted += 1;
+                    let temp_path = format!("receipts/{bucket_name}/{shard_name}/{tmp_name}");
+
                     let tmp_fd = match fs::create_exclusive(shard_fd.as_raw_fd(), &tmp_name, 0o600)
                     {
                         Ok(fd) => fd,
-                        Err(_) => continue,
-                    };
-
-                    if fs::write_all(tmp_fd.as_raw_fd(), &compact_bytes).is_err() {
-                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
-                        continue;
-                    }
-                    if fs::fsync(tmp_fd.as_raw_fd()).is_err() {
-                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
-                        continue;
-                    }
-
-                    // The lock protects the opened inode, so prove the pathname
-                    // still names that inode before replacing it.
-                    let current = match fs::fstatat(shard_fd.as_raw_fd(), entry) {
-                        Ok(stat) => stat,
-                        Err(_) => {
-                            let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+                        Err(error) => {
+                            Self::record_error(
+                                stats,
+                                "receipt_compact_temp_create_not_committed",
+                                &temp_path,
+                                &format!("phase=TempCreate: {error}"),
+                            );
                             continue;
                         }
                     };
-                    if !crate::queue::verified::receipt_path_identity_matches(
-                        &current, device, inode,
-                    ) {
-                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+
+                    if let Err(error) = fs::write_all(tmp_fd.as_raw_fd(), &compact_bytes) {
+                        Self::record_error(
+                            stats,
+                            "receipt_compact_temp_write_not_committed",
+                            &temp_path,
+                            &format!("phase=TempWrite: {error}"),
+                        );
+                        Self::cleanup_compaction_temp(
+                            stats,
+                            shard_fd.as_raw_fd(),
+                            &tmp_name,
+                            &temp_path,
+                        );
+                        continue;
+                    }
+                    if let Err(error) = fs::fsync(tmp_fd.as_raw_fd()) {
+                        Self::record_error(
+                            stats,
+                            "receipt_compact_temp_fsync_not_committed",
+                            &temp_path,
+                            &format!("phase=TempFsync: {error}"),
+                        );
+                        Self::cleanup_compaction_temp(
+                            stats,
+                            shard_fd.as_raw_fd(),
+                            &tmp_name,
+                            &temp_path,
+                        );
                         continue;
                     }
 
                     // Replace the original with the compact version
-                    if fs::durable_move_replace(
+                    match replace_verified(
                         shard_fd.as_raw_fd(),
                         &tmp_name,
                         shard_fd.as_raw_fd(),
                         entry,
-                    )
-                    .is_ok()
-                    {
-                        stats.receipts_compacted += 1;
-                    } else {
-                        let _ = fs::unlinkat(shard_fd.as_raw_fd(), &tmp_name);
+                        Some(ReplaceIdentity::new(device, inode)),
+                        MoveActor::Recovery,
+                    ) {
+                        Ok(()) => stats.receipts_compacted += 1,
+                        Err(failure) => {
+                            let source_missing = matches!(failure, ReplaceFailure::SourceMissing);
+                            let outcome_unknown = failure.is_outcome_unknown();
+                            Self::record_replace_failure(
+                                stats,
+                                "receipt_compact_replace",
+                                &receipt_path,
+                                failure,
+                            );
+                            if !outcome_unknown || source_missing {
+                                Self::cleanup_compaction_temp(
+                                    stats,
+                                    shard_fd.as_raw_fd(),
+                                    &tmp_name,
+                                    &temp_path,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3118,7 +3232,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::engine::UnlinkPhase;
+    use crate::queue::engine::{ReplacePhase, UnlinkPhase};
     use crate::{AckOutcome, CreateOptions, EnqueueInput, LeaseOutcome, OpenOptions};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -3245,6 +3359,21 @@ mod tests {
             if path.is_dir() {
                 find_files(&path, extension, found);
             } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+                found.push(path);
+            }
+        }
+    }
+
+    fn find_compaction_temporary_files(root: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                find_compaction_temporary_files(&path, found);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(compaction_temporary_name)
+            {
                 found.push(path);
             }
         }
@@ -3452,6 +3581,23 @@ mod tests {
         let mut stats = RecoveryStats::default();
         queue.cleanup_temp_files(
             u64::MAX,
+            &WorkBudget::default(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+        stats
+    }
+
+    fn compact_receipts_with_budget(queue: &mut Queue) -> RecoveryStats {
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.compact_receipts_with_scan_budget(
             &WorkBudget::default(),
             &mut scan,
             &mut stats,
@@ -6494,6 +6640,201 @@ mod tests {
     }
 
     #[test]
+    fn compaction_temporary_name_is_strict() {
+        assert!(compaction_temporary_name(
+            ".compact-0123456789abcdef0123456789abcdef.tmp"
+        ));
+        for invalid in [
+            ".compact-0123456789abcdef0123456789abcde.tmp",
+            ".compact-0123456789abcdef0123456789abcdef0.tmp",
+            ".compact-0123456789ABCDEF0123456789ABCDEF.tmp",
+            ".compact-0123456789abcdef0123456789abcdeg.tmp",
+            "compact-0123456789abcdef0123456789abcdef.tmp",
+            ".compact-0123456789abcdef0123456789abcdef.rct",
+        ] {
+            assert!(!compaction_temporary_name(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn recovery_compaction_fault_matrix_preserves_receipt_and_replays() {
+        for (fault, count, errno, expected_operation, expected_phase, replaced) in [
+            (
+                "get_random",
+                1,
+                libc::EIO,
+                "receipt_compact_temp_name_not_committed",
+                "phase=TempName",
+                false,
+            ),
+            (
+                "openat",
+                2,
+                libc::EIO,
+                "receipt_compact_temp_create_not_committed",
+                "phase=TempCreate",
+                false,
+            ),
+            (
+                "write_all",
+                1,
+                libc::EIO,
+                "receipt_compact_temp_write_not_committed",
+                "phase=TempWrite",
+                false,
+            ),
+            (
+                "fsync",
+                1,
+                libc::EIO,
+                "receipt_compact_temp_fsync_not_committed",
+                "phase=TempFsync",
+                false,
+            ),
+            (
+                "fstatat",
+                1,
+                libc::EIO,
+                "receipt_compact_replace_not_committed",
+                "phase=DestinationIdentity",
+                false,
+            ),
+            (
+                "renameat",
+                1,
+                libc::EIO,
+                "receipt_compact_replace_not_committed",
+                "phase=Rename",
+                false,
+            ),
+            (
+                "renameat",
+                1,
+                libc::ENOENT,
+                "receipt_compact_replace_source_missing",
+                "source is missing",
+                false,
+            ),
+            (
+                "fsync_dir_fd",
+                1,
+                libc::EIO,
+                "receipt_compact_replace_outcome_unknown",
+                "phase=DestinationFsync",
+                true,
+            ),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            enqueue_and_ack(&mut queue);
+            let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, errno);
+            let stats = compact_receipts_with_budget(&mut queue);
+            fs::fault::reset();
+
+            assert_eq!(stats.receipts_compacted, 0);
+            let error = stats
+                .errors
+                .iter()
+                .find(|error| error.operation == expected_operation)
+                .unwrap_or_else(|| panic!("missing {expected_operation}: {:?}", stats.errors));
+            assert!(
+                error.error.contains(expected_phase),
+                "fault={fault} errors={:?}",
+                stats.errors
+            );
+            assert_eq!(
+                std::fs::metadata(&receipt).unwrap().len()
+                    == steadq_format::COMPACT_RECEIPT_SIZE as u64,
+                replaced,
+                "fault={fault} errors={:?}",
+                stats.errors
+            );
+            let mut temporary_files = Vec::new();
+            find_compaction_temporary_files(&tmp.path().join("receipts"), &mut temporary_files);
+            assert!(temporary_files.is_empty(), "{temporary_files:?}");
+
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay = compact_receipts_with_budget(&mut reopened);
+            assert_eq!(replay.receipts_compacted, u32::from(!replaced));
+            assert_eq!(
+                std::fs::metadata(receipt).unwrap().len(),
+                steadq_format::COMPACT_RECEIPT_SIZE as u64
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_compaction_cleanup_failures_are_reported_and_replayed() {
+        for (cleanup_fault, expected_operation, temp_remains) in [
+            (
+                "unlinkat",
+                "receipt_compact_temp_cleanup_not_committed",
+                true,
+            ),
+            (
+                "fsync_dir_fd",
+                "receipt_compact_temp_cleanup_outcome_unknown",
+                false,
+            ),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            enqueue_and_ack(&mut queue);
+            let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno("write_all", 1, libc::EIO);
+            fs::fault::inject_errno(cleanup_fault, 1, libc::EIO);
+            let stats = compact_receipts_with_budget(&mut queue);
+            fs::fault::reset();
+
+            assert_eq!(stats.receipts_compacted, 0);
+            assert!(stats
+                .errors
+                .iter()
+                .any(|error| error.operation == "receipt_compact_temp_write_not_committed"));
+            assert!(stats
+                .errors
+                .iter()
+                .any(|error| error.operation == expected_operation));
+            assert!(std::fs::metadata(&receipt).unwrap().len() > 128);
+            let mut temporary_files = Vec::new();
+            find_compaction_temporary_files(&tmp.path().join("receipts"), &mut temporary_files);
+            assert_eq!(temporary_files.len(), usize::from(temp_remains));
+
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay = compact_receipts_with_budget(&mut reopened);
+            assert_eq!(replay.receipts_compacted, 1, "errors: {:?}", replay.errors);
+            assert_eq!(
+                std::fs::metadata(receipt).unwrap().len(),
+                steadq_format::COMPACT_RECEIPT_SIZE as u64
+            );
+            temporary_files.clear();
+            find_compaction_temporary_files(&tmp.path().join("receipts"), &mut temporary_files);
+            assert!(temporary_files.is_empty(), "{temporary_files:?}");
+        }
+    }
+
+    #[test]
     fn corrupt_full_receipt_is_never_compacted_or_accepted_as_duplicate() {
         let (tmp, mut queue) = create_test_queue();
         let lease = enqueue_and_ack(&mut queue);
@@ -6619,6 +6960,45 @@ mod tests {
             assert_eq!(stats.errors.len(), 1);
             assert_eq!(stats.errors[0].operation, expected_operation);
             assert_eq!(stats.errors[0].relative_path, "source/path");
+            assert!(stats.errors[0].error.contains(expected_detail));
+        }
+    }
+
+    #[test]
+    fn recovery_replace_failure_preserves_category_and_phase() {
+        for (failure, expected_operation, expected_detail) in [
+            (
+                ReplaceFailure::NotCommitted {
+                    phase: ReplacePhase::Rename,
+                    source: "rename failed".into(),
+                },
+                "replace_not_committed",
+                "phase=Rename",
+            ),
+            (
+                ReplaceFailure::OutcomeUnknown {
+                    phase: ReplacePhase::DestinationFsync,
+                    source: "sync failed".into(),
+                },
+                "replace_outcome_unknown",
+                "phase=DestinationFsync",
+            ),
+            (
+                ReplaceFailure::SourceMissing,
+                "replace_source_missing",
+                "source is missing",
+            ),
+            (
+                ReplaceFailure::DestinationChanged,
+                "replace_destination_changed",
+                "destination identity changed",
+            ),
+        ] {
+            let mut stats = RecoveryStats::default();
+            Queue::record_replace_failure(&mut stats, "replace", "receipt/path", failure);
+            assert_eq!(stats.errors.len(), 1);
+            assert_eq!(stats.errors[0].operation, expected_operation);
+            assert_eq!(stats.errors[0].relative_path, "receipt/path");
             assert!(stats.errors[0].error.contains(expected_detail));
         }
     }
