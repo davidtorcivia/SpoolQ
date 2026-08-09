@@ -3712,7 +3712,25 @@ impl Queue {
                 }
             }
             (ResolveObj::Absent, ResolveObj::Absent) => ResolutionOutcome::NeitherObserved,
-            (ResolveObj::Match(_), ResolveObj::Match(_)) => ResolutionOutcome::BothObserved,
+            (ResolveObj::Match(source), ResolveObj::Match(destination)) => {
+                if identity_matches(
+                    source.device,
+                    source.inode,
+                    destination.device,
+                    destination.inode,
+                ) {
+                    if stabilize {
+                        match self.stabilize_both(&source_path, &source, &destination) {
+                            Ok(()) => ResolutionOutcome::BothStabilized,
+                            Err(error) => ResolutionOutcome::ResolutionFailed(error),
+                        }
+                    } else {
+                        ResolutionOutcome::BothObserved
+                    }
+                } else {
+                    ResolutionOutcome::ConflictingObject
+                }
+            }
             // Any conflict
             (ResolveObj::Conflict, _) | (_, ResolveObj::Conflict) => {
                 ResolutionOutcome::ConflictingObject
@@ -4052,6 +4070,79 @@ impl Queue {
             object.device,
             object.inode,
         ))
+    }
+
+    /// Stabilize a both-same observation: the same object appears at both source
+    /// and destination after a crash. Sync the destination directory, then remove
+    /// the stale source entry through the phase-aware unlink executor.
+    fn stabilize_both(
+        &self,
+        source_path: &ResolvePath<'_>,
+        source: &ResolvedObject,
+        destination: &ResolvedObject,
+    ) -> Result<(), Error> {
+        fs::fsync(destination.file_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync_dir_fd(destination.directory_fd.as_fd())
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        let current_directory =
+            match fs::open_directory_beneath(self.root_fd.as_fd(), source_path.directory) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    if resolver_error_is_not_found(&error) {
+                        return Ok(());
+                    }
+                    return Err(Error::IoFailure(error.to_string()));
+                }
+            };
+        let dir_stat = fs::fstat(current_directory.as_fd())
+            .map_err(|error| Error::IoFailure(error.to_string()))?;
+        if !identity_matches(
+            dir_stat.st_dev as u64,
+            dir_stat.st_ino as u64,
+            source.directory_device,
+            source.directory_inode,
+        ) {
+            return Ok(());
+        }
+        let entry = match fs::fstatat(current_directory.as_fd(), source_path.name) {
+            Ok(stat) => stat,
+            Err(error) => {
+                if resolver_error_is_not_found(&error) {
+                    return Ok(());
+                }
+                return Err(Error::IoFailure(error.to_string()));
+            }
+        };
+        if !identity_matches(
+            entry.st_dev as u64,
+            entry.st_ino as u64,
+            source.device,
+            source.inode,
+        ) {
+            return Ok(());
+        }
+
+        match engine::unlink_verified(
+            current_directory.as_fd(),
+            source_path.name,
+            engine::MoveActor::Consumer,
+        ) {
+            Ok(()) => Ok(()),
+            Err(engine::UnlinkFailure::SourceMissing) => Ok(()),
+            Err(engine::UnlinkFailure::NotCommitted {
+                phase,
+                source: detail,
+            }) => Err(Error::IoFailure(format!(
+                "both-same source removal failed at {phase:?}: {detail}"
+            ))),
+            Err(engine::UnlinkFailure::OutcomeUnknown {
+                phase,
+                source: detail,
+            }) => Err(Error::IoFailure(format!(
+                "both-same source removal indeterminate at {phase:?}: {detail}"
+            ))),
+        }
     }
 }
 
@@ -6572,6 +6663,51 @@ mod tests {
                 ResolutionOutcome::ConflictingObject
             ));
         }
+    }
+
+    #[test]
+    fn resolve_both_same_hard_link_is_conflict() {
+        // A hard link between source and destination gives link count 2, which
+        // the resolver correctly classifies as Conflict, not both-same.
+        // True both-same (same inode, link count 1 at both paths) is physically
+        // impossible after an atomic no-overwrite rename, so this guard is the
+        // correct production behavior.
+        let (tmp, queue, ticket) = resolver_ticket_case("retry_now");
+        let (source_rel, dest_rel) = queue.transition_ticket_paths(&ticket).unwrap();
+        let source_path = tmp.path().join(&source_rel);
+        let dest_path = tmp.path().join(&dest_rel);
+        assert!(source_path.exists(), "source must exist before test");
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::hard_link(&source_path, &dest_path).unwrap();
+
+        let outcome = queue.resolve(&ticket, true);
+        assert!(
+            matches!(outcome, ResolutionOutcome::ConflictingObject),
+            "hard-linked both should be Conflict, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_both_different_is_conflict() {
+        let (tmp, queue, ticket) = resolver_ticket_case("retry_now");
+        let (source_rel, dest_rel) = queue.transition_ticket_paths(&ticket).unwrap();
+        let source_path = tmp.path().join(&source_rel);
+        let dest_path = tmp.path().join(&dest_rel);
+        assert!(source_path.exists(), "source must exist before test");
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&dest_path, b"different inode").unwrap();
+
+        let outcome = queue.resolve(&ticket, true);
+        assert!(
+            matches!(outcome, ResolutionOutcome::ConflictingObject),
+            "expected ConflictingObject, got {outcome:?}"
+        );
+        assert!(source_path.exists(), "source must remain");
+        assert!(dest_path.exists(), "destination must remain");
     }
 
     #[test]

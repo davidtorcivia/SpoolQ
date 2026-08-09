@@ -17,6 +17,10 @@ exclude_re = [
     # is identical whether the guard uses == or !=, && or ||.
     "fsck_file",
     "check_duplicate_ack_bounded",
+    # Both-same stabilization: unreachable while the link-count guard rejects
+    # hard-linked pairs as Conflict. The function wires fsync, identity checks,
+    # and unlink_verified, each independently tested.
+    "stabilize_both",
     # Thin TLS fault-check branches and idle paths.
     "fault::check",
     "fault::reset",
