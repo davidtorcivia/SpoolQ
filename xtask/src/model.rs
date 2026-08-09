@@ -25,6 +25,11 @@ const MODEL_EVIDENCE: &[ModelEvidence] = &[
         ],
         readme: "model/namespace/README.md",
     },
+    ModelEvidence {
+        model: "model/SteadQScheduling.tla",
+        configs: &["model/scheduling/SteadQScheduling.cfg"],
+        readme: "model/scheduling/README.md",
+    },
 ];
 const INVARIANT_START: &str = "(* ---- Invariants ---- *)";
 const INVARIANT_END: &str = "(* ---- End invariants ---- *)";
@@ -299,13 +304,18 @@ CONSTANTS
     #[test]
     fn repository_evidence_check_rejects_config_and_readme_drift() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("model/namespace")).unwrap();
         for evidence in MODEL_EVIDENCE {
-            fs::write(temp.path().join(evidence.model), VALID_MODEL).unwrap();
+            let model = temp.path().join(evidence.model);
+            fs::create_dir_all(model.parent().unwrap()).unwrap();
+            fs::write(model, VALID_MODEL).unwrap();
             for config in evidence.configs {
-                fs::write(temp.path().join(config), VALID_CONFIG).unwrap();
+                let config = temp.path().join(config);
+                fs::create_dir_all(config.parent().unwrap()).unwrap();
+                fs::write(config, VALID_CONFIG).unwrap();
             }
-            fs::write(temp.path().join(evidence.readme), VALID_README).unwrap();
+            let readme = temp.path().join(evidence.readme);
+            fs::create_dir_all(readme.parent().unwrap()).unwrap();
+            fs::write(readme, VALID_README).unwrap();
         }
         check_invariant_evidence(temp.path()).unwrap();
 
