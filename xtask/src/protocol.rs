@@ -9,7 +9,7 @@ mod schema;
 
 const SPEC: &str = "spec/state-machine.json";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateMachineSpec {
     transitions: Vec<Transition>,
@@ -17,7 +17,7 @@ struct StateMachineSpec {
     reentry: Vec<Reentry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Transition {
     operation: Operation,
@@ -33,7 +33,7 @@ struct Transition {
     notes: Nullable<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(untagged)]
 enum Nullable<T> {
     Value(T),
@@ -116,7 +116,7 @@ enum SyncStep {
     SameOrDestinationDir,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Exception {
     name: ExceptionName,
@@ -131,7 +131,7 @@ enum ExceptionName {
     WallWatermarkAdvancement,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reentry {
     name: ReentryName,
@@ -430,6 +430,24 @@ impl Operation {
         }
     }
 
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::EnqueueImmediate => "EnqueueImmediate",
+            Self::EnqueueDelayed => "EnqueueDelayed",
+            Self::Promote => "Promote",
+            Self::Claim => "Claim",
+            Self::ExhaustedReadyCleanup => "ExhaustedReadyCleanup",
+            Self::Renew => "Renew",
+            Self::Acknowledge => "Acknowledge",
+            Self::RetryNow => "RetryNow",
+            Self::RetryLater => "RetryLater",
+            Self::Bury => "Bury",
+            Self::ReapExpiredToReady => "ReapExpiredToReady",
+            Self::ReapExpiredToDead => "ReapExpiredToDead",
+            Self::Quarantine => "Quarantine",
+        }
+    }
+
     fn invariant(self) -> TransitionInvariant {
         use AttemptChange::{Increment as AttemptIncrement, Unchanged, Zero as AttemptZero};
         use GenerationChange::{Increment as GenerationIncrement, Zero as GenerationZero};
@@ -594,6 +612,19 @@ impl State {
         }
     }
 
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::Hidden => "Hidden",
+            Self::Ready => "Ready",
+            Self::Leased => "Leased",
+            Self::Delayed => "Delayed",
+            Self::Dead => "Dead",
+            Self::Receipt => "Receipt",
+            Self::Quarantine => "Quarantine",
+            Self::Active => "Active",
+        }
+    }
+
     fn is_destination(self) -> bool {
         matches!(
             self,
@@ -661,6 +692,14 @@ impl ReasonClass {
             Self::Corruption => "corruption",
         }
     }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::AttemptsExhausted => "AttemptsExhausted",
+            Self::ApplicationDefined => "ApplicationDefined",
+            Self::Corruption => "Corruption",
+        }
+    }
 }
 
 impl SyncStep {
@@ -679,6 +718,15 @@ impl SyncStep {
             Self::SameOrDestinationDir => "same_or_destination_dir_fsync",
         }
     }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::File => "File",
+            Self::DestinationDir => "DestinationDirectory",
+            Self::SourceDir => "SourceDirectory",
+            Self::SameOrDestinationDir => "SameOrDestinationDirectory",
+        }
+    }
 }
 
 impl ExceptionName {
@@ -690,6 +738,13 @@ impl ExceptionName {
             Self::WallWatermarkAdvancement => "wall_watermark_advancement",
         }
     }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::ReceiptCompaction => "ReceiptCompaction",
+            Self::WallWatermarkAdvancement => "WallWatermarkAdvancement",
+        }
+    }
 }
 
 impl ReentryName {
@@ -699,6 +754,13 @@ impl ReentryName {
         match self {
             Self::RequeueDead => "requeue_dead",
             Self::RequeueQuarantine => "requeue_quarantine",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::RequeueDead => "RequeueDead",
+            Self::RequeueQuarantine => "RequeueQuarantine",
         }
     }
 

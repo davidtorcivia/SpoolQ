@@ -4,6 +4,7 @@ use super::*;
 use crate::{check_all, check_target, dispatch_command, run_command, workspace_root};
 use serde_json::Value;
 use std::path::Path;
+use std::process::Command;
 use tempfile::TempDir;
 
 fn fixture() -> StateMachineSpec {
@@ -205,8 +206,126 @@ fn rejects_overwriting_transition() {
 #[test]
 fn generated_rust_contains_source_transition() {
     let output = render_rust(&fixture(), "fixture-digest");
-    assert!(output.contains("operation: \"claim\""));
+    assert!(output.contains("operation: Operation::Claim"));
     assert!(output.contains("attempt_change: AttemptChange::Increment"));
+    assert!(output
+        .contains("required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]"));
+    assert!(output.contains("pub const EXCEPTIONS: &[ExceptionDef]"));
+    assert!(output.contains("pub const REENTRY: &[ReentryDef]"));
+}
+
+#[test]
+fn generated_rust_wraps_the_exact_width_boundary() {
+    let mut spec = fixture();
+    let boundary = "x".repeat(69);
+    spec.transitions[0].resolution_behavior = boundary.clone();
+    let output = render_rust(&spec, "fixture-digest");
+    assert!(output.contains(&format!("resolution_behavior:\n            {boundary:?}")));
+}
+
+#[test]
+fn generated_rust_compiles_schema_valid_control_characters() {
+    let mut spec = fixture();
+    spec.transitions[0].resolution_behavior = "resolver\u{8}behavior".into();
+    spec.transitions[0].notes = Nullable::Value("note\nwith\tcontrols".into());
+    spec.exceptions[0].description = "exception\u{0}description".into();
+    spec.reentry[0].description = "reentry\rdescription".into();
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("generated.rs");
+    fs::write(&source, render_rust(&spec, "fixture-digest")).unwrap();
+    let output = Command::new("rustc")
+        .args(["--crate-type", "lib", "--edition", "2021"])
+        .arg(&source)
+        .arg("-o")
+        .arg(temp.path().join("generated.rlib"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated Rust did not compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_every_projection_changes(mutate: impl FnOnce(&mut StateMachineSpec)) {
+    let mut changed = fixture();
+    let baseline = generated_outputs(&changed, "fixture-digest");
+    mutate(&mut changed);
+    let changed = generated_outputs(&changed, "fixture-digest");
+    for ((baseline_path, baseline), (changed_path, changed)) in baseline.iter().zip(&changed) {
+        assert_eq!(baseline_path, changed_path);
+        assert_ne!(
+            baseline, changed,
+            "{baseline_path} omitted a protocol IR field"
+        );
+    }
+}
+
+#[test]
+fn every_transition_field_affects_every_projection() {
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].operation = Operation::Claim;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].source = State::Ready;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].destination = State::Delayed;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].generation_change = GenerationChange::Increment;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].attempt_change = AttemptChange::Increment;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].token_change = TokenChange::New;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].reason_class = Nullable::Value(ReasonClass::Corruption);
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].required_syncs = vec![SyncStep::SourceDir];
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].no_overwrite = false;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].resolution_behavior = "different resolver documentation".into();
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].notes = Nullable::Value("different qualification".into());
+    });
+}
+
+#[test]
+fn every_exception_field_affects_every_projection() {
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].name = ExceptionName::WallWatermarkAdvancement;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].description = "different exception documentation".into();
+    });
+    assert_every_projection_changes(|spec| {
+        spec.exceptions[0].uses_replacing_rename = false;
+    });
+}
+
+#[test]
+fn every_reentry_field_affects_every_projection() {
+    assert_every_projection_changes(|spec| {
+        spec.reentry[0].name = ReentryName::RequeueQuarantine;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.reentry[0].source = State::Quarantine;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.reentry[0].description = "different reentry documentation".into();
+    });
+    assert_every_projection_changes(|spec| {
+        spec.reentry[0].creates_new_identity = false;
+    });
 }
 
 #[test]
