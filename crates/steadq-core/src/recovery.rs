@@ -5250,42 +5250,61 @@ mod tests {
 
     #[test]
     fn recovery_cursor_cleanup_failure_classifies_stale_temporary_file() {
-        let (tmp, mut queue) = create_test_queue();
-        let old_cursor = RecoveryCursor {
-            phase: RecoveryPhase::PromoteDelayed,
-            ..Default::default()
-        };
-        queue.recovery_cursor = old_cursor.clone();
-        queue.persist_recovery_cursor().unwrap();
-        queue.recovery_cursor.phase = RecoveryPhase::DeleteReceipts;
-
-        fs::fault::reset();
-        fs::fault::inject_errno("write_all", 1, libc::EIO);
-        fs::fault::inject_errno("unlinkat", 1, libc::EIO);
-        let error = queue.persist_recovery_cursor().unwrap_err();
-        fs::fault::reset();
-        let Error::IoFailure(message) = error else {
-            panic!("unexpected cursor publication error: {error:?}");
-        };
-        assert!(message.contains("stale recovery cursor temporary file requires later cleanup"));
-        assert!(message.contains("control/.recovery-cursor."));
-        drop(queue);
-
-        let reopened = Queue::open(
-            tmp.path(),
-            &OpenOptions {
-                allow_unsupported_fs: true,
+        for (cleanup_fault, expected_diagnosis, expected_live_temps) in [
+            (
+                "unlinkat",
+                "stale recovery cursor temporary file requires later cleanup",
+                1,
+            ),
+            (
+                "fsync_dir_fd",
+                "cleanup durability is unknown for stale recovery cursor temporary file",
+                0,
+            ),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            let old_cursor = RecoveryCursor {
+                phase: RecoveryPhase::PromoteDelayed,
                 ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(reopened.recovery_cursor, old_cursor);
-        let stale_temps = std::fs::read_dir(tmp.path().join("control"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.as_encoded_bytes().starts_with(b".recovery-cursor."))
-            .count();
-        assert_eq!(stale_temps, 1);
+            };
+            queue.recovery_cursor = old_cursor.clone();
+            queue.persist_recovery_cursor().unwrap();
+            queue.recovery_cursor.phase = RecoveryPhase::DeleteReceipts;
+
+            fs::fault::reset();
+            fs::fault::inject_errno("write_all", 1, libc::EIO);
+            fs::fault::inject_errno(cleanup_fault, 1, libc::EIO);
+            let error = queue.persist_recovery_cursor().unwrap_err();
+            fs::fault::reset();
+            let Error::IoFailure(message) = error else {
+                panic!("unexpected cursor publication error: {error:?}");
+            };
+            assert!(
+                message.contains(expected_diagnosis),
+                "cleanup_fault={cleanup_fault}: {message}"
+            );
+            assert!(message.contains("control/.recovery-cursor."));
+            drop(queue);
+
+            let reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(reopened.recovery_cursor, old_cursor);
+            let stale_temps = std::fs::read_dir(tmp.path().join("control"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.as_encoded_bytes().starts_with(b".recovery-cursor."))
+                .count();
+            assert_eq!(
+                stale_temps, expected_live_temps,
+                "cleanup_fault={cleanup_fault}"
+            );
+        }
     }
 
     #[test]
