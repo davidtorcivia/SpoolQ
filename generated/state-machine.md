@@ -1,8 +1,8 @@
-<!-- Source: spec/state-machine.json; SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008 -->
+<!-- Source: spec/state-machine.json; SHA-256: 8eba1a6b7a3d72aca483b07f52bbb1c97bee9828a0b338cdbdaf02dbfdf1ba92 -->
 
 # SteadQ/1 State Machine (Generated)
 
-Protocol IR: `steadq-state-machine`, version `2`.
+Protocol IR: `steadq-state-machine`, version `3`.
 
 ## Transitions
 
@@ -28,6 +28,13 @@ Protocol IR: `steadq-state-machine`, version `2`.
 |-----------|-------------|------------------|-------------------|-------|---------------|----------------|----------------|---------------|-------------|
 | receipt_compaction | full_receipt | compact_receipt | none | replacing_move | rename_replace | file_fsync, same_or_destination_dir_fsync | not_committed | outcome_unknown | Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname |
 | wall_watermark_advancement | watermark_record | watermark_record | authenticated_wall_floor | replacing_move | rename_replace | file_fsync, same_or_destination_dir_fsync | not_committed | outcome_unknown | Monotone wall-watermark record replaced under exclusive OFD lock |
+
+## Unlink mutations
+
+| Operation | Source | Source kind | Authentication | Clock requirement | Qualification | Class | Linearization | Required syncs | Before failure | After failure | Resolver probes | Description |
+|-----------|--------|-------------|----------------|-------------------|---------------|-------|---------------|----------------|----------------|---------------|-----------------|-------------|
+| full_receipt_retention_deletion | receipt | full_receipt | strict_receipt | authenticated_wall_floor | receipt_bucket_end_plus_retention_not_after_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | source_presence | Authenticated retention deletion of an eligible full receipt |
+| compact_receipt_retention_deletion | receipt | compact_receipt | strict_receipt | authenticated_wall_floor | receipt_bucket_end_plus_retention_not_after_wall_floor | unlink | unlink | source_dir_fsync | not_committed | outcome_unknown | source_presence | Authenticated retention deletion of an eligible compact receipt |
 
 ## Administrative re-entry (creates new identity)
 

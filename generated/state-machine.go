@@ -1,10 +1,10 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008
+// Source SHA-256: 8eba1a6b7a3d72aca483b07f52bbb1c97bee9828a0b338cdbdaf02dbfdf1ba92
 
 package steadq
 
 const ProtocolIRIdentity = "steadq-state-machine"
-const ProtocolIRVersion uint32 = 2
+const ProtocolIRVersion uint32 = 3
 
 type OptionalString struct {
 	Value   string
@@ -43,6 +43,22 @@ type ExceptionDef struct {
 	AfterLinearizationFailure  string
 }
 
+type UnlinkDef struct {
+	Name                       string
+	Description                string
+	Source                     string
+	SourceObjectKind           string
+	SourceAuthentication       string
+	ClockRequirement           string
+	Qualification              string
+	MutationClass              string
+	Linearization              string
+	RequiredSyncs              []string
+	BeforeLinearizationFailure string
+	AfterLinearizationFailure  string
+	ResolverProbeTopology      string
+}
+
 type ReentryDef struct {
 	Name               string
 	Source             string
@@ -69,6 +85,11 @@ var Transitions = []TransitionDef{
 var Exceptions = []ExceptionDef{
 	{Name: "receipt_compaction", Description: "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname", SourceObjectKind: "full_receipt", DestinationObjectKind: "compact_receipt", ClockRequirement: "none", MutationClass: "replacing_move", Linearization: "rename_replace", RequiredSyncs: []string{"file_fsync", "same_or_destination_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown"},
 	{Name: "wall_watermark_advancement", Description: "Monotone wall-watermark record replaced under exclusive OFD lock", SourceObjectKind: "watermark_record", DestinationObjectKind: "watermark_record", ClockRequirement: "authenticated_wall_floor", MutationClass: "replacing_move", Linearization: "rename_replace", RequiredSyncs: []string{"file_fsync", "same_or_destination_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown"},
+}
+
+var Unlinks = []UnlinkDef{
+	{Name: "full_receipt_retention_deletion", Description: "Authenticated retention deletion of an eligible full receipt", Source: "receipt", SourceObjectKind: "full_receipt", SourceAuthentication: "strict_receipt", ClockRequirement: "authenticated_wall_floor", Qualification: "receipt_bucket_end_plus_retention_not_after_wall_floor", MutationClass: "unlink", Linearization: "unlink", RequiredSyncs: []string{"source_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolverProbeTopology: "source_presence"},
+	{Name: "compact_receipt_retention_deletion", Description: "Authenticated retention deletion of an eligible compact receipt", Source: "receipt", SourceObjectKind: "compact_receipt", SourceAuthentication: "strict_receipt", ClockRequirement: "authenticated_wall_floor", Qualification: "receipt_bucket_end_plus_retention_not_after_wall_floor", MutationClass: "unlink", Linearization: "unlink", RequiredSyncs: []string{"source_dir_fsync"}, BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolverProbeTopology: "source_presence"},
 }
 
 var Reentry = []ReentryDef{

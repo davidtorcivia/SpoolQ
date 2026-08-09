@@ -1,6 +1,6 @@
 {
   "protocol": "steadq-state-machine",
-  "version": 2,
+  "version": 3,
   "transitions": [
     {
       "operation": "enqueue_immediate",
@@ -306,6 +306,42 @@
       ],
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown"
+    }
+  ],
+  "unlinks": [
+    {
+      "name": "full_receipt_retention_deletion",
+      "description": "Authenticated retention deletion of an eligible full receipt",
+      "source": "receipt",
+      "source_object_kind": "full_receipt",
+      "source_authentication": "strict_receipt",
+      "clock_requirement": "authenticated_wall_floor",
+      "qualification": "receipt_bucket_end_plus_retention_not_after_wall_floor",
+      "mutation_class": "unlink",
+      "linearization": "unlink",
+      "required_syncs": [
+        "source_dir_fsync"
+      ],
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
+      "resolver_probe_topology": "source_presence"
+    },
+    {
+      "name": "compact_receipt_retention_deletion",
+      "description": "Authenticated retention deletion of an eligible compact receipt",
+      "source": "receipt",
+      "source_object_kind": "compact_receipt",
+      "source_authentication": "strict_receipt",
+      "clock_requirement": "authenticated_wall_floor",
+      "qualification": "receipt_bucket_end_plus_retention_not_after_wall_floor",
+      "mutation_class": "unlink",
+      "linearization": "unlink",
+      "required_syncs": [
+        "source_dir_fsync"
+      ],
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
+      "resolver_probe_topology": "source_presence"
     }
   ],
   "reentry": [

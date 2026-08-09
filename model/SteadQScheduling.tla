@@ -60,6 +60,28 @@ WatermarkExceptionRows == {
     ProtocolExceptions[index] : index \in WatermarkExceptionIndices
 }
 
+UnlinkIndicesFor(unlinkName) == {
+    index \in 1..Len(ProtocolUnlinks) :
+        ProtocolUnlinks[index].name = unlinkName
+}
+
+ReceiptRetentionUnlinkMatches(unlinkName, objectKind) ==
+    /\ Cardinality(UnlinkIndicesFor(unlinkName)) = 1
+    /\ \A index \in UnlinkIndicesFor(unlinkName) :
+        LET row == ProtocolUnlinks[index] IN
+            /\ row.source = StateReceipt
+            /\ row.sourceObjectKind = objectKind
+            /\ row.sourceAuthentication = SourceAuthenticationStrictReceipt
+            /\ row.clockRequirement = ClockRequirementAuthenticatedWallFloor
+            /\ row.qualification =
+                TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor
+            /\ row.mutationClass = MutationClassUnlink
+            /\ row.linearization = LinearizationUnlink
+            /\ row.requiredSyncs = <<SyncStepSourceDirectory>>
+            /\ row.beforeLinearizationFailure = FailureOutcomeNotCommitted
+            /\ row.afterLinearizationFailure = FailureOutcomeOutcomeUnknown
+            /\ row.resolverProbeTopology = ResolverProbeTopologySourcePresence
+
 ProtocolSchedulingMetadataMatches ==
     /\ OperationHasClock(
         OperationEnqueueImmediate,
@@ -111,6 +133,12 @@ ProtocolSchedulingMetadataMatches ==
             <<SyncStepFile, SyncStepSameOrDestinationDirectory>>
         /\ row.beforeLinearizationFailure = FailureOutcomeNotCommitted
         /\ row.afterLinearizationFailure = FailureOutcomeOutcomeUnknown
+    /\ ReceiptRetentionUnlinkMatches(
+        UnlinkFullReceiptRetentionDeletion,
+        ObjectKindFullReceipt)
+    /\ ReceiptRetentionUnlinkMatches(
+        UnlinkCompactReceiptRetentionDeletion,
+        ObjectKindCompactReceipt)
 
 VARIABLES
     realTime,

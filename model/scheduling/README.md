@@ -1,12 +1,12 @@
 # Scheduling model
 
-`SteadQScheduling.tla` is a bounded model of authenticated wall snapshots, realtime rollback, boottime lease expiration, delayed promotion, and receipt retention. It validates every generated transition clock requirement plus watermark replacement metadata from the protocol IR.
+`SteadQScheduling.tla` is a bounded model of authenticated wall snapshots, realtime rollback, boottime lease expiration, delayed promotion, and receipt retention. It validates every generated transition clock requirement, watermark replacement metadata, and both exact receipt-retention unlink rows from the protocol IR. The unlink checks bind the receipt source state and kind, strict authentication, eligibility rule, wall authority, linearization, durability barrier, failure classes, and source-presence resolver topology.
 
 The model starts with delayed work, a retained receipt, and a current-boot lease. Realtime can move to any bounded value, including backward. Boottime advances monotonically. A successful wall snapshot records `max(realtime, watermark)` durably before wall-sensitive work may proceed.
 
 ## Invariants checked
 
-- `TypeInvariant`: variables, deadlines, generated scheduling metadata, and the watermark exception remain in their bounded domains.
+- `TypeInvariant`: variables, deadlines, generated transition clocks, watermark replacement, and both receipt-retention unlink definitions remain in their bounded domains and exact protocol forms.
 
 - `AuthenticatedFloorIsDurable`: an active authenticated wall snapshot equals the durable watermark.
 

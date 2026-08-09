@@ -1,9 +1,9 @@
 -------------------------- MODULE SteadQProtocol --------------------------
 (* Auto-generated from spec/state-machine.json. Do not edit by hand. *)
-(* Source SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008 *)
+(* Source SHA-256: 8eba1a6b7a3d72aca483b07f52bbb1c97bee9828a0b338cdbdaf02dbfdf1ba92 *)
 
 ProtocolIRIdentity == "steadq-state-machine"
-ProtocolIRVersion == 2
+ProtocolIRVersion == 3
 
 OperationEnqueueImmediate == "enqueue_immediate"
 OperationEnqueueDelayed == "enqueue_delayed"
@@ -76,7 +76,8 @@ ProtocolSyncSteps == {SyncStepFile, SyncStepDestinationDirectory, SyncStepSource
 LinearizationPublishNoreplace == "publish_noreplace"
 LinearizationRenameNoreplace == "rename_noreplace"
 LinearizationRenameReplace == "rename_replace"
-ProtocolLinearizationPrimitives == {LinearizationPublishNoreplace, LinearizationRenameNoreplace, LinearizationRenameReplace}
+LinearizationUnlink == "unlink"
+ProtocolLinearizationPrimitives == {LinearizationPublishNoreplace, LinearizationRenameNoreplace, LinearizationRenameReplace, LinearizationUnlink}
 
 FailureOutcomeNotCommitted == "not_committed"
 FailureOutcomeOutcomeUnknown == "outcome_unknown"
@@ -85,13 +86,15 @@ ProtocolFailureOutcomes == {FailureOutcomeNotCommitted, FailureOutcomeOutcomeUnk
 ResolverProbeTopologyDestinationOnly == "destination_only"
 ResolverProbeTopologySourceAndDestination == "source_and_destination"
 ResolverProbeTopologyReceiptCandidatesAndSource == "receipt_candidates_and_source"
-ProtocolResolverProbeTopologies == {ResolverProbeTopologyDestinationOnly, ResolverProbeTopologySourceAndDestination, ResolverProbeTopologyReceiptCandidatesAndSource}
+ResolverProbeTopologySourcePresence == "source_presence"
+ProtocolResolverProbeTopologies == {ResolverProbeTopologyDestinationOnly, ResolverProbeTopologySourceAndDestination, ResolverProbeTopologyReceiptCandidatesAndSource, ResolverProbeTopologySourcePresence}
 
 TransitionQualificationNone == "none"
 TransitionQualificationAttemptsRemaining == "attempts_remaining"
 TransitionQualificationAttemptsExhausted == "attempts_exhausted"
 TransitionQualificationRawBytesPreserved == "raw_bytes_preserved"
-ProtocolTransitionQualifications == {TransitionQualificationNone, TransitionQualificationAttemptsRemaining, TransitionQualificationAttemptsExhausted, TransitionQualificationRawBytesPreserved}
+TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor == "receipt_bucket_end_plus_retention_not_after_wall_floor"
+ProtocolTransitionQualifications == {TransitionQualificationNone, TransitionQualificationAttemptsRemaining, TransitionQualificationAttemptsExhausted, TransitionQualificationRawBytesPreserved, TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor}
 
 MutationClassNoOverwriteMove == "no_overwrite_move"
 MutationClassReplacingMove == "replacing_move"
@@ -103,6 +106,14 @@ ProtocolMutationClasses == {MutationClassNoOverwriteMove, MutationClassReplacing
 ExceptionReceiptCompaction == "receipt_compaction"
 ExceptionWallWatermarkAdvancement == "wall_watermark_advancement"
 ProtocolExceptionNames == {ExceptionReceiptCompaction, ExceptionWallWatermarkAdvancement}
+
+UnlinkFullReceiptRetentionDeletion == "full_receipt_retention_deletion"
+UnlinkCompactReceiptRetentionDeletion == "compact_receipt_retention_deletion"
+ProtocolUnlinkNames == {UnlinkFullReceiptRetentionDeletion, UnlinkCompactReceiptRetentionDeletion}
+
+SourceAuthenticationNone == "none"
+SourceAuthenticationStrictReceipt == "strict_receipt"
+ProtocolSourceAuthentications == {SourceAuthenticationNone, SourceAuthenticationStrictReceipt}
 
 ReentryRequeueDead == "requeue_dead"
 ReentryRequeueQuarantine == "requeue_quarantine"
@@ -341,6 +352,35 @@ ProtocolExceptions == <<
      requiredSyncs |-> <<SyncStepFile, SyncStepSameOrDestinationDirectory>>,
      beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
      afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown]
+>>
+
+ProtocolUnlinks == <<
+    [name |-> UnlinkFullReceiptRetentionDeletion,
+     descriptionUtf8Hex |-> "41757468656e7469636174656420726574656e74696f6e2064656c6574696f6e206f6620616e20656c696769626c652066756c6c2072656365697074",
+     source |-> StateReceipt,
+     sourceObjectKind |-> ObjectKindFullReceipt,
+     sourceAuthentication |-> SourceAuthenticationStrictReceipt,
+     clockRequirement |-> ClockRequirementAuthenticatedWallFloor,
+     qualification |-> TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor,
+     mutationClass |-> MutationClassUnlink,
+     linearization |-> LinearizationUnlink,
+     requiredSyncs |-> <<SyncStepSourceDirectory>>,
+     beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
+     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown,
+     resolverProbeTopology |-> ResolverProbeTopologySourcePresence],
+    [name |-> UnlinkCompactReceiptRetentionDeletion,
+     descriptionUtf8Hex |-> "41757468656e7469636174656420726574656e74696f6e2064656c6574696f6e206f6620616e20656c696769626c6520636f6d706163742072656365697074",
+     source |-> StateReceipt,
+     sourceObjectKind |-> ObjectKindCompactReceipt,
+     sourceAuthentication |-> SourceAuthenticationStrictReceipt,
+     clockRequirement |-> ClockRequirementAuthenticatedWallFloor,
+     qualification |-> TransitionQualificationReceiptBucketEndPlusRetentionNotAfterWallFloor,
+     mutationClass |-> MutationClassUnlink,
+     linearization |-> LinearizationUnlink,
+     requiredSyncs |-> <<SyncStepSourceDirectory>>,
+     beforeLinearizationFailure |-> FailureOutcomeNotCommitted,
+     afterLinearizationFailure |-> FailureOutcomeOutcomeUnknown,
+     resolverProbeTopology |-> ResolverProbeTopologySourcePresence]
 >>
 
 ProtocolReentry == <<

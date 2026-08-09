@@ -149,6 +149,16 @@ pub const PROTOCOL_IR_VERSION: u32 = {};\n\n",
     );
     write_rust_enum(
         &mut output,
+        "UnlinkName",
+        &UnlinkName::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "SourceAuthentication",
+        &SourceAuthentication::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
         "ReentryName",
         &ReentryName::ALL.map(|value| (value.rust_name(), value.as_str())),
     );
@@ -185,6 +195,23 @@ pub struct ExceptionDef {
     pub required_syncs: &'static [SyncStep],
     pub before_linearization_failure: FailureOutcome,
     pub after_linearization_failure: FailureOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnlinkDef {
+    pub name: UnlinkName,
+    pub description: &'static str,
+    pub source: State,
+    pub source_object_kind: ObjectKind,
+    pub source_authentication: SourceAuthentication,
+    pub clock_requirement: ClockRequirement,
+    pub qualification: TransitionQualification,
+    pub mutation_class: MutationClass,
+    pub linearization: LinearizationPrimitive,
+    pub required_syncs: &'static [SyncStep],
+    pub before_linearization_failure: FailureOutcome,
+    pub after_linearization_failure: FailureOutcome,
+    pub resolver_probe_topology: ResolverProbeTopology,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +272,28 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         )
         .expect("writing to String cannot fail");
     }
+    output.push_str("];\n\npub const UNLINKS: &[UnlinkDef] = &[\n");
+    for unlink in &spec.unlinks {
+        let required_syncs = render_rust_sync_slice(&unlink.required_syncs);
+        writeln!(
+            output,
+            "    UnlinkDef {{\n        name: UnlinkName::{},\n        description: {},\n        source: State::{},\n        source_object_kind: ObjectKind::{},\n        source_authentication: SourceAuthentication::{},\n        clock_requirement: ClockRequirement::{},\n        qualification: TransitionQualification::{},\n        mutation_class: MutationClass::{},\n        linearization: LinearizationPrimitive::{},\n        required_syncs: {},\n        before_linearization_failure: FailureOutcome::{},\n        after_linearization_failure: FailureOutcome::{},\n        resolver_probe_topology: ResolverProbeTopology::{},\n    }},",
+            unlink.name.rust_name(),
+            rust_literal(&unlink.description),
+            unlink.source.rust_name(),
+            unlink.source_object_kind.rust_name(),
+            unlink.source_authentication.rust_name(),
+            unlink.clock_requirement.rust_name(),
+            unlink.qualification.rust_name(),
+            unlink.mutation_class.rust_name(),
+            unlink.linearization.rust_name(),
+            required_syncs,
+            unlink.before_linearization_failure.rust_name(),
+            unlink.after_linearization_failure.rust_name(),
+            unlink.resolver_probe_topology.rust_name(),
+        )
+        .expect("writing to String cannot fail");
+    }
     output.push_str("];\n\npub const REENTRY: &[ReentryDef] = &[\n");
     for reentry in &spec.reentry {
         writeln!(
@@ -302,6 +351,58 @@ mod tests {
         spec.reentry.len(),
     )
     .expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "\n#[cfg(test)]\nmod unlink_tests {{\n    use super::*;\n\n    #[test]\n    fn receipt_retention_unlinks_are_complete() {{\n        assert_eq!(UNLINKS.len(), {});",
+        spec.unlinks.len(),
+    )
+    .expect("writing to String cannot fail");
+    output.push_str(
+        r#"
+        let full = UNLINKS
+            .iter()
+            .find(|unlink| unlink.name == UnlinkName::FullReceiptRetentionDeletion)
+            .unwrap();
+        assert_eq!(full.source_object_kind, ObjectKind::FullReceipt);
+        let compact = UNLINKS
+            .iter()
+            .find(|unlink| unlink.name == UnlinkName::CompactReceiptRetentionDeletion)
+            .unwrap();
+        assert_eq!(compact.source_object_kind, ObjectKind::CompactReceipt);
+        for unlink in UNLINKS {
+            assert_eq!(unlink.source, State::Receipt);
+            assert_eq!(
+                unlink.source_authentication,
+                SourceAuthentication::StrictReceipt
+            );
+            assert_eq!(
+                unlink.clock_requirement,
+                ClockRequirement::AuthenticatedWallFloor
+            );
+            assert_eq!(
+                unlink.qualification,
+                TransitionQualification::ReceiptBucketEndPlusRetentionNotAfterWallFloor
+            );
+            assert_eq!(unlink.mutation_class, MutationClass::Unlink);
+            assert_eq!(unlink.linearization, LinearizationPrimitive::Unlink);
+            assert_eq!(unlink.required_syncs, &[SyncStep::SourceDirectory]);
+            assert_eq!(
+                unlink.before_linearization_failure,
+                FailureOutcome::NotCommitted
+            );
+            assert_eq!(
+                unlink.after_linearization_failure,
+                FailureOutcome::OutcomeUnknown
+            );
+            assert_eq!(
+                unlink.resolver_probe_topology,
+                ResolverProbeTopology::SourcePresence
+            );
+        }
+    }
+}
+"#,
+    );
     output.push_str(
         r#"
 #[cfg(test)]
@@ -392,6 +493,21 @@ type ExceptionDef struct {\n\
 \tBeforeLinearizationFailure string\n\
 \tAfterLinearizationFailure  string\n\
 }\n\n\
+type UnlinkDef struct {\n\
+\tName                       string\n\
+\tDescription                string\n\
+\tSource                     string\n\
+\tSourceObjectKind           string\n\
+\tSourceAuthentication       string\n\
+\tClockRequirement           string\n\
+\tQualification              string\n\
+\tMutationClass              string\n\
+\tLinearization              string\n\
+\tRequiredSyncs              []string\n\
+\tBeforeLinearizationFailure string\n\
+\tAfterLinearizationFailure  string\n\
+\tResolverProbeTopology      string\n\
+}\n\n\
 type ReentryDef struct {\n\
 \tName               string\n\
 \tSource             string\n\
@@ -457,6 +573,33 @@ var Transitions = []TransitionDef{\n",
             required_syncs,
             json_string(exception.before_linearization_failure.as_str()),
             json_string(exception.after_linearization_failure.as_str()),
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("}\n\nvar Unlinks = []UnlinkDef{\n");
+    for unlink in &spec.unlinks {
+        let required_syncs = unlink
+            .required_syncs
+            .iter()
+            .map(|sync| json_string(sync.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            output,
+            "\t{{Name: {}, Description: {}, Source: {}, SourceObjectKind: {}, SourceAuthentication: {}, ClockRequirement: {}, Qualification: {}, MutationClass: {}, Linearization: {}, RequiredSyncs: []string{{{}}}, BeforeLinearizationFailure: {}, AfterLinearizationFailure: {}, ResolverProbeTopology: {}}},",
+            json_string(unlink.name.as_str()),
+            json_string(&unlink.description),
+            json_string(unlink.source.as_str()),
+            json_string(unlink.source_object_kind.as_str()),
+            json_string(unlink.source_authentication.as_str()),
+            json_string(unlink.clock_requirement.as_str()),
+            json_string(unlink.qualification.as_str()),
+            json_string(unlink.mutation_class.as_str()),
+            json_string(unlink.linearization.as_str()),
+            required_syncs,
+            json_string(unlink.before_linearization_failure.as_str()),
+            json_string(unlink.after_linearization_failure.as_str()),
+            json_string(unlink.resolver_probe_topology.as_str()),
         )
         .expect("writing to String cannot fail");
     }
@@ -554,6 +697,37 @@ Protocol IR: `{}`, version `{}`.\n\n\
             exception.before_linearization_failure.as_str(),
             exception.after_linearization_failure.as_str(),
             markdown(&exception.description),
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str(
+        "\n## Unlink mutations\n\n\
+| Operation | Source | Source kind | Authentication | Clock requirement | Qualification | Class | Linearization | Required syncs | Before failure | After failure | Resolver probes | Description |\n\
+|-----------|--------|-------------|----------------|-------------------|---------------|-------|---------------|----------------|----------------|---------------|-----------------|-------------|\n",
+    );
+    for unlink in &spec.unlinks {
+        let required_syncs = unlink
+            .required_syncs
+            .iter()
+            .map(|sync| sync.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            output,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            markdown(unlink.name.as_str()),
+            unlink.source.as_str(),
+            unlink.source_object_kind.as_str(),
+            unlink.source_authentication.as_str(),
+            unlink.clock_requirement.as_str(),
+            unlink.qualification.as_str(),
+            unlink.mutation_class.as_str(),
+            unlink.linearization.as_str(),
+            required_syncs,
+            unlink.before_linearization_failure.as_str(),
+            unlink.after_linearization_failure.as_str(),
+            unlink.resolver_probe_topology.as_str(),
+            markdown(&unlink.description),
         )
         .expect("writing to String cannot fail");
     }
@@ -676,6 +850,18 @@ ProtocolIRVersion == {}\n\n",
     );
     write_tla_enum(
         &mut output,
+        "ProtocolUnlinkNames",
+        "Unlink",
+        &UnlinkName::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
+        "ProtocolSourceAuthentications",
+        "SourceAuthentication",
+        &SourceAuthentication::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_tla_enum(
+        &mut output,
         "ProtocolReentryNames",
         "Reentry",
         &ReentryName::ALL.map(|value| (value.rust_name(), value.as_str())),
@@ -745,6 +931,38 @@ ProtocolExceptions == <<\n",
             exception.before_linearization_failure.rust_name(),
             exception.after_linearization_failure.rust_name(),
             if index + 1 == spec.exceptions.len() {
+                ""
+            } else {
+                ","
+            },
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str(">>\n\nProtocolUnlinks == <<\n");
+    for (index, unlink) in spec.unlinks.iter().enumerate() {
+        let required_syncs = unlink
+            .required_syncs
+            .iter()
+            .map(|sync| format!("SyncStep{}", sync.rust_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            output,
+            "    [name |-> Unlink{},\n     descriptionUtf8Hex |-> {},\n     source |-> State{},\n     sourceObjectKind |-> ObjectKind{},\n     sourceAuthentication |-> SourceAuthentication{},\n     clockRequirement |-> ClockRequirement{},\n     qualification |-> TransitionQualification{},\n     mutationClass |-> MutationClass{},\n     linearization |-> Linearization{},\n     requiredSyncs |-> <<{}>>,\n     beforeLinearizationFailure |-> FailureOutcome{},\n     afterLinearizationFailure |-> FailureOutcome{},\n     resolverProbeTopology |-> ResolverProbeTopology{}]{}",
+            unlink.name.rust_name(),
+            tla_string(&utf8_hex(&unlink.description)),
+            unlink.source.rust_name(),
+            unlink.source_object_kind.rust_name(),
+            unlink.source_authentication.rust_name(),
+            unlink.clock_requirement.rust_name(),
+            unlink.qualification.rust_name(),
+            unlink.mutation_class.rust_name(),
+            unlink.linearization.rust_name(),
+            required_syncs,
+            unlink.before_linearization_failure.rust_name(),
+            unlink.after_linearization_failure.rust_name(),
+            unlink.resolver_probe_topology.rust_name(),
+            if index + 1 == spec.unlinks.len() {
                 ""
             } else {
                 ","

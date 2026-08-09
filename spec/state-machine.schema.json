@@ -8,6 +8,7 @@
     "version",
     "transitions",
     "exceptions",
+    "unlinks",
     "reentry"
   ],
   "properties": {
@@ -17,8 +18,8 @@
     },
     "version": {
       "type": "integer",
-      "minimum": 2,
-      "const": 2
+      "minimum": 3,
+      "const": 3
     },
     "transitions": {
       "type": "array",
@@ -297,6 +298,101 @@
           },
           "after_linearization_failure": {
             "const": "outcome_unknown"
+          }
+        }
+      }
+    },
+    "unlinks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description",
+          "source",
+          "source_object_kind",
+          "source_authentication",
+          "clock_requirement",
+          "qualification",
+          "mutation_class",
+          "linearization",
+          "required_syncs",
+          "before_linearization_failure",
+          "after_linearization_failure",
+          "resolver_probe_topology"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "full_receipt_retention_deletion",
+              "compact_receipt_retention_deletion"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source": {
+            "const": "receipt"
+          },
+          "source_object_kind": {
+            "type": "string",
+            "enum": [
+              "full_job",
+              "full_receipt",
+              "compact_receipt",
+              "raw_object",
+              "watermark_record"
+            ]
+          },
+          "source_authentication": {
+            "const": "strict_receipt"
+          },
+          "clock_requirement": {
+            "type": "string",
+            "enum": [
+              "none",
+              "authenticated_wall_floor",
+              "boottime_and_authenticated_wall_floor",
+              "lease_expiration_evidence",
+              "lease_expiration_evidence_and_authenticated_wall_floor"
+            ]
+          },
+          "qualification": {
+            "const": "receipt_bucket_end_plus_retention_not_after_wall_floor"
+          },
+          "mutation_class": {
+            "const": "unlink"
+          },
+          "linearization": {
+            "const": "unlink"
+          },
+          "required_syncs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "file_fsync",
+                "destination_dir_fsync",
+                "source_dir_fsync",
+                "same_or_destination_dir_fsync",
+                "source_dir_fsync_if_distinct"
+              ]
+            }
+          },
+          "before_linearization_failure": {
+            "const": "not_committed"
+          },
+          "after_linearization_failure": {
+            "const": "outcome_unknown"
+          },
+          "resolver_probe_topology": {
+            "const": "source_presence"
           }
         }
       }
