@@ -1294,6 +1294,17 @@ mod tests {
         (tmp, queue)
     }
 
+    fn different_byte(original: u8) -> u8 {
+        original ^ u8::MAX
+    }
+
+    #[test]
+    fn corrupt_header_fixture_changes_every_byte_value() {
+        for original in u8::MIN..=u8::MAX {
+            assert_ne!(different_byte(original), original);
+        }
+    }
+
     #[test]
     fn quarantine_collision_and_attempt_boundaries_are_exact() {
         assert!(quarantine_destination_collision(
@@ -1762,13 +1773,18 @@ mod tests {
             let shard_dir = shard_dir.unwrap().path();
             for entry in std::fs::read_dir(&shard_dir).unwrap() {
                 let entry = entry.unwrap().path();
-                use std::io::{Seek, SeekFrom, Write};
+                use std::io::{Read, Seek, SeekFrom, Write};
                 let mut f = std::fs::OpenOptions::new()
+                    .read(true)
                     .write(true)
                     .open(&entry)
                     .unwrap();
                 f.seek(SeekFrom::Start(32)).unwrap();
-                f.write_all(&[0xFF]).unwrap();
+                let mut original = [0_u8; 1];
+                f.read_exact(&mut original).unwrap();
+                let corrupted = different_byte(original[0]);
+                f.seek(SeekFrom::Start(32)).unwrap();
+                f.write_all(&[corrupted]).unwrap();
                 f.sync_all().unwrap();
             }
         }
