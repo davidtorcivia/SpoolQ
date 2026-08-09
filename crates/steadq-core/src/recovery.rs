@@ -351,10 +351,18 @@ pub struct RecoveryStats {
     pub buckets_removed: u32,
     pub receipts_compacted: u32,
     pub receipts_expired: u32,
+    pub quarantined: Vec<RecoveryQuarantine>,
     pub budget_exhausted: bool,
     pub phase_blocked: bool,
     pub errors: Vec<RecoveryError>,
     pub scan_skips: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryQuarantine {
+    pub relative_path: String,
+    pub quarantine_id: [u8; 16],
+    pub quarantine_name: String,
 }
 
 /// Exact directory-enumeration work completed by a recovery pass.
@@ -704,16 +712,19 @@ impl Queue {
         filename: &str,
         full_path: &str,
         reason: crate::QuarantineReason,
-    ) -> Result<(), Error> {
-        let qid = fs::random_128bit().map_err(|e| Error::IoFailure(e.to_string()))?;
-        let q_name = steadq_names::quarantine_filename(&qid, reason as u16);
-        let _ = self.ensure_dir("quarantine");
-        let q_dir_fd = crate::queue::open_relative(self.root_fd(), "quarantine")
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::durable_move_noreplace(src_dir_fd, filename, q_dir_fd.as_raw_fd(), &q_name)
-            .map_err(|e| Error::IoFailure(format!("quarantine move failed: {e}")))?;
-        let _ = full_path; // logged by caller
-        Ok(())
+        stats: &mut RecoveryStats,
+    ) {
+        stats.operations_attempted += 1;
+        match self.publish_quarantine_object(src_dir_fd, filename, reason) {
+            Ok(publication) => stats.quarantined.push(RecoveryQuarantine {
+                relative_path: full_path.to_string(),
+                quarantine_id: publication.quarantine_id,
+                quarantine_name: publication.quarantine_name,
+            }),
+            Err(error) => {
+                Self::record_error(stats, "quarantine", full_path, &error.to_string());
+            }
+        }
     }
 
     /// R2-H05: Check if the monotonic deadline has been exceeded.
@@ -1548,13 +1559,14 @@ impl Queue {
                             );
                             // B1: Quarantine corrupt objects
                             if matches!(e, Error::QueueCorrupt(_)) {
-                                let _ = self.quarantine_recovery_object(
+                                self.quarantine_recovery_object(
                                     shard_fd.as_raw_fd(),
                                     entry,
                                     &format!(
                                         "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
                                     ),
                                     crate::QuarantineReason::EnvelopeCorrupt,
+                                    stats,
                                 );
                             }
                             continue;
@@ -2077,11 +2089,12 @@ impl Queue {
                                 &format!("{e}"),
                             );
                             if matches!(e, Error::QueueCorrupt(_)) {
-                                let _ = self.quarantine_recovery_object(
+                                self.quarantine_recovery_object(
                                     shard_fd.as_raw_fd(),
                                     entry,
                                     &format!("delayed/{bucket_name}/{shard_name}/{entry}"),
                                     crate::QuarantineReason::EnvelopeCorrupt,
+                                    stats,
                                 );
                             }
                             continue;
@@ -3313,6 +3326,59 @@ mod tests {
         )
         .unwrap();
         (tmp, queue)
+    }
+
+    #[test]
+    fn recovery_quarantine_records_identity_and_failure_context() {
+        let (tmp, queue) = create_test_queue();
+        std::fs::write(tmp.path().join("candidate.raw"), b"candidate").unwrap();
+        let mut stats = RecoveryStats::default();
+        queue.quarantine_recovery_object(
+            queue.root_fd(),
+            "candidate.raw",
+            "ready/00000000/candidate.raw",
+            crate::QuarantineReason::EnvelopeCorrupt,
+            &mut stats,
+        );
+        assert_eq!(stats.operations_attempted, 1);
+        assert!(stats.errors.is_empty());
+        assert_eq!(stats.quarantined.len(), 1);
+        let quarantined = &stats.quarantined[0];
+        assert_eq!(quarantined.relative_path, "ready/00000000/candidate.raw");
+        assert!(tmp
+            .path()
+            .join("quarantine")
+            .join(&quarantined.quarantine_name)
+            .exists());
+        assert_eq!(
+            steadq_names::parse_quarantine(&quarantined.quarantine_name)
+                .unwrap()
+                .quarantine_id,
+            quarantined.quarantine_id
+        );
+
+        std::fs::write(tmp.path().join("failure.raw"), b"failure").unwrap();
+        let mut failed = RecoveryStats::default();
+        fs::fault::reset();
+        fs::fault::inject_errno("get_random", 1, libc::EIO);
+        queue.quarantine_recovery_object(
+            queue.root_fd(),
+            "failure.raw",
+            "delayed/0000000000000000/00000000/failure.raw",
+            crate::QuarantineReason::EnvelopeCorrupt,
+            &mut failed,
+        );
+        fs::fault::reset();
+        assert_eq!(failed.operations_attempted, 1);
+        assert!(failed.quarantined.is_empty());
+        assert_eq!(failed.errors.len(), 1);
+        assert_eq!(failed.errors[0].operation, "quarantine");
+        assert_eq!(
+            failed.errors[0].relative_path,
+            "delayed/0000000000000000/00000000/failure.raw"
+        );
+        assert!(failed.errors[0].error.contains("phase=RandomName"));
+        assert!(tmp.path().join("failure.raw").exists());
     }
 
     fn enqueue_for_shard(
