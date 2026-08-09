@@ -46,7 +46,11 @@ pub(super) fn generated_outputs(
 
 pub(super) fn render_rust(spec: &StateMachineSpec, digest: &str) -> String {
     let mut output = format!(
-        "// Auto-generated from spec/state-machine.json. Do not edit by hand.\n// Source SHA-256: {digest}\n\n"
+        "// Auto-generated from spec/state-machine.json. Do not edit by hand.\n// Source SHA-256: {digest}\n\n\
+pub const PROTOCOL_IR_IDENTITY: &str = {};\n\
+pub const PROTOCOL_IR_VERSION: u32 = {};\n\n",
+        rust_literal(&spec.protocol),
+        spec.version,
     );
     write_rust_enum(
         &mut output,
@@ -336,11 +340,15 @@ fn write_rust_enum(output: &mut String, name: &str, variants: &[(&str, &str)]) {
 
 fn render_go(spec: &StateMachineSpec, digest: &str) -> String {
     let mut output = format!(
-        "// Auto-generated from spec/state-machine.json. Do not edit by hand.\n// Source SHA-256: {digest}\n\n"
+        "// Auto-generated from spec/state-machine.json. Do not edit by hand.\n// Source SHA-256: {digest}\n\n\
+package steadq\n\n\
+const ProtocolIRIdentity = {}\n\
+const ProtocolIRVersion uint32 = {}\n\n",
+        json_string(&spec.protocol),
+        spec.version,
     );
     output.push_str(
-        "package steadq\n\n\
-type OptionalString struct {\n\
+        "type OptionalString struct {\n\
 \tValue   string\n\
 \tPresent bool\n\
 }\n\n\
@@ -472,9 +480,12 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
     let mut output = format!(
         "<!-- Source: spec/state-machine.json; SHA-256: {digest} -->\n\n\
 # SteadQ/1 State Machine (Generated)\n\n\
+Protocol IR: `{}`, version `{}`.\n\n\
 ## Transitions\n\n\
 | Operation | Source | Source kind | Destination | Destination kind | Gen | Attempt | Token | Reason | Clock requirement | Required syncs | Linearization | Before failure | After failure | Resolver probes | Qualification |\n\
 |-----------|--------|-------------|-------------|------------------|-----|---------|-------|--------|-------------------|----------------|---------------|----------------|---------------|-----------------|---------------|\n",
+        markdown(&spec.protocol),
+        spec.version,
     );
     for transition in &spec.transitions {
         let required_syncs = transition

@@ -6,11 +6,12 @@ use super::{
     AttemptChange, ClockRequirement, ExceptionName, FailureOutcome, GenerationChange,
     LinearizationPrimitive, MutationClass, ObjectKind, Operation, ReasonClass, ReentryName,
     ResolverProbeTopology, State, SyncStep, TokenChange, TransitionQualification,
+    PROTOCOL_IR_IDENTITY, PROTOCOL_IR_VERSION,
 };
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "7f1ce3181c6bd5bb876ebb0528129d4ca70d491561958c7e2f1a9ada424b8517";
+    "feb03547b7ab04a30c0e18cbf9384c316989c6c59c2fe202ac134e79752b37e4";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =
@@ -26,6 +27,17 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
         ));
     }
     validate_schema_value(&schema, "#")?;
+    validate_schema_const(&schema, "/properties/protocol/const", PROTOCOL_IR_IDENTITY)?;
+    validate_schema_u64_const(
+        &schema,
+        "/properties/version/minimum",
+        u64::from(PROTOCOL_IR_VERSION),
+    )?;
+    validate_schema_u64_const(
+        &schema,
+        "/properties/version/const",
+        u64::from(PROTOCOL_IR_VERSION),
+    )?;
     validate_schema_domain(
         &schema,
         "/properties/transitions/items/properties/operation/enum",
@@ -175,6 +187,23 @@ pub(super) fn validate_schema_const(
     if actual != expected {
         return Err(format!(
             "{SCHEMA} const at {pointer} differs from xtask: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_schema_u64_const(
+    schema: &serde_json::Value,
+    pointer: &str,
+    expected: u64,
+) -> Result<(), String> {
+    let actual = schema
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{SCHEMA} has no unsigned integer at {pointer}"))?;
+    if actual != expected {
+        return Err(format!(
+            "{SCHEMA} integer at {pointer} differs from xtask: expected {expected}, got {actual}"
         ));
     }
     Ok(())

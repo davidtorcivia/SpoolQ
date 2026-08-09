@@ -1,6 +1,7 @@
 use super::render::*;
 use super::schema::{
-    validate_schema, validate_schema_const, validate_schema_domain, validate_schema_value, SCHEMA,
+    validate_schema, validate_schema_const, validate_schema_domain, validate_schema_u64_const,
+    validate_schema_value, SCHEMA,
 };
 use super::*;
 use crate::{check_all, check_target, dispatch_command, run_command, workspace_root};
@@ -28,6 +29,20 @@ fn rejects_schema_const_drift() {
     assert_eq!(
         validate_schema_const(&schema, "/missing/const", "not_committed").unwrap_err(),
         "spec/state-machine.schema.json has no string const at /missing/const"
+    );
+}
+
+#[test]
+fn rejects_schema_integer_const_drift() {
+    let schema = serde_json::json!({"version": {"const": 1}});
+    assert!(validate_schema_u64_const(&schema, "/version/const", 1).is_ok());
+    assert_eq!(
+        validate_schema_u64_const(&schema, "/version/const", 2).unwrap_err(),
+        "spec/state-machine.schema.json integer at /version/const differs from xtask: expected 2, got 1"
+    );
+    assert_eq!(
+        validate_schema_u64_const(&schema, "/missing/const", 1).unwrap_err(),
+        "spec/state-machine.schema.json has no unsigned integer at /missing/const"
     );
 }
 
@@ -88,7 +103,29 @@ fn read(path: &Path, relative: &str) -> String {
 
 #[test]
 fn validates_complete_fixture() {
-    validate_spec(&fixture()).unwrap();
+    let spec = fixture();
+    assert_eq!(spec.protocol, PROTOCOL_IR_IDENTITY);
+    assert_eq!(spec.version, PROTOCOL_IR_VERSION);
+    validate_spec(&spec).unwrap();
+}
+
+#[test]
+fn rejects_unsupported_protocol_ir_identity_and_version() {
+    let mut spec = fixture();
+    spec.protocol = "another-protocol".into();
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "unsupported protocol IR identity: expected steadq-state-machine, got another-protocol"
+    );
+
+    for version in [0, PROTOCOL_IR_VERSION + 1, u32::MAX] {
+        let mut spec = fixture();
+        spec.version = version;
+        assert_eq!(
+            validate_spec(&spec).unwrap_err(),
+            format!("unsupported protocol IR version: expected 1, got {version}")
+        );
+    }
 }
 
 #[test]
@@ -480,6 +517,16 @@ fn every_transition_field_affects_every_projection() {
 }
 
 #[test]
+fn protocol_ir_identity_and_version_affect_every_projection() {
+    assert_every_projection_changes(|spec| {
+        spec.protocol = "different-protocol".into();
+    });
+    assert_every_projection_changes(|spec| {
+        spec.version = 2;
+    });
+}
+
+#[test]
 fn every_exception_field_affects_every_projection() {
     assert_every_projection_changes(|spec| {
         spec.exceptions[0].name = ExceptionName::WallWatermarkAdvancement;
@@ -660,12 +707,34 @@ fn rejects_omitted_semantic_fields() {
         );
     }
 
-    for field in ["transitions", "exceptions", "reentry"] {
+    for field in [
+        "protocol",
+        "version",
+        "transitions",
+        "exceptions",
+        "reentry",
+    ] {
         let mut input = fixture_value();
         input.as_object_mut().unwrap().remove(field);
         assert!(
             serde_json::from_value::<StateMachineSpec>(input).is_err(),
             "accepted root without {field}"
+        );
+    }
+}
+
+#[test]
+fn rejects_non_u32_protocol_ir_versions() {
+    for version in [
+        Value::String("1".into()),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+    ] {
+        let mut input = fixture_value();
+        input["version"] = version;
+        assert!(
+            serde_json::from_value::<StateMachineSpec>(input).is_err(),
+            "accepted a noninteger protocol IR version"
         );
     }
 }
@@ -801,7 +870,13 @@ fn schema_closes_every_object() {
     validate_schema_value(&schema, "#").unwrap();
     assert_eq!(
         schema["required"],
-        serde_json::json!(["transitions", "exceptions", "reentry"])
+        serde_json::json!([
+            "protocol",
+            "version",
+            "transitions",
+            "exceptions",
+            "reentry"
+        ])
     );
 }
 
