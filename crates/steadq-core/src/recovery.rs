@@ -9,8 +9,8 @@ use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
 use crate::queue::{
-    open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryPhase, ThreeLevelCursor,
-    WallFloor,
+    open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryHierarchyRetry, RecoveryPhase,
+    ThreeLevelCursor, WallFloor,
 };
 
 const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
@@ -23,6 +23,7 @@ const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES * 255;
 const MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_ENTRIES as u64 + 1;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_NAME_BYTES as u64 + 255;
+const MAX_RECOVERY_HIERARCHY_RETRIES: usize = 64;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +112,43 @@ fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
             .all(|component| cursor_component_is_valid(component))
     };
 
+    let retry_depth_is_valid = |retry: &RecoveryHierarchyRetry| {
+        let allowed_depth = match retry.phase {
+            RecoveryPhase::ReapLeases => 1..=3,
+            RecoveryPhase::PromoteDelayed
+            | RecoveryPhase::CleanupTemp
+            | RecoveryPhase::CompactReceipts
+            | RecoveryPhase::DeleteReceipts => 1..=2,
+        };
+        if !allowed_depth.contains(&retry.components.len()) {
+            return false;
+        }
+        retry
+            .components
+            .iter()
+            .enumerate()
+            .all(|(index, component)| match retry.phase {
+                RecoveryPhase::ReapLeases => match index {
+                    0 => steadq_names::boot_id_bytes(component).is_some(),
+                    1 => steadq_names::bucket_from_hex(component).is_some(),
+                    2 => steadq_names::shard_from_hex(component).is_some(),
+                    _ => false,
+                },
+                RecoveryPhase::CleanupTemp => match index {
+                    0 => steadq_names::boot_id_bytes(component).is_some(),
+                    1 => steadq_names::shard_from_hex(component).is_some(),
+                    _ => false,
+                },
+                RecoveryPhase::PromoteDelayed
+                | RecoveryPhase::CompactReceipts
+                | RecoveryPhase::DeleteReceipts => match index {
+                    0 => steadq_names::bucket_from_hex(component).is_some(),
+                    1 => steadq_names::shard_from_hex(component).is_some(),
+                    _ => false,
+                },
+            })
+    };
+
     cursor.reap_leases.as_ref().is_none_or(four_level_is_valid)
         && cursor
             .promote_delayed
@@ -128,6 +166,12 @@ fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
             .delete_receipts
             .as_ref()
             .is_none_or(three_level_is_valid)
+        && cursor.hierarchy_retries.len() <= MAX_RECOVERY_HIERARCHY_RETRIES
+        && cursor.hierarchy_retries.iter().all(retry_depth_is_valid)
+        && cursor
+            .hierarchy_retries
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
 }
 
 fn cursor_file_metadata_is_valid(mode: libc::mode_t, link_count: libc::nlink_t) -> bool {
@@ -646,6 +690,106 @@ impl Queue {
         }
     }
 
+    fn remember_hierarchy_retry(&mut self, phase: RecoveryPhase, components: &[&[u8]]) -> bool {
+        let Some(components) = components
+            .iter()
+            .map(|component| std::str::from_utf8(component).ok().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        let retry = RecoveryHierarchyRetry { phase, components };
+        match self.recovery_cursor.hierarchy_retries.binary_search(&retry) {
+            Ok(_) => true,
+            Err(index)
+                if self.recovery_cursor.hierarchy_retries.len()
+                    < MAX_RECOVERY_HIERARCHY_RETRIES =>
+            {
+                self.recovery_cursor.hierarchy_retries.insert(index, retry);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn remember_hierarchy_retry_or_block(
+        &mut self,
+        phase: RecoveryPhase,
+        components: &[&[u8]],
+        stats: &mut RecoveryStats,
+        path: &str,
+    ) -> bool {
+        if self.remember_hierarchy_retry(phase, components) {
+            true
+        } else {
+            Self::block_phase(
+                stats,
+                "hierarchy_retry_full",
+                path,
+                "recovery hierarchy retry ledger is full",
+            );
+            false
+        }
+    }
+
+    fn retry_hierarchy_directories(
+        &mut self,
+        phase: RecoveryPhase,
+        phase_root_fd: std::os::unix::io::RawFd,
+        stats: &mut RecoveryStats,
+    ) {
+        let retries = self
+            .recovery_cursor
+            .hierarchy_retries
+            .iter()
+            .filter(|retry| retry.phase == phase)
+            .cloned()
+            .collect::<Vec<_>>();
+        for retry in retries {
+            let mut current = None::<OwnedFd>;
+            let mut failure = None;
+            for component in &retry.components {
+                let parent_fd = current
+                    .as_ref()
+                    .map_or(phase_root_fd, std::os::fd::AsRawFd::as_raw_fd);
+                match fs::open_directory(parent_fd, component) {
+                    Ok(directory) => current = Some(directory),
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => break,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                stats.scan_skips += 1;
+                Self::block_phase(
+                    stats,
+                    "hierarchy_retry_open",
+                    &retry
+                        .components
+                        .iter()
+                        .map(|component| steadq_names::hex_encode(component.as_bytes()))
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    &error.to_string(),
+                );
+                continue;
+            }
+
+            self.recovery_cursor
+                .hierarchy_retries
+                .retain(|candidate| candidate != &retry);
+            match phase {
+                RecoveryPhase::ReapLeases => self.recovery_cursor.reap_leases = None,
+                RecoveryPhase::PromoteDelayed => self.recovery_cursor.promote_delayed = None,
+                RecoveryPhase::CleanupTemp => self.recovery_cursor.cleanup_temp = None,
+                RecoveryPhase::CompactReceipts => self.recovery_cursor.compact_receipts = None,
+                RecoveryPhase::DeleteReceipts => self.recovery_cursor.delete_receipts = None,
+            }
+        }
+    }
+
     fn reap_expired_leases(
         &mut self,
         boottime_now: u64,
@@ -679,7 +823,7 @@ impl Queue {
             }
         };
         boot_dirs.sort();
-        let mut cursor_can_advance = true;
+        self.retry_hierarchy_directories(RecoveryPhase::ReapLeases, leased_fd.as_raw_fd(), stats);
 
         for boot_dir_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.reap_leases {
@@ -717,7 +861,14 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "reap_boot_open", boot_dir_name, &error.to_string());
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::ReapLeases,
+                        &[boot_dir_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -739,7 +890,14 @@ impl Queue {
                     ) {
                         return;
                     }
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::ReapLeases,
+                        &[boot_dir_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -804,7 +962,14 @@ impl Queue {
                             &format!("leased/{boot_dir_name}/{bucket_name}"),
                             &error.to_string(),
                         );
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::ReapLeases,
+                            &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
+                            stats,
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -826,7 +991,14 @@ impl Queue {
                         ) {
                             return;
                         }
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::ReapLeases,
+                            &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
+                            stats,
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -878,7 +1050,18 @@ impl Queue {
                                 &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
                                 &error.to_string(),
                             );
-                            cursor_can_advance = false;
+                            if !self.remember_hierarchy_retry_or_block(
+                                RecoveryPhase::ReapLeases,
+                                &[
+                                    boot_dir_entry.as_bytes(),
+                                    bucket_entry.as_bytes(),
+                                    shard_entry.as_bytes(),
+                                ],
+                                stats,
+                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                            ) {
+                                return;
+                            }
                             continue;
                         }
                     };
@@ -900,7 +1083,18 @@ impl Queue {
                             ) {
                                 return;
                             }
-                            cursor_can_advance = false;
+                            if !self.remember_hierarchy_retry_or_block(
+                                RecoveryPhase::ReapLeases,
+                                &[
+                                    boot_dir_entry.as_bytes(),
+                                    bucket_entry.as_bytes(),
+                                    shard_entry.as_bytes(),
+                                ],
+                                stats,
+                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                            ) {
+                                return;
+                            }
                             continue;
                         }
                     };
@@ -927,14 +1121,12 @@ impl Queue {
                             stats.budget_exhausted = true;
                             return;
                         }
-                        if cursor_can_advance {
-                            self.recovery_cursor.reap_leases = Some(FourLevelCursor::new(
-                                boot_dir_entry.as_bytes(),
-                                bucket_entry.as_bytes(),
-                                shard_entry.as_bytes(),
-                                raw_entry.as_bytes(),
-                            ));
-                        }
+                        self.recovery_cursor.reap_leases = Some(FourLevelCursor::new(
+                            boot_dir_entry.as_bytes(),
+                            bucket_entry.as_bytes(),
+                            shard_entry.as_bytes(),
+                            raw_entry.as_bytes(),
+                        ));
                         let Some(entry) = raw_entry.as_str() else {
                             Self::record_error(
                                 stats,
@@ -1218,7 +1410,11 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
-        let mut cursor_can_advance = true;
+        self.retry_hierarchy_directories(
+            RecoveryPhase::PromoteDelayed,
+            delayed_fd.as_raw_fd(),
+            stats,
+        );
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -1279,7 +1475,14 @@ impl Queue {
                         &format!("delayed/{bucket_name}"),
                         &error.to_string(),
                     );
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::PromoteDelayed,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("delayed/{bucket_name}"),
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -1301,7 +1504,14 @@ impl Queue {
                     ) {
                         return;
                     }
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::PromoteDelayed,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("delayed/{bucket_name}"),
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -1353,7 +1563,14 @@ impl Queue {
                             &format!("{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::PromoteDelayed,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("delayed/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -1375,7 +1592,14 @@ impl Queue {
                         ) {
                             return;
                         }
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::PromoteDelayed,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("delayed/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -1397,13 +1621,11 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    if cursor_can_advance {
-                        self.recovery_cursor.promote_delayed = Some(ThreeLevelCursor::new(
-                            bucket_entry.as_bytes(),
-                            shard_entry.as_bytes(),
-                            raw_entry.as_bytes(),
-                        ));
-                    }
+                    self.recovery_cursor.promote_delayed = Some(ThreeLevelCursor::new(
+                        bucket_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -1543,7 +1765,7 @@ impl Queue {
             }
         };
         boot_dirs.sort();
-        let mut cursor_can_advance = true;
+        self.retry_hierarchy_directories(RecoveryPhase::CleanupTemp, tmp_fd.as_raw_fd(), stats);
 
         for boot_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
@@ -1581,7 +1803,14 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "temp_boot_open", boot_dir_name, &error.to_string());
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CleanupTemp,
+                        &[boot_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -1599,7 +1828,14 @@ impl Queue {
                     {
                         return;
                     }
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CleanupTemp,
+                        &[boot_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -1650,7 +1886,14 @@ impl Queue {
                             &format!("tmp/{boot_dir_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CleanupTemp,
+                            &[boot_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("tmp/{boot_dir_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -1672,7 +1915,14 @@ impl Queue {
                         ) {
                             return;
                         }
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CleanupTemp,
+                            &[boot_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("tmp/{boot_dir_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -1693,13 +1943,11 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    if cursor_can_advance {
-                        self.recovery_cursor.cleanup_temp = Some(ThreeLevelCursor::new(
-                            boot_entry.as_bytes(),
-                            shard_entry.as_bytes(),
-                            raw_entry.as_bytes(),
-                        ));
-                    }
+                    self.recovery_cursor.cleanup_temp = Some(ThreeLevelCursor::new(
+                        boot_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -1786,7 +2034,11 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
-        let mut cursor_can_advance = true;
+        self.retry_hierarchy_directories(
+            RecoveryPhase::CompactReceipts,
+            receipts_fd.as_raw_fd(),
+            stats,
+        );
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -1829,7 +2081,14 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CompactReceipts,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -1851,7 +2110,14 @@ impl Queue {
                     ) {
                         return;
                     }
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CompactReceipts,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -1903,7 +2169,14 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CompactReceipts,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -1925,7 +2198,14 @@ impl Queue {
                         ) {
                             return;
                         }
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CompactReceipts,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -1947,13 +2227,11 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    if cursor_can_advance {
-                        self.recovery_cursor.compact_receipts = Some(ThreeLevelCursor::new(
-                            bucket_entry.as_bytes(),
-                            shard_entry.as_bytes(),
-                            raw_entry.as_bytes(),
-                        ));
-                    }
+                    self.recovery_cursor.compact_receipts = Some(ThreeLevelCursor::new(
+                        bucket_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -2137,7 +2415,11 @@ impl Queue {
             }
         };
         bucket_dirs.sort();
-        let mut cursor_can_advance = true;
+        self.retry_hierarchy_directories(
+            RecoveryPhase::DeleteReceipts,
+            receipts_fd.as_raw_fd(),
+            stats,
+        );
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -2203,7 +2485,14 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::DeleteReceipts,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -2225,7 +2514,14 @@ impl Queue {
                     ) {
                         return;
                     }
-                    cursor_can_advance = false;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::DeleteReceipts,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -2277,7 +2573,14 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::DeleteReceipts,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -2299,7 +2602,14 @@ impl Queue {
                         ) {
                             return;
                         }
-                        cursor_can_advance = false;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::DeleteReceipts,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -2321,13 +2631,11 @@ impl Queue {
                         stats.budget_exhausted = true;
                         return;
                     }
-                    if cursor_can_advance {
-                        self.recovery_cursor.delete_receipts = Some(ThreeLevelCursor::new(
-                            bucket_entry.as_bytes(),
-                            shard_entry.as_bytes(),
-                            raw_entry.as_bytes(),
-                        ));
-                    }
+                    self.recovery_cursor.delete_receipts = Some(ThreeLevelCursor::new(
+                        bucket_entry.as_bytes(),
+                        shard_entry.as_bytes(),
+                        raw_entry.as_bytes(),
+                    ));
                     let Some(entry) = raw_entry.as_str() else {
                         Self::record_error(
                             stats,
@@ -2829,7 +3137,15 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.operation == "reap_boot_open"));
-        assert!(queue.recovery_cursor.reap_leases.is_none());
+        assert!(queue.recovery_cursor.reap_leases.is_some());
+        assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries[0],
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                components: vec!["00000000-0000-0000-0000-000000000000".into()],
+            }
+        );
         queue.persist_recovery_cursor().unwrap();
         drop(queue);
 
@@ -2841,7 +3157,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(reopened.recovery_cursor.reap_leases.is_none());
+        assert!(reopened.recovery_cursor.reap_leases.is_some());
+        assert_eq!(reopened.recovery_cursor.hierarchy_retries.len(), 1);
         let second = reap_expired_with_budget(&mut reopened, &budget);
         assert!(second.phase_blocked);
         assert_eq!(second.scan_skips, 1);
@@ -2849,8 +3166,13 @@ mod tests {
         assert!(second
             .errors
             .iter()
-            .any(|error| error.operation == "reap_boot_open"));
+            .any(|error| error.operation == "hierarchy_retry_open"));
         assert!(blocked.is_symlink());
+
+        std::fs::remove_file(&blocked).unwrap();
+        let third = reap_expired_with_budget(&mut reopened, &WorkBudget::default());
+        assert!(!third.phase_blocked, "errors: {:?}", third.errors);
+        assert!(reopened.recovery_cursor.hierarchy_retries.is_empty());
     }
 
     #[test]
@@ -2866,9 +3188,14 @@ mod tests {
             max_operations: 1,
             max_duration_ms: 5_000,
         };
+        let scan_budget = RecoveryScanBudget {
+            max_entries_read: MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE * 20,
+            max_name_bytes_read: MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE * 20,
+        };
+        queue.recovery_cursor.phase = RecoveryPhase::CompactReceipts;
+        queue.persist_recovery_cursor().unwrap();
 
-        let mut first = RecoveryStats::default();
-        queue.compact_receipts(&budget, &mut first, u64::MAX);
+        let first = queue.recover_with_scan_budget(&budget, &scan_budget).stats;
         assert!(first.phase_blocked);
         assert!(first.budget_exhausted);
         assert_eq!(first.scan_skips, 1);
@@ -2877,9 +3204,15 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.operation == "compact_bucket_open"));
-        assert!(queue.recovery_cursor.compact_receipts.is_none());
-        queue.persist_recovery_cursor().unwrap();
-
+        assert!(queue.recovery_cursor.compact_receipts.is_some());
+        assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries[0],
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CompactReceipts,
+                components: vec!["0000000000000000".into()],
+            }
+        );
         drop(queue);
         let mut reopened = Queue::open(
             tmp.path(),
@@ -2889,16 +3222,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(reopened.recovery_cursor.compact_receipts.is_none());
-        let mut second = RecoveryStats::default();
-        reopened.compact_receipts(&WorkBudget::default(), &mut second, u64::MAX);
+        assert!(reopened.recovery_cursor.compact_receipts.is_some());
+        assert_eq!(reopened.recovery_cursor.hierarchy_retries.len(), 1);
+        let second = reopened
+            .recover_with_scan_budget(&budget, &scan_budget)
+            .stats;
         assert!(second.phase_blocked);
         assert_eq!(second.scan_skips, 1);
         assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
         assert!(second
             .errors
             .iter()
-            .any(|error| error.operation == "compact_bucket_open"));
+            .any(|error| error.operation == "hierarchy_retry_open"));
         assert!(blocked.is_symlink());
     }
 
@@ -3046,6 +3381,7 @@ mod tests {
             cleanup_temp: Some(valid_three.clone()),
             compact_receipts: Some(valid_three.clone()),
             delete_receipts: Some(valid_three),
+            hierarchy_retries: Vec::new(),
         };
         assert!(cursor_is_valid(&valid));
 
@@ -3085,6 +3421,135 @@ mod tests {
         for (index, cursor) in invalid.iter().enumerate() {
             assert!(!cursor_is_valid(cursor), "invalid cursor {index} accepted");
         }
+
+        let retry = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::ReapLeases,
+            components: vec![
+                "00000000-0000-0000-0000-000000000000".into(),
+                "0000000000000000".into(),
+                "0000".into(),
+            ],
+        };
+        let mut with_retry = valid.clone();
+        with_retry.hierarchy_retries.push(retry.clone());
+        assert!(cursor_is_valid(&with_retry));
+
+        let boot = "00000000-0000-0000-0000-000000000000".to_string();
+        let bucket = "0000000000000000".to_string();
+        let shard = "0000".to_string();
+        let mut all_shapes = valid.clone();
+        all_shapes.hierarchy_retries = vec![
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                components: vec![boot.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                components: vec![boot.clone(), bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                components: vec![boot.clone(), bucket.clone(), shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::PromoteDelayed,
+                components: vec![bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::PromoteDelayed,
+                components: vec![bucket.clone(), shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CleanupTemp,
+                components: vec![boot.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CleanupTemp,
+                components: vec![boot, shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CompactReceipts,
+                components: vec![bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CompactReceipts,
+                components: vec![bucket.clone(), shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::DeleteReceipts,
+                components: vec![bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::DeleteReceipts,
+                components: vec![bucket, shard],
+            },
+        ];
+        assert!(cursor_is_valid(&all_shapes));
+
+        let mut duplicate = with_retry;
+        duplicate.hierarchy_retries.push(retry);
+        assert!(!cursor_is_valid(&duplicate));
+
+        let mut wrong_depth = valid.clone();
+        wrong_depth.hierarchy_retries.push(RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            components: vec!["0000000000000000".into(), "0000".into(), "extra".into()],
+        });
+        assert!(!cursor_is_valid(&wrong_depth));
+
+        let mut wrong_shape = valid;
+        wrong_shape.hierarchy_retries.push(RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CleanupTemp,
+            components: vec!["not-a-boot-id".into()],
+        });
+        assert!(!cursor_is_valid(&wrong_shape));
+    }
+
+    #[test]
+    fn hierarchy_retry_ledger_is_bounded_sorted_and_deduplicated() {
+        let (_tmp, mut queue) = create_test_queue();
+        for bucket in (0..MAX_RECOVERY_HIERARCHY_RETRIES).rev() {
+            let component = format!("{bucket:016x}");
+            assert!(queue
+                .remember_hierarchy_retry(RecoveryPhase::CompactReceipts, &[component.as_bytes()]));
+        }
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries.len(),
+            MAX_RECOVERY_HIERARCHY_RETRIES
+        );
+        assert!(queue
+            .recovery_cursor
+            .hierarchy_retries
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        assert!(
+            queue.remember_hierarchy_retry(RecoveryPhase::CompactReceipts, &[b"0000000000000000"])
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries.len(),
+            MAX_RECOVERY_HIERARCHY_RETRIES
+        );
+        assert!(
+            !queue.remember_hierarchy_retry(RecoveryPhase::CompactReceipts, &[b"0000000000000040"])
+        );
+
+        queue.recovery_cursor.hierarchy_retries.clear();
+        for suffix in 0..MAX_RECOVERY_HIERARCHY_RETRIES {
+            let boot = format!("00000000-0000-0000-0000-{suffix:012x}");
+            assert!(queue.remember_hierarchy_retry(
+                RecoveryPhase::ReapLeases,
+                &[boot.as_bytes(), b"0000000000000000", b"0000"]
+            ));
+        }
+        queue.persist_recovery_cursor().unwrap();
+    }
+
+    #[test]
+    fn recovery_cursor_without_retry_ledger_remains_compatible() {
+        let mut value = serde_json::to_value(RecoveryCursor::default()).unwrap();
+        value.as_object_mut().unwrap().remove("hierarchy_retries");
+        let decoded: RecoveryCursor = serde_json::from_value(value).unwrap();
+        assert!(decoded.hierarchy_retries.is_empty());
     }
 
     #[test]
