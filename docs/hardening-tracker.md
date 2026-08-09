@@ -28,7 +28,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P1-005 Lossy directory names](https://github.com/davidtorcivia/SteadQ/issues/65) | A-009 | Open |
 | [SQ-P1-006 Raw-FD ownership](https://github.com/davidtorcivia/SteadQ/issues/66) | A-009 | Open |
 | [SQ-P1-007 Init/open protocol](https://github.com/davidtorcivia/SteadQ/issues/67) | A-008 | Complete in [#184](https://github.com/davidtorcivia/SteadQ/pull/184): FORMAT publication through executor, post-linearization failure classification, interrupted init detection in open() |
-| [SQ-P1-008 Incomplete fsck namespace accounting](https://github.com/davidtorcivia/SteadQ/issues/68) | A-012 | Open |
+| [SQ-P1-008 Incomplete fsck namespace accounting](https://github.com/davidtorcivia/SteadQ/issues/68) | A-012 | Complete in [#185](https://github.com/davidtorcivia/SteadQ/pull/185): unexpected entries classified as findings in all state directories |
 | [SQ-P1-009 Inconsistent compact receipt validation](https://github.com/davidtorcivia/SteadQ/issues/69) | A-005 | Complete in [#83](https://github.com/davidtorcivia/SteadQ/pull/83) |
 | [SQ-P1-010 Destructive maintenance TOCTOU](https://github.com/davidtorcivia/SteadQ/issues/70) | A-008/A-012 | Complete: maintenance paths authenticate path-to-inode identity via fstatat before mutation; residual POSIX TOCTOU window documented |
 | [SQ-P1-011 String-flattened errors](https://github.com/davidtorcivia/SteadQ/issues/71) | A-008/A-017/A-018 | Open |
