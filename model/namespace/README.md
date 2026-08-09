@@ -1,6 +1,6 @@
 # Namespace durability model
 
-`SteadQNamespace.tla` is a bounded model of one cross-directory no-overwrite move. It imports the generated protocol IR vocabulary and validates the metadata shared by every generated `rename_noreplace` transition with destination-directory and source-directory barriers.
+`SteadQNamespace.tla` is a bounded model of one cross-directory no-overwrite move. It imports the generated protocol IR vocabulary and validates both metadata forms that can produce such a move: distinct-state transitions with destination and source directory barriers, and renewal with a same-or-destination barrier followed by a source barrier when the directories differ.
 
 The model keeps separate volatile and durable source and destination entries. `Crash` restores the volatile namespace from the durable snapshots. `SteadQNamespaceOrdered.cfg` changes durable entries only through explicit barriers. `SteadQNamespaceWeak.cfg` also permits independent source-removal and destination-addition persistence before an explicit barrier.
 
@@ -15,7 +15,7 @@ TLC 2026.07.31 with `-workers auto` completes the ordered profile with 29 genera
 
 ## Invariants checked
 
-- `TypeInvariant`: variables and the crash profile remain in their bounded domains, and every generated cross-directory no-overwrite move uses not-committed before linearization, outcome-unknown after linearization, and a source-aware resolver topology.
+- `TypeInvariant`: variables and the crash profile remain in their bounded domains. Distinct-state no-overwrite moves use destination and source barriers; renewal uses same-or-destination followed by conditional-source. Both forms use not-committed before linearization, outcome-unknown after linearization, and a source-aware resolver topology.
 
 - `BeforeLinearizationPreservesSource`: an operation that has not linearized retains the source object.
 

@@ -89,7 +89,7 @@ PhaseForObservation(observationValue) ==
     THEN PhaseObservedBothDifferent
     ELSE PhaseObservedNeither
 
-CrossDirectoryMoveIndices == {
+DistinctStateMoveIndices == {
     index \in 1..Len(ProtocolTransitions) :
         /\ ProtocolTransitions[index].linearization =
             LinearizationRenameNoreplace
@@ -97,13 +97,24 @@ CrossDirectoryMoveIndices == {
             ProtocolTransitions[index].destination
 }
 
-CrossDirectoryMoveRows == {
-    ProtocolTransitions[index] : index \in CrossDirectoryMoveIndices
+DistinctStateMoveRows == {
+    ProtocolTransitions[index] : index \in DistinctStateMoveIndices
+}
+
+RenewMoveIndices == {
+    index \in 1..Len(ProtocolTransitions) :
+        /\ ProtocolTransitions[index].operation = OperationRenew
+        /\ ProtocolTransitions[index].linearization =
+            LinearizationRenameNoreplace
+}
+
+RenewMoveRows == {
+    ProtocolTransitions[index] : index \in RenewMoveIndices
 }
 
 ProtocolMoveMetadataMatches ==
-    /\ CrossDirectoryMoveRows # {}
-    /\ \A row \in CrossDirectoryMoveRows :
+    /\ DistinctStateMoveRows # {}
+    /\ \A row \in DistinctStateMoveRows :
         /\ row.requiredSyncs =
             <<SyncStepDestinationDirectory, SyncStepSourceDirectory>>
         /\ row.beforeLinearizationFailure = FailureOutcomeNotCommitted
@@ -111,6 +122,17 @@ ProtocolMoveMetadataMatches ==
         /\ row.resolverProbeTopology \in
             {ResolverProbeTopologySourceAndDestination,
              ResolverProbeTopologyReceiptCandidatesAndSource}
+    /\ Cardinality(RenewMoveRows) = 1
+    /\ \A row \in RenewMoveRows :
+        /\ row.source = StateLeased
+        /\ row.destination = StateLeased
+        /\ row.requiredSyncs =
+            <<SyncStepSameOrDestinationDirectory,
+              SyncStepSourceDirectoryIfDistinct>>
+        /\ row.beforeLinearizationFailure = FailureOutcomeNotCommitted
+        /\ row.afterLinearizationFailure = FailureOutcomeOutcomeUnknown
+        /\ row.resolverProbeTopology =
+            ResolverProbeTopologySourceAndDestination
 
 VARIABLES
     source,
