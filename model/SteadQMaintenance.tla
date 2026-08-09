@@ -52,13 +52,13 @@ VARIABLES
     retryBudgetFailuresRemaining,
     crashesRemaining,
     fullScanSeen,
-    retryOrderSound
+    retryBeforeScanSound
 
 Vars == <<entryState, applyCount, retryFailuresRemaining, cursor,
           durableCursor, retryLedger, durableRetryLedger, retryFrontier,
           durableRetryFrontier, selectedRetry, active, cycleFinished, budget,
           traversalRemaining, workUsed, retryBudgetFailuresRemaining,
-          crashesRemaining, fullScanSeen, retryOrderSound>>
+          crashesRemaining, fullScanSeen, retryBeforeScanSound>>
 
 TypeInvariant ==
     /\ EntryCount \in Nat \ {0}
@@ -88,7 +88,7 @@ TypeInvariant ==
     /\ retryBudgetFailuresRemaining \in 0..MaxRetryBudgetFailures
     /\ crashesRemaining \in 0..MaxCrashes
     /\ fullScanSeen \in BOOLEAN
-    /\ retryOrderSound \in BOOLEAN
+    /\ retryBeforeScanSound \in BOOLEAN
 
 Init ==
     /\ entryState = [entry \in Entries |-> Pending]
@@ -110,7 +110,7 @@ Init ==
     /\ retryBudgetFailuresRemaining = MaxRetryBudgetFailures
     /\ crashesRemaining = MaxCrashes
     /\ fullScanSeen = FALSE
-    /\ retryOrderSound = TRUE
+    /\ retryBeforeScanSound = TRUE
 
 BeginPass ==
     /\ ~active
@@ -129,11 +129,12 @@ BeginPass ==
     /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
                     durableCursor, durableRetryLedger, durableRetryFrontier,
                     retryBudgetFailuresRemaining, crashesRemaining,
-                    fullScanSeen, retryOrderSound>>
+                    fullScanSeen, retryBeforeScanSound>>
 
 TraverseHierarchy ==
     /\ active
     /\ ~cycleFinished
+    /\ selectedRetry = 0
     /\ traversalRemaining > 0
     /\ budget > 0
     /\ traversalRemaining' = traversalRemaining - 1
@@ -143,7 +144,7 @@ TraverseHierarchy ==
                     durableCursor, retryLedger, durableRetryLedger,
                     retryFrontier, durableRetryFrontier, selectedRetry,
                     active, cycleFinished, retryBudgetFailuresRemaining,
-                    crashesRemaining, fullScanSeen, retryOrderSound>>
+                    crashesRemaining, fullScanSeen, retryBeforeScanSound>>
 
 ReplayAppliedEntry(entry) ==
     /\ entryState[entry] = Applied
@@ -156,7 +157,7 @@ ReplayAppliedEntry(entry) ==
                     retryFrontier, durableRetryFrontier, selectedRetry,
                     active, cycleFinished, traversalRemaining,
                     retryBudgetFailuresRemaining, crashesRemaining,
-                    retryOrderSound>>
+                    retryBeforeScanSound>>
 
 ApplyEntry(entry) ==
     /\ entryState[entry] = Pending
@@ -170,11 +171,12 @@ ApplyEntry(entry) ==
                     durableRetryLedger, retryFrontier, durableRetryFrontier,
                     selectedRetry, active, cycleFinished, crashesRemaining,
                     traversalRemaining, retryBudgetFailuresRemaining,
-                    retryOrderSound>>
+                    retryBeforeScanSound>>
 
 ScanNext ==
     /\ active
     /\ ~cycleFinished
+    /\ selectedRetry = 0
     /\ traversalRemaining = 0
     /\ budget > 0
     /\ cursor < EntryCount
@@ -186,14 +188,13 @@ FailBlockedRetry ==
     /\ selectedRetry = BlockedRetry
     /\ retryFrontier' = selectedRetry
     /\ selectedRetry' = 0
-    /\ cursor' = 0
-    /\ cycleFinished' = TRUE
     /\ budget' = budget - 1
     /\ workUsed' = workUsed + 1
-    /\ retryOrderSound' = (retryOrderSound /\ (cursor = EntryCount))
+    /\ retryBeforeScanSound' =
+        (retryBeforeScanSound /\ (traversalRemaining = TraversalCost))
     /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
-                    durableCursor, retryLedger, durableRetryLedger,
-                    durableRetryFrontier, active, crashesRemaining,
+                    cursor, durableCursor, retryLedger, durableRetryLedger,
+                    durableRetryFrontier, active, cycleFinished, crashesRemaining,
                     traversalRemaining, retryBudgetFailuresRemaining,
                     fullScanSeen>>
 
@@ -204,14 +205,13 @@ FailTransientRetry ==
         [retryFailuresRemaining EXCEPT ![selectedRetry] = @ - 1]
     /\ retryFrontier' = selectedRetry
     /\ selectedRetry' = 0
-    /\ cursor' = 0
-    /\ cycleFinished' = TRUE
     /\ budget' = budget - 1
     /\ workUsed' = workUsed + 1
-    /\ retryOrderSound' = (retryOrderSound /\ (cursor = EntryCount))
-    /\ UNCHANGED <<entryState, applyCount, durableCursor, retryLedger,
+    /\ retryBeforeScanSound' =
+        (retryBeforeScanSound /\ (traversalRemaining = TraversalCost))
+    /\ UNCHANGED <<entryState, applyCount, cursor, durableCursor, retryLedger,
                     durableRetryLedger, durableRetryFrontier, active,
-                    traversalRemaining, retryBudgetFailuresRemaining,
+                    cycleFinished, traversalRemaining, retryBudgetFailuresRemaining,
                     crashesRemaining, fullScanSeen>>
 
 ResolveTransientRetry ==
@@ -222,20 +222,20 @@ ResolveTransientRetry ==
         /\ retryFrontier' = IF remaining = {} THEN 0 ELSE selectedRetry
     /\ selectedRetry' = 0
     /\ cursor' = 0
-    /\ cycleFinished' = TRUE
     /\ budget' = budget - 1
     /\ workUsed' = workUsed + 1
-    /\ retryOrderSound' = (retryOrderSound /\ (cursor = EntryCount))
+    /\ retryBeforeScanSound' =
+        (retryBeforeScanSound /\ (traversalRemaining = TraversalCost))
     /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
                     durableCursor, durableRetryLedger, durableRetryFrontier,
-                    active, traversalRemaining, retryBudgetFailuresRemaining,
+                    active, cycleFinished, traversalRemaining,
+                    retryBudgetFailuresRemaining,
                     crashesRemaining, fullScanSeen>>
 
-RetryAfterScan ==
+RetryBeforeScan ==
     /\ active
     /\ ~cycleFinished
-    /\ traversalRemaining = 0
-    /\ cursor = EntryCount
+    /\ traversalRemaining = TraversalCost
     /\ selectedRetry # 0
     /\ budget > 0
     /\ \/ FailBlockedRetry
@@ -245,8 +245,7 @@ RetryAfterScan ==
 ExhaustRetryBudget ==
     /\ active
     /\ ~cycleFinished
-    /\ traversalRemaining = 0
-    /\ cursor = EntryCount
+    /\ traversalRemaining = TraversalCost
     /\ selectedRetry # 0
     /\ budget > 0
     /\ retryBudgetFailuresRemaining > 0
@@ -257,9 +256,9 @@ ExhaustRetryBudget ==
                     durableCursor, retryLedger, durableRetryLedger,
                     retryFrontier, durableRetryFrontier, selectedRetry,
                     active, cycleFinished, traversalRemaining,
-                    crashesRemaining, fullScanSeen, retryOrderSound>>
+                    crashesRemaining, fullScanSeen, retryBeforeScanSound>>
 
-FinishScanWithoutRetry ==
+FinishScan ==
     /\ active
     /\ ~cycleFinished
     /\ traversalRemaining = 0
@@ -272,7 +271,7 @@ FinishScanWithoutRetry ==
                     retryFrontier, durableRetryFrontier, selectedRetry,
                     active, traversalRemaining, budget, workUsed,
                     retryBudgetFailuresRemaining, crashesRemaining,
-                    fullScanSeen, retryOrderSound>>
+                    fullScanSeen, retryBeforeScanSound>>
 
 EndPass ==
     /\ active
@@ -289,7 +288,7 @@ EndPass ==
     /\ workUsed' = 0
     /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining, cursor,
                     retryLedger, retryFrontier, retryBudgetFailuresRemaining,
-                    crashesRemaining, fullScanSeen, retryOrderSound>>
+                    crashesRemaining, fullScanSeen, retryBeforeScanSound>>
 
 CrashAndReopen ==
     /\ crashesRemaining > 0
@@ -306,15 +305,15 @@ CrashAndReopen ==
     /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
                     durableCursor, durableRetryLedger, durableRetryFrontier,
                     retryBudgetFailuresRemaining, fullScanSeen,
-                    retryOrderSound>>
+                    retryBeforeScanSound>>
 
 Next ==
     \/ BeginPass
     \/ TraverseHierarchy
     \/ ScanNext
-    \/ RetryAfterScan
+    \/ RetryBeforeScan
     \/ ExhaustRetryBudget
-    \/ FinishScanWithoutRetry
+    \/ FinishScan
     \/ EndPass
     \/ CrashAndReopen
 
@@ -325,9 +324,9 @@ FairSpec ==
     /\ WF_Vars(BeginPass)
     /\ WF_Vars(TraverseHierarchy)
     /\ WF_Vars(ScanNext)
-    /\ WF_Vars(RetryAfterScan)
+    /\ WF_Vars(RetryBeforeScan)
     /\ WF_Vars(ExhaustRetryBudget)
-    /\ WF_Vars(FinishScanWithoutRetry)
+    /\ WF_Vars(FinishScan)
     /\ WF_Vars(EndPass)
 
 SafeThrough(frontier) ==
@@ -361,8 +360,8 @@ SharedBudgetAccountsForAllWork ==
     THEN budget + workUsed = PassBudget
     ELSE workUsed = 0
 
-RetryRunsOnlyAfterFullScan ==
-    retryOrderSound
+RetryRunsBeforeCanonicalScan ==
+    retryBeforeScanSound
 
 LeafAndRetryDomainsAreDisjoint ==
     /\ retryLedger \cap Entries = {}
