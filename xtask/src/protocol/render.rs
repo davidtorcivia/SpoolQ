@@ -85,6 +85,16 @@ pub(super) fn render_rust(spec: &StateMachineSpec, digest: &str) -> String {
     );
     write_rust_enum(
         &mut output,
+        "LinearizationPrimitive",
+        &LinearizationPrimitive::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "FailureOutcome",
+        &FailureOutcome::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
         "ExceptionName",
         &ExceptionName::ALL.map(|value| (value.rust_name(), value.as_str())),
     );
@@ -104,7 +114,9 @@ pub struct TransitionDef {
     pub token_change: TokenChange,
     pub reason_class: Option<ReasonClass>,
     pub required_syncs: &'static [SyncStep],
-    pub no_overwrite: bool,
+    pub linearization: LinearizationPrimitive,
+    pub before_linearization_failure: FailureOutcome,
+    pub after_linearization_failure: FailureOutcome,
     /// Human-readable resolver documentation, not an executable rule.
     pub resolution_behavior: &'static str,
     /// Human-readable qualification, not an executable precondition.
@@ -153,7 +165,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
             };
         writeln!(
             output,
-            "    TransitionDef {{\n        operation: Operation::{},\n        source: State::{},\n        destination: State::{},\n        generation_change: GenerationChange::{},\n        attempt_change: AttemptChange::{},\n        token_change: TokenChange::{},\n        reason_class: {},\n        required_syncs: &[{}],\n        no_overwrite: {},\n        {},\n        notes: {},\n    }},",
+            "    TransitionDef {{\n        operation: Operation::{},\n        source: State::{},\n        destination: State::{},\n        generation_change: GenerationChange::{},\n        attempt_change: AttemptChange::{},\n        token_change: TokenChange::{},\n        reason_class: {},\n        required_syncs: &[{}],\n        linearization: LinearizationPrimitive::{},\n        before_linearization_failure: FailureOutcome::{},\n        after_linearization_failure: FailureOutcome::{},\n        {},\n        notes: {},\n    }},",
             transition.operation.rust_name(),
             transition.source.rust_name(),
             transition.destination.rust_name(),
@@ -162,7 +174,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
             transition.token_change.rust_name(),
             reason_class,
             required_syncs,
-            transition.no_overwrite,
+            transition.linearization.rust_name(),
+            transition.before_linearization_failure.rust_name(),
+            transition.after_linearization_failure.rust_name(),
             resolution_field,
             notes,
         )
@@ -220,7 +234,7 @@ mod tests {
     }
     writeln!(
         output,
-        "    }}\n\n    #[test]\n    fn illegal_transitions() {{\n        for (source, destination) in [\n            (State::Receipt, State::Ready),\n            (State::Dead, State::Ready),\n            (State::Quarantine, State::Ready),\n            (State::Ready, State::Ready),\n            (State::Hidden, State::Leased),\n            (State::Ready, State::Receipt),\n        ] {{\n            assert!(!is_legal_transition(source, destination));\n        }}\n    }}\n\n    #[test]\n    fn generated_collections_are_complete() {{\n        assert_eq!(TRANSITIONS.len(), {});\n        assert_eq!(EXCEPTIONS.len(), {});\n        assert_eq!(REENTRY.len(), {});\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.required_syncs.is_empty()));\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.resolution_behavior.is_empty()));\n        assert!(TRANSITIONS.iter().all(|transition| transition.no_overwrite));\n        assert!(EXCEPTIONS\n            .iter()\n            .all(|exception| exception.uses_replacing_rename));\n        assert!(REENTRY.iter().all(|reentry| reentry.creates_new_identity));\n    }}\n\n    #[test]\n    fn claim_projects_complete_semantics() {{\n        let claim = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::Claim)\n            .unwrap();\n        assert_eq!(claim.source, State::Ready);\n        assert_eq!(claim.destination, State::Leased);\n        assert_eq!(claim.attempt_change, AttemptChange::Increment);\n        assert_eq!(claim.generation_change, GenerationChange::Increment);\n        assert_eq!(claim.token_change, TokenChange::New);\n        assert_eq!(claim.reason_class, None);\n        assert_eq!(\n            claim.required_syncs,\n            &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]\n        );\n        assert!(claim.resolution_behavior.contains(\"both\"));\n        assert_eq!(claim.notes, None);\n    }}\n\n    #[test]\n    fn terminal_and_exception_metadata_are_projected() {{\n        let reap = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::ReapExpiredToDead)\n            .unwrap();\n        assert_eq!(reap.reason_class, Some(ReasonClass::AttemptsExhausted));\n        assert_eq!(reap.notes, Some(\"attempt >= maximum_attempts\"));\n        assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);\n        assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);\n        assert_eq!(REENTRY[0].source, State::Dead);\n    }}\n}}",
+        "    }}\n\n    #[test]\n    fn illegal_transitions() {{\n        for (source, destination) in [\n            (State::Receipt, State::Ready),\n            (State::Dead, State::Ready),\n            (State::Quarantine, State::Ready),\n            (State::Ready, State::Ready),\n            (State::Hidden, State::Leased),\n            (State::Ready, State::Receipt),\n        ] {{\n            assert!(!is_legal_transition(source, destination));\n        }}\n    }}\n\n    #[test]\n    fn generated_collections_are_complete() {{\n        assert_eq!(TRANSITIONS.len(), {});\n        assert_eq!(EXCEPTIONS.len(), {});\n        assert_eq!(REENTRY.len(), {});\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.required_syncs.is_empty()));\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.resolution_behavior.is_empty()));\n        assert!(TRANSITIONS.iter().all(|transition| {{\n            transition.before_linearization_failure == FailureOutcome::NotCommitted\n                && transition.after_linearization_failure == FailureOutcome::OutcomeUnknown\n        }}));\n        assert!(EXCEPTIONS\n            .iter()\n            .all(|exception| exception.uses_replacing_rename));\n        assert!(REENTRY.iter().all(|reentry| reentry.creates_new_identity));\n    }}\n\n    #[test]\n    fn claim_projects_complete_semantics() {{\n        let claim = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::Claim)\n            .unwrap();\n        assert_eq!(claim.source, State::Ready);\n        assert_eq!(claim.destination, State::Leased);\n        assert_eq!(claim.attempt_change, AttemptChange::Increment);\n        assert_eq!(claim.generation_change, GenerationChange::Increment);\n        assert_eq!(claim.token_change, TokenChange::New);\n        assert_eq!(claim.reason_class, None);\n        assert_eq!(\n            claim.required_syncs,\n            &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]\n        );\n        assert_eq!(claim.linearization, LinearizationPrimitive::RenameNoreplace);\n        assert_eq!(\n            claim.before_linearization_failure,\n            FailureOutcome::NotCommitted\n        );\n        assert_eq!(\n            claim.after_linearization_failure,\n            FailureOutcome::OutcomeUnknown\n        );\n        assert!(claim.resolution_behavior.contains(\"both\"));\n        assert_eq!(claim.notes, None);\n    }}\n\n    #[test]\n    fn enqueue_uses_no_overwrite_publication() {{\n        let enqueue = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::EnqueueImmediate)\n            .unwrap();\n        assert_eq!(\n            enqueue.linearization,\n            LinearizationPrimitive::PublishNoreplace\n        );\n    }}\n\n    #[test]\n    fn terminal_and_exception_metadata_are_projected() {{\n        let reap = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::ReapExpiredToDead)\n            .unwrap();\n        assert_eq!(reap.reason_class, Some(ReasonClass::AttemptsExhausted));\n        assert_eq!(reap.notes, Some(\"attempt >= maximum_attempts\"));\n        assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);\n        assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);\n        assert_eq!(REENTRY[0].source, State::Dead);\n    }}\n}}",
         spec.transitions.len(),
         spec.exceptions.len(),
         spec.reentry.len(),
@@ -252,17 +266,19 @@ type OptionalString struct {\n\
 \tPresent bool\n\
 }\n\n\
 type TransitionDef struct {\n\
-\tOperation          string\n\
-\tSource             string\n\
-\tDestination        string\n\
-\tGenerationChange   string\n\
-\tAttemptChange      string\n\
-\tTokenChange        string\n\
-\tReasonClass        OptionalString\n\
-\tRequiredSyncs      []string\n\
-\tNoOverwrite        bool\n\
-\tResolutionBehavior string\n\
-\tNotes              OptionalString\n\
+\tOperation                  string\n\
+\tSource                     string\n\
+\tDestination                string\n\
+\tGenerationChange           string\n\
+\tAttemptChange              string\n\
+\tTokenChange                string\n\
+\tReasonClass                OptionalString\n\
+\tRequiredSyncs              []string\n\
+\tLinearization              string\n\
+\tBeforeLinearizationFailure string\n\
+\tAfterLinearizationFailure  string\n\
+\tResolutionBehavior         string\n\
+\tNotes                      OptionalString\n\
 }\n\n\
 type ExceptionDef struct {\n\
 \tName                string\n\
@@ -300,7 +316,7 @@ var Transitions = []TransitionDef{\n",
         };
         writeln!(
             output,
-            "\t{{Operation: {}, Source: {}, Destination: {}, GenerationChange: {}, AttemptChange: {}, TokenChange: {}, ReasonClass: {}, RequiredSyncs: []string{{{}}}, NoOverwrite: {}, ResolutionBehavior: {}, Notes: {}}},",
+            "\t{{Operation: {}, Source: {}, Destination: {}, GenerationChange: {}, AttemptChange: {}, TokenChange: {}, ReasonClass: {}, RequiredSyncs: []string{{{}}}, Linearization: {}, BeforeLinearizationFailure: {}, AfterLinearizationFailure: {}, ResolutionBehavior: {}, Notes: {}}},",
             json_string(transition.operation.as_str()),
             json_string(transition.source.as_str()),
             json_string(transition.destination.as_str()),
@@ -309,7 +325,9 @@ var Transitions = []TransitionDef{\n",
             json_string(transition.token_change.as_str()),
             reason_class,
             required_syncs,
-            transition.no_overwrite,
+            json_string(transition.linearization.as_str()),
+            json_string(transition.before_linearization_failure.as_str()),
+            json_string(transition.after_linearization_failure.as_str()),
             json_string(&transition.resolution_behavior),
             notes,
         )
@@ -357,8 +375,8 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
         "<!-- Source: spec/state-machine.json; SHA-256: {digest} -->\n\n\
 # SteadQ/1 State Machine (Generated)\n\n\
 ## Transitions\n\n\
-| Operation | Source | Destination | Gen | Attempt | Token | Reason | Required syncs | No-overwrite | Resolution | Notes |\n\
-|-----------|--------|-------------|-----|---------|-------|--------|----------------|--------------|------------|-------|\n",
+| Operation | Source | Destination | Gen | Attempt | Token | Reason | Required syncs | Linearization | Before failure | After failure | Resolution | Notes |\n\
+|-----------|--------|-------------|-----|---------|-------|--------|----------------|---------------|----------------|---------------|------------|-------|\n",
     );
     for transition in &spec.transitions {
         let required_syncs = transition
@@ -369,7 +387,7 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
             .join(", ");
         writeln!(
             output,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             markdown(transition.operation.as_str()),
             markdown(transition.source.as_str()),
             markdown(transition.destination.as_str()),
@@ -381,11 +399,9 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
                 Nullable::Null => "none",
             },
             required_syncs,
-            if transition.no_overwrite {
-                "True"
-            } else {
-                "False"
-            },
+            transition.linearization.as_str(),
+            transition.before_linearization_failure.as_str(),
+            transition.after_linearization_failure.as_str(),
             markdown(&transition.resolution_behavior),
             match &transition.notes {
                 Nullable::Value(notes) => markdown(notes),

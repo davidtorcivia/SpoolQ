@@ -28,7 +28,9 @@ struct Transition {
     token_change: TokenChange,
     reason_class: Nullable<ReasonClass>,
     required_syncs: Vec<SyncStep>,
-    no_overwrite: bool,
+    linearization: LinearizationPrimitive,
+    before_linearization_failure: FailureOutcome,
+    after_linearization_failure: FailureOutcome,
     resolution_behavior: String,
     notes: Nullable<String>,
 }
@@ -116,6 +118,20 @@ enum SyncStep {
     SameOrDestinationDir,
 }
 
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LinearizationPrimitive {
+    PublishNoreplace,
+    RenameNoreplace,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum FailureOutcome {
+    NotCommitted,
+    OutcomeUnknown,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Exception {
@@ -191,12 +207,6 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
         if transition.required_syncs.is_empty() {
             return Err(format!(
                 "transition {} has no required syncs",
-                transition.operation.as_str()
-            ));
-        }
-        if !transition.no_overwrite {
-            return Err(format!(
-                "transition {} must prohibit overwrite",
                 transition.operation.as_str()
             ));
         }
@@ -302,6 +312,27 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
 
 fn validate_transition_invariant(transition: &Transition) -> Result<(), String> {
     let expected = transition.operation.invariant();
+    let expected_linearization = transition.operation.linearization();
+    if transition.linearization != expected_linearization {
+        return Err(format!(
+            "transition {} has linearization {}; expected {}",
+            transition.operation.as_str(),
+            transition.linearization.as_str(),
+            expected_linearization.as_str()
+        ));
+    }
+    if transition.before_linearization_failure != FailureOutcome::NotCommitted {
+        return Err(format!(
+            "transition {} must classify pre-linearization failure as not_committed",
+            transition.operation.as_str()
+        ));
+    }
+    if transition.after_linearization_failure != FailureOutcome::OutcomeUnknown {
+        return Err(format!(
+            "transition {} must classify post-linearization failure as outcome_unknown",
+            transition.operation.as_str()
+        ));
+    }
     if transition.source != expected.source {
         return Err(format!(
             "transition {} has source {}; expected {}",
@@ -445,6 +476,25 @@ impl Operation {
             Self::ReapExpiredToReady => "ReapExpiredToReady",
             Self::ReapExpiredToDead => "ReapExpiredToDead",
             Self::Quarantine => "Quarantine",
+        }
+    }
+
+    fn linearization(self) -> LinearizationPrimitive {
+        match self {
+            Self::EnqueueImmediate | Self::EnqueueDelayed => {
+                LinearizationPrimitive::PublishNoreplace
+            }
+            Self::Promote
+            | Self::Claim
+            | Self::ExhaustedReadyCleanup
+            | Self::Renew
+            | Self::Acknowledge
+            | Self::RetryNow
+            | Self::RetryLater
+            | Self::Bury
+            | Self::ReapExpiredToReady
+            | Self::ReapExpiredToDead
+            | Self::Quarantine => LinearizationPrimitive::RenameNoreplace,
         }
     }
 
@@ -725,6 +775,42 @@ impl SyncStep {
             Self::DestinationDir => "DestinationDirectory",
             Self::SourceDir => "SourceDirectory",
             Self::SameOrDestinationDir => "SameOrDestinationDirectory",
+        }
+    }
+}
+
+impl LinearizationPrimitive {
+    const ALL: [Self; 2] = [Self::PublishNoreplace, Self::RenameNoreplace];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PublishNoreplace => "publish_noreplace",
+            Self::RenameNoreplace => "rename_noreplace",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::PublishNoreplace => "PublishNoreplace",
+            Self::RenameNoreplace => "RenameNoreplace",
+        }
+    }
+}
+
+impl FailureOutcome {
+    const ALL: [Self; 2] = [Self::NotCommitted, Self::OutcomeUnknown];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotCommitted => "not_committed",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::NotCommitted => "NotCommitted",
+            Self::OutcomeUnknown => "OutcomeUnknown",
         }
     }
 }

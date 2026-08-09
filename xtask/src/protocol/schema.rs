@@ -3,13 +3,13 @@ use std::fs;
 use std::path::Path;
 
 use super::{
-    AttemptChange, ExceptionName, GenerationChange, Operation, ReasonClass, ReentryName, State,
-    SyncStep, TokenChange,
+    AttemptChange, ExceptionName, FailureOutcome, GenerationChange, LinearizationPrimitive,
+    Operation, ReasonClass, ReentryName, State, SyncStep, TokenChange,
 };
 
 pub(super) const SCHEMA: &str = "spec/state-machine.schema.json";
 const SCHEMA_CONTRACT_SHA256: &str =
-    "2d60a9f0d851f7587d63b1180f7dbec8345bb9194864d7bbf5c5a21e025564f6";
+    "5a6c352e7c6a7624e557b31c1f24cccd0ab0f0677152d09edf98cbbcbb943028";
 
 pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     let bytes =
@@ -67,6 +67,21 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
     )?;
     validate_schema_domain(
         &schema,
+        "/properties/transitions/items/properties/linearization/enum",
+        &LinearizationPrimitive::ALL.map(LinearizationPrimitive::as_str),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/transitions/items/properties/before_linearization_failure/const",
+        FailureOutcome::NotCommitted.as_str(),
+    )?;
+    validate_schema_const(
+        &schema,
+        "/properties/transitions/items/properties/after_linearization_failure/const",
+        FailureOutcome::OutcomeUnknown.as_str(),
+    )?;
+    validate_schema_domain(
+        &schema,
         "/properties/exceptions/items/properties/name/enum",
         &ExceptionName::ALL.map(ExceptionName::as_str),
     )?;
@@ -80,6 +95,23 @@ pub(super) fn validate_schema(root: &Path) -> Result<(), String> {
         "/properties/reentry/items/properties/source/enum",
         &State::REENTRY_SOURCES.map(State::as_str),
     )
+}
+
+pub(super) fn validate_schema_const(
+    schema: &serde_json::Value,
+    pointer: &str,
+    expected: &str,
+) -> Result<(), String> {
+    let actual = schema
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{SCHEMA} has no string const at {pointer}"))?;
+    if actual != expected {
+        return Err(format!(
+            "{SCHEMA} const at {pointer} differs from xtask: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_schema_domain(

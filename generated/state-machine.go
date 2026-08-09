@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: ef2e7b2b1da9c377a7dc8737dd1ba8adb6275ef674315cac43c85df18ff8be3f
+// Source SHA-256: 98d2c334df4679cf27cbc45ce270590345f7dd1050305e46ce8fd1b960948e93
 
 package steadq
 
@@ -9,17 +9,19 @@ type OptionalString struct {
 }
 
 type TransitionDef struct {
-	Operation          string
-	Source             string
-	Destination        string
-	GenerationChange   string
-	AttemptChange      string
-	TokenChange        string
-	ReasonClass        OptionalString
-	RequiredSyncs      []string
-	NoOverwrite        bool
-	ResolutionBehavior string
-	Notes              OptionalString
+	Operation                  string
+	Source                     string
+	Destination                string
+	GenerationChange           string
+	AttemptChange              string
+	TokenChange                string
+	ReasonClass                OptionalString
+	RequiredSyncs              []string
+	Linearization              string
+	BeforeLinearizationFailure string
+	AfterLinearizationFailure  string
+	ResolutionBehavior         string
+	Notes                      OptionalString
 }
 
 type ExceptionDef struct {
@@ -36,19 +38,19 @@ type ReentryDef struct {
 }
 
 var Transitions = []TransitionDef{
-	{Operation: "enqueue_immediate", Source: "hidden", Destination: "ready", GenerationChange: "zero", AttemptChange: "zero", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"file_fsync", "destination_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe destination: observed = committed, absent = not committed", Notes: OptionalString{}},
-	{Operation: "enqueue_delayed", Source: "hidden", Destination: "delayed", GenerationChange: "zero", AttemptChange: "zero", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"file_fsync", "destination_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe destination: observed = committed, absent = not committed", Notes: OptionalString{}},
-	{Operation: "promote", Source: "delayed", Destination: "ready", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both: destination observed = committed, source only = not committed", Notes: OptionalString{}},
-	{Operation: "claim", Source: "ready", Destination: "leased", GenerationChange: "increment", AttemptChange: "increment", TokenChange: "new", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both directories", Notes: OptionalString{}},
-	{Operation: "exhausted_ready_cleanup", Source: "ready", Destination: "dead", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "attempts_exhausted", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both", Notes: OptionalString{}},
-	{Operation: "renew", Source: "leased", Destination: "leased", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "same", ReasonClass: OptionalString{}, RequiredSyncs: []string{"same_or_destination_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe destination: new generation observed = renewed, old gen observed = lease lost", Notes: OptionalString{}},
-	{Operation: "acknowledge", Source: "leased", Destination: "receipt", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "same", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe receipt buckets by exact name", Notes: OptionalString{}},
-	{Operation: "retry_now", Source: "leased", Destination: "ready", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both", Notes: OptionalString{}},
-	{Operation: "retry_later", Source: "leased", Destination: "delayed", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both", Notes: OptionalString{}},
-	{Operation: "bury", Source: "leased", Destination: "dead", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "application_defined", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both", Notes: OptionalString{}},
-	{Operation: "reap_expired_to_ready", Source: "leased", Destination: "ready", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both", Notes: OptionalString{Value: "attempt < maximum_attempts", Present: true}},
-	{Operation: "reap_expired_to_dead", Source: "leased", Destination: "dead", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "attempts_exhausted", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both", Notes: OptionalString{Value: "attempt >= maximum_attempts", Present: true}},
-	{Operation: "quarantine", Source: "active", Destination: "quarantine", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "corruption", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, NoOverwrite: true, ResolutionBehavior: "probe both", Notes: OptionalString{Value: "raw bytes preserved", Present: true}},
+	{Operation: "enqueue_immediate", Source: "hidden", Destination: "ready", GenerationChange: "zero", AttemptChange: "zero", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"file_fsync", "destination_dir_fsync"}, Linearization: "publish_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe destination: observed = committed, absent = not committed", Notes: OptionalString{}},
+	{Operation: "enqueue_delayed", Source: "hidden", Destination: "delayed", GenerationChange: "zero", AttemptChange: "zero", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"file_fsync", "destination_dir_fsync"}, Linearization: "publish_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe destination: observed = committed, absent = not committed", Notes: OptionalString{}},
+	{Operation: "promote", Source: "delayed", Destination: "ready", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both: destination observed = committed, source only = not committed", Notes: OptionalString{}},
+	{Operation: "claim", Source: "ready", Destination: "leased", GenerationChange: "increment", AttemptChange: "increment", TokenChange: "new", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both directories", Notes: OptionalString{}},
+	{Operation: "exhausted_ready_cleanup", Source: "ready", Destination: "dead", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "attempts_exhausted", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both", Notes: OptionalString{}},
+	{Operation: "renew", Source: "leased", Destination: "leased", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "same", ReasonClass: OptionalString{}, RequiredSyncs: []string{"same_or_destination_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe destination: new generation observed = renewed, old gen observed = lease lost", Notes: OptionalString{}},
+	{Operation: "acknowledge", Source: "leased", Destination: "receipt", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "same", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe receipt buckets by exact name", Notes: OptionalString{}},
+	{Operation: "retry_now", Source: "leased", Destination: "ready", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both", Notes: OptionalString{}},
+	{Operation: "retry_later", Source: "leased", Destination: "delayed", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both", Notes: OptionalString{}},
+	{Operation: "bury", Source: "leased", Destination: "dead", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "application_defined", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both", Notes: OptionalString{}},
+	{Operation: "reap_expired_to_ready", Source: "leased", Destination: "ready", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both", Notes: OptionalString{Value: "attempt < maximum_attempts", Present: true}},
+	{Operation: "reap_expired_to_dead", Source: "leased", Destination: "dead", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "attempts_exhausted", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both", Notes: OptionalString{Value: "attempt >= maximum_attempts", Present: true}},
+	{Operation: "quarantine", Source: "active", Destination: "quarantine", GenerationChange: "increment", AttemptChange: "unchanged", TokenChange: "none", ReasonClass: OptionalString{Value: "corruption", Present: true}, RequiredSyncs: []string{"destination_dir_fsync", "source_dir_fsync"}, Linearization: "rename_noreplace", BeforeLinearizationFailure: "not_committed", AfterLinearizationFailure: "outcome_unknown", ResolutionBehavior: "probe both", Notes: OptionalString{Value: "raw bytes preserved", Present: true}},
 }
 
 var Exceptions = []ExceptionDef{
