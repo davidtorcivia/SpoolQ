@@ -289,9 +289,9 @@ struct LeasedSourceWitness {
 }
 
 #[derive(Debug)]
-enum WitnessedRenameOutcome {
-    Linearized,
-    LinearizedIdentityUnknown,
+enum LeasedMoveOutcome {
+    Committed,
+    OutcomeUnknown(TransitionPhase),
     SourceGone,
     SourceChanged,
     Collision,
@@ -357,19 +357,6 @@ fn stat_matches_witness(stat: &libc::stat, device: u64, inode: u64) -> bool {
         && identity_matches(stat.st_dev, stat.st_ino, device, inode)
 }
 
-fn classify_renamed_destination(
-    stat: Option<&libc::stat>,
-    device: u64,
-    inode: u64,
-) -> WitnessedRenameOutcome {
-    match stat {
-        Some(stat) if stat_matches_witness(stat, device, inode) => {
-            WitnessedRenameOutcome::Linearized
-        }
-        Some(_) | None => WitnessedRenameOutcome::LinearizedIdentityUnknown,
-    }
-}
-
 fn resolver_file_open_flags() -> i32 {
     libc::O_NOFOLLOW
         .checked_add(libc::O_CLOEXEC)
@@ -425,12 +412,14 @@ fn resolver_object_verifier(
     }
 }
 
-fn same_directory_identity(source: Option<&libc::stat>, destination: Option<&libc::stat>) -> bool {
-    match (source, destination) {
-        (Some(source), Some(destination)) => {
-            source.st_dev == destination.st_dev && source.st_ino == destination.st_ino
-        }
-        _ => false,
+fn ticket_phase_for_move_outcome_unknown(phase: engine::MovePhase) -> TransitionPhase {
+    match phase {
+        engine::MovePhase::SourceFsync => TransitionPhase::DestinationDirectoryDurable,
+        engine::MovePhase::EnsureDest
+        | engine::MovePhase::PreRename
+        | engine::MovePhase::Rename
+        | engine::MovePhase::DestinationIdentity
+        | engine::MovePhase::DestFsync => TransitionPhase::Linearized,
     }
 }
 
@@ -2120,32 +2109,13 @@ impl Queue {
             return AckOutcome::NotCommitted(e);
         }
 
-        // Rename leased -> receipt with NOREPLACE
-        match Self::rename_leased_witness_noreplace(&source, receipt_dir_fd.as_fd(), &receipt_name)
-        {
-            WitnessedRenameOutcome::Linearized => {
-                // Sync both directories
-                if fs::fsync_dir_fd(receipt_dir_fd.as_fd()).is_err() {
-                    self.poison();
-                    return AckOutcome::OutcomeUnknown(
-                        transition_ticket.with_phase(TransitionPhase::Linearized),
-                    );
-                }
-                if fs::fsync_dir_fd(source.directory_fd.as_fd()).is_err() {
-                    self.poison();
-                    return AckOutcome::OutcomeUnknown(
-                        transition_ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
-                    );
-                }
-                AckOutcome::Acked
-            }
-            WitnessedRenameOutcome::LinearizedIdentityUnknown => {
+        match Self::execute_leased_move(&source, receipt_dir_fd.as_fd(), &receipt_name) {
+            LeasedMoveOutcome::Committed => AckOutcome::Acked,
+            LeasedMoveOutcome::OutcomeUnknown(phase) => {
                 self.poison();
-                AckOutcome::OutcomeUnknown(
-                    transition_ticket.with_phase(TransitionPhase::Linearized),
-                )
+                AckOutcome::OutcomeUnknown(transition_ticket.with_phase(phase))
             }
-            WitnessedRenameOutcome::Collision => {
+            LeasedMoveOutcome::Collision => {
                 // P0-04: Authenticate the existing receipt instead of blindly
                 // reporting AlreadyAcked. A conflicting object at the
                 // deterministic path must not be treated as idempotent success.
@@ -2164,7 +2134,7 @@ impl Queue {
                     ))
                 }
             }
-            WitnessedRenameOutcome::SourceGone => {
+            LeasedMoveOutcome::SourceGone => {
                 // C-22: On source absence, do a bounded receipt probe.
                 // Construct the finite set of exact retained receipt paths
                 // and check them directly (C-23: bounded, not full scan).
@@ -2174,13 +2144,13 @@ impl Queue {
                     AckOutcome::LeaseLost
                 }
             }
-            WitnessedRenameOutcome::SourceChanged => {
+            LeasedMoveOutcome::SourceChanged => {
                 self.poison();
                 AckOutcome::NotCommitted(Error::QueueCorrupt(
                     "leased source identity changed before acknowledgment".into(),
                 ))
             }
-            WitnessedRenameOutcome::Failed(error) => AckOutcome::NotCommitted(error),
+            LeasedMoveOutcome::Failed(error) => AckOutcome::NotCommitted(error),
         }
     }
 
@@ -2487,7 +2457,7 @@ impl Queue {
             Err(error) => return RenewOutcome::NotCommitted(error),
         };
 
-        match self.move_leased_renew(lease, &dest_dir, &fname, &ticket) {
+        match self.move_leased(lease, &dest_dir, &fname, &ticket) {
             TransitionOutcome::Committed => RenewOutcome::Renewed(LeaseInfo {
                 generation: new_gen,
                 expires_boottime_ns: new_boottime_dl,
@@ -2757,37 +2727,37 @@ impl Queue {
         }
     }
 
-    fn rename_leased_witness_noreplace(
+    fn execute_leased_move(
         source: &LeasedSourceWitness,
         destination_directory_fd: BorrowedFd<'_>,
         destination_name: &str,
-    ) -> WitnessedRenameOutcome {
+    ) -> LeasedMoveOutcome {
         match Self::observe_leased_source_path(source) {
             Ok(WitnessPathObservation::Match) => {}
-            Ok(WitnessPathObservation::Gone) => return WitnessedRenameOutcome::SourceGone,
+            Ok(WitnessPathObservation::Gone) => return LeasedMoveOutcome::SourceGone,
             Ok(WitnessPathObservation::Mismatch) => {
-                return WitnessedRenameOutcome::SourceChanged;
+                return LeasedMoveOutcome::SourceChanged;
             }
-            Err(error) => return WitnessedRenameOutcome::Failed(error),
+            Err(error) => return LeasedMoveOutcome::Failed(error),
         }
 
-        match fs::renameat2_noreplace(
+        match engine::move_witnessed_noreplace(
             source.directory_fd.as_fd(),
             &source.name,
             destination_directory_fd,
             destination_name,
+            engine::MoveIdentity::new(source.device, source.inode),
+            engine::MoveActor::Consumer,
         ) {
-            Ok(()) => {
-                let destination_stat = fs::fstatat(destination_directory_fd, destination_name).ok();
-                classify_renamed_destination(destination_stat.as_ref(), source.device, source.inode)
+            Ok(()) => LeasedMoveOutcome::Committed,
+            Err(engine::MoveFailure::SourceMissing) => LeasedMoveOutcome::SourceGone,
+            Err(engine::MoveFailure::AlreadyExists) => LeasedMoveOutcome::Collision,
+            Err(engine::MoveFailure::NotCommitted { source, .. }) => {
+                LeasedMoveOutcome::Failed(Error::IoFailure(source))
             }
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                WitnessedRenameOutcome::SourceGone
+            Err(engine::MoveFailure::OutcomeUnknown { phase, .. }) => {
+                LeasedMoveOutcome::OutcomeUnknown(ticket_phase_for_move_outcome_unknown(phase))
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                WitnessedRenameOutcome::Collision
-            }
-            Err(error) => WitnessedRenameOutcome::Failed(Error::IoFailure(error.to_string())),
         }
     }
 
@@ -2819,62 +2789,24 @@ impl Queue {
             Err(e) => return TransitionOutcome::NotCommitted(e),
         };
 
-        match Self::rename_leased_witness_noreplace(&source, dest_dir_fd.as_fd(), dest_name) {
-            WitnessedRenameOutcome::Linearized => {
-                // Check if source and destination are the same directory
-                let src_stat = fs::fstat(source.directory_fd.as_fd()).ok();
-                let dest_stat = fs::fstat(dest_dir_fd.as_fd()).ok();
-                let src_same = same_directory_identity(src_stat.as_ref(), dest_stat.as_ref());
-                if src_same {
-                    if fs::fsync_dir_fd(dest_dir_fd.as_fd()).is_err() {
-                        self.poison();
-                        return TransitionOutcome::OutcomeUnknown(
-                            ticket.with_phase(TransitionPhase::Linearized),
-                        );
-                    }
-                } else {
-                    if fs::fsync_dir_fd(dest_dir_fd.as_fd()).is_err() {
-                        self.poison();
-                        return TransitionOutcome::OutcomeUnknown(
-                            ticket.with_phase(TransitionPhase::Linearized),
-                        );
-                    }
-                    if fs::fsync_dir_fd(source.directory_fd.as_fd()).is_err() {
-                        self.poison();
-                        return TransitionOutcome::OutcomeUnknown(
-                            ticket.with_phase(TransitionPhase::DestinationDirectoryDurable),
-                        );
-                    }
-                }
-                TransitionOutcome::Committed
-            }
-            WitnessedRenameOutcome::LinearizedIdentityUnknown => {
+        match Self::execute_leased_move(&source, dest_dir_fd.as_fd(), dest_name) {
+            LeasedMoveOutcome::Committed => TransitionOutcome::Committed,
+            LeasedMoveOutcome::OutcomeUnknown(phase) => {
                 self.poison();
-                TransitionOutcome::OutcomeUnknown(ticket.with_phase(TransitionPhase::Linearized))
+                TransitionOutcome::OutcomeUnknown(ticket.with_phase(phase))
             }
-            WitnessedRenameOutcome::SourceGone => TransitionOutcome::LeaseLost,
-            WitnessedRenameOutcome::SourceChanged => {
+            LeasedMoveOutcome::SourceGone => TransitionOutcome::LeaseLost,
+            LeasedMoveOutcome::SourceChanged => {
                 self.poison();
                 TransitionOutcome::NotCommitted(Error::QueueCorrupt(
                     "leased source identity changed before transition".into(),
                 ))
             }
-            WitnessedRenameOutcome::Collision => {
+            LeasedMoveOutcome::Collision => {
                 TransitionOutcome::NotCommitted(Error::QueueCorrupt("destination exists".into()))
             }
-            WitnessedRenameOutcome::Failed(error) => TransitionOutcome::NotCommitted(error),
+            LeasedMoveOutcome::Failed(error) => TransitionOutcome::NotCommitted(error),
         }
-    }
-
-    /// Same as move_leased but for renewal (same token, same attempt).
-    fn move_leased_renew(
-        &mut self,
-        lease: &LeaseInfo,
-        dest_dir: &str,
-        dest_name: &str,
-        ticket: &TransitionTicket,
-    ) -> TransitionOutcome {
-        self.move_leased(lease, dest_dir, dest_name, ticket)
     }
 
     fn transition_ticket_for_lease(
@@ -4429,26 +4361,23 @@ mod tests {
     }
 
     #[test]
-    fn same_directory_identity_table() {
-        let (_tmp, queue) = create_test_queue();
-        let source = fs::fstat(queue.root_fd()).unwrap();
-        let mut different_device = source;
-        different_device.st_dev ^= 1;
-        let mut different_inode = source;
-        different_inode.st_ino ^= 1;
-
-        assert!(same_directory_identity(Some(&source), Some(&source)));
-        assert!(!same_directory_identity(
-            Some(&source),
-            Some(&different_device),
-        ));
-        assert!(!same_directory_identity(
-            Some(&source),
-            Some(&different_inode),
-        ));
-        assert!(!same_directory_identity(None, Some(&source)));
-        assert!(!same_directory_identity(Some(&source), None));
-        assert!(!same_directory_identity(None, None));
+    fn move_outcome_unknown_phase_maps_to_the_last_durable_barrier() {
+        for phase in [
+            engine::MovePhase::EnsureDest,
+            engine::MovePhase::PreRename,
+            engine::MovePhase::Rename,
+            engine::MovePhase::DestinationIdentity,
+            engine::MovePhase::DestFsync,
+        ] {
+            assert_eq!(
+                ticket_phase_for_move_outcome_unknown(phase),
+                TransitionPhase::Linearized
+            );
+        }
+        assert_eq!(
+            ticket_phase_for_move_outcome_unknown(engine::MovePhase::SourceFsync),
+            TransitionPhase::DestinationDirectoryDurable
+        );
     }
 
     #[test]
@@ -4619,12 +4548,8 @@ mod tests {
         });
         let destination_directory = open_relative(queue.root_fd(), &ready.directory()).unwrap();
         assert!(matches!(
-            Queue::rename_leased_witness_noreplace(
-                &source,
-                destination_directory.as_fd(),
-                &ready.filename,
-            ),
-            WitnessedRenameOutcome::SourceChanged
+            Queue::execute_leased_move(&source, destination_directory.as_fd(), &ready.filename,),
+            LeasedMoveOutcome::SourceChanged
         ));
         assert!(!tmp.path().join(ready.relative_path()).exists());
     }
@@ -4673,30 +4598,6 @@ mod tests {
     }
 
     #[test]
-    fn renamed_destination_requires_exact_witness_identity() {
-        let (_tmp, mut queue) = create_test_queue();
-        let lease = enqueue_and_lease(&mut queue);
-        let source = queue
-            .open_and_validate_current_lease(&lease)
-            .unwrap()
-            .unwrap();
-        let mut stat = fs::fstat(source.file_fd.as_fd()).unwrap();
-        assert!(matches!(
-            classify_renamed_destination(Some(&stat), source.device, source.inode),
-            WitnessedRenameOutcome::Linearized
-        ));
-        stat.st_ino ^= 1;
-        assert!(matches!(
-            classify_renamed_destination(Some(&stat), source.device, source.inode),
-            WitnessedRenameOutcome::LinearizedIdentityUnknown
-        ));
-        assert!(matches!(
-            classify_renamed_destination(None, source.device, source.inode),
-            WitnessedRenameOutcome::LinearizedIdentityUnknown
-        ));
-    }
-
-    #[test]
     fn witnessed_rename_preserves_failure_categories() {
         for (errno, expected) in [
             (libc::ENOENT, "gone"),
@@ -4718,15 +4619,12 @@ mod tests {
             let destination_directory = open_relative(queue.root_fd(), &ready.directory()).unwrap();
             fs::fault::reset();
             fs::fault::inject_errno("renameat2_noreplace", 1, errno);
-            let outcome = Queue::rename_leased_witness_noreplace(
-                &source,
-                destination_directory.as_fd(),
-                &ready.filename,
-            );
+            let outcome =
+                Queue::execute_leased_move(&source, destination_directory.as_fd(), &ready.filename);
             match expected {
-                "gone" => assert!(matches!(outcome, WitnessedRenameOutcome::SourceGone)),
-                "collision" => assert!(matches!(outcome, WitnessedRenameOutcome::Collision)),
-                "failed" => assert!(matches!(outcome, WitnessedRenameOutcome::Failed(_))),
+                "gone" => assert!(matches!(outcome, LeasedMoveOutcome::SourceGone)),
+                "collision" => assert!(matches!(outcome, LeasedMoveOutcome::Collision)),
+                "failed" => assert!(matches!(outcome, LeasedMoveOutcome::Failed(_))),
                 _ => unreachable!(),
             }
             fs::fault::reset();
@@ -4751,12 +4649,8 @@ mod tests {
         fs::fault::reset();
         fs::fault::inject_errno("fstatat", 2, libc::EIO);
         assert!(matches!(
-            Queue::rename_leased_witness_noreplace(
-                &source,
-                destination_directory.as_fd(),
-                &ready.filename,
-            ),
-            WitnessedRenameOutcome::LinearizedIdentityUnknown
+            Queue::execute_leased_move(&source, destination_directory.as_fd(), &ready.filename,),
+            LeasedMoveOutcome::OutcomeUnknown(TransitionPhase::Linearized)
         ));
         fs::fault::reset();
     }
@@ -5081,7 +4975,7 @@ mod tests {
 
             fs::fault::reset();
             fs::fault::inject("fsync_dir_fd", u64::MAX);
-            let outcome = queue.move_leased_renew(
+            let outcome = queue.move_leased(
                 &lease,
                 &destination_directory,
                 "renew-barrier-test.sqj",
@@ -8600,10 +8494,10 @@ mod tests {
         steadq_fs_linux::fault::inject("fsync_dir_fd", 1);
         let result = queue.ack(&lease);
         steadq_fs_linux::fault::reset();
-        assert!(
-            matches!(result, AckOutcome::OutcomeUnknown(_)),
-            "expected OutcomeUnknown, got {result:?}"
-        );
+        let AckOutcome::OutcomeUnknown(ticket) = result else {
+            panic!("expected OutcomeUnknown");
+        };
+        assert_eq!(ticket.phase(), TransitionPhase::Linearized);
     }
 
     #[test]
@@ -8654,10 +8548,34 @@ mod tests {
         steadq_fs_linux::fault::inject("fsync_dir_fd", 1);
         let result = queue.retry_now(&lease);
         steadq_fs_linux::fault::reset();
-        assert!(
-            matches!(result, TransitionOutcome::OutcomeUnknown(_)),
-            "expected OutcomeUnknown, got {result:?}"
-        );
+        let TransitionOutcome::OutcomeUnknown(ticket) = result else {
+            panic!("expected OutcomeUnknown");
+        };
+        assert_eq!(ticket.phase(), TransitionPhase::Linearized);
+    }
+
+    #[test]
+    fn fault_retry_source_fsync_records_destination_durability() {
+        steadq_fs_linux::fault::reset();
+        let (_tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"data".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            other => panic!("lease failed: {other:?}"),
+        };
+
+        steadq_fs_linux::fault::inject_errno("fsync_dir_fd", 2, libc::EIO);
+        let result = queue.retry_now(&lease);
+        steadq_fs_linux::fault::reset();
+        let TransitionOutcome::OutcomeUnknown(ticket) = result else {
+            panic!("expected OutcomeUnknown");
+        };
+        assert_eq!(ticket.phase(), TransitionPhase::DestinationDirectoryDurable);
     }
 
     #[test]
