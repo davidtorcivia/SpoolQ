@@ -190,6 +190,24 @@ pub struct FsckReport {
     pub quarantined: Vec<[u8; 16]>,
 }
 
+fn fsck_protocol_name<'a>(
+    parent: &str,
+    entry: &'a fs::DirEntryName,
+    report: &mut FsckReport,
+) -> Option<&'a str> {
+    let Some(name) = entry.as_ascii_str() else {
+        let raw_name = steadq_names::hex_encode(entry.as_bytes());
+        report.findings.push(CorruptionFinding {
+            relative_path: format!("{parent}/<bytes:{raw_name}>"),
+            finding_type: "invalid_name_encoding".into(),
+            severity: FindingSeverity::Error,
+            details: format!("directory entry name is not ASCII; raw_name_hex={raw_name}"),
+        });
+        return None;
+    };
+    Some(name)
+}
+
 impl Queue {
     /// Run fsck on the queue.
     pub fn fsck(&self, opts: &FsckOptions) -> FsckReport {
@@ -221,7 +239,10 @@ impl Queue {
             Err(_) => return,
         };
 
-        for entry in &top_entries {
+        for raw_entry in &top_entries {
+            let Some(entry) = fsck_protocol_name(state_name, raw_entry, report) else {
+                continue;
+            };
             let sub_fd = match fs::open_directory(state_fd.as_raw_fd(), entry) {
                 Ok(fd) => fd,
                 Err(_) => continue,
@@ -232,7 +253,11 @@ impl Queue {
                 Err(_) => continue,
             };
 
-            for sub_entry in &sub_entries {
+            let sub_parent = format!("{state_name}/{entry}");
+            for raw_sub_entry in &sub_entries {
+                let Some(sub_entry) = fsck_protocol_name(&sub_parent, raw_sub_entry, report) else {
+                    continue;
+                };
                 if sub_entry.ends_with(".sqj") || sub_entry.ends_with(".rct") {
                     // C-41: Carry full root-relative path
                     report.total_objects += 1;
@@ -255,7 +280,11 @@ impl Queue {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
-                    for file in &files {
+                    let shard_parent = format!("{sub_parent}/{sub_entry}");
+                    for raw_file in &files {
+                        let Some(file) = fsck_protocol_name(&shard_parent, raw_file, report) else {
+                            continue;
+                        };
                         if file.ends_with(".sqj") || file.ends_with(".rct") {
                             report.total_objects += 1;
                             // C-41: Full path includes all directory levels
@@ -287,7 +316,10 @@ impl Queue {
             Err(_) => return,
         };
 
-        for boot_dir in &boot_dirs {
+        for raw_boot_dir in &boot_dirs {
+            let Some(boot_dir) = fsck_protocol_name("leased", raw_boot_dir, report) else {
+                continue;
+            };
             let boot_fd = match fs::open_directory(leased_fd.as_raw_fd(), boot_dir) {
                 Ok(fd) => fd,
                 Err(_) => continue,
@@ -296,7 +328,12 @@ impl Queue {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            for bucket_dir in &bucket_dirs {
+            let boot_parent = format!("leased/{boot_dir}");
+            for raw_bucket_dir in &bucket_dirs {
+                let Some(bucket_dir) = fsck_protocol_name(&boot_parent, raw_bucket_dir, report)
+                else {
+                    continue;
+                };
                 let bucket_fd = match fs::open_directory(boot_fd.as_raw_fd(), bucket_dir) {
                     Ok(fd) => fd,
                     Err(_) => continue,
@@ -305,7 +342,12 @@ impl Queue {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
-                for shard_dir in &shard_dirs {
+                let bucket_parent = format!("{boot_parent}/{bucket_dir}");
+                for raw_shard_dir in &shard_dirs {
+                    let Some(shard_dir) = fsck_protocol_name(&bucket_parent, raw_shard_dir, report)
+                    else {
+                        continue;
+                    };
                     let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_dir) {
                         Ok(fd) => fd,
                         Err(_) => continue,
@@ -314,7 +356,11 @@ impl Queue {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
-                    for file in &files {
+                    let shard_parent = format!("{bucket_parent}/{shard_dir}");
+                    for raw_file in &files {
+                        let Some(file) = fsck_protocol_name(&shard_parent, raw_file, report) else {
+                            continue;
+                        };
                         if file.ends_with(".sqj") {
                             report.total_objects += 1;
                             let full_path =
@@ -1253,17 +1299,22 @@ fn collect_quarantine_entries(
             collect_quarantine_entries(&path, root, out);
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
         if let Ok(parsed) = steadq_names::parse_quarantine(&name) {
-            let relative = path
+            let Some(relative) = path
                 .strip_prefix(root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                .ok()
+                .and_then(std::path::Path::to_str)
+            else {
+                continue;
+            };
             out.push(QuarantineEntry {
                 quarantine_id: parsed.quarantine_id,
                 reason: parsed.reason,
                 filename: name,
-                relative_path: relative,
+                relative_path: relative.to_string(),
             });
         }
     }
@@ -1584,6 +1635,37 @@ mod tests {
         let report = queue.fsck(&FsckOptions::default());
         assert_eq!(report.findings.len(), 0);
         assert_eq!(report.total_objects, 0);
+    }
+
+    #[test]
+    fn fsck_preserves_non_ascii_name_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let shard = tmp.path().join("ready/0000");
+        std::fs::write(shard.join(OsStr::from_bytes(b"bad-\x80")), b"a").unwrap();
+        std::fs::write(shard.join(OsStr::from_bytes(b"bad-\x81")), b"b").unwrap();
+        std::fs::write(shard.join("café"), b"c").unwrap();
+        let queue = open_test_queue(tmp.path());
+
+        let mut paths = queue
+            .fsck(&FsckOptions::default())
+            .findings
+            .into_iter()
+            .filter(|finding| finding.finding_type == "invalid_name_encoding")
+            .map(|finding| finding.relative_path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "ready/0000/<bytes:6261642d80>",
+                "ready/0000/<bytes:6261642d81>",
+                "ready/0000/<bytes:636166c3a9>",
+            ]
+        );
     }
 
     #[test]

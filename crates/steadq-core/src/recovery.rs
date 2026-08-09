@@ -1365,12 +1365,12 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(boot_dir_name) = boot_dir_entry.as_str() else {
+            let Some(boot_dir_name) = boot_dir_entry.as_ascii_str() else {
                 Self::record_error(
                     stats,
                     "reap_boot_name",
                     &raw_name_for_error(boot_dir_entry),
-                    "boot directory name is not UTF-8",
+                    "boot directory name is not ASCII",
                 );
                 continue;
             };
@@ -1447,12 +1447,12 @@ impl Queue {
                     stats.budget_exhausted = true;
                     return;
                 }
-                let Some(bucket_name) = bucket_entry.as_str() else {
+                let Some(bucket_name) = bucket_entry.as_ascii_str() else {
                     Self::record_error(
                         stats,
                         "reap_bucket_name",
                         &raw_name_for_error(bucket_entry),
-                        "bucket directory name is not UTF-8",
+                        "bucket directory name is not ASCII",
                     );
                     continue;
                 };
@@ -1547,12 +1547,12 @@ impl Queue {
                             continue;
                         }
                     }
-                    let Some(shard_name) = shard_entry.as_str() else {
+                    let Some(shard_name) = shard_entry.as_ascii_str() else {
                         Self::record_error(
                             stats,
                             "reap_shard_name",
                             &raw_name_for_error(shard_entry),
-                            "shard directory name is not UTF-8",
+                            "shard directory name is not ASCII",
                         );
                         continue;
                     };
@@ -1658,12 +1658,12 @@ impl Queue {
                             shard_entry.as_bytes(),
                             raw_entry.as_bytes(),
                         ));
-                        let Some(entry) = raw_entry.as_str() else {
+                        let Some(entry) = raw_entry.as_ascii_str() else {
                             Self::record_error(
                                 stats,
                                 "reap_entry_name",
                                 &raw_name_for_error(raw_entry),
-                                "entry name is not UTF-8",
+                                "entry name is not ASCII",
                             );
                             continue;
                         };
@@ -2011,12 +2011,12 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(bucket_name) = bucket_entry.as_str() else {
+            let Some(bucket_name) = bucket_entry.as_ascii_str() else {
                 Self::record_error(
                     stats,
                     "promote_bucket_name",
                     &raw_name_for_error(bucket_entry),
-                    "bucket directory name is not UTF-8",
+                    "bucket directory name is not ASCII",
                 );
                 continue;
             };
@@ -2111,12 +2111,12 @@ impl Queue {
                         continue;
                     }
                 }
-                let Some(shard_name) = shard_entry.as_str() else {
+                let Some(shard_name) = shard_entry.as_ascii_str() else {
                     Self::record_error(
                         stats,
                         "promote_shard_name",
                         &raw_name_for_error(shard_entry),
-                        "shard directory name is not UTF-8",
+                        "shard directory name is not ASCII",
                     );
                     continue;
                 };
@@ -2213,12 +2213,12 @@ impl Queue {
                         shard_entry.as_bytes(),
                         raw_entry.as_bytes(),
                     ));
-                    let Some(entry) = raw_entry.as_str() else {
+                    let Some(entry) = raw_entry.as_ascii_str() else {
                         Self::record_error(
                             stats,
                             "promote_entry_name",
                             &raw_name_for_error(raw_entry),
-                            "entry name is not UTF-8",
+                            "entry name is not ASCII",
                         );
                         continue;
                     };
@@ -2384,12 +2384,12 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(boot_dir_name) = boot_entry.as_str() else {
+            let Some(boot_dir_name) = boot_entry.as_ascii_str() else {
                 Self::record_error(
                     stats,
                     "temp_boot_name",
                     &raw_name_for_error(boot_entry),
-                    "boot directory name is not UTF-8",
+                    "boot directory name is not ASCII",
                 );
                 continue;
             };
@@ -2458,12 +2458,12 @@ impl Queue {
                         continue;
                     }
                 }
-                let Some(shard_name) = shard_entry.as_str() else {
+                let Some(shard_name) = shard_entry.as_ascii_str() else {
                     Self::record_error(
                         stats,
                         "temp_shard_name",
                         &raw_name_for_error(shard_entry),
-                        "shard directory name is not UTF-8",
+                        "shard directory name is not ASCII",
                     );
                     continue;
                 };
@@ -2558,12 +2558,12 @@ impl Queue {
                         shard_entry.as_bytes(),
                         raw_entry.as_bytes(),
                     ));
-                    let Some(entry) = raw_entry.as_str() else {
+                    let Some(entry) = raw_entry.as_ascii_str() else {
                         Self::record_error(
                             stats,
                             "temp_entry_name",
                             &raw_name_for_error(raw_entry),
-                            "entry name is not UTF-8",
+                            "entry name is not ASCII",
                         );
                         continue;
                     };
@@ -2676,12 +2676,12 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(bucket_name) = bucket_entry.as_str() else {
+            let Some(bucket_name) = bucket_entry.as_ascii_str() else {
                 Self::record_error(
                     stats,
                     "compact_bucket_name",
                     &raw_name_for_error(bucket_entry),
-                    "bucket directory name is not UTF-8",
+                    "bucket directory name is not ASCII",
                 );
                 continue;
             };
@@ -2758,12 +2758,12 @@ impl Queue {
                         continue;
                     }
                 }
-                let Some(shard_name) = shard_entry.as_str() else {
+                let Some(shard_name) = shard_entry.as_ascii_str() else {
                     Self::record_error(
                         stats,
                         "compact_shard_name",
                         &raw_name_for_error(shard_entry),
-                        "shard directory name is not UTF-8",
+                        "shard directory name is not ASCII",
                     );
                     continue;
                 };
@@ -2859,12 +2859,12 @@ impl Queue {
                         shard_entry.as_bytes(),
                         raw_entry.as_bytes(),
                     ));
-                    let Some(entry) = raw_entry.as_str() else {
+                    let Some(entry) = raw_entry.as_ascii_str() else {
                         Self::record_error(
                             stats,
                             "compact_entry_name",
                             &raw_name_for_error(raw_entry),
-                            "entry name is not UTF-8",
+                            "entry name is not ASCII",
                         );
                         continue;
                     };
@@ -3124,12 +3124,12 @@ impl Queue {
                 stats.budget_exhausted = true;
                 return;
             }
-            let Some(bucket_name) = bucket_entry.as_str() else {
+            let Some(bucket_name) = bucket_entry.as_ascii_str() else {
                 Self::record_error(
                     stats,
                     "delete_bucket_name",
                     &raw_name_for_error(bucket_entry),
-                    "bucket directory name is not UTF-8",
+                    "bucket directory name is not ASCII",
                 );
                 continue;
             };
@@ -3230,12 +3230,12 @@ impl Queue {
                         continue;
                     }
                 }
-                let Some(shard_name) = shard_entry.as_str() else {
+                let Some(shard_name) = shard_entry.as_ascii_str() else {
                     Self::record_error(
                         stats,
                         "delete_shard_name",
                         &raw_name_for_error(shard_entry),
-                        "shard directory name is not UTF-8",
+                        "shard directory name is not ASCII",
                     );
                     continue;
                 };
@@ -3332,12 +3332,12 @@ impl Queue {
                         shard_entry.as_bytes(),
                         raw_entry.as_bytes(),
                     ));
-                    let Some(entry) = raw_entry.as_str() else {
+                    let Some(entry) = raw_entry.as_ascii_str() else {
                         Self::record_error(
                             stats,
                             "delete_entry_name",
                             &raw_name_for_error(raw_entry),
-                            "entry name is not UTF-8",
+                            "entry name is not ASCII",
                         );
                         continue;
                     };
