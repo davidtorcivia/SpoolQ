@@ -619,22 +619,29 @@ impl Queue {
         stats.phase_blocked = true;
     }
 
-    fn stop_for_directory_error(
+    fn record_directory_error(
         stats: &mut RecoveryStats,
         op: &str,
         path: &str,
         error: &RecoveryDirectoryError,
-    ) {
+    ) -> bool {
         match error {
-            RecoveryDirectoryError::BudgetExhausted => stats.budget_exhausted = true,
-            RecoveryDirectoryError::Clock(error) => Self::block_phase(
-                stats,
-                "clock_monotonic",
-                path,
-                &format!("directory budget clock unavailable during {op}: {error}"),
-            ),
+            RecoveryDirectoryError::BudgetExhausted => {
+                stats.budget_exhausted = true;
+                true
+            }
+            RecoveryDirectoryError::Clock(error) => {
+                Self::block_phase(
+                    stats,
+                    "clock_monotonic",
+                    path,
+                    &format!("directory budget clock unavailable during {op}: {error}"),
+                );
+                true
+            }
             RecoveryDirectoryError::Io(error) => {
                 Self::block_phase(stats, op, path, &error.to_string());
+                false
             }
         }
     }
@@ -667,7 +674,7 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(e) => {
-                Self::stop_for_directory_error(stats, "read_leased_dirs", "leased", &e);
+                Self::record_directory_error(stats, "read_leased_dirs", "leased", &e);
                 return;
             }
         };
@@ -709,7 +716,7 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "reap_boot_open", boot_dir_name, &error.to_string());
-                    return;
+                    continue;
                 }
             };
 
@@ -722,13 +729,15 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "reap_bucket_read",
                         boot_dir_name,
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             bucket_dirs.sort();
@@ -792,7 +801,7 @@ impl Queue {
                             &format!("leased/{boot_dir_name}/{bucket_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        continue;
                     }
                 };
 
@@ -805,13 +814,15 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "reap_shard_read",
                             &format!("leased/{boot_dir_name}/{bucket_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 shard_dirs.sort();
@@ -862,7 +873,7 @@ impl Queue {
                                 &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
                                 &error.to_string(),
                             );
-                            return;
+                            continue;
                         }
                     };
 
@@ -875,13 +886,15 @@ impl Queue {
                         Ok(e) => e,
                         Err(error) => {
                             stats.scan_skips += 1;
-                            Self::stop_for_directory_error(
+                            if Self::record_directory_error(
                                 stats,
                                 "reap_entry_read",
                                 &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
                                 &error,
-                            );
-                            return;
+                            ) {
+                                return;
+                            }
+                            continue;
                         }
                     };
                     entries.sort();
@@ -1191,7 +1204,7 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "promote_bucket_read", "delayed", &error);
+                Self::record_directory_error(stats, "promote_bucket_read", "delayed", &error);
                 return;
             }
         };
@@ -1256,7 +1269,7 @@ impl Queue {
                         &format!("delayed/{bucket_name}"),
                         &error.to_string(),
                     );
-                    return;
+                    continue;
                 }
             };
 
@@ -1269,13 +1282,15 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "promote_shard_read",
                         &format!("delayed/{bucket_name}"),
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -1325,7 +1340,7 @@ impl Queue {
                             &format!("{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        continue;
                     }
                 };
 
@@ -1338,13 +1353,15 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "promote_entry_read",
                             &format!("delayed/{bucket_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -1504,7 +1521,7 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "temp_boot_read", "tmp", &error);
+                Self::record_directory_error(stats, "temp_boot_read", "tmp", &error);
                 return;
             }
         };
@@ -1546,7 +1563,7 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "temp_boot_open", boot_dir_name, &error.to_string());
-                    return;
+                    continue;
                 }
             };
 
@@ -1559,8 +1576,11 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(stats, "temp_shard_read", boot_dir_name, &error);
-                    return;
+                    if Self::record_directory_error(stats, "temp_shard_read", boot_dir_name, &error)
+                    {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -1610,7 +1630,7 @@ impl Queue {
                             &format!("tmp/{boot_dir_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        continue;
                     }
                 };
 
@@ -1623,13 +1643,15 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "temp_entry_read",
                             &format!("tmp/{boot_dir_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -1735,7 +1757,7 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "compact_bucket_read", "receipts", &error);
+                Self::record_directory_error(stats, "compact_bucket_read", "receipts", &error);
                 return;
             }
         };
@@ -1782,7 +1804,7 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
-                    return;
+                    continue;
                 }
             };
 
@@ -1795,13 +1817,15 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "compact_shard_read",
                         &format!("receipts/{bucket_name}"),
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -1852,7 +1876,7 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        continue;
                     }
                 };
 
@@ -1865,13 +1889,15 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "compact_entry_read",
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -2075,7 +2101,7 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "delete_bucket_read", "receipts", &error);
+                Self::record_directory_error(stats, "delete_bucket_read", "receipts", &error);
                 return;
             }
         };
@@ -2145,7 +2171,7 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
-                    return;
+                    continue;
                 }
             };
 
@@ -2158,13 +2184,15 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "delete_shard_read",
                         &format!("receipts/{bucket_name}"),
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -2215,7 +2243,7 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        continue;
                     }
                 };
 
@@ -2228,13 +2256,15 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "delete_entry_read",
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -2458,6 +2488,26 @@ mod tests {
         lease
     }
 
+    fn reap_all_expired(queue: &mut Queue) -> RecoveryStats {
+        let budget = WorkBudget::default();
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.reap_expired_leases(
+            u64::MAX,
+            Some(queue.authenticated_wall_floor().unwrap()),
+            &budget,
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+        stats
+    }
+
     fn valid_cursor_record(queue: &Queue) -> RecoveryCursorRecord {
         RecoveryCursorRecord {
             schema: RECOVERY_CURSOR_SCHEMA.into(),
@@ -2576,35 +2626,35 @@ mod tests {
         assert_eq!(stats.errors[1].error, "blocked-error");
 
         let mut timed_out = RecoveryStats::default();
-        Queue::stop_for_directory_error(
+        assert!(Queue::record_directory_error(
             &mut timed_out,
             "read",
             "directory",
             &RecoveryDirectoryError::BudgetExhausted,
-        );
+        ));
         assert!(timed_out.budget_exhausted);
         assert!(!timed_out.phase_blocked);
         assert!(timed_out.errors.is_empty());
 
         let mut io_failed = RecoveryStats::default();
-        Queue::stop_for_directory_error(
+        assert!(!Queue::record_directory_error(
             &mut io_failed,
             "read",
             "directory",
             &RecoveryDirectoryError::Io(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
-        );
+        ));
         assert!(!io_failed.budget_exhausted);
         assert!(io_failed.phase_blocked);
         assert_eq!(io_failed.errors.len(), 1);
         assert_eq!(io_failed.errors[0].operation, "read");
 
         let mut clock_failed = RecoveryStats::default();
-        Queue::stop_for_directory_error(
+        assert!(Queue::record_directory_error(
             &mut clock_failed,
             "read",
             "directory",
             &RecoveryDirectoryError::Clock(io::Error::from_raw_os_error(libc::EIO)),
-        );
+        ));
         assert!(!clock_failed.budget_exhausted);
         assert!(clock_failed.phase_blocked);
         assert_eq!(clock_failed.errors.len(), 1);
@@ -2694,7 +2744,7 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_open_failure_cannot_advance_past_unclassified_work() {
+    fn persistent_hierarchy_open_failure_does_not_starve_later_sibling_across_reopen() {
         use std::os::unix::fs::symlink;
 
         let (tmp, mut queue) = create_test_queue();
@@ -2708,33 +2758,87 @@ mod tests {
             EnqueueOutcome::Committed(_)
         ));
         assert!(matches!(
-            queue.lease(0, 1_000_000_000),
+            queue.lease(0, 30_000_000_000),
             LeaseOutcome::Leased(_)
         ));
-        let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
-        std::fs::create_dir_all(&receipt_dir).unwrap();
-        std::fs::write(receipt_dir.join("invalid.rct"), b"invalid").unwrap();
         let blocked = tmp
             .path()
             .join("leased/00000000-0000-0000-0000-000000000000");
         symlink(tmp.path(), &blocked).unwrap();
 
-        let first = queue.recover(&WorkBudget::default());
+        let first = reap_all_expired(&mut queue);
         assert!(first.phase_blocked);
+        assert_eq!(first.scan_skips, 1);
+        assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
         assert!(first
             .errors
             .iter()
-            .any(|error| error.operation == "receipt_compact_invalid"));
-        assert_eq!(queue.recovery_cursor.phase, RecoveryPhase::ReapLeases);
+            .any(|error| error.operation == "reap_boot_open"));
         assert!(queue.recovery_cursor.reap_leases.is_none());
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
+        drop(queue);
 
-        std::fs::remove_file(blocked).unwrap();
-        let second = queue.recover(&WorkBudget::default());
-        assert!(!second.phase_blocked);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = reap_all_expired(&mut reopened);
+        assert!(second.phase_blocked);
+        assert_eq!(second.scan_skips, 1);
+        assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
         assert!(second
             .errors
             .iter()
-            .any(|error| error.operation == "receipt_compact_invalid"));
+            .any(|error| error.operation == "reap_boot_open"));
+        assert!(blocked.is_symlink());
+    }
+
+    #[test]
+    fn persistent_bucket_open_failure_does_not_starve_receipt_compaction() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        let blocked = tmp.path().join("receipts/0000000000000000");
+        symlink(tmp.path(), &blocked).unwrap();
+
+        let mut first = RecoveryStats::default();
+        queue.compact_receipts(&WorkBudget::default(), &mut first, u64::MAX);
+        assert!(first.phase_blocked);
+        assert_eq!(first.scan_skips, 1);
+        assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
+        assert!(first
+            .errors
+            .iter()
+            .any(|error| error.operation == "compact_bucket_open"));
+
+        enqueue_and_ack(&mut queue);
+        drop(queue);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut second = RecoveryStats::default();
+        reopened.compact_receipts(&WorkBudget::default(), &mut second, u64::MAX);
+        assert!(second.phase_blocked);
+        assert_eq!(second.scan_skips, 1);
+        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        assert!(second
+            .errors
+            .iter()
+            .any(|error| error.operation == "compact_bucket_open"));
+        assert!(blocked.is_symlink());
     }
 
     #[test]
