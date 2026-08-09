@@ -76,6 +76,7 @@ pub mod fault {
         fd_identities: HashMap<String, Vec<(u64, u64)>>,
         readdir_rotation: usize,
         readdir_reversed: bool,
+        realtime_ns: Option<u64>,
     }
 
     impl State {
@@ -86,6 +87,7 @@ pub mod fault {
                 fd_identities: HashMap::new(),
                 readdir_rotation: 0,
                 readdir_reversed: false,
+                realtime_ns: None,
             }
         }
     }
@@ -103,7 +105,17 @@ pub mod fault {
             s.fd_identities.clear();
             s.readdir_rotation = 0;
             s.readdir_reversed = false;
+            s.realtime_ns = None;
         });
+    }
+
+    /// Return a fixed value from subsequent realtime clock reads on this thread.
+    pub fn set_clock_realtime_ns(unix_ns: u64) {
+        STATE.with(|state| state.borrow_mut().realtime_ns = Some(unix_ns));
+    }
+
+    pub(crate) fn clock_realtime_ns() -> Option<u64> {
+        STATE.with(|state| state.borrow().realtime_ns)
     }
 
     /// Permute complete directory enumerations on this thread.
@@ -537,6 +549,9 @@ pub fn clock_boottime_ns() -> io::Result<u64> {
 /// CLOCK_REALTIME in nanoseconds.
 pub fn clock_realtime_ns() -> io::Result<u64> {
     fault_check!("clock_realtime_ns");
+    if let Some(unix_ns) = fault::clock_realtime_ns() {
+        return Ok(unix_ns);
+    }
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     if rc < 0 {
@@ -2115,6 +2130,35 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
         fault::reset();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn realtime_override_is_thread_local_and_resettable() {
+        fault::reset();
+        fault::set_clock_realtime_ns(1);
+        assert_eq!(clock_realtime_ns().unwrap(), 1);
+        assert!(
+            std::thread::spawn(|| clock_realtime_ns().unwrap())
+                .join()
+                .unwrap()
+                > 1
+        );
+
+        fault::reset();
+        assert!(clock_realtime_ns().unwrap() > 1);
+    }
+
+    #[test]
+    fn realtime_fault_precedes_fixed_value() {
+        fault::reset();
+        fault::set_clock_realtime_ns(1);
+        fault::inject_errno("clock_realtime_ns", 1, libc::EIO);
+        assert_eq!(
+            clock_realtime_ns().unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(clock_realtime_ns().unwrap(), 1);
+        fault::reset();
     }
 
     #[test]

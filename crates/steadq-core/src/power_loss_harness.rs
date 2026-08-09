@@ -93,11 +93,35 @@ fn normalize(p: &str) -> String {
     p.trim_matches('/').to_string()
 }
 
+struct FaultScope {
+    realtime_ns: u64,
+}
+
+impl FaultScope {
+    fn new(realtime_ns: u64) -> Self {
+        let scope = Self { realtime_ns };
+        scope.reset();
+        scope
+    }
+
+    fn reset(&self) {
+        fs::fault::reset();
+        fs::fault::set_clock_realtime_ns(self.realtime_ns);
+    }
+}
+
+impl Drop for FaultScope {
+    fn drop(&mut self) {
+        fs::fault::reset();
+    }
+}
+
 /// Single durable class for power-loss testing. Prefer this harness over
 /// one-off scripts per transition path.
 pub struct PowerLossHarness {
     tmp: TempDir,
     queue: Option<Queue>,
+    fault_scope: FaultScope,
     durability: DurabilityTracker,
     last_rename_src: Option<String>,
     last_rename_dest: Option<String>,
@@ -114,6 +138,13 @@ impl Default for PowerLossHarness {
 impl PowerLossHarness {
     /// Create a new harness with an initialized queue.
     pub fn new() -> Self {
+        fs::fault::reset();
+        let fixed_realtime_ns = fs::clock_realtime_ns().expect("CLOCK_REALTIME");
+        Self::new_at(fixed_realtime_ns)
+    }
+
+    fn new_at(fixed_realtime_ns: u64) -> Self {
+        let fault_scope = FaultScope::new(fixed_realtime_ns);
         let tmp = TempDir::new().expect("TempDir");
         let path = tmp.path();
         Queue::init(path, &CreateOptions::default()).expect("init");
@@ -142,12 +173,17 @@ impl PowerLossHarness {
         PowerLossHarness {
             tmp,
             queue: Some(queue),
+            fault_scope,
             durability,
             last_rename_src: None,
             last_rename_dest: None,
             saved_source_bytes: None,
             saved_dest_bytes: None,
         }
+    }
+
+    fn reset_faults(&self) {
+        self.fault_scope.reset();
     }
 
     pub fn path(&self) -> &Path {
@@ -182,7 +218,7 @@ impl PowerLossHarness {
 
     /// Enqueue with fault injected at dest dir fsync, producing OutcomeUnknown.
     pub fn enqueue_outcome_unknown(&mut self, payload: Vec<u8>) -> crate::EnqueueTicket {
-        fs::fault::reset();
+        self.reset_faults();
         // Enqueue does linkat then fsync_dir; ensure tmp shards exist to avoid extra fsync.
         // The first fsync after link is the desired post-publish window.
         fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
@@ -193,7 +229,7 @@ impl PowerLossHarness {
             ..Default::default()
         };
         let outcome = self.queue_mut().enqueue(input);
-        fs::fault::reset();
+        self.reset_faults();
         match outcome {
             EnqueueOutcome::OutcomeUnknown(t, _) => {
                 self.last_rename_dest = Some(t.expected_relative_path.clone());
@@ -257,10 +293,10 @@ impl PowerLossHarness {
                 }
             }
         }
-        fs::fault::reset();
+        self.reset_faults();
         fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
         let outcome = self.queue_mut().ack(lease);
-        fs::fault::reset();
+        self.reset_faults();
         match outcome {
             AckOutcome::OutcomeUnknown(t) => {
                 let (source, destination) = self.queue().transition_ticket_paths(&t).unwrap();
@@ -276,12 +312,12 @@ impl PowerLossHarness {
     pub fn retry_outcome_unknown(&mut self, lease: &crate::LeaseInfo) -> TransitionTicket {
         // Ensure ready shard exists (it does after init), but also ensure no mkdir fsync interferes.
         // The retry path does not need warmup, but we reset faults to isolate the post-rename fsync.
-        fs::fault::reset();
+        self.reset_faults();
         // Retry's first post-rename fsync is dest, but ensure_dir may have consumed one if shard missing.
         // Ready shards were created at init, so count 1 is post-rename.
         fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
         let outcome = self.queue_mut().retry_now(lease);
-        fs::fault::reset();
+        self.reset_faults();
         match outcome {
             TransitionOutcome::OutcomeUnknown(t) => {
                 let (source, destination) = self.queue().transition_ticket_paths(&t).unwrap();
@@ -689,6 +725,20 @@ fn power_loss_ack_all_windows_with_resolve() {
         );
         h.verify_post_crash_invariants();
     }
+}
+
+#[test]
+fn power_loss_ack_fault_is_stable_at_wall_bucket_boundary() {
+    let bucket_width = CreateOptions::default().delayed_bucket_width_ns;
+    let fixed_realtime_ns = bucket_width - 1;
+    {
+        let mut h = PowerLossHarness::new_at(fixed_realtime_ns);
+        h.enqueue_committed(b"ack boundary".to_vec());
+        let lease = h.lease_one();
+        let _ticket = h.ack_outcome_unknown(&lease);
+        assert_eq!(fs::clock_realtime_ns().unwrap(), fixed_realtime_ns);
+    }
+    assert_ne!(fs::clock_realtime_ns().unwrap(), fixed_realtime_ns);
 }
 
 #[test]
