@@ -488,7 +488,7 @@ impl Queue {
         let record = RecoveryCursorRecord {
             schema: RECOVERY_CURSOR_SCHEMA.to_string(),
             version: RECOVERY_CURSOR_VERSION,
-            queue_id: steadq_names::hex_encode(&self.format.queue_id),
+            queue_id: steadq_names::hex_encode(self.format.queue_id()),
             cursor: self.recovery_cursor.clone(),
         };
         let bytes = serde_json::to_vec(&record)
@@ -632,7 +632,7 @@ impl Queue {
                 };
             }
         };
-        self.recovery_cursor = match load_recovery_cursor(self.root_fd(), &self.format.queue_id) {
+        self.recovery_cursor = match load_recovery_cursor(self.root_fd(), self.format.queue_id()) {
             Ok(cursor) => cursor,
             Err(error) => {
                 stats.errors.push(RecoveryError {
@@ -1464,9 +1464,10 @@ impl Queue {
 
                 // For current boot, check if bucket is expired
                 if is_current_boot {
-                    let Some(current_bucket) =
-                        steadq_math::bucket_number(boottime_now, self.format.lease_bucket_width_ns)
-                    else {
+                    let Some(current_bucket) = steadq_math::bucket_number(
+                        boottime_now,
+                        self.format.lease_bucket_width_ns(),
+                    ) else {
                         Self::block_phase(
                             stats,
                             "reap_bucket_check",
@@ -1561,7 +1562,7 @@ impl Queue {
                         );
                         continue;
                     };
-                    if shard >= self.format.shard_count {
+                    if shard >= self.format.shard_count() {
                         Self::record_error(
                             stats,
                             "reap_shard_name",
@@ -1730,7 +1731,7 @@ impl Queue {
                         // R4-B02: Verify bucket placement matches deadline-derived bucket
                         let Some(expected_lease_bucket) = steadq_math::lease_bucket(
                             parsed.boottime_deadline_ns,
-                            self.format.lease_bucket_width_ns,
+                            self.format.lease_bucket_width_ns(),
                         ) else {
                             Self::record_error(
                                 stats,
@@ -1860,7 +1861,8 @@ impl Queue {
             maximum_attempts: common.maximum_attempts,
         };
 
-        let ready_name = steadq_names::make_ready_name(&self.format.queue_id, shard, &ready_common);
+        let ready_name =
+            steadq_names::make_ready_name(self.format.queue_id(), shard, &ready_common);
 
         let src_fd =
             open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
@@ -1895,12 +1897,14 @@ impl Queue {
         wall_floor: WallFloor,
     ) -> Result<(), MoveFailure> {
         let src_dir = format!("leased/{boot_dir}/{bucket}/{shard}");
-        let terminal_bucket =
-            steadq_math::bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns)
-                .ok_or_else(|| MoveFailure::NotCommitted {
-                    phase: MovePhase::PreRename,
-                    source: "terminal bucket overflow".into(),
-                })?;
+        let terminal_bucket = steadq_math::bucket_number(
+            wall_floor.unix_ns(),
+            self.format.terminal_bucket_width_ns(),
+        )
+        .ok_or_else(|| MoveFailure::NotCommitted {
+            phase: MovePhase::PreRename,
+            source: "terminal bucket overflow".into(),
+        })?;
         let bucket_str = bucket_hex(terminal_bucket);
         let dest_dir = format!("dead/{bucket_str}/{shard}");
 
@@ -1920,7 +1924,7 @@ impl Queue {
         };
 
         let dead_name = steadq_names::make_dead_name(
-            &self.format.queue_id,
+            self.format.queue_id(),
             &bucket_str,
             shard,
             &dead_common,
@@ -2033,7 +2037,7 @@ impl Queue {
             // Read effective wall floor
             let current_wall_bucket = match steadq_math::bucket_number(
                 wall_floor.unix_ns(),
-                self.format.delayed_bucket_width_ns,
+                self.format.delayed_bucket_width_ns(),
             ) {
                 Some(bucket) => bucket,
                 None => return,
@@ -2125,7 +2129,7 @@ impl Queue {
                     );
                     continue;
                 };
-                if shard >= self.format.shard_count {
+                if shard >= self.format.shard_count() {
                     Self::record_error(
                         stats,
                         "promote_shard_name",
@@ -2304,7 +2308,8 @@ impl Queue {
             attempt: common.attempt,
             maximum_attempts: common.maximum_attempts,
         };
-        let ready_name = steadq_names::make_ready_name(&self.format.queue_id, shard, &ready_common);
+        let ready_name =
+            steadq_names::make_ready_name(self.format.queue_id(), shard, &ready_common);
         let src_dir = format!("delayed/{bucket}/{shard}");
         let dest_dir = format!("ready/{shard}");
         let src_fd =
@@ -2468,7 +2473,7 @@ impl Queue {
                     );
                     continue;
                 };
-                if shard >= self.format.shard_count {
+                if shard >= self.format.shard_count() {
                     Self::record_error(
                         stats,
                         "temp_shard_name",
@@ -2768,7 +2773,7 @@ impl Queue {
                     );
                     continue;
                 };
-                if shard >= self.format.shard_count {
+                if shard >= self.format.shard_count() {
                     Self::record_error(
                         stats,
                         "compact_shard_name",
@@ -2899,10 +2904,10 @@ impl Queue {
                     let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
                         receipt_fd.as_fd(),
                         crate::queue::verified::ReceiptContext {
-                            queue_id: &self.format.queue_id,
-                            shard_count: self.format.shard_count,
-                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
-                            max_payload_length: self.format.max_payload_length,
+                            queue_id: self.format.queue_id(),
+                            shard_count: self.format.shard_count(),
+                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
+                            max_payload_length: self.format.max_payload_length(),
                             bucket: bucket_name,
                             shard: shard_name,
                             filename: entry,
@@ -2933,7 +2938,7 @@ impl Queue {
                         crate::queue::verified::VerifiedReceiptKind::Compact => continue,
                     };
                     let bucket_start =
-                        match bucket_number.checked_mul(self.format.terminal_bucket_width_ns) {
+                        match bucket_number.checked_mul(self.format.terminal_bucket_width_ns()) {
                             Some(bucket_start) => bucket_start,
                             None => continue,
                         };
@@ -3138,11 +3143,13 @@ impl Queue {
                 }
             };
 
-            let bucket_start = match bucket_num.checked_mul(self.format.terminal_bucket_width_ns) {
+            let bucket_start = match bucket_num.checked_mul(self.format.terminal_bucket_width_ns())
+            {
                 Some(s) => s,
                 None => continue,
             };
-            let bucket_end = match bucket_start.checked_add(self.format.terminal_bucket_width_ns) {
+            let bucket_end = match bucket_start.checked_add(self.format.terminal_bucket_width_ns())
+            {
                 Some(e) => e,
                 None => continue,
             };
@@ -3239,7 +3246,7 @@ impl Queue {
                     );
                     continue;
                 };
-                if shard >= self.format.shard_count {
+                if shard >= self.format.shard_count() {
                     Self::record_error(
                         stats,
                         "delete_shard_name",
@@ -3365,10 +3372,10 @@ impl Queue {
                     let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
                         receipt_fd.as_fd(),
                         crate::queue::verified::ReceiptContext {
-                            queue_id: &self.format.queue_id,
-                            shard_count: self.format.shard_count,
-                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
-                            max_payload_length: self.format.max_payload_length,
+                            queue_id: self.format.queue_id(),
+                            shard_count: self.format.shard_count(),
+                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
+                            max_payload_length: self.format.max_payload_length(),
                             bucket: bucket_name,
                             shard: shard_name,
                             filename: entry,
@@ -3673,7 +3680,7 @@ mod tests {
     #[test]
     fn recovery_quarantine_budget_exhaustion_does_not_advance_cursor() {
         let (tmp, mut queue) = create_test_queue();
-        let width = queue.format.delayed_bucket_width_ns;
+        let width = queue.format.delayed_bucket_width_ns();
         let not_before = queue
             .authenticated_wall_floor()
             .unwrap()
@@ -3801,8 +3808,8 @@ mod tests {
             .unwrap();
         let delayed_buckets_per_terminal = queue
             .format
-            .terminal_bucket_width_ns
-            .checked_div(queue.format.delayed_bucket_width_ns)
+            .terminal_bucket_width_ns()
+            .checked_div(queue.format.delayed_bucket_width_ns())
             .unwrap();
         let high_floor_bucket = low_terminal_bucket
             .checked_add(2)
@@ -3933,7 +3940,7 @@ mod tests {
         };
         format!(
             "ready/{shard}/{}",
-            steadq_names::make_ready_name(&queue.format.queue_id, shard, &ready_common)
+            steadq_names::make_ready_name(queue.format.queue_id(), shard, &ready_common)
         )
     }
 
@@ -3943,9 +3950,11 @@ mod tests {
         common: &steadq_names::CommonFields,
         wall_floor: WallFloor,
     ) -> String {
-        let terminal_bucket =
-            steadq_math::bucket_number(wall_floor.unix_ns(), queue.format.terminal_bucket_width_ns)
-                .unwrap();
+        let terminal_bucket = steadq_math::bucket_number(
+            wall_floor.unix_ns(),
+            queue.format.terminal_bucket_width_ns(),
+        )
+        .unwrap();
         let bucket = bucket_hex(terminal_bucket);
         let dead_common = steadq_names::CommonFields {
             job_id: common.job_id,
@@ -3956,7 +3965,7 @@ mod tests {
         format!(
             "dead/{bucket}/{shard}/{}",
             steadq_names::make_dead_name(
-                &queue.format.queue_id,
+                queue.format.queue_id(),
                 &bucket,
                 shard,
                 &dead_common,
@@ -4242,7 +4251,7 @@ mod tests {
         RecoveryCursorRecord {
             schema: RECOVERY_CURSOR_SCHEMA.into(),
             version: RECOVERY_CURSOR_VERSION,
-            queue_id: steadq_names::hex_encode(&queue.format.queue_id),
+            queue_id: steadq_names::hex_encode(queue.format.queue_id()),
             cursor: RecoveryCursor::default(),
         }
     }
@@ -4730,7 +4739,7 @@ mod tests {
             .authenticated_wall_floor()
             .unwrap()
             .unix_ns()
-            .checked_add(queue.format.delayed_bucket_width_ns)
+            .checked_add(queue.format.delayed_bucket_width_ns())
             .unwrap();
         let ticket = (0..128)
             .find_map(|_| {
@@ -4852,10 +4861,10 @@ mod tests {
             .authenticated_wall_floor()
             .unwrap()
             .unix_ns()
-            .checked_add(queue.format.delayed_bucket_width_ns * 4)
+            .checked_add(queue.format.delayed_bucket_width_ns() * 4)
             .unwrap();
         let high_not_before = low_not_before
-            .checked_add(queue.format.delayed_bucket_width_ns * 4)
+            .checked_add(queue.format.delayed_bucket_width_ns() * 4)
             .unwrap();
         for (not_before, shard, payload) in [
             (low_not_before, 0, b"promote-a" as &[u8]),
@@ -5111,8 +5120,8 @@ mod tests {
             .unwrap();
         let delayed_buckets_per_terminal = queue
             .format
-            .terminal_bucket_width_ns
-            .checked_div(queue.format.delayed_bucket_width_ns)
+            .terminal_bucket_width_ns()
+            .checked_div(queue.format.delayed_bucket_width_ns())
             .unwrap();
         let retention_floor_bucket = terminal_bucket
             .checked_add(1)
@@ -6121,12 +6130,12 @@ mod tests {
     #[test]
     fn recovery_cursor_load_distinguishes_absence_from_io_failure() {
         let (_tmp, queue) = create_test_queue();
-        let absent = load_recovery_cursor(queue.root_fd(), &queue.format.queue_id).unwrap();
+        let absent = load_recovery_cursor(queue.root_fd(), queue.format.queue_id()).unwrap();
         assert_eq!(absent, RecoveryCursor::default());
 
         fs::fault::reset();
         fs::fault::inject_errno("openat", 1, libc::EIO);
-        let error = load_recovery_cursor(queue.root_fd(), &queue.format.queue_id).unwrap_err();
+        let error = load_recovery_cursor(queue.root_fd(), queue.format.queue_id()).unwrap_err();
         fs::fault::reset();
         assert!(matches!(
             error,
@@ -6141,7 +6150,7 @@ mod tests {
         assert!(matches!(
             load_recovery_cursor(
                 directory_queue.root_fd(),
-                &directory_queue.format.queue_id
+                directory_queue.format.queue_id()
             ),
             Err(Error::QueueCorrupt(ref message))
                 if message == "recovery cursor is not a singly linked regular file"
@@ -6160,7 +6169,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            load_recovery_cursor(link_queue.root_fd(), &link_queue.format.queue_id),
+            load_recovery_cursor(link_queue.root_fd(), link_queue.format.queue_id()),
             Err(Error::QueueCorrupt(ref message))
                 if message == "recovery cursor is not a singly linked regular file"
         ));
@@ -6169,7 +6178,7 @@ mod tests {
             let (tmp, queue) = create_test_queue();
             std::fs::write(tmp.path().join("control/recovery-cursor.json"), bytes).unwrap();
             assert!(matches!(
-                load_recovery_cursor(queue.root_fd(), &queue.format.queue_id),
+                load_recovery_cursor(queue.root_fd(), queue.format.queue_id()),
                 Err(Error::QueueCorrupt(ref message))
                     if message == "recovery cursor size is invalid"
             ));
@@ -6187,7 +6196,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            load_recovery_cursor(schema_queue.root_fd(), &schema_queue.format.queue_id),
+            load_recovery_cursor(schema_queue.root_fd(), schema_queue.format.queue_id()),
             Err(Error::QueueCorrupt(ref message))
                 if message == "recovery cursor schema or version is unsupported"
         ));
@@ -6201,7 +6210,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            load_recovery_cursor(version_queue.root_fd(), &version_queue.format.queue_id),
+            load_recovery_cursor(version_queue.root_fd(), version_queue.format.queue_id()),
             Err(Error::QueueCorrupt(ref message))
                 if message == "recovery cursor schema or version is unsupported"
         ));
@@ -6218,7 +6227,7 @@ mod tests {
         assert!(matches!(
             load_recovery_cursor(
                 component_queue.root_fd(),
-                &component_queue.format.queue_id
+                component_queue.format.queue_id()
             ),
             Err(Error::QueueCorrupt(ref message))
                 if message == "recovery cursor contains an invalid component"
@@ -6243,7 +6252,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            load_recovery_cursor(queue.root_fd(), &queue.format.queue_id),
+            load_recovery_cursor(queue.root_fd(), queue.format.queue_id()),
             Err(Error::IoFailure(_))
         ));
     }
@@ -6414,7 +6423,7 @@ mod tests {
             .authenticated_wall_floor()
             .unwrap()
             .unix_ns()
-            .checked_add(queue.format.delayed_bucket_width_ns * 4)
+            .checked_add(queue.format.delayed_bucket_width_ns() * 4)
             .unwrap();
         let ticket = enqueue_for_shard(&mut queue, &tmp, 0, Some(not_before), b"cursor-replay");
         let delayed_parts = ticket
@@ -6818,7 +6827,7 @@ mod tests {
             let wall_floor = queue.authenticated_wall_floor().unwrap();
             let terminal_bucket = steadq_math::bucket_number(
                 wall_floor.unix_ns(),
-                queue.format.terminal_bucket_width_ns,
+                queue.format.terminal_bucket_width_ns(),
             )
             .unwrap();
             queue
@@ -6856,7 +6865,7 @@ mod tests {
                 .authenticated_wall_floor()
                 .unwrap()
                 .unix_ns()
-                .checked_add(queue.format.delayed_bucket_width_ns)
+                .checked_add(queue.format.delayed_bucket_width_ns())
                 .unwrap();
             let ticket = match queue.enqueue(EnqueueInput {
                 maximum_attempts: 3,
@@ -6944,7 +6953,7 @@ mod tests {
                 .join(dead_destination(&queue, shard, &common, wall_floor));
             let terminal_bucket = steadq_math::bucket_number(
                 wall_floor.unix_ns(),
-                queue.format.terminal_bucket_width_ns,
+                queue.format.terminal_bucket_width_ns(),
             )
             .unwrap();
             queue
@@ -6993,7 +7002,7 @@ mod tests {
                 .authenticated_wall_floor()
                 .unwrap()
                 .unix_ns()
-                .checked_add(queue.format.delayed_bucket_width_ns)
+                .checked_add(queue.format.delayed_bucket_width_ns())
                 .unwrap();
             let ticket = match queue.enqueue(EnqueueInput {
                 maximum_attempts: 3,
@@ -7170,7 +7179,7 @@ mod tests {
                 .authenticated_wall_floor()
                 .unwrap()
                 .unix_ns()
-                .checked_add(queue.format.delayed_bucket_width_ns)
+                .checked_add(queue.format.delayed_bucket_width_ns())
                 .unwrap();
             let ticket = match queue.enqueue(EnqueueInput {
                 maximum_attempts: 3,
@@ -7259,7 +7268,7 @@ mod tests {
     #[test]
     fn recovery_promotes_eligible_delayed_job() {
         let (tmp, mut queue) = create_test_queue();
-        let width = queue.format.delayed_bucket_width_ns;
+        let width = queue.format.delayed_bucket_width_ns();
         let not_before = queue
             .authenticated_wall_floor()
             .unwrap()
@@ -7576,10 +7585,10 @@ mod tests {
             .unwrap();
         let expiration_floor = receipt_bucket
             .checked_add(1)
-            .and_then(|bucket| bucket.checked_mul(queue.format.terminal_bucket_width_ns))
+            .and_then(|bucket| bucket.checked_mul(queue.format.terminal_bucket_width_ns()))
             .unwrap();
         let watermark_bucket =
-            steadq_math::ceiling_bucket(expiration_floor, queue.format.delayed_bucket_width_ns)
+            steadq_math::ceiling_bucket(expiration_floor, queue.format.delayed_bucket_width_ns())
                 .unwrap();
         write_wall_watermark(&tmp, watermark_bucket);
 
@@ -7883,11 +7892,13 @@ mod tests {
                 .unwrap();
             let expiration_floor = receipt_bucket
                 .checked_add(1)
-                .and_then(|bucket| bucket.checked_mul(queue.format.terminal_bucket_width_ns))
+                .and_then(|bucket| bucket.checked_mul(queue.format.terminal_bucket_width_ns()))
                 .unwrap();
-            let watermark_bucket =
-                steadq_math::ceiling_bucket(expiration_floor, queue.format.delayed_bucket_width_ns)
-                    .unwrap();
+            let watermark_bucket = steadq_math::ceiling_bucket(
+                expiration_floor,
+                queue.format.delayed_bucket_width_ns(),
+            )
+            .unwrap();
             write_wall_watermark(&tmp, watermark_bucket);
             let wall_floor = queue.authenticated_wall_floor().unwrap();
 

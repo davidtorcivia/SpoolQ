@@ -655,15 +655,16 @@ impl Queue {
         let queue_id = fs::random_128bit()?;
         let created_at = fs::clock_realtime_ns()?;
 
-        let format_rec = FormatRecord {
+        let format_rec = FormatRecord::new(
             queue_id,
-            created_at_unix_ns: created_at,
-            shard_count: opts.shard_count,
-            lease_bucket_width_ns: opts.lease_bucket_width_ns,
-            delayed_bucket_width_ns: opts.delayed_bucket_width_ns,
-            terminal_bucket_width_ns: opts.terminal_bucket_width_ns,
-            max_payload_length: opts.max_payload_length,
-        };
+            created_at,
+            opts.shard_count,
+            opts.lease_bucket_width_ns,
+            opts.delayed_bucket_width_ns,
+            opts.terminal_bucket_width_ns,
+            opts.max_payload_length,
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Create static directories
         for dir in [
@@ -806,7 +807,7 @@ impl Queue {
         // Validate retention bound: ceil(retention / terminal_width) + 2 <= 4096
         let probe_count = ceiling_bucket(
             opts.receipt_retention_ns,
-            format_rec.terminal_bucket_width_ns,
+            format_rec.terminal_bucket_width_ns(),
         )
         .ok_or_else(|| Error::QueueCorrupt("invalid terminal bucket width".into()))?
         .saturating_add(2);
@@ -883,7 +884,7 @@ impl Queue {
             return Err(Error::MaintenanceBusy);
         }
         let recovery_cursor =
-            crate::recovery::load_recovery_cursor(root_fd.as_fd(), &format_rec.queue_id)?;
+            crate::recovery::load_recovery_cursor(root_fd.as_fd(), format_rec.queue_id())?;
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -904,7 +905,7 @@ impl Queue {
     }
 
     pub fn queue_id(&self) -> &[u8; 16] {
-        &self.format.queue_id
+        self.format.queue_id()
     }
 
     pub fn boot_id(&self) -> &str {
@@ -933,11 +934,11 @@ impl Queue {
     #[allow(dead_code)]
     pub(crate) fn layout(&self) -> layout::Layout<'_> {
         layout::Layout::new(
-            &self.format.queue_id,
-            self.format.shard_count,
-            self.format.lease_bucket_width_ns,
-            self.format.delayed_bucket_width_ns,
-            self.format.terminal_bucket_width_ns,
+            self.format.queue_id(),
+            self.format.shard_count(),
+            self.format.lease_bucket_width_ns(),
+            self.format.delayed_bucket_width_ns(),
+            self.format.terminal_bucket_width_ns(),
             &self.boot_id,
         )
     }
@@ -979,7 +980,7 @@ impl Queue {
         let unix_ns = steadq_math::effective_wall_floor(
             clock,
             watermark.highest_observed_bucket,
-            self.format.delayed_bucket_width_ns,
+            self.format.delayed_bucket_width_ns(),
         )
         .ok_or_else(|| Error::QueueCorrupt("watermark computation overflow".into()))?;
         Ok(WallFloor {
@@ -992,9 +993,11 @@ impl Queue {
     pub(crate) fn stabilized_wall_floor(&self) -> Result<WallFloor, Error> {
         self.with_wall_watermark_write_lock(|control_fd| {
             let observed = self.authenticated_wall_floor()?;
-            let observed_bucket =
-                steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
-                    .ok_or(Error::StateExhausted)?;
+            let observed_bucket = steadq_math::bucket_number(
+                observed.unix_ns(),
+                self.format.delayed_bucket_width_ns(),
+            )
+            .ok_or(Error::StateExhausted)?;
             if !watermark_should_advance(observed_bucket, observed.watermark_bucket) {
                 return Ok(observed);
             }
@@ -1084,7 +1087,7 @@ impl Queue {
         control_fd: BorrowedFd<'_>,
     ) -> Result<WallFloor, Error> {
         let observed_bucket =
-            steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns)
+            steadq_math::bucket_number(observed.unix_ns(), self.format.delayed_bucket_width_ns())
                 .ok_or(Error::StateExhausted)?;
 
         // Re-read current watermark under lock
@@ -1094,7 +1097,7 @@ impl Queue {
                 if !watermark_should_advance(observed_bucket, wm.highest_observed_bucket) {
                     let durable_ns = wm
                         .highest_observed_bucket
-                        .checked_mul(self.format.delayed_bucket_width_ns)
+                        .checked_mul(self.format.delayed_bucket_width_ns())
                         .ok_or(Error::StateExhausted)?;
                     return Ok(WallFloor {
                         unix_ns: observed.unix_ns().max(durable_ns),
@@ -1222,7 +1225,7 @@ impl Queue {
         };
 
         // C-11: Validate payload size BEFORE hashing
-        if job.payload.len() as u64 > self.format.max_payload_length.min(MAX_PAYLOAD_LENGTH) {
+        if job.payload.len() as u64 > self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH) {
             let ticket = EnqueueTicket {
                 job_id,
                 envelope_digest: [0; 32],
@@ -1273,7 +1276,7 @@ impl Queue {
         let (initial_state, _) = match job.initial_not_before {
             Some(nb) if nb > now_wall => {
                 let (eb, _) =
-                    match eligibility_bucket_and_ns(nb, self.format.delayed_bucket_width_ns) {
+                    match eligibility_bucket_and_ns(nb, self.format.delayed_bucket_width_ns()) {
                         Some(v) => v,
                         None => {
                             let ticket = EnqueueTicket {
@@ -1554,15 +1557,15 @@ impl Queue {
         let scan_round = self.scan_round;
         self.scan_round = self.scan_round.wrapping_add(1);
         let (start, stride) = steadq_names::shard_scan_params(
-            &self.format.queue_id,
+            self.format.queue_id(),
             &self.boot_id_bytes,
             &self.worker_nonce,
             scan_round,
-            self.format.shard_count,
+            self.format.shard_count(),
         );
 
-        for i in 0..self.format.shard_count {
-            let shard = steadq_names::shard_at(start, stride, i, self.format.shard_count);
+        for i in 0..self.format.shard_count() {
+            let shard = steadq_names::shard_at(start, stride, i, self.format.shard_count());
             let shard_str = shard_hex(shard);
 
             // Open the ready shard directory
@@ -1599,15 +1602,15 @@ impl Queue {
                     Err(_) => continue,
                 };
 
-                if !parsed.authenticate_tag(&self.format.queue_id, &shard_str) {
+                if !parsed.authenticate_tag(self.format.queue_id(), &shard_str) {
                     continue;
                 }
 
                 // Verify shard matches job_id
                 let computed_shard = compute_shard(
-                    &self.format.queue_id,
+                    self.format.queue_id(),
                     &parsed.common.job_id,
-                    self.format.shard_count,
+                    self.format.shard_count(),
                 );
                 if computed_shard != shard {
                     continue;
@@ -1672,7 +1675,7 @@ impl Queue {
                 };
                 let lease_bucket = match steadq_math::lease_bucket(
                     boottime_deadline,
-                    self.format.lease_bucket_width_ns,
+                    self.format.lease_bucket_width_ns(),
                 ) {
                     Some(bucket) => bucket,
                     None => return LeaseOutcome::NotCommitted(Error::StateExhausted),
@@ -1698,7 +1701,7 @@ impl Queue {
                 };
 
                 let leased_name = steadq_names::make_leased_name(
-                    &self.format.queue_id,
+                    self.format.queue_id(),
                     &self.boot_id,
                     &bucket_str,
                     &shard_str,
@@ -1863,7 +1866,7 @@ impl Queue {
                                 );
                             }
                             // Verify payload limit
-                            if header.payload_length > self.format.max_payload_length {
+                            if header.payload_length > self.format.max_payload_length() {
                                 self.poison();
                                 return LeaseOutcome::OutcomeUnknown(
                                     claim_ticket
@@ -2025,7 +2028,7 @@ impl Queue {
         };
 
         let terminal_bucket =
-            match bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns) {
+            match bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns()) {
                 Some(bucket) => bucket,
                 None => return AckOutcome::NotCommitted(Error::StateExhausted),
             };
@@ -2173,7 +2176,7 @@ impl Queue {
         }
 
         let delay_ms = match steadq_math::retry_delay_ms(
-            &self.format.queue_id,
+            self.format.queue_id(),
             &lease.job_id,
             lease.attempt,
             policy,
@@ -2332,7 +2335,7 @@ impl Queue {
         };
 
         let terminal_bucket =
-            match bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns) {
+            match bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns()) {
                 Some(bucket) => bucket,
                 None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
             };
@@ -2489,9 +2492,9 @@ impl Queue {
         }
 
         let computed_shard = compute_shard(
-            &self.format.queue_id,
+            self.format.queue_id(),
             &lease.job_id,
-            self.format.shard_count,
+            self.format.shard_count(),
         );
         if !Self::shard_matches(path_shard, computed_shard) {
             return Err(Error::QueueCorrupt(format!(
@@ -2574,14 +2577,14 @@ impl Queue {
         }
         let expected_bucket = steadq_math::lease_bucket(
             parsed.boottime_deadline_ns,
-            self.format.lease_bucket_width_ns,
+            self.format.lease_bucket_width_ns(),
         )
         .ok_or(Error::StateExhausted)?;
         if path_bucket != expected_bucket {
             return Err(Error::QueueCorrupt("source lease bucket mismatch".into()));
         }
         if !parsed.authenticate_tag(
-            &self.format.queue_id,
+            self.format.queue_id(),
             &boot_id,
             &bucket_hex(path_bucket),
             &shard_hex(path_shard),
@@ -2781,7 +2784,7 @@ impl Queue {
         destination: TicketDestination,
     ) -> Result<TransitionTicket, Error> {
         TransitionTicket::new(
-            self.format.queue_id,
+            *self.format.queue_id(),
             operation,
             TransitionPhase::Linearized,
             TicketIdentity::new(
@@ -2810,7 +2813,7 @@ impl Queue {
         wall_deadline_ns: u64,
     ) -> Result<TransitionTicket, Error> {
         TransitionTicket::new(
-            self.format.queue_id,
+            *self.format.queue_id(),
             TransitionOperation::Claim,
             TransitionPhase::Linearized,
             TicketIdentity::new(
@@ -2890,7 +2893,7 @@ impl Queue {
         let shard_str = ready_dir.rsplit('/').next().unwrap_or("0000");
         let terminal_bucket = match steadq_math::bucket_number(
             wall_floor.unix_ns(),
-            self.format.terminal_bucket_width_ns,
+            self.format.terminal_bucket_width_ns(),
         ) {
             Some(bucket) => bucket,
             None => return Err(Error::StateExhausted),
@@ -2909,7 +2912,7 @@ impl Queue {
         };
 
         let dead_name = steadq_names::make_dead_name(
-            &self.format.queue_id,
+            self.format.queue_id(),
             &bucket_str,
             shard_str,
             &dead_common,
@@ -3133,7 +3136,7 @@ impl Queue {
     /// Scans active and terminal states for the computed shard.
     pub fn inspect(&self, job_id: &[u8; 16]) -> Vec<Snapshot> {
         let mut results = Vec::new();
-        let shard = compute_shard(&self.format.queue_id, job_id, self.format.shard_count);
+        let shard = compute_shard(self.format.queue_id(), job_id, self.format.shard_count());
         let shard_str = shard_hex(shard);
 
         // Check ready
@@ -3311,12 +3314,14 @@ impl Queue {
                                         if verified::verify_receipt_on_fd(
                                             file_fd.as_fd(),
                                             verified::ReceiptContext {
-                                                queue_id: &self.format.queue_id,
-                                                shard_count: self.format.shard_count,
+                                                queue_id: self.format.queue_id(),
+                                                shard_count: self.format.shard_count(),
                                                 terminal_bucket_width_ns: self
                                                     .format
-                                                    .terminal_bucket_width_ns,
-                                                max_payload_length: self.format.max_payload_length,
+                                                    .terminal_bucket_width_ns(),
+                                                max_payload_length: self
+                                                    .format
+                                                    .max_payload_length(),
                                                 bucket: bucket_dir,
                                                 shard: &shard_str,
                                                 filename: entry,
@@ -3397,10 +3402,11 @@ impl Queue {
         let header = verified.header;
 
         // R4-H06: Check queue-configured payload limit
-        if header.payload_length > self.format.max_payload_length {
+        if header.payload_length > self.format.max_payload_length() {
             return Err(Error::QueueCorrupt(format!(
                 "payload length {} exceeds queue limit {}",
-                header.payload_length, self.format.max_payload_length
+                header.payload_length,
+                self.format.max_payload_length()
             )));
         }
 
@@ -3417,7 +3423,7 @@ impl Queue {
             ActivePathContext::Ready { shard } => {
                 let p = steadq_names::parse_ready(name)
                     .map_err(|_| Error::QueueCorrupt("invalid ready filename".into()))?;
-                if !p.authenticate_tag(&self.format.queue_id, shard) {
+                if !p.authenticate_tag(self.format.queue_id(), shard) {
                     return Err(Error::QueueCorrupt("name tag mismatch".into()));
                 }
                 (
@@ -3437,12 +3443,12 @@ impl Queue {
             } => {
                 let p = steadq_names::parse_leased(name)
                     .map_err(|_| Error::QueueCorrupt("invalid leased filename".into()))?;
-                if !p.authenticate_tag(&self.format.queue_id, boot_id, bucket, shard) {
+                if !p.authenticate_tag(self.format.queue_id(), boot_id, bucket, shard) {
                     return Err(Error::QueueCorrupt("name tag mismatch".into()));
                 }
                 let expected_bucket = steadq_math::lease_bucket(
                     p.boottime_deadline_ns,
-                    self.format.lease_bucket_width_ns,
+                    self.format.lease_bucket_width_ns(),
                 )
                 .ok_or_else(|| Error::QueueCorrupt("invalid lease bucket width".into()))?;
                 let expected_bucket_str = steadq_names::bucket_hex(expected_bucket);
@@ -3464,12 +3470,12 @@ impl Queue {
             ActivePathContext::Delayed { bucket, shard } => {
                 let p = steadq_names::parse_delayed(name)
                     .map_err(|_| Error::QueueCorrupt("invalid delayed filename".into()))?;
-                if !p.authenticate_tag(&self.format.queue_id, bucket, shard) {
+                if !p.authenticate_tag(self.format.queue_id(), bucket, shard) {
                     return Err(Error::QueueCorrupt("name tag mismatch".into()));
                 }
                 let expected_bucket = steadq_math::ceiling_bucket(
                     p.not_before_ns,
-                    self.format.delayed_bucket_width_ns,
+                    self.format.delayed_bucket_width_ns(),
                 )
                 .ok_or_else(|| Error::QueueCorrupt("invalid delayed bucket width".into()))?;
                 let expected_bucket_str = steadq_names::bucket_hex(expected_bucket);
@@ -3507,7 +3513,8 @@ impl Queue {
         }
 
         // Verify shard placement
-        let computed_shard = compute_shard(&self.format.queue_id, &job_id, self.format.shard_count);
+        let computed_shard =
+            compute_shard(self.format.queue_id(), &job_id, self.format.shard_count());
         let path_shard = steadq_names::shard_from_hex(&path_shard_str)
             .ok_or_else(|| Error::QueueCorrupt(format!("invalid shard hex: {path_shard_str}")))?;
         if path_shard != computed_shard {
@@ -3556,10 +3563,10 @@ impl Queue {
         verified::verify_receipt_on_fd(
             file_fd.as_fd(),
             verified::ReceiptContext {
-                queue_id: &self.format.queue_id,
-                shard_count: self.format.shard_count,
-                terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
-                max_payload_length: self.format.max_payload_length,
+                queue_id: self.format.queue_id(),
+                shard_count: self.format.shard_count(),
+                terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
+                max_payload_length: self.format.max_payload_length(),
                 bucket,
                 shard: shard_hex,
                 filename: name,
@@ -3571,7 +3578,7 @@ impl Queue {
 
     fn check_duplicate_ack_bounded(&self, lease: &LeaseInfo, wall_floor: WallFloor) -> bool {
         let retention = self.options.receipt_retention_ns;
-        let width = self.format.terminal_bucket_width_ns;
+        let width = self.format.terminal_bucket_width_ns();
         let now_bucket = match steadq_math::bucket_number(wall_floor.unix_ns(), width) {
             Some(bucket) => bucket,
             None => return false,
@@ -3582,9 +3589,9 @@ impl Queue {
         };
         let min_bucket = now_bucket.saturating_sub(retention_buckets + 2);
         let shard = compute_shard(
-            &self.format.queue_id,
+            self.format.queue_id(),
             &lease.job_id,
-            self.format.shard_count,
+            self.format.shard_count(),
         );
         let shard_str = shard_hex(shard);
         let new_generation = match lease.generation.checked_add(1) {
@@ -3606,7 +3613,7 @@ impl Queue {
         for bucket_num in min_bucket..=now_bucket {
             let bucket_str = bucket_hex(bucket_num);
             let receipt_name = steadq_names::make_receipt_name(
-                &self.format.queue_id,
+                self.format.queue_id(),
                 &bucket_str,
                 &shard_str,
                 &receipt_common,
@@ -3623,10 +3630,10 @@ impl Queue {
                     if verified::verify_receipt_on_fd(
                         file_fd.as_fd(),
                         verified::ReceiptContext {
-                            queue_id: &self.format.queue_id,
-                            shard_count: self.format.shard_count,
-                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
-                            max_payload_length: self.format.max_payload_length,
+                            queue_id: self.format.queue_id(),
+                            shard_count: self.format.shard_count(),
+                            terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
+                            max_payload_length: self.format.max_payload_length(),
                             bucket: &bucket_str,
                             shard: &shard_str,
                             filename: &receipt_name,
@@ -3649,7 +3656,7 @@ impl Queue {
     /// comparing job_id and generation against the ticket.
     /// Helper: verify shard placement from a shard hex string.
     fn verify_shard_placement(&self, shard_hex: &str, job_id: &[u8; 16]) -> bool {
-        let computed = compute_shard(&self.format.queue_id, job_id, self.format.shard_count);
+        let computed = compute_shard(self.format.queue_id(), job_id, self.format.shard_count());
         match steadq_names::shard_from_hex(shard_hex) {
             Some(s) => s == computed,
             None => false,
@@ -3746,7 +3753,7 @@ impl Queue {
         &self,
         ticket: &TransitionTicket,
     ) -> Result<(String, String), Error> {
-        ticket.validate_for_queue(&self.format.queue_id)?;
+        ticket.validate_for_queue(self.format.queue_id())?;
         let source_common = ticket.source_common();
         let destination_common = ticket.destination_common()?;
         let layout = self.layout();
@@ -3865,10 +3872,10 @@ impl Queue {
             match verified::verify_receipt_on_fd(
                 file_fd.as_fd(),
                 verified::ReceiptContext {
-                    queue_id: &self.format.queue_id,
-                    shard_count: self.format.shard_count,
-                    terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
-                    max_payload_length: self.format.max_payload_length,
+                    queue_id: self.format.queue_id(),
+                    shard_count: self.format.shard_count(),
+                    terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
+                    max_payload_length: self.format.max_payload_length(),
                     bucket: parts[1],
                     shard: parts[2],
                     filename: name,
@@ -3939,7 +3946,7 @@ impl Queue {
                     return ResolveObj::Conflict;
                 }
                 let shard_hex = parts[1];
-                if !p.authenticate_tag(&self.format.queue_id, shard_hex) {
+                if !p.authenticate_tag(self.format.queue_id(), shard_hex) {
                     return ResolveObj::Conflict;
                 }
                 if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
@@ -3964,7 +3971,7 @@ impl Queue {
                 let boot = parts[1];
                 let bucket = parts[2];
                 let shard_hex = parts[3];
-                if !p.authenticate_tag(&self.format.queue_id, boot, bucket, shard_hex) {
+                if !p.authenticate_tag(self.format.queue_id(), boot, bucket, shard_hex) {
                     return ResolveObj::Conflict;
                 }
                 if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
@@ -3985,7 +3992,7 @@ impl Queue {
                 }
                 let bucket = parts[1];
                 let shard_hex = parts[2];
-                if !p.authenticate_tag(&self.format.queue_id, bucket, shard_hex) {
+                if !p.authenticate_tag(self.format.queue_id(), bucket, shard_hex) {
                     return ResolveObj::Conflict;
                 }
                 if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
@@ -4006,7 +4013,7 @@ impl Queue {
                 }
                 let bucket = parts[1];
                 let shard_hex = parts[2];
-                if !p.authenticate_tag(&self.format.queue_id, bucket, shard_hex) {
+                if !p.authenticate_tag(self.format.queue_id(), bucket, shard_hex) {
                     return ResolveObj::Conflict;
                 }
                 if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
@@ -4348,10 +4355,10 @@ mod tests {
             .unwrap()
             .checked_add(lease_duration_ns)
             .unwrap();
-        let bucket = steadq_math::lease_bucket(deadline, queue.format.lease_bucket_width_ns)
+        let bucket = steadq_math::lease_bucket(deadline, queue.format.lease_bucket_width_ns())
             .expect("test lease deadline has a bucket");
         for bucket in bucket.saturating_sub(1)..=bucket.saturating_add(1) {
-            for shard in 0..queue.format.shard_count {
+            for shard in 0..queue.format.shard_count() {
                 std::fs::create_dir_all(tmp.path().join(format!(
                     "leased/{}/{}/{shard:04x}",
                     queue.boot_id,
@@ -4363,7 +4370,7 @@ mod tests {
     }
 
     fn precreate_named_temp_shards(tmp: &TempDir, queue: &Queue) {
-        for shard in 0..queue.format.shard_count {
+        for shard in 0..queue.format.shard_count() {
             std::fs::create_dir_all(
                 tmp.path()
                     .join(format!("tmp/{}/{shard:04x}", queue.boot_id)),
@@ -4583,7 +4590,7 @@ mod tests {
     #[test]
     fn init_and_open() {
         let (_tmp, queue) = create_test_queue();
-        assert_eq!(queue.format().shard_count, 64);
+        assert_eq!(queue.format().shard_count(), 64);
     }
 
     #[test]
@@ -5476,12 +5483,7 @@ mod tests {
             LeaseOutcome::Leased(l) => l,
             _ => panic!("lease failed"),
         };
-        let policy = steadq_math::RetryPolicy {
-            base_ms: 1000,
-            cap_ms: 300_000,
-            use_jitter: false,
-            max_delay_ms: None,
-        };
+        let policy = steadq_math::RetryPolicy::new(1000, 300_000, false, None).unwrap();
         let result = queue.retry_with_policy(&lease, &policy);
         assert!(matches!(result, TransitionOutcome::Committed));
     }
@@ -6542,7 +6544,7 @@ mod tests {
         let envelope_digest = [9; 32];
         let terminal_bucket = 2;
         let ticket = TransitionTicket::new(
-            queue.format.queue_id,
+            *queue.format.queue_id(),
             TransitionOperation::Acknowledge,
             TransitionPhase::SourceDirectoryDurable,
             TicketIdentity::new(
@@ -6569,7 +6571,7 @@ mod tests {
             envelope_digest,
             final_attempt: 1,
             lease_token,
-            receipt_bucket_start_unix_ns: terminal_bucket * queue.format.terminal_bucket_width_ns,
+            receipt_bucket_start_unix_ns: terminal_bucket * queue.format.terminal_bucket_width_ns(),
             original_payload_length: 4,
         };
         std::fs::write(&destination_path, receipt.encode()).unwrap();
@@ -6848,7 +6850,7 @@ mod tests {
         assert_eq!(floor.watermark_sequence(), watermark.sequence);
         assert!(
             floor.unix_ns()
-                >= watermark.highest_observed_bucket * queue.format.delayed_bucket_width_ns
+                >= watermark.highest_observed_bucket * queue.format.delayed_bucket_width_ns()
         );
 
         let wm_path = tmp.path().join("control/wall-watermark");
@@ -6914,7 +6916,7 @@ mod tests {
 
         let floor = queue.authenticated_wall_floor().unwrap();
         let minimum = future_bucket
-            .checked_mul(queue.format.delayed_bucket_width_ns)
+            .checked_mul(queue.format.delayed_bucket_width_ns())
             .unwrap();
         assert_eq!(floor.unix_ns(), minimum);
         assert_eq!(floor.watermark_bucket(), future_bucket);
@@ -6929,7 +6931,7 @@ mod tests {
         let floor = queue.wall_floor_for_mutation().unwrap();
         let stored = queue.read_wall_watermark().unwrap();
         let observed_bucket =
-            steadq_math::bucket_number(floor.unix_ns(), queue.format.delayed_bucket_width_ns)
+            steadq_math::bucket_number(floor.unix_ns(), queue.format.delayed_bucket_width_ns())
                 .unwrap();
         assert_eq!(stored.highest_observed_bucket, observed_bucket);
         assert_eq!(floor.watermark_bucket(), observed_bucket);
@@ -7068,7 +7070,7 @@ mod tests {
         });
         let wm_before = queue.read_wall_watermark().expect("watermark exists");
         let bucket = wm_before.highest_observed_bucket;
-        let width = queue.format().delayed_bucket_width_ns;
+        let width = queue.format().delayed_bucket_width_ns();
         let observed = WallFloor {
             unix_ns: bucket * width,
             watermark_bucket: bucket,
@@ -7113,7 +7115,7 @@ mod tests {
             let watermark = queue.read_wall_watermark().unwrap();
             let observed_bucket = watermark.highest_observed_bucket.checked_add(1).unwrap();
             let observed_ns = observed_bucket
-                .checked_mul(queue.format.delayed_bucket_width_ns)
+                .checked_mul(queue.format.delayed_bucket_width_ns())
                 .unwrap();
             let observed = WallFloor {
                 unix_ns: observed_ns,
@@ -7211,7 +7213,7 @@ mod tests {
         let current = queue.authenticated_wall_floor().unwrap();
         write_wall_watermark(
             &tmp,
-            steadq_math::bucket_number(current.unix_ns(), queue.format.delayed_bucket_width_ns)
+            steadq_math::bucket_number(current.unix_ns(), queue.format.delayed_bucket_width_ns())
                 .unwrap(),
             current.watermark_sequence(),
         );
@@ -8500,14 +8502,14 @@ mod tests {
         };
         // Compute the EXACT receipt path ack() will target.
         let shard = compute_shard(
-            &queue.format.queue_id,
+            queue.format.queue_id(),
             &lease.job_id,
-            queue.format.shard_count,
+            queue.format.shard_count(),
         );
         let shard_str = shard_hex(shard);
         let wall = queue.effective_wall_floor_ns_checked().unwrap();
         let bucket =
-            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap();
+            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns()).unwrap();
         let bucket_str = bucket_hex(bucket);
         let new_gen = lease.generation + 1;
         let receipt_common = CommonFields {
@@ -8530,7 +8532,7 @@ mod tests {
             &shard_str,
             &receipt_base,
         );
-        let receipt_tag = steadq_names::compute_name_tag(&queue.format.queue_id, &receipt_ctx);
+        let receipt_tag = steadq_names::compute_name_tag(queue.format.queue_id(), &receipt_ctx);
         let receipt_name =
             steadq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
         // Pre-plant a non-receipt file at the exact destination.
@@ -8563,7 +8565,7 @@ mod tests {
             outcome => panic!("lease failed: {outcome:?}"),
         };
         let wall = queue.effective_wall_floor_ns_checked().unwrap();
-        let bucket = bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap();
+        let bucket = bucket_number(wall, queue.format.terminal_bucket_width_ns()).unwrap();
         let common = CommonFields {
             job_id: lease.job_id,
             generation: lease.generation.checked_add(1).unwrap(),
@@ -8803,14 +8805,14 @@ mod tests {
         };
         // Compute exact receipt path.
         let shard = compute_shard(
-            &queue.format.queue_id,
+            queue.format.queue_id(),
             &lease.job_id,
-            queue.format.shard_count,
+            queue.format.shard_count(),
         );
         let shard_str = shard_hex(shard);
         let wall = queue.effective_wall_floor_ns_checked().unwrap();
         let bucket =
-            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns).unwrap();
+            steadq_math::bucket_number(wall, queue.format.terminal_bucket_width_ns()).unwrap();
         let bucket_str = bucket_hex(bucket);
         let new_gen = lease.generation + 1;
         let receipt_common = CommonFields {
@@ -8833,7 +8835,7 @@ mod tests {
             &shard_str,
             &receipt_base,
         );
-        let receipt_tag = steadq_names::compute_name_tag(&queue.format.queue_id, &receipt_ctx);
+        let receipt_tag = steadq_names::compute_name_tag(queue.format.queue_id(), &receipt_ctx);
         let receipt_name =
             steadq_names::receipt_filename(&receipt_common, &lease.token, &receipt_tag);
         let receipt_dir = format!("receipts/{bucket_str}/{shard_str}");
@@ -8993,7 +8995,7 @@ mod tests {
         // during the next ack performs no mkdir and no fsync_dir_fd. The next
         // fsync_dir_fd is then strictly post-rename (OutcomeUnknown).
         let receipts = tmp.path().join("receipts");
-        let shard_count = queue.format().shard_count;
+        let shard_count = queue.format().shard_count();
         if let Ok(buckets) = std::fs::read_dir(&receipts) {
             for bucket in buckets.flatten() {
                 if !bucket.path().is_dir() {
@@ -9130,7 +9132,7 @@ mod tests {
         // Pre-create every ready shard so ensure_dir during retry_now does not
         // fsync. The next fsync_dir_fd is post-rename.
         let ready = tmp.path().join("ready");
-        let shard_count = queue.format().shard_count;
+        let shard_count = queue.format().shard_count();
         for shard in 0..shard_count {
             let _ = std::fs::create_dir_all(ready.join(format!("{shard:04x}")));
         }

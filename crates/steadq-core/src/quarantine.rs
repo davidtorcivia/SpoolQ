@@ -395,7 +395,7 @@ impl Queue {
         opts: &FsckOptions,
         report: &mut FsckReport,
     ) {
-        let queue_id = &self.format.queue_id;
+        let queue_id = self.format.queue_id();
 
         // C-40: Parse the filename using the state-appropriate parser.
         // Extract job_id, generation, attempt, max_attempts, tag from the parsed result.
@@ -529,9 +529,9 @@ impl Queue {
                     file_fd.as_fd(),
                     crate::queue::verified::ReceiptContext {
                         queue_id,
-                        shard_count: self.format.shard_count,
-                        terminal_bucket_width_ns: self.format.terminal_bucket_width_ns,
-                        max_payload_length: self.format.max_payload_length,
+                        shard_count: self.format.shard_count(),
+                        terminal_bucket_width_ns: self.format.terminal_bucket_width_ns(),
+                        max_payload_length: self.format.max_payload_length(),
                         bucket,
                         shard,
                         filename,
@@ -751,14 +751,15 @@ impl Queue {
         }
 
         // R4-H16: Verify payload limit.
-        if header.payload_length > self.format.max_payload_length {
+        if header.payload_length > self.format.max_payload_length() {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
                 finding_type: "payload_exceeds_limit".into(),
                 severity: FindingSeverity::Error,
                 details: format!(
                     "payload length {} exceeds queue limit {}",
-                    header.payload_length, self.format.max_payload_length
+                    header.payload_length,
+                    self.format.max_payload_length()
                 ),
             });
             if opts.mode == FsckMode::Repair {
@@ -804,7 +805,7 @@ impl Queue {
 
         // R4-H16: Verify shard placement.
         let computed_shard =
-            steadq_names::compute_shard(queue_id, &common.job_id, self.format.shard_count);
+            steadq_names::compute_shard(queue_id, &common.job_id, self.format.shard_count());
         let shard_hex_in_path = self.fsck_extract_shard_hex(state_name, &path_parts);
         if let Some(shard_hex) = shard_hex_in_path {
             if let Some(path_shard) = steadq_names::shard_from_hex(shard_hex) {

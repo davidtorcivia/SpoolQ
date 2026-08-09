@@ -214,8 +214,8 @@ fn main() -> ExitCode {
             match Queue::init(&path, &opts) {
                 Ok(format) => {
                     eprintln!("initialized queue at {}", path.display());
-                    eprintln!("queue_id: {}", steadq_names::hex_encode(&format.queue_id));
-                    eprintln!("shards: {}", format.shard_count);
+                    eprintln!("queue_id: {}", steadq_names::hex_encode(format.queue_id()));
+                    eprintln!("shards: {}", format.shard_count());
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -321,7 +321,7 @@ fn main() -> ExitCode {
                 LeaseOutcome::Leased(lease) => {
                     if let Some(ref hf) = handle_file {
                         if let Err(e) =
-                            save_handle_to_file(&path, &queue.format().queue_id, hf, &lease)
+                            save_handle_to_file(&path, queue.format().queue_id(), hf, &lease)
                         {
                             eprintln!("warning: failed to write handle file: {e}");
                         }
@@ -526,7 +526,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_IO_FAILURE);
                 }
             };
-            let lease = match load_handle(&handle_file, &queue.format().queue_id) {
+            let lease = match load_handle(&handle_file, queue.format().queue_id()) {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
@@ -572,7 +572,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let lease = match load_handle(&handle_file, &queue.format().queue_id) {
+            let lease = match load_handle(&handle_file, queue.format().queue_id()) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("handle load failed: {e}");
@@ -620,7 +620,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let lease = match load_handle(&handle_file, &queue.format().queue_id) {
+            let lease = match load_handle(&handle_file, queue.format().queue_id()) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("handle load failed: {e}");
@@ -731,8 +731,8 @@ fn main() -> ExitCode {
             } else if data.len() == 160 && &data[0..8] == b"SDQFMT1\0" {
                 match steadq_format::FormatRecord::decode(&data) {
                     Ok(fmt) => {
-                        eprintln!("queue_id: {}", steadq_names::hex_encode(&fmt.queue_id));
-                        eprintln!("shard_count: {}", fmt.shard_count);
+                        eprintln!("queue_id: {}", steadq_names::hex_encode(fmt.queue_id()));
+                        eprintln!("shard_count: {}", fmt.shard_count());
                         eprintln!("valid");
                         ExitCode::SUCCESS
                     }
@@ -782,12 +782,12 @@ fn main() -> ExitCode {
                 match steadq_format::FormatRecord::decode(&data) {
                     Ok(f) => {
                         println!("type: format");
-                        println!("queue_id: {}", steadq_names::hex_encode(&f.queue_id));
-                        println!("shard_count: {}", f.shard_count);
-                        println!("lease_bucket_width_ns: {}", f.lease_bucket_width_ns);
-                        println!("delayed_bucket_width_ns: {}", f.delayed_bucket_width_ns);
-                        println!("terminal_bucket_width_ns: {}", f.terminal_bucket_width_ns);
-                        println!("max_payload_length: {}", f.max_payload_length);
+                        println!("queue_id: {}", steadq_names::hex_encode(f.queue_id()));
+                        println!("shard_count: {}", f.shard_count());
+                        println!("lease_bucket_width_ns: {}", f.lease_bucket_width_ns());
+                        println!("delayed_bucket_width_ns: {}", f.delayed_bucket_width_ns());
+                        println!("terminal_bucket_width_ns: {}", f.terminal_bucket_width_ns());
+                        println!("max_payload_length: {}", f.max_payload_length());
                         ExitCode::SUCCESS
                     }
                     Err(e) => {

@@ -28,13 +28,13 @@ pub const MAX_EXTENSION_HEADER_LENGTH: u64 = 65_536;
 
 #[derive(Clone, Debug)]
 pub struct FormatRecord {
-    pub queue_id: [u8; 16],
-    pub created_at_unix_ns: u64,
-    pub shard_count: u32,
-    pub lease_bucket_width_ns: u64,
-    pub delayed_bucket_width_ns: u64,
-    pub terminal_bucket_width_ns: u64,
-    pub max_payload_length: u64,
+    queue_id: [u8; 16],
+    created_at_unix_ns: u64,
+    shard_count: u32,
+    lease_bucket_width_ns: u64,
+    delayed_bucket_width_ns: u64,
+    terminal_bucket_width_ns: u64,
+    max_payload_length: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +66,69 @@ pub enum FormatError {
 }
 
 impl FormatRecord {
+    pub fn new(
+        queue_id: [u8; 16],
+        created_at_unix_ns: u64,
+        shard_count: u32,
+        lease_bucket_width_ns: u64,
+        delayed_bucket_width_ns: u64,
+        terminal_bucket_width_ns: u64,
+        max_payload_length: u64,
+    ) -> Result<Self, FormatError> {
+        if shard_count == 0 || !shard_count.is_power_of_two() || shard_count > 4096 {
+            return Err(FormatError::InvalidShardCount(shard_count));
+        }
+        if lease_bucket_width_ns == 0 || delayed_bucket_width_ns == 0 {
+            return Err(FormatError::InvalidBucketWidth);
+        }
+        if !(60_000_000_000..=86_400_000_000_000).contains(&terminal_bucket_width_ns) {
+            return Err(FormatError::InvalidBucketWidth);
+        }
+        if !terminal_bucket_width_ns.is_multiple_of(delayed_bucket_width_ns) {
+            return Err(FormatError::InvalidBucketWidth);
+        }
+        if max_payload_length > MAX_PAYLOAD_LENGTH {
+            return Err(FormatError::PayloadLimitExceeded);
+        }
+        Ok(FormatRecord {
+            queue_id,
+            created_at_unix_ns,
+            shard_count,
+            lease_bucket_width_ns,
+            delayed_bucket_width_ns,
+            terminal_bucket_width_ns,
+            max_payload_length,
+        })
+    }
+
+    pub fn queue_id(&self) -> &[u8; 16] {
+        &self.queue_id
+    }
+
+    pub fn created_at_unix_ns(&self) -> u64 {
+        self.created_at_unix_ns
+    }
+
+    pub fn shard_count(&self) -> u32 {
+        self.shard_count
+    }
+
+    pub fn lease_bucket_width_ns(&self) -> u64 {
+        self.lease_bucket_width_ns
+    }
+
+    pub fn delayed_bucket_width_ns(&self) -> u64 {
+        self.delayed_bucket_width_ns
+    }
+
+    pub fn terminal_bucket_width_ns(&self) -> u64 {
+        self.terminal_bucket_width_ns
+    }
+
+    pub fn max_payload_length(&self) -> u64 {
+        self.max_payload_length
+    }
+
     pub fn encode(&self) -> [u8; FORMAT_SIZE] {
         let mut buf = [0u8; FORMAT_SIZE];
         buf[0..8].copy_from_slice(FORMAT_MAGIC);
@@ -995,6 +1058,42 @@ mod tests {
             out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
         }
         out
+    }
+
+    #[test]
+    fn format_accessors_return_validated_fields() {
+        let rec = FormatRecord::new(
+            [0xAB; 16],
+            999_999_999,
+            128,
+            1_000_000_000,
+            5_000_000_000,
+            60_000_000_000,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(rec.queue_id(), &[0xAB; 16]);
+        assert_eq!(rec.created_at_unix_ns(), 999_999_999);
+        assert_eq!(rec.shard_count(), 128);
+        assert_eq!(rec.lease_bucket_width_ns(), 1_000_000_000);
+        assert_eq!(rec.delayed_bucket_width_ns(), 5_000_000_000);
+        assert_eq!(rec.terminal_bucket_width_ns(), 60_000_000_000);
+        assert_eq!(rec.max_payload_length(), 1024 * 1024);
+    }
+
+    #[test]
+    fn format_new_rejects_invalid_values() {
+        assert!(FormatRecord::new([0; 16], 0, 0, 1, 1, 60_000_000_000, 0).is_err());
+        assert!(FormatRecord::new([0; 16], 0, 3, 1, 1, 60_000_000_000, 0).is_err());
+        assert!(FormatRecord::new([0; 16], 0, 8192, 1, 1, 60_000_000_000, 0).is_err());
+        assert!(FormatRecord::new([0; 16], 0, 64, 0, 1, 60_000_000_000, 0).is_err());
+        assert!(FormatRecord::new([0; 16], 0, 64, 1, 0, 60_000_000_000, 0).is_err());
+        assert!(FormatRecord::new([0; 16], 0, 64, 1, 1, 59_000_000_000, 0).is_err());
+        assert!(FormatRecord::new([0; 16], 0, 64, 1, 7, 60_000_000_000, 0).is_err());
+        assert!(
+            FormatRecord::new([0; 16], 0, 64, 1, 1, 60_000_000_000, MAX_PAYLOAD_LENGTH + 1)
+                .is_err()
+        );
     }
 
     #[test]

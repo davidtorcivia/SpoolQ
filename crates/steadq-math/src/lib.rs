@@ -68,21 +68,10 @@ pub fn lease_bucket(boottime_deadline_ns: u64, lease_bucket_width_ns: u64) -> Op
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetryPolicy {
-    pub base_ms: u64,
-    pub cap_ms: u64,
-    pub use_jitter: bool,
-    pub max_delay_ms: Option<u64>,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        RetryPolicy {
-            base_ms: 1_000,
-            cap_ms: 300_000,
-            use_jitter: true,
-            max_delay_ms: None,
-        }
-    }
+    base_ms: u64,
+    cap_ms: u64,
+    use_jitter: bool,
+    max_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -96,6 +85,53 @@ pub enum RetryError {
 }
 
 impl RetryPolicy {
+    pub fn new(
+        base_ms: u64,
+        cap_ms: u64,
+        use_jitter: bool,
+        max_delay_ms: Option<u64>,
+    ) -> Result<Self, RetryError> {
+        let policy = RetryPolicy {
+            base_ms,
+            cap_ms,
+            use_jitter,
+            max_delay_ms,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn base_ms(&self) -> u64 {
+        self.base_ms
+    }
+
+    pub fn cap_ms(&self) -> u64 {
+        self.cap_ms
+    }
+
+    pub fn use_jitter(&self) -> bool {
+        self.use_jitter
+    }
+
+    pub fn max_delay_ms(&self) -> Option<u64> {
+        self.max_delay_ms
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        base_ms: u64,
+        cap_ms: u64,
+        use_jitter: bool,
+        max_delay_ms: Option<u64>,
+    ) -> Self {
+        RetryPolicy {
+            base_ms,
+            cap_ms,
+            use_jitter,
+            max_delay_ms,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), RetryError> {
         if self.base_ms == 0 {
             return Err(RetryError::ZeroBase);
@@ -153,9 +189,9 @@ pub fn retry_delay_ms(
     }
 
     let cap = policy.effective_cap_ms();
-    let ceiling = cap.min(saturating_double(policy.base_ms, attempt));
+    let ceiling = cap.min(saturating_double(policy.base_ms(), attempt));
 
-    if !policy.use_jitter {
+    if !policy.use_jitter() {
         return Ok(ceiling);
     }
 
@@ -252,13 +288,17 @@ mod tests {
     }
 
     #[test]
+    fn retry_policy_accessors_return_validated_fields() {
+        let policy = RetryPolicy::new(2000, 500_000, true, Some(100_000)).unwrap();
+        assert_eq!(policy.base_ms(), 2000);
+        assert_eq!(policy.cap_ms(), 500_000);
+        assert!(policy.use_jitter());
+        assert_eq!(policy.max_delay_ms(), Some(100_000));
+    }
+
+    #[test]
     fn retry_no_jitter() {
-        let policy = RetryPolicy {
-            base_ms: 1000,
-            cap_ms: 300_000,
-            use_jitter: false,
-            max_delay_ms: None,
-        };
+        let policy = RetryPolicy::new(1000, 300_000, false, None).unwrap();
         let qid = [1u8; 16];
         let jid = [2u8; 16];
         // attempt 1: ceiling = min(300_000, 1000*1) = 1000
@@ -275,7 +315,7 @@ mod tests {
 
     #[test]
     fn retry_jitter_in_range() {
-        let policy = RetryPolicy::default();
+        let policy = RetryPolicy::new(1000, 300_000, true, None).unwrap();
         let qid = [1u8; 16];
         let jid = [2u8; 16];
 
@@ -283,7 +323,7 @@ mod tests {
             let delay = retry_delay_ms(&qid, &jid, attempt, &policy).unwrap();
             let ceiling = policy
                 .effective_cap_ms()
-                .min(saturating_double(policy.base_ms, attempt));
+                .min(saturating_double(policy.base_ms(), attempt));
             let lower = ceiling.div_ceil(2);
             assert!(
                 (lower..=ceiling).contains(&delay),
@@ -294,7 +334,7 @@ mod tests {
 
     #[test]
     fn retry_deterministic() {
-        let policy = RetryPolicy::default();
+        let policy = RetryPolicy::new(1000, 300_000, true, None).unwrap();
         let qid = [1u8; 16];
         let jid = [2u8; 16];
         let d1 = retry_delay_ms(&qid, &jid, 3, &policy).unwrap();
@@ -304,7 +344,7 @@ mod tests {
 
     #[test]
     fn retry_zero_attempt() {
-        let policy = RetryPolicy::default();
+        let policy = RetryPolicy::new(1000, 300_000, true, None).unwrap();
         let qid = [1u8; 16];
         let jid = [2u8; 16];
         assert_eq!(retry_delay_ms(&qid, &jid, 0, &policy).unwrap(), 0);
@@ -312,18 +352,15 @@ mod tests {
 
     #[test]
     fn retry_validation() {
-        let bad = RetryPolicy {
-            base_ms: 0,
-            ..Default::default()
-        };
+        let bad = RetryPolicy::new_unchecked(0, 1000, false, None);
         assert_eq!(bad.validate(), Err(RetryError::ZeroBase));
 
-        let bad2 = RetryPolicy {
-            base_ms: 1000,
-            cap_ms: 500,
-            ..Default::default()
-        };
+        let bad2 = RetryPolicy::new_unchecked(1000, 500, false, None);
         assert_eq!(bad2.validate(), Err(RetryError::CapTooSmall));
+
+        assert!(RetryPolicy::new(0, 1000, false, None).is_err());
+        assert!(RetryPolicy::new(1000, 500, false, None).is_err());
+        assert!(RetryPolicy::new(1000, 300_000, true, None).is_ok());
     }
 
     #[test]
@@ -401,12 +438,7 @@ mod tests {
 
     #[test]
     fn retry_delay_jitter_bounds_table() {
-        let policy = RetryPolicy {
-            base_ms: 1000,
-            cap_ms: 8_000,
-            use_jitter: true,
-            max_delay_ms: Some(4_000),
-        };
+        let policy = RetryPolicy::new(1000, 8_000, true, Some(4_000)).unwrap();
         assert_eq!(policy.effective_cap_ms(), 4_000);
         policy.validate().unwrap();
         let qid = [9u8; 16];
@@ -415,7 +447,7 @@ mod tests {
             let d = retry_delay_ms(&qid, &jid, attempt, &policy).unwrap();
             let ceiling = policy
                 .effective_cap_ms()
-                .min(saturating_double(policy.base_ms, attempt));
+                .min(saturating_double(policy.base_ms(), attempt));
             let lower = ceiling.div_ceil(2);
             assert!(
                 (lower..=ceiling).contains(&d),
