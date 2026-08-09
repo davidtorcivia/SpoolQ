@@ -10,6 +10,8 @@ Requires Java 17 and the TLA+ toolkit.
 java -cp /tmp/tla2tools.jar tlc2.TLC -config model/SteadQ.cfg model/SteadQ.tla -workers auto
 ```
 
+The separate namespace durability model and its two crash profiles are documented in `model/namespace/README.md`.
+
 Download `tla2tools.jar` from https://github.com/tlaplus/tlaplus/releases.
 
 Local check (after `curl -fsSL .../tla2tools.jar -o /tmp/tla2tools.jar`):
