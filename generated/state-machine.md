@@ -1,10 +1,10 @@
-<!-- Source: spec/state-machine.json; SHA-256: 51784a8a723ff47b4cdc878dd1eecb55dd23ed71b2111ebfa661768a8e96b478 -->
+<!-- Source: spec/state-machine.json; SHA-256: bb0a2f768044b96e8346939974403c6bc484aeab3bffee2c6cc647a32eada641 -->
 
 # SteadQ/1 State Machine (Generated)
 
 ## Transitions
 
-| Operation | Source | Destination | Gen | Attempt | Token | Reason | Clock requirement | Required syncs | Linearization | Before failure | After failure | Resolution | Notes |
+| Operation | Source | Destination | Gen | Attempt | Token | Reason | Clock requirement | Required syncs | Linearization | Before failure | After failure | Resolution | Qualification |
 |-----------|--------|-------------|-----|---------|-------|--------|-------------------|----------------|---------------|----------------|---------------|------------|-------|
 | enqueue_immediate | hidden | ready | zero | zero | none | none | authenticated_wall_floor | file_fsync, destination_dir_fsync | publish_noreplace | not_committed | outcome_unknown | probe destination: observed = committed, absent = not committed | none |
 | enqueue_delayed | hidden | delayed | zero | zero | none | none | authenticated_wall_floor | file_fsync, destination_dir_fsync | publish_noreplace | not_committed | outcome_unknown | probe destination: observed = committed, absent = not committed | none |
@@ -16,9 +16,9 @@
 | retry_now | leased | ready | increment | unchanged | none | none | none | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | none |
 | retry_later | leased | delayed | increment | unchanged | none | none | authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | none |
 | bury | leased | dead | increment | unchanged | none | application_defined | authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | none |
-| reap_expired_to_ready | leased | ready | increment | unchanged | none | none | lease_expiration_evidence | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | attempt < maximum_attempts |
-| reap_expired_to_dead | leased | dead | increment | unchanged | none | attempts_exhausted | lease_expiration_evidence_and_authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | attempt >= maximum_attempts |
-| quarantine | active | quarantine | increment | unchanged | none | corruption | none | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | raw bytes preserved |
+| reap_expired_to_ready | leased | ready | increment | unchanged | none | none | lease_expiration_evidence | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | attempts_remaining |
+| reap_expired_to_dead | leased | dead | increment | unchanged | none | attempts_exhausted | lease_expiration_evidence_and_authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | attempts_exhausted |
+| quarantine | active | quarantine | increment | unchanged | none | corruption | none | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | probe both | raw_bytes_preserved |
 
 ## Exceptional mutations
 

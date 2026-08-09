@@ -17,7 +17,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe destination: observed = committed, absent = not committed",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "enqueue_delayed",
@@ -36,7 +36,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe destination: observed = committed, absent = not committed",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "promote",
@@ -55,7 +55,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both: destination observed = committed, source only = not committed",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "claim",
@@ -74,7 +74,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both directories",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "exhausted_ready_cleanup",
@@ -93,7 +93,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "renew",
@@ -111,7 +111,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe destination: new generation observed = renewed, old gen observed = lease lost",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "acknowledge",
@@ -130,7 +130,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe receipt buckets by exact name",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "retry_now",
@@ -149,7 +149,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "retry_later",
@@ -168,7 +168,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "bury",
@@ -187,7 +187,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
-      "notes": null
+      "qualification": "none"
     },
     {
       "operation": "reap_expired_to_ready",
@@ -206,7 +206,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
-      "notes": "attempt < maximum_attempts"
+      "qualification": "attempts_remaining"
     },
     {
       "operation": "reap_expired_to_dead",
@@ -225,7 +225,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
-      "notes": "attempt >= maximum_attempts"
+      "qualification": "attempts_exhausted"
     },
     {
       "operation": "quarantine",
@@ -244,7 +244,7 @@
       "before_linearization_failure": "not_committed",
       "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
-      "notes": "raw bytes preserved"
+      "qualification": "raw_bytes_preserved"
     }
   ],
   "exceptions": [

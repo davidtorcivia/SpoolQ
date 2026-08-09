@@ -33,7 +33,7 @@ struct Transition {
     before_linearization_failure: FailureOutcome,
     after_linearization_failure: FailureOutcome,
     resolution_behavior: String,
-    notes: Nullable<String>,
+    qualification: TransitionQualification,
 }
 
 #[derive(Clone, Deserialize)]
@@ -114,6 +114,15 @@ enum ClockRequirement {
     BoottimeAndAuthenticatedWallFloor,
     LeaseExpirationEvidence,
     LeaseExpirationEvidenceAndAuthenticatedWallFloor,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum TransitionQualification {
+    None,
+    AttemptsRemaining,
+    AttemptsExhausted,
+    RawBytesPreserved,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
@@ -257,15 +266,6 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
         if transition.resolution_behavior.trim().is_empty() {
             return Err(format!(
                 "transition {} has empty resolution behavior",
-                transition.operation.as_str()
-            ));
-        }
-        if matches!(
-            &transition.notes,
-            Nullable::Value(value) if value.trim().is_empty()
-        ) {
-            return Err(format!(
-                "transition {} has empty notes",
                 transition.operation.as_str()
             ));
         }
@@ -417,6 +417,15 @@ fn validate_transition_invariant(transition: &Transition) -> Result<(), String> 
             transition.operation.as_str(),
             transition.clock_requirement.as_str(),
             expected_clock_requirement.as_str()
+        ));
+    }
+    let expected_qualification = transition.operation.qualification();
+    if transition.qualification != expected_qualification {
+        return Err(format!(
+            "transition {} has qualification {}; expected {}",
+            transition.operation.as_str(),
+            transition.qualification.as_str(),
+            expected_qualification.as_str()
         ));
     }
     let expected_linearization = transition.operation.linearization();
@@ -620,6 +629,24 @@ impl Operation {
             Self::ReapExpiredToDead => {
                 ClockRequirement::LeaseExpirationEvidenceAndAuthenticatedWallFloor
             }
+        }
+    }
+
+    fn qualification(self) -> TransitionQualification {
+        match self {
+            Self::ReapExpiredToReady => TransitionQualification::AttemptsRemaining,
+            Self::ReapExpiredToDead => TransitionQualification::AttemptsExhausted,
+            Self::Quarantine => TransitionQualification::RawBytesPreserved,
+            Self::EnqueueImmediate
+            | Self::EnqueueDelayed
+            | Self::Promote
+            | Self::Claim
+            | Self::ExhaustedReadyCleanup
+            | Self::Renew
+            | Self::Acknowledge
+            | Self::RetryNow
+            | Self::RetryLater
+            | Self::Bury => TransitionQualification::None,
         }
     }
 
@@ -907,6 +934,33 @@ impl ClockRequirement {
             Self::LeaseExpirationEvidenceAndAuthenticatedWallFloor => {
                 "LeaseExpirationEvidenceAndAuthenticatedWallFloor"
             }
+        }
+    }
+}
+
+impl TransitionQualification {
+    const ALL: [Self; 4] = [
+        Self::None,
+        Self::AttemptsRemaining,
+        Self::AttemptsExhausted,
+        Self::RawBytesPreserved,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::AttemptsRemaining => "attempts_remaining",
+            Self::AttemptsExhausted => "attempts_exhausted",
+            Self::RawBytesPreserved => "raw_bytes_preserved",
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::AttemptsRemaining => "AttemptsRemaining",
+            Self::AttemptsExhausted => "AttemptsExhausted",
+            Self::RawBytesPreserved => "RawBytesPreserved",
         }
     }
 }
