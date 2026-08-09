@@ -60,6 +60,7 @@ pub mod fault {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io;
+    use std::os::fd::RawFd;
 
     #[derive(Clone, Copy, Debug)]
     struct Fault {
@@ -71,6 +72,7 @@ pub mod fault {
     struct State {
         faults: HashMap<String, Fault>,
         counts: HashMap<String, u64>,
+        fd_identities: HashMap<String, Vec<(u64, u64)>>,
         readdir_rotation: usize,
         readdir_reversed: bool,
     }
@@ -80,6 +82,7 @@ pub mod fault {
             State {
                 faults: HashMap::new(),
                 counts: HashMap::new(),
+                fd_identities: HashMap::new(),
                 readdir_rotation: 0,
                 readdir_reversed: false,
             }
@@ -96,6 +99,7 @@ pub mod fault {
             let mut s = s.borrow_mut();
             s.faults.clear();
             s.counts.clear();
+            s.fd_identities.clear();
             s.readdir_rotation = 0;
             s.readdir_reversed = false;
         });
@@ -152,6 +156,41 @@ pub mod fault {
     /// Number of times `func_name` has been checked since the last reset.
     pub fn call_count(func_name: &str) -> u64 {
         STATE.with(|s| *s.borrow().counts.get(func_name).unwrap_or(&0))
+    }
+
+    /// Ordered device/inode identities recorded for fd-bearing fault points.
+    pub fn fd_identities(func_name: &str) -> Vec<(u64, u64)> {
+        STATE.with(|state| {
+            state
+                .borrow()
+                .fd_identities
+                .get(func_name)
+                .cloned()
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn record_fd_identity(func_name: &str, fd: RawFd) -> io::Result<()> {
+        STATE.with(|state| {
+            if state.borrow().faults.is_empty() {
+                return Ok(());
+            }
+
+            let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `statbuf` points to writable storage for one `libc::stat`,
+            // and the caller supplies an open descriptor for the duration of
+            // this synchronous instrumentation call.
+            if unsafe { libc::fstat(fd, &mut statbuf) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            state
+                .borrow_mut()
+                .fd_identities
+                .entry(func_name.to_string())
+                .or_default()
+                .push((statbuf.st_dev as u64, statbuf.st_ino as u64));
+            Ok(())
+        })
     }
 
     /// Called by instrumented functions. Returns an error when a fault fires.
@@ -320,6 +359,7 @@ pub fn fsync_dir(dir_fd: RawFd, name: &str) -> io::Result<()> {
 
 /// fsync a directory by its already-open fd.
 pub fn fsync_dir_fd(fd: RawFd) -> io::Result<()> {
+    fault::record_fd_identity("fsync_dir_fd", fd)?;
     fault_check!("fsync_dir_fd");
     fsync(fd)
 }
@@ -2111,6 +2151,35 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         fault::reset();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fsync_dir_fd_records_ordered_directory_identities() {
+        fault::reset();
+        let first_dir = tempfile_dir("fsyncdir-record-first");
+        let second_dir = tempfile_dir("fsyncdir-record-second");
+        let first_fd = open_dir_absolute(&first_dir).unwrap();
+        let second_fd = open_dir_absolute(&second_dir).unwrap();
+        let first_stat = fstat(first_fd.as_raw_fd()).unwrap();
+        let second_stat = fstat(second_fd.as_raw_fd()).unwrap();
+        let expected = [
+            (first_stat.st_dev as u64, first_stat.st_ino as u64),
+            (second_stat.st_dev as u64, second_stat.st_ino as u64),
+        ];
+
+        fault::inject("fsync_dir_fd", u64::MAX);
+        fsync_dir_fd(first_fd.as_raw_fd()).unwrap();
+        fsync_dir_fd(second_fd.as_raw_fd()).unwrap();
+        assert_eq!(fault::fd_identities("fsync_dir_fd"), expected);
+        assert_eq!(fault::call_count("fsync_dir_fd"), 2);
+
+        let error = fault::record_fd_identity("invalid", -1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+
+        fault::reset();
+        assert!(fault::fd_identities("fsync_dir_fd").is_empty());
+        let _ = std::fs::remove_dir_all(&first_dir);
+        let _ = std::fs::remove_dir_all(&second_dir);
     }
 
     #[test]

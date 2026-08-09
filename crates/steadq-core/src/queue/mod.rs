@@ -5045,6 +5045,79 @@ mod tests {
     }
 
     #[test]
+    fn renew_syncs_source_directory_only_when_distinct() {
+        fn synced_directories(distinct_destination: bool) -> Vec<(u64, u64)> {
+            let (_tmp, mut queue) = create_test_queue();
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: b"data".to_vec(),
+                ..Default::default()
+            });
+            let lease = match queue.lease(0, 30_000_000_000) {
+                LeaseOutcome::Leased(lease) => lease,
+                other => panic!("lease failed: {other:?}"),
+            };
+            let source_directory = lease
+                .exact_source_path
+                .rsplit_once('/')
+                .unwrap()
+                .0
+                .to_string();
+            let destination_directory = if distinct_destination {
+                let directory = format!("leased/{}/ffffffffffffffff/0000", queue.boot_id);
+                queue.ensure_dir(&directory).unwrap();
+                directory
+            } else {
+                source_directory.clone()
+            };
+            let source_directory_fd =
+                open_relative(queue.root_fd.as_raw_fd(), &source_directory).unwrap();
+            let source_stat = fs::fstat(source_directory_fd.as_raw_fd()).unwrap();
+            let source_identity = (source_stat.st_dev as u64, source_stat.st_ino as u64);
+            let destination_directory_fd =
+                open_relative(queue.root_fd.as_raw_fd(), &destination_directory).unwrap();
+            let destination_stat = fs::fstat(destination_directory_fd.as_raw_fd()).unwrap();
+            let destination_identity = (
+                destination_stat.st_dev as u64,
+                destination_stat.st_ino as u64,
+            );
+            let ticket = queue
+                .transition_ticket_for_lease(
+                    &lease,
+                    TransitionOperation::Renew,
+                    TicketDestination::Leased {
+                        boot_id: queue.boot_id.clone(),
+                        boottime_deadline_ns: lease.expires_boottime_ns,
+                        wall_deadline_ns: lease.expires_wall_ns,
+                    },
+                )
+                .unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject("fsync_dir_fd", u64::MAX);
+            let outcome = queue.move_leased_renew(
+                &lease,
+                &destination_directory,
+                "renew-barrier-test.sqj",
+                &ticket,
+            );
+            let identities = fs::fault::fd_identities("fsync_dir_fd");
+            fs::fault::reset();
+            assert!(matches!(outcome, TransitionOutcome::Committed));
+            if distinct_destination {
+                assert_eq!(identities, [destination_identity, source_identity]);
+            } else {
+                assert_eq!(identities, [destination_identity]);
+            }
+            identities
+        }
+
+        assert_eq!(synced_directories(false).len(), 1);
+        assert_eq!(synced_directories(true).len(), 2);
+    }
+
+    #[test]
     fn ack_already_lost_returns_lease_lost() {
         let (_tmp, mut queue) = create_test_queue();
         let input = EnqueueInput {

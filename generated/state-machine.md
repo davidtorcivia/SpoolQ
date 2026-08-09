@@ -1,8 +1,8 @@
-<!-- Source: spec/state-machine.json; SHA-256: 0a1a4a12c42e8bdb74478372dd4e34a983a144e17c8714d332a75dabd582df0b -->
+<!-- Source: spec/state-machine.json; SHA-256: 6638e55adbf6356e3e28defe170a8a21d37d672fb4542d99f2b0809bad8b0008 -->
 
 # SteadQ/1 State Machine (Generated)
 
-Protocol IR: `steadq-state-machine`, version `1`.
+Protocol IR: `steadq-state-machine`, version `2`.
 
 ## Transitions
 
@@ -13,7 +13,7 @@ Protocol IR: `steadq-state-machine`, version `1`.
 | promote | delayed | full_job | ready | full_job | increment | unchanged | none | none | authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | source_and_destination | none |
 | claim | ready | full_job | leased | full_job | increment | increment | new | none | boottime_and_authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | source_and_destination | none |
 | exhausted_ready_cleanup | ready | full_job | dead | full_job | increment | unchanged | none | attempts_exhausted | authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | source_and_destination | none |
-| renew | leased | full_job | leased | full_job | increment | unchanged | same | none | boottime_and_authenticated_wall_floor | same_or_destination_dir_fsync | rename_noreplace | not_committed | outcome_unknown | source_and_destination | none |
+| renew | leased | full_job | leased | full_job | increment | unchanged | same | none | boottime_and_authenticated_wall_floor | same_or_destination_dir_fsync, source_dir_fsync_if_distinct | rename_noreplace | not_committed | outcome_unknown | source_and_destination | none |
 | acknowledge | leased | full_job | receipt | full_receipt | increment | unchanged | same | none | authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | receipt_candidates_and_source | none |
 | retry_now | leased | full_job | ready | full_job | increment | unchanged | none | none | none | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | source_and_destination | none |
 | retry_later | leased | full_job | delayed | full_job | increment | unchanged | none | none | authenticated_wall_floor | destination_dir_fsync, source_dir_fsync | rename_noreplace | not_committed | outcome_unknown | source_and_destination | none |
