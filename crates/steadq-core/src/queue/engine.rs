@@ -46,6 +46,32 @@ pub enum MoveFailure {
     SourceMissing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnlinkPhase {
+    Unlink,
+    DirectoryFsync,
+}
+
+#[derive(Clone, Debug)]
+pub enum UnlinkFailure {
+    NotCommitted { phase: UnlinkPhase, source: String },
+    OutcomeUnknown { phase: UnlinkPhase, source: String },
+    SourceMissing,
+}
+
+impl UnlinkFailure {
+    pub fn phase(&self) -> Option<UnlinkPhase> {
+        match self {
+            Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
+            Self::SourceMissing => None,
+        }
+    }
+
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown { .. })
+    }
+}
+
 impl MoveFailure {
     pub fn is_outcome_unknown(&self) -> bool {
         matches!(self, Self::OutcomeUnknown { .. })
@@ -107,6 +133,29 @@ pub fn move_verified_noreplace(
         });
     }
     Ok(())
+}
+
+pub fn unlink_verified(
+    directory_fd: std::os::unix::io::RawFd,
+    name: &str,
+    _actor: MoveActor,
+) -> Result<(), UnlinkFailure> {
+    match fs::unlinkat(directory_fd, name) {
+        Ok(()) => {}
+        Err(error) if is_not_found_io_kind(error.kind()) => {
+            return Err(UnlinkFailure::SourceMissing);
+        }
+        Err(error) => {
+            return Err(UnlinkFailure::NotCommitted {
+                phase: UnlinkPhase::Unlink,
+                source: error.to_string(),
+            });
+        }
+    }
+    fs::fsync_dir_fd(directory_fd).map_err(|error| UnlinkFailure::OutcomeUnknown {
+        phase: UnlinkPhase::DirectoryFsync,
+        source: error.to_string(),
+    })
 }
 
 /// Convert a MoveFailure into the public Error / poison decision.
@@ -320,5 +369,50 @@ mod tests {
             MoveActor::Recovery,
         );
         assert!(matches!(r3, Err(MoveFailure::AlreadyExists)));
+    }
+
+    #[test]
+    fn unlink_verified_preserves_linearization_phase() {
+        for (fault, expected_phase, outcome_unknown, file_remains) in [
+            ("unlinkat", UnlinkPhase::Unlink, false, true),
+            ("fsync_dir_fd", UnlinkPhase::DirectoryFsync, true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("object.raw");
+            std::fs::write(&path, b"object").unwrap();
+            let directory_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .open(dir.path())
+                .unwrap();
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, libc::EIO);
+            let result =
+                unlink_verified(directory_fd.as_raw_fd(), "object.raw", MoveActor::Recovery);
+            fs::fault::reset();
+            let failure = result.unwrap_err();
+            assert_eq!(failure.phase(), Some(expected_phase));
+            assert_eq!(failure.is_outcome_unknown(), outcome_unknown);
+            assert_eq!(path.exists(), file_remains);
+        }
+    }
+
+    #[test]
+    fn unlink_verified_distinguishes_missing_source_and_io_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open(dir.path())
+            .unwrap();
+        assert!(matches!(
+            unlink_verified(directory_fd.as_raw_fd(), "missing.raw", MoveActor::Recovery),
+            Err(UnlinkFailure::SourceMissing)
+        ));
+        assert!(matches!(
+            unlink_verified(-1, "missing.raw", MoveActor::Recovery),
+            Err(UnlinkFailure::NotCommitted {
+                phase: UnlinkPhase::Unlink,
+                ..
+            })
+        ));
     }
 }

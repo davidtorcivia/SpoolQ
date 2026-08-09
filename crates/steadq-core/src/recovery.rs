@@ -8,7 +8,9 @@ use steadq_math;
 use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
-use crate::queue::engine::{move_verified_noreplace, MoveActor, MoveFailure, MovePhase};
+use crate::queue::engine::{
+    move_verified_noreplace, unlink_verified, MoveActor, MoveFailure, MovePhase, UnlinkFailure,
+};
 use crate::queue::{
     open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryHierarchyRetry,
     RecoveryHierarchyRetryKind, RecoveryPhase, ThreeLevelCursor, WallFloor,
@@ -715,6 +717,26 @@ impl Queue {
             ),
             MoveFailure::SourceMissing => {
                 ("source_missing", "phase=Rename: source is missing".into())
+            }
+        };
+        Self::record_error(stats, &format!("{operation}_{category}"), path, &detail);
+    }
+
+    fn record_unlink_failure(
+        stats: &mut RecoveryStats,
+        operation: &str,
+        path: &str,
+        failure: UnlinkFailure,
+    ) {
+        let (category, detail) = match failure {
+            UnlinkFailure::NotCommitted { phase, source } => {
+                ("not_committed", format!("phase={phase:?}: {source}"))
+            }
+            UnlinkFailure::OutcomeUnknown { phase, source } => {
+                ("outcome_unknown", format!("phase={phase:?}: {source}"))
+            }
+            UnlinkFailure::SourceMissing => {
+                ("source_missing", "phase=Unlink: source is missing".into())
             }
         };
         Self::record_error(stats, &format!("{operation}_{category}"), path, &detail);
@@ -2273,9 +2295,16 @@ impl Queue {
                     };
 
                     if should_delete {
+                        let relative_path = format!("tmp/{boot_dir_name}/{shard_name}/{entry}");
                         stats.operations_attempted += 1;
-                        if fs::unlinkat(shard_fd.as_raw_fd(), entry).is_ok() {
-                            stats.temp_files_deleted += 1;
+                        match unlink_verified(shard_fd.as_raw_fd(), entry, MoveActor::Recovery) {
+                            Ok(()) => stats.temp_files_deleted += 1,
+                            Err(failure) => Self::record_unlink_failure(
+                                stats,
+                                "temp_delete",
+                                &relative_path,
+                                failure,
+                            ),
                         }
                     }
                 }
@@ -3039,18 +3068,15 @@ impl Queue {
                     }
 
                     stats.operations_attempted += 1;
-                    if fs::unlinkat(shard_fd.as_raw_fd(), entry).is_ok() {
-                        // P1-11: Only count as durable success after fsync.
-                        if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_ok() {
-                            stats.receipts_expired += 1;
-                        } else {
-                            Self::record_error(
-                                stats,
-                                "receipt_expire_indeterminate",
-                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
-                                "unlink succeeded but shard dir fsync failed",
-                            );
-                        }
+                    let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
+                    match unlink_verified(shard_fd.as_raw_fd(), entry, MoveActor::Recovery) {
+                        Ok(()) => stats.receipts_expired += 1,
+                        Err(failure) => Self::record_unlink_failure(
+                            stats,
+                            "receipt_delete",
+                            &relative_path,
+                            failure,
+                        ),
                     }
                 }
 
@@ -3092,6 +3118,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::engine::UnlinkPhase;
     use crate::{AckOutcome, CreateOptions, EnqueueInput, LeaseOutcome, OpenOptions};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -3413,6 +3440,67 @@ mod tests {
             u64::MAX,
         );
         stats
+    }
+
+    fn cleanup_temp_with_budget(queue: &mut Queue) -> RecoveryStats {
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.cleanup_temp_files(
+            u64::MAX,
+            &WorkBudget::default(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+        stats
+    }
+
+    fn delete_receipts_with_budget(queue: &mut Queue, wall_floor: WallFloor) -> RecoveryStats {
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.delete_expired_receipts(
+            wall_floor,
+            0,
+            &WorkBudget::default(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+        stats
+    }
+
+    fn assert_recorded_unlink_failure(
+        stats: &RecoveryStats,
+        operation: &str,
+        phase: UnlinkPhase,
+        outcome_unknown: bool,
+    ) {
+        let expected_operation = format!(
+            "{operation}_{}",
+            if outcome_unknown {
+                "outcome_unknown"
+            } else {
+                "not_committed"
+            }
+        );
+        assert_eq!(stats.operations_attempted, 1);
+        assert_eq!(stats.errors.len(), 1, "errors: {:?}", stats.errors);
+        assert_eq!(stats.errors[0].operation, expected_operation);
+        assert!(
+            stats.errors[0].error.contains(&format!("phase={phase:?}")),
+            "errors: {:?}",
+            stats.errors
+        );
     }
 
     fn retry_next_hierarchy_directory(
@@ -6499,6 +6587,178 @@ mod tests {
         let stats = queue.recover(&WorkBudget::default());
         assert_eq!(stats.receipts_expired, 1, "errors: {:?}", stats.errors);
         assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn recovery_unlink_failure_preserves_category_and_phase() {
+        for (failure, expected_operation, expected_detail) in [
+            (
+                UnlinkFailure::NotCommitted {
+                    phase: UnlinkPhase::Unlink,
+                    source: "unlink failed".into(),
+                },
+                "delete_not_committed",
+                "phase=Unlink",
+            ),
+            (
+                UnlinkFailure::OutcomeUnknown {
+                    phase: UnlinkPhase::DirectoryFsync,
+                    source: "sync failed".into(),
+                },
+                "delete_outcome_unknown",
+                "phase=DirectoryFsync",
+            ),
+            (
+                UnlinkFailure::SourceMissing,
+                "delete_source_missing",
+                "source is missing",
+            ),
+        ] {
+            let mut stats = RecoveryStats::default();
+            Queue::record_unlink_failure(&mut stats, "delete", "source/path", failure);
+            assert_eq!(stats.errors.len(), 1);
+            assert_eq!(stats.errors[0].operation, expected_operation);
+            assert_eq!(stats.errors[0].relative_path, "source/path");
+            assert!(stats.errors[0].error.contains(expected_detail));
+        }
+    }
+
+    #[test]
+    fn temporary_cleanup_records_unlink_phase_without_counting_commit() {
+        for (fault, errno, phase, category, file_remains) in [
+            (
+                "unlinkat",
+                libc::EIO,
+                Some(UnlinkPhase::Unlink),
+                "not_committed",
+                true,
+            ),
+            (
+                "fsync_dir_fd",
+                libc::EIO,
+                Some(UnlinkPhase::DirectoryFsync),
+                "outcome_unknown",
+                false,
+            ),
+            ("unlinkat", libc::ENOENT, None, "source_missing", true),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            let old_boot = "00000000-0000-0000-0000-000000000000";
+            assert_ne!(queue.boot_id, old_boot);
+            let shard = tmp.path().join(format!("tmp/{old_boot}/0000"));
+            std::fs::create_dir_all(&shard).unwrap();
+            let path = shard.join(steadq_names::temp_filename(0, &[0xAB; 16]));
+            std::fs::write(&path, b"temp").unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, errno);
+            let stats = cleanup_temp_with_budget(&mut queue);
+            fs::fault::reset();
+            assert_eq!(stats.temp_files_deleted, 0);
+            assert_eq!(path.exists(), file_remains);
+            if let Some(phase) = phase {
+                assert_recorded_unlink_failure(
+                    &stats,
+                    "temp_delete",
+                    phase,
+                    category == "outcome_unknown",
+                );
+            } else {
+                assert_eq!(stats.operations_attempted, 1);
+                assert_eq!(stats.errors.len(), 1);
+                assert_eq!(stats.errors[0].operation, "temp_delete_source_missing");
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay = cleanup_temp_with_budget(&mut reopened);
+            assert_eq!(replay.temp_files_deleted, u32::from(file_remains));
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn receipt_deletion_records_unlink_phase_without_counting_commit() {
+        for (fault, errno, phase, category, file_remains) in [
+            (
+                "unlinkat",
+                libc::EIO,
+                Some(UnlinkPhase::Unlink),
+                "not_committed",
+                true,
+            ),
+            (
+                "fsync_dir_fd",
+                libc::EIO,
+                Some(UnlinkPhase::DirectoryFsync),
+                "outcome_unknown",
+                false,
+            ),
+            ("unlinkat", libc::ENOENT, None, "source_missing", true),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            enqueue_and_ack(&mut queue);
+            let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+            let receipt_bucket = receipt
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .and_then(steadq_names::bucket_from_hex)
+                .unwrap();
+            let expiration_floor = receipt_bucket
+                .checked_add(1)
+                .and_then(|bucket| bucket.checked_mul(queue.format.terminal_bucket_width_ns))
+                .unwrap();
+            let watermark_bucket =
+                steadq_math::ceiling_bucket(expiration_floor, queue.format.delayed_bucket_width_ns)
+                    .unwrap();
+            write_wall_watermark(&tmp, watermark_bucket);
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, errno);
+            let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+            fs::fault::reset();
+            assert_eq!(stats.receipts_expired, 0);
+            assert_eq!(receipt.exists(), file_remains);
+            if let Some(phase) = phase {
+                assert_recorded_unlink_failure(
+                    &stats,
+                    "receipt_delete",
+                    phase,
+                    category == "outcome_unknown",
+                );
+            } else {
+                assert_eq!(stats.operations_attempted, 1);
+                assert_eq!(stats.errors.len(), 1);
+                assert_eq!(stats.errors[0].operation, "receipt_delete_source_missing");
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay_floor = reopened.authenticated_wall_floor().unwrap();
+            let replay = delete_receipts_with_budget(&mut reopened, replay_floor);
+            assert_eq!(replay.receipts_expired, u32::from(file_remains));
+            assert!(!receipt.exists());
+        }
     }
 
     #[test]
