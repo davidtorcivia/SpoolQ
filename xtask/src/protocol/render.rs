@@ -48,42 +48,197 @@ pub(super) fn render_rust(spec: &StateMachineSpec, digest: &str) -> String {
     let mut output = format!(
         "// Auto-generated from spec/state-machine.json. Do not edit by hand.\n// Source SHA-256: {digest}\n\n"
     );
+    write_rust_enum(
+        &mut output,
+        "Operation",
+        &Operation::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "State",
+        &State::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "GenerationChange",
+        &GenerationChange::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "AttemptChange",
+        &AttemptChange::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "TokenChange",
+        &TokenChange::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "ReasonClass",
+        &ReasonClass::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "SyncStep",
+        &SyncStep::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "ExceptionName",
+        &ExceptionName::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
+    write_rust_enum(
+        &mut output,
+        "ReentryName",
+        &ReentryName::ALL.map(|value| (value.rust_name(), value.as_str())),
+    );
     output.push_str(
-        "pub struct TransitionDef {\n    pub operation: &'static str,\n    pub source: &'static str,\n    pub destination: &'static str,\n    pub generation_change: GenerationChange,\n    pub attempt_change: AttemptChange,\n    pub token_change: TokenChange,\n    pub no_overwrite: bool,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum GenerationChange {\n    Zero,\n    Increment,\n    IncrementOrSame,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum AttemptChange {\n    Zero,\n    Increment,\n    Unchanged,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum TokenChange {\n    None,\n    New,\n    Same,\n}\n\npub const TRANSITIONS: &[TransitionDef] = &[\n",
+        r#"#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransitionDef {
+    pub operation: Operation,
+    pub source: State,
+    pub destination: State,
+    pub generation_change: GenerationChange,
+    pub attempt_change: AttemptChange,
+    pub token_change: TokenChange,
+    pub reason_class: Option<ReasonClass>,
+    pub required_syncs: &'static [SyncStep],
+    pub no_overwrite: bool,
+    /// Human-readable resolver documentation, not an executable rule.
+    pub resolution_behavior: &'static str,
+    /// Human-readable qualification, not an executable precondition.
+    pub notes: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExceptionDef {
+    pub name: ExceptionName,
+    pub description: &'static str,
+    pub uses_replacing_rename: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReentryDef {
+    pub name: ReentryName,
+    pub source: State,
+    pub description: &'static str,
+    pub creates_new_identity: bool,
+}
+
+pub const TRANSITIONS: &[TransitionDef] = &[
+"#,
     );
     for transition in &spec.transitions {
+        let required_syncs = transition
+            .required_syncs
+            .iter()
+            .map(|sync| format!("SyncStep::{}", sync.rust_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason_class = match &transition.reason_class {
+            Nullable::Value(reason) => format!("Some(ReasonClass::{})", reason.rust_name()),
+            Nullable::Null => "None".into(),
+        };
+        let notes = match &transition.notes {
+            Nullable::Value(notes) => format!("Some({})", rust_literal(notes)),
+            Nullable::Null => "None".into(),
+        };
+        let resolution_behavior = rust_literal(&transition.resolution_behavior);
+        let resolution_field =
+            if 8 + "resolution_behavior: ".len() + resolution_behavior.len() < 100 {
+                format!("resolution_behavior: {resolution_behavior}")
+            } else {
+                format!("resolution_behavior:\n            {resolution_behavior}")
+            };
         writeln!(
             output,
-            "    TransitionDef {{\n        operation: {},\n        source: {},\n        destination: {},\n        generation_change: GenerationChange::{},\n        attempt_change: AttemptChange::{},\n        token_change: TokenChange::{},\n        no_overwrite: {},\n    }},",
-            rust_string(transition.operation.as_str()),
-            rust_string(transition.source.as_str()),
-            rust_string(transition.destination.as_str()),
+            "    TransitionDef {{\n        operation: Operation::{},\n        source: State::{},\n        destination: State::{},\n        generation_change: GenerationChange::{},\n        attempt_change: AttemptChange::{},\n        token_change: TokenChange::{},\n        reason_class: {},\n        required_syncs: &[{}],\n        no_overwrite: {},\n        {},\n        notes: {},\n    }},",
+            transition.operation.rust_name(),
+            transition.source.rust_name(),
+            transition.destination.rust_name(),
             transition.generation_change.rust_name(),
             transition.attempt_change.rust_name(),
             transition.token_change.rust_name(),
+            reason_class,
+            required_syncs,
             transition.no_overwrite,
+            resolution_field,
+            notes,
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("];\n\npub const EXCEPTIONS: &[ExceptionDef] = &[\n");
+    for exception in &spec.exceptions {
+        writeln!(
+            output,
+            "    ExceptionDef {{\n        name: ExceptionName::{},\n        description: {},\n        uses_replacing_rename: {},\n    }},",
+            exception.name.rust_name(),
+            rust_literal(&exception.description),
+            exception.uses_replacing_rename,
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("];\n\npub const REENTRY: &[ReentryDef] = &[\n");
+    for reentry in &spec.reentry {
+        writeln!(
+            output,
+            "    ReentryDef {{\n        name: ReentryName::{},\n        source: State::{},\n        description: {},\n        creates_new_identity: {},\n    }},",
+            reentry.name.rust_name(),
+            reentry.source.rust_name(),
+            rust_literal(&reentry.description),
+            reentry.creates_new_identity,
         )
         .expect("writing to String cannot fail");
     }
     output.push_str(
-        "];\n\n/// Check if a transition from source to destination is legal.\npub fn is_legal_transition(source: &str, destination: &str) -> bool {\n    TRANSITIONS\n        .iter()\n        .any(|transition| transition.source == source && transition.destination == destination)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn legal_transitions() {\n",
+        r#"];
+
+/// Check if a transition from source to destination is legal.
+pub fn is_legal_transition(source: State, destination: State) -> bool {
+    TRANSITIONS
+        .iter()
+        .any(|transition| transition.source == source && transition.destination == destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legal_transitions() {
+"#,
     );
     for transition in &spec.transitions {
         writeln!(
             output,
-            "        assert!(is_legal_transition({}, {}));",
-            rust_string(transition.source.as_str()),
-            rust_string(transition.destination.as_str()),
+            "        assert!(is_legal_transition(State::{}, State::{}));",
+            transition.source.rust_name(),
+            transition.destination.rust_name(),
         )
         .expect("writing to String cannot fail");
     }
     writeln!(
         output,
-        "    }}\n\n    #[test]\n    fn illegal_transitions() {{\n        for (source, destination) in [\n            (\"receipt\", \"ready\"),\n            (\"dead\", \"ready\"),\n            (\"quarantine\", \"ready\"),\n            (\"ready\", \"ready\"),\n            (\"hidden\", \"leased\"),\n            (\"ready\", \"receipt\"),\n        ] {{\n            assert!(!is_legal_transition(source, destination));\n        }}\n    }}\n\n    #[test]\n    fn transition_count() {{\n        assert_eq!(TRANSITIONS.len(), {});\n    }}\n\n    #[test]\n    fn all_transitions_use_no_overwrite() {{\n        for transition in TRANSITIONS {{\n            assert!(\n                transition.no_overwrite,\n                \"transition {{}} must use no-overwrite\",\n                transition.operation\n            );\n        }}\n    }}\n\n    #[test]\n    fn claim_increments_attempt() {{\n        let claim = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == \"claim\")\n            .unwrap();\n        assert_eq!(claim.attempt_change, AttemptChange::Increment);\n        assert_eq!(claim.generation_change, GenerationChange::Increment);\n        assert_eq!(claim.token_change, TokenChange::New);\n    }}\n\n    #[test]\n    fn ack_does_not_change_attempt() {{\n        let ack = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == \"acknowledge\")\n            .unwrap();\n        assert_eq!(ack.attempt_change, AttemptChange::Unchanged);\n    }}\n\n    #[test]\n    fn renew_preserves_token() {{\n        let renew = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == \"renew\")\n            .unwrap();\n        assert_eq!(renew.token_change, TokenChange::Same);\n        assert_eq!(renew.attempt_change, AttemptChange::Unchanged);\n    }}\n}}",
-        spec.transitions.len()
+        "    }}\n\n    #[test]\n    fn illegal_transitions() {{\n        for (source, destination) in [\n            (State::Receipt, State::Ready),\n            (State::Dead, State::Ready),\n            (State::Quarantine, State::Ready),\n            (State::Ready, State::Ready),\n            (State::Hidden, State::Leased),\n            (State::Ready, State::Receipt),\n        ] {{\n            assert!(!is_legal_transition(source, destination));\n        }}\n    }}\n\n    #[test]\n    fn generated_collections_are_complete() {{\n        assert_eq!(TRANSITIONS.len(), {});\n        assert_eq!(EXCEPTIONS.len(), {});\n        assert_eq!(REENTRY.len(), {});\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.required_syncs.is_empty()));\n        assert!(TRANSITIONS\n            .iter()\n            .all(|transition| !transition.resolution_behavior.is_empty()));\n        assert!(TRANSITIONS.iter().all(|transition| transition.no_overwrite));\n        assert!(EXCEPTIONS\n            .iter()\n            .all(|exception| exception.uses_replacing_rename));\n        assert!(REENTRY.iter().all(|reentry| reentry.creates_new_identity));\n    }}\n\n    #[test]\n    fn claim_projects_complete_semantics() {{\n        let claim = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::Claim)\n            .unwrap();\n        assert_eq!(claim.source, State::Ready);\n        assert_eq!(claim.destination, State::Leased);\n        assert_eq!(claim.attempt_change, AttemptChange::Increment);\n        assert_eq!(claim.generation_change, GenerationChange::Increment);\n        assert_eq!(claim.token_change, TokenChange::New);\n        assert_eq!(claim.reason_class, None);\n        assert_eq!(\n            claim.required_syncs,\n            &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]\n        );\n        assert!(claim.resolution_behavior.contains(\"both\"));\n        assert_eq!(claim.notes, None);\n    }}\n\n    #[test]\n    fn terminal_and_exception_metadata_are_projected() {{\n        let reap = TRANSITIONS\n            .iter()\n            .find(|transition| transition.operation == Operation::ReapExpiredToDead)\n            .unwrap();\n        assert_eq!(reap.reason_class, Some(ReasonClass::AttemptsExhausted));\n        assert_eq!(reap.notes, Some(\"attempt >= maximum_attempts\"));\n        assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);\n        assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);\n        assert_eq!(REENTRY[0].source, State::Dead);\n    }}\n}}",
+        spec.transitions.len(),
+        spec.exceptions.len(),
+        spec.reentry.len(),
     )
     .expect("writing to String cannot fail");
     output
+}
+
+fn write_rust_enum(output: &mut String, name: &str, variants: &[(&str, &str)]) {
+    writeln!(
+        output,
+        "#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]\npub enum {name} {{"
+    )
+    .expect("writing to String cannot fail");
+    for (variant, _) in variants {
+        writeln!(output, "    {variant},").expect("writing to String cannot fail");
+    }
+    output.push_str("}\n\n");
 }
 
 fn render_go(spec: &StateMachineSpec, digest: &str) -> String {
@@ -92,28 +247,94 @@ fn render_go(spec: &StateMachineSpec, digest: &str) -> String {
     );
     output.push_str(
         "package steadq\n\n\
+type OptionalString struct {\n\
+\tValue   string\n\
+\tPresent bool\n\
+}\n\n\
 type TransitionDef struct {\n\
-\tOperation       string\n\
-\tSource           string\n\
-\tDestination      string\n\
-\tGenerationChange string\n\
-\tAttemptChange    string\n\
-\tTokenChange      string\n\
-\tNoOverwrite      bool\n\
+\tOperation          string\n\
+\tSource             string\n\
+\tDestination        string\n\
+\tGenerationChange   string\n\
+\tAttemptChange      string\n\
+\tTokenChange        string\n\
+\tReasonClass        OptionalString\n\
+\tRequiredSyncs      []string\n\
+\tNoOverwrite        bool\n\
+\tResolutionBehavior string\n\
+\tNotes              OptionalString\n\
+}\n\n\
+type ExceptionDef struct {\n\
+\tName                string\n\
+\tDescription         string\n\
+\tUsesReplacingRename bool\n\
+}\n\n\
+type ReentryDef struct {\n\
+\tName               string\n\
+\tSource             string\n\
+\tDescription        string\n\
+\tCreatesNewIdentity bool\n\
 }\n\n\
 var Transitions = []TransitionDef{\n",
     );
     for transition in &spec.transitions {
+        let reason_class = match &transition.reason_class {
+            Nullable::Value(reason) => format!(
+                "OptionalString{{Value: {}, Present: true}}",
+                json_string(reason.as_str())
+            ),
+            Nullable::Null => "OptionalString{}".into(),
+        };
+        let required_syncs = transition
+            .required_syncs
+            .iter()
+            .map(|sync| json_string(sync.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let notes = match &transition.notes {
+            Nullable::Value(notes) => format!(
+                "OptionalString{{Value: {}, Present: true}}",
+                json_string(notes)
+            ),
+            Nullable::Null => "OptionalString{}".into(),
+        };
         writeln!(
             output,
-            "\t{{Operation: {}, Source: {}, Destination: {}, GenerationChange: {}, AttemptChange: {}, TokenChange: {}, NoOverwrite: {}}},",
-            rust_string(transition.operation.as_str()),
-            rust_string(transition.source.as_str()),
-            rust_string(transition.destination.as_str()),
-            rust_string(transition.generation_change.as_str()),
-            rust_string(transition.attempt_change.as_str()),
-            rust_string(transition.token_change.as_str()),
+            "\t{{Operation: {}, Source: {}, Destination: {}, GenerationChange: {}, AttemptChange: {}, TokenChange: {}, ReasonClass: {}, RequiredSyncs: []string{{{}}}, NoOverwrite: {}, ResolutionBehavior: {}, Notes: {}}},",
+            json_string(transition.operation.as_str()),
+            json_string(transition.source.as_str()),
+            json_string(transition.destination.as_str()),
+            json_string(transition.generation_change.as_str()),
+            json_string(transition.attempt_change.as_str()),
+            json_string(transition.token_change.as_str()),
+            reason_class,
+            required_syncs,
             transition.no_overwrite,
+            json_string(&transition.resolution_behavior),
+            notes,
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("}\n\nvar Exceptions = []ExceptionDef{\n");
+    for exception in &spec.exceptions {
+        writeln!(
+            output,
+            "\t{{Name: {}, Description: {}, UsesReplacingRename: {}}},",
+            json_string(exception.name.as_str()),
+            json_string(&exception.description),
+            exception.uses_replacing_rename,
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("}\n\nvar Reentry = []ReentryDef{\n");
+    for reentry in &spec.reentry {
+        writeln!(
+            output,
+            "\t{{Name: {}, Source: {}, Description: {}, CreatesNewIdentity: {}}},",
+            json_string(reentry.name.as_str()),
+            json_string(reentry.source.as_str()),
+            json_string(&reentry.description),
+            reentry.creates_new_identity,
         )
         .expect("writing to String cannot fail");
     }
@@ -136,13 +357,19 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
         "<!-- Source: spec/state-machine.json; SHA-256: {digest} -->\n\n\
 # SteadQ/1 State Machine (Generated)\n\n\
 ## Transitions\n\n\
-| Operation | Source | Destination | Gen | Attempt | Token | Reason | No-overwrite |\n\
-|-----------|--------|-------------|-----|---------|-------|--------|--------------|\n",
+| Operation | Source | Destination | Gen | Attempt | Token | Reason | Required syncs | No-overwrite | Resolution | Notes |\n\
+|-----------|--------|-------------|-----|---------|-------|--------|----------------|--------------|------------|-------|\n",
     );
     for transition in &spec.transitions {
+        let required_syncs = transition
+            .required_syncs
+            .iter()
+            .map(|sync| sync.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         writeln!(
             output,
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             markdown(transition.operation.as_str()),
             markdown(transition.source.as_str()),
             markdown(transition.destination.as_str()),
@@ -153,10 +380,16 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
                 Nullable::Value(reason) => (*reason).as_str(),
                 Nullable::Null => "none",
             },
+            required_syncs,
             if transition.no_overwrite {
                 "True"
             } else {
                 "False"
+            },
+            markdown(&transition.resolution_behavior),
+            match &transition.notes {
+                Nullable::Value(notes) => markdown(notes),
+                Nullable::Null => "none".into(),
             },
         )
         .expect("writing to String cannot fail");
@@ -165,9 +398,10 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
     for exception in &spec.exceptions {
         writeln!(
             output,
-            "**{}**: {}",
+            "- **{}**: {} (uses replacing rename: {})",
             markdown(exception.name.as_str()),
-            markdown(&exception.description)
+            markdown(&exception.description),
+            exception.uses_replacing_rename,
         )
         .expect("writing to String cannot fail");
     }
@@ -175,17 +409,22 @@ fn render_markdown(spec: &StateMachineSpec, digest: &str) -> String {
     for reentry in &spec.reentry {
         writeln!(
             output,
-            "**{}** (from {}): {}",
+            "- **{}** (from {}): {} (creates new identity: {})",
             markdown(reentry.name.as_str()),
             markdown(reentry.source.as_str()),
-            markdown(&reentry.description)
+            markdown(&reentry.description),
+            reentry.creates_new_identity,
         )
         .expect("writing to String cannot fail");
     }
     output
 }
 
-fn rust_string(value: &str) -> String {
+fn rust_literal(value: &str) -> String {
+    format!("{value:?}")
+}
+
+fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
