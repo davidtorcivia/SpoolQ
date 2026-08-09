@@ -24,20 +24,23 @@ VARIABLES
     destSynced,      (* [job -> Bool] destination dir synced *)
     srcSynced,       (* [job -> Bool] source dir synced *)
     poisoned,        (* set of poisoned handles *)
-    token            (* [job -> Workers \cup {Nil}] *)
+    token,           (* [job -> Workers \cup {Nil}] *)
+    receiptSeen      (* set of jobs that reached receipt *)
 
-Vars == <<state, generation, attempt, fileSynced, destSynced, srcSynced, poisoned, token>>
+Vars == <<state, generation, attempt, fileSynced, destSynced, srcSynced,
+          poisoned, token, receiptSeen>>
 
 TypeInvariant ==
     /\ state \in [Jobs -> {StateHidden, StateReady, StateLeased, StateDelayed,
                             StateDead, StateReceipt, StateQuarantine}]
     /\ generation \in [Jobs -> Nat]
-    /\ attempt \in [Jobs -> 0..MaxAttempts]
+    /\ attempt \in [Jobs -> Nat]
     /\ fileSynced \in [Jobs -> BOOLEAN]
     /\ destSynced \in [Jobs -> BOOLEAN]
     /\ srcSynced \in [Jobs -> BOOLEAN]
     /\ poisoned \in SUBSET (Workers \cup {<<"reaper">>})
     /\ token \in [Jobs -> (Workers \cup {Nil})]
+    /\ receiptSeen \in SUBSET Jobs
 
 (* Initial state: all jobs hidden, not synced *)
 Init ==
@@ -49,6 +52,7 @@ Init ==
     /\ srcSynced = [j \in Jobs |-> FALSE]
     /\ poisoned = {}
     /\ token = [j \in Jobs |-> Nil]
+    /\ receiptSeen = {}
 
 (* ---- Actions ---- *)
 
@@ -63,22 +67,26 @@ Enqueue(j) ==
     /\ srcSynced' = srcSynced
     /\ poisoned' = poisoned
     /\ token' = [token EXCEPT ![j] = Nil]
+    /\ receiptSeen' = receiptSeen
 
 (* File sync: make file content durable *)
 FileSync(j) ==
     /\ state[j] \in {StateReady, StateLeased, StateDelayed, StateDead, StateReceipt}
     /\ fileSynced' = [fileSynced EXCEPT ![j] = TRUE]
-    /\ UNCHANGED <<state, generation, attempt, destSynced, srcSynced, poisoned, token>>
+    /\ UNCHANGED <<state, generation, attempt, destSynced, srcSynced,
+                    poisoned, token, receiptSeen>>
 
 (* Destination dir sync *)
 DestDirSync(j) ==
     /\ destSynced' = [destSynced EXCEPT ![j] = TRUE]
-    /\ UNCHANGED <<state, generation, attempt, fileSynced, srcSynced, poisoned, token>>
+    /\ UNCHANGED <<state, generation, attempt, fileSynced, srcSynced,
+                    poisoned, token, receiptSeen>>
 
 (* Source dir sync *)
 SrcDirSync(j) ==
     /\ srcSynced' = [srcSynced EXCEPT ![j] = TRUE]
-    /\ UNCHANGED <<state, generation, attempt, fileSynced, destSynced, poisoned, token>>
+    /\ UNCHANGED <<state, generation, attempt, fileSynced, destSynced,
+                    poisoned, token, receiptSeen>>
 
 (* Claim: ready -> leased, issues per-worker token *)
 Claim(w, j) ==
@@ -94,6 +102,7 @@ Claim(w, j) ==
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = w]
     /\ poisoned' = poisoned
+    /\ receiptSeen' = receiptSeen
 
 (* Acknowledge: leased -> receipt, requires matching token *)
 Ack(w, j) ==
@@ -106,6 +115,7 @@ Ack(w, j) ==
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
+    /\ receiptSeen' = receiptSeen \cup {j}
     /\ UNCHANGED <<attempt, fileSynced, poisoned>>
 
 (* Retry: leased -> ready, requires matching token *)
@@ -119,7 +129,7 @@ RetryNow(w, j) ==
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
-    /\ UNCHANGED <<attempt, fileSynced, poisoned>>
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, receiptSeen>>
 
 (* Bury: leased -> dead, requires matching token *)
 Bury(w, j) ==
@@ -132,7 +142,7 @@ Bury(w, j) ==
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
-    /\ UNCHANGED <<attempt, fileSynced, poisoned>>
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, receiptSeen>>
 
 (* Reap expired: leased -> ready or dead *)
 ReapExpired(j) ==
@@ -144,12 +154,13 @@ ReapExpired(j) ==
     /\ destSynced' = [destSynced EXCEPT ![j] = FALSE]
     /\ srcSynced' = [srcSynced EXCEPT ![j] = FALSE]
     /\ token' = [token EXCEPT ![j] = Nil]
-    /\ UNCHANGED <<attempt, fileSynced, poisoned>>
+    /\ UNCHANGED <<attempt, fileSynced, poisoned, receiptSeen>>
 
 (* Poison handle *)
 PoisonHandle(h) ==
     /\ poisoned' = poisoned \cup {h}
-    /\ UNCHANGED <<state, generation, attempt, fileSynced, destSynced, srcSynced, token>>
+    /\ UNCHANGED <<state, generation, attempt, fileSynced, destSynced,
+                    srcSynced, token, receiptSeen>>
 
 (* Crash: reset volatile sync states, preserve file durability, clear stale lease token if claim never completed *)
 Crash ==
@@ -171,7 +182,7 @@ Crash ==
          IF state[j] = StateLeased /\ ~fileSynced[j]
          THEN Nil
          ELSE token[j]]
-    /\ UNCHANGED <<generation, attempt>>
+    /\ UNCHANGED <<generation, attempt, receiptSeen>>
 
 (* Next-state relation *)
 Next ==
@@ -207,10 +218,9 @@ AttemptWithinLimit ==
     \A j \in Jobs :
         attempt[j] =< MaxAttempts
 
-(* Receipt jobs cannot execute another acknowledgment action. *)
-ReceiptIsTerminal ==
-    \A j \in Jobs :
-        state[j] = StateReceipt => \A w \in Workers : ~ENABLED Ack(w, j)
+(* Every job that reached receipt remains in receipt. *)
+ReceiptRemainsTerminal ==
+    \A j \in receiptSeen : state[j] = StateReceipt
 
 (* Every modeled delivery has a positive attempt. *)
 DeliveredAttemptIsPositive ==

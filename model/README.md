@@ -36,7 +36,7 @@ Bounded configuration: 2 jobs, 2 workers, and MaxAttempts=2. The `Crash` action 
 
 - `AttemptWithinLimit`: modeled attempts do not exceed `MaxAttempts`.
 
-- `ReceiptIsTerminal`: a receipt cannot execute another acknowledgment action.
+- `ReceiptRemainsTerminal`: every job that reached receipt in the modeled history remains in receipt.
 
 - `DeliveredAttemptIsPositive`: every modeled lease has a positive attempt.
 

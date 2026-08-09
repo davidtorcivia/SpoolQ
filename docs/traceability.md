@@ -11,7 +11,7 @@ Status: Phase 0 skeleton. A-007 will generate or mechanically validate this matr
 | Stale-token exclusion | I5 | `queue` | Operation-bound source identity | Not modeled; worker identity is not a lease capability | Unit tests | Partial |
 | Generation monotonicity | I6 | Duplicated production logic | Pending A-007 | Partial | Unit tests | Partial |
 | Attempt discipline | I7 | Generated transition metadata and production queue logic | Operation-bound attempt derivation | Bounded `AttemptWithinLimit` and `DeliveredAttemptIsPositive` | Unit tests | Partial |
-| Terminal monotonicity | I8 | Recovery and queue | Operation-bound terminal verification | Bounded `ReceiptIsTerminal` covers acknowledgment only | Partial | Open |
+| Terminal monotonicity | I8 | Recovery and queue | Operation-bound terminal verification | Bounded `ReceiptRemainsTerminal` covers modeled acknowledgment history | Partial | Open |
 | Strict receipt evidence | I9 | Strict ack and central receipt verifier | Operation-bound receipt verification | Not modeled | Payload corruption, legacy receipt, resolver, fsck, recovery, and mutation tests | Partial |
 | Resolver soundness | I10 | Resolver | Handwritten | Not modeled | Observation harness | Open |
 | Recovery idempotence/progress | I11/I12 | Recovery | N/A | Not modeled | Partial | Open |
