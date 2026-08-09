@@ -1,251 +1,261 @@
 --------------------------- MODULE SteadQMaintenance ---------------------------
 (**************************************************************************)
-(* Bounded persisted recovery progress, replay, and retry-frontier model. *)
+(* Bounded production-shaped recovery cursor and hierarchy-retry model.  *)
 (**************************************************************************)
 
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     EntryCount,
+    RetryCount,
     PassBudget,
     MaxTransientFailures,
     MaxCrashes,
-    BlockedEntry
+    BlockedRetry
 
 Entries == 1..EntryCount
+RetryTargets == (EntryCount + 1)..(EntryCount + RetryCount)
 CursorValues == 0..EntryCount
+RetryFrontiers == {0} \cup RetryTargets
 
 Pending == "pending"
 Applied == "applied"
 EntryStates == {Pending, Applied}
 
-EligibleEntries == Entries \ {BlockedEntry}
+TransientRetries == RetryTargets \ {BlockedRetry}
 
-Minimum(set) == CHOOSE entry \in set :
-    \A other \in set : entry <= other
+Minimum(set) == CHOOSE value \in set :
+    \A other \in set : value <= other
 
 NextRetry(ledger, frontier) ==
-    LET after == {entry \in ledger : entry > frontier} IN
+    LET after == {target \in ledger : target > frontier} IN
         IF after # {} THEN Minimum(after) ELSE Minimum(ledger)
 
 VARIABLES
     entryState,
     applyCount,
-    failuresRemaining,
+    retryFailuresRemaining,
     cursor,
     durableCursor,
     retryLedger,
     durableRetryLedger,
     retryFrontier,
     durableRetryFrontier,
+    selectedRetry,
     active,
-    retryAttempted,
+    cycleFinished,
     budget,
-    crashesRemaining
+    workUsed,
+    crashesRemaining,
+    fullScanSeen,
+    retryOrderSound
 
-Vars == <<entryState, applyCount, failuresRemaining, cursor,
+Vars == <<entryState, applyCount, retryFailuresRemaining, cursor,
           durableCursor, retryLedger, durableRetryLedger, retryFrontier,
-          durableRetryFrontier, active, retryAttempted, budget,
-          crashesRemaining>>
+          durableRetryFrontier, selectedRetry, active, cycleFinished, budget,
+          workUsed, crashesRemaining, fullScanSeen, retryOrderSound>>
 
 TypeInvariant ==
     /\ EntryCount \in Nat \ {0}
+    /\ RetryCount \in Nat \ {0}
     /\ PassBudget \in 1..EntryCount
     /\ MaxTransientFailures \in Nat
     /\ MaxCrashes \in Nat
-    /\ BlockedEntry \in Entries
+    /\ BlockedRetry \in RetryTargets
     /\ entryState \in [Entries -> EntryStates]
     /\ applyCount \in [Entries -> 0..1]
-    /\ failuresRemaining \in [Entries -> 0..MaxTransientFailures]
+    /\ retryFailuresRemaining \in
+        [RetryTargets -> 0..MaxTransientFailures]
     /\ cursor \in CursorValues
     /\ durableCursor \in CursorValues
-    /\ retryLedger \subseteq Entries
-    /\ durableRetryLedger \subseteq Entries
-    /\ retryFrontier \in CursorValues
-    /\ durableRetryFrontier \in CursorValues
+    /\ retryLedger \subseteq RetryTargets
+    /\ durableRetryLedger \subseteq RetryTargets
+    /\ retryFrontier \in RetryFrontiers
+    /\ durableRetryFrontier \in RetryFrontiers
+    /\ selectedRetry \in RetryFrontiers
     /\ active \in BOOLEAN
-    /\ retryAttempted \in BOOLEAN
+    /\ cycleFinished \in BOOLEAN
     /\ budget \in 0..PassBudget
+    /\ workUsed \in 0..PassBudget
     /\ crashesRemaining \in 0..MaxCrashes
+    /\ fullScanSeen \in BOOLEAN
+    /\ retryOrderSound \in BOOLEAN
 
 Init ==
     /\ entryState = [entry \in Entries |-> Pending]
     /\ applyCount = [entry \in Entries |-> 0]
-    /\ failuresRemaining = [entry \in Entries |->
-        IF entry = BlockedEntry THEN 0 ELSE MaxTransientFailures]
+    /\ retryFailuresRemaining = [target \in RetryTargets |->
+        IF target = BlockedRetry THEN 0 ELSE MaxTransientFailures]
     /\ cursor = 0
     /\ durableCursor = 0
-    /\ retryLedger = {}
-    /\ durableRetryLedger = {}
+    /\ retryLedger = RetryTargets
+    /\ durableRetryLedger = RetryTargets
     /\ retryFrontier = 0
     /\ durableRetryFrontier = 0
+    /\ selectedRetry = 0
     /\ active = FALSE
-    /\ retryAttempted = FALSE
+    /\ cycleFinished = FALSE
     /\ budget = 0
+    /\ workUsed = 0
     /\ crashesRemaining = MaxCrashes
+    /\ fullScanSeen = FALSE
+    /\ retryOrderSound = TRUE
 
 BeginPass ==
     /\ ~active
     /\ cursor' = durableCursor
     /\ retryLedger' = durableRetryLedger
     /\ retryFrontier' = durableRetryFrontier
+    /\ selectedRetry' =
+        IF durableRetryLedger = {}
+        THEN 0
+        ELSE NextRetry(durableRetryLedger, durableRetryFrontier)
     /\ active' = TRUE
-    /\ retryAttempted' = FALSE
+    /\ cycleFinished' = FALSE
     /\ budget' = PassBudget
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining,
+    /\ workUsed' = 0
+    /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
                     durableCursor, durableRetryLedger, durableRetryFrontier,
-                    crashesRemaining>>
-
-NoRetry ==
-    /\ retryLedger = {}
-    /\ retryAttempted' = TRUE
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining, cursor,
-                    durableCursor, retryLedger, durableRetryLedger,
-                    retryFrontier, durableRetryFrontier, active, budget,
-                    crashesRemaining>>
-
-DiscardAppliedRetry(entry) ==
-    /\ entry = NextRetry(retryLedger, retryFrontier)
-    /\ entryState[entry] = Applied
-    /\ retryLedger' = retryLedger \ {entry}
-    /\ retryFrontier' = entry
-    /\ retryAttempted' = TRUE
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining, cursor,
-                    durableCursor, durableRetryLedger, durableRetryFrontier,
-                    active, budget, crashesRemaining>>
-
-DeferBlockedRetry(entry) ==
-    /\ entry = NextRetry(retryLedger, retryFrontier)
-    /\ entry = BlockedEntry
-    /\ retryFrontier' = entry
-    /\ retryAttempted' = TRUE
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining, cursor,
-                    durableCursor, retryLedger, durableRetryLedger,
-                    durableRetryFrontier, active, budget, crashesRemaining>>
-
-FailTransientRetry(entry) ==
-    /\ entry = NextRetry(retryLedger, retryFrontier)
-    /\ entry \in EligibleEntries
-    /\ entryState[entry] = Pending
-    /\ failuresRemaining[entry] > 0
-    /\ failuresRemaining' =
-        [failuresRemaining EXCEPT ![entry] = @ - 1]
-    /\ retryFrontier' = entry
-    /\ retryAttempted' = TRUE
-    /\ UNCHANGED <<entryState, applyCount, cursor, durableCursor,
-                    retryLedger, durableRetryLedger, durableRetryFrontier,
-                    active, budget, crashesRemaining>>
-
-ApplyRetry(entry) ==
-    /\ entry = NextRetry(retryLedger, retryFrontier)
-    /\ entry \in EligibleEntries
-    /\ entryState[entry] = Pending
-    /\ failuresRemaining[entry] = 0
-    /\ entryState' = [entryState EXCEPT ![entry] = Applied]
-    /\ applyCount' = [applyCount EXCEPT ![entry] = @ + 1]
-    /\ retryLedger' = retryLedger \ {entry}
-    /\ retryFrontier' = entry
-    /\ retryAttempted' = TRUE
-    /\ UNCHANGED <<failuresRemaining, cursor, durableCursor,
-                    durableRetryLedger, durableRetryFrontier, active, budget,
-                    crashesRemaining>>
-
-PrepareRetry ==
-    /\ active
-    /\ ~retryAttempted
-    /\ \/ NoRetry
-       \/ \E entry \in retryLedger :
-            \/ DiscardAppliedRetry(entry)
-            \/ DeferBlockedRetry(entry)
-            \/ FailTransientRetry(entry)
-            \/ ApplyRetry(entry)
+                    crashesRemaining, fullScanSeen, retryOrderSound>>
 
 ReplayAppliedEntry(entry) ==
     /\ entryState[entry] = Applied
     /\ cursor' = entry
     /\ budget' = budget - 1
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining, durableCursor,
-                    retryLedger, durableRetryLedger, retryFrontier,
-                    durableRetryFrontier, active, retryAttempted,
-                    crashesRemaining>>
-
-DeferBlockedEntry(entry) ==
-    /\ entry = BlockedEntry
-    /\ entryState[entry] = Pending
-    /\ cursor' = entry
-    /\ retryLedger' = retryLedger \cup {entry}
-    /\ budget' = budget - 1
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining, durableCursor,
-                    durableRetryLedger, retryFrontier, durableRetryFrontier,
-                    active, retryAttempted, crashesRemaining>>
-
-FailTransientEntry(entry) ==
-    /\ entry \in EligibleEntries
-    /\ entryState[entry] = Pending
-    /\ failuresRemaining[entry] > 0
-    /\ failuresRemaining' =
-        [failuresRemaining EXCEPT ![entry] = @ - 1]
-    /\ cursor' = entry
-    /\ retryLedger' = retryLedger \cup {entry}
-    /\ budget' = budget - 1
-    /\ UNCHANGED <<entryState, applyCount, durableCursor,
-                    durableRetryLedger, retryFrontier, durableRetryFrontier,
-                    active, retryAttempted, crashesRemaining>>
+    /\ workUsed' = workUsed + 1
+    /\ fullScanSeen' = (fullScanSeen \/ (entry = EntryCount))
+    /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
+                    durableCursor, retryLedger, durableRetryLedger,
+                    retryFrontier, durableRetryFrontier, selectedRetry,
+                    active, cycleFinished, crashesRemaining, retryOrderSound>>
 
 ApplyEntry(entry) ==
-    /\ entry \in EligibleEntries
     /\ entryState[entry] = Pending
-    /\ failuresRemaining[entry] = 0
     /\ entryState' = [entryState EXCEPT ![entry] = Applied]
     /\ applyCount' = [applyCount EXCEPT ![entry] = @ + 1]
     /\ cursor' = entry
-    /\ retryLedger' = retryLedger \ {entry}
     /\ budget' = budget - 1
-    /\ UNCHANGED <<failuresRemaining, durableCursor, durableRetryLedger,
-                    retryFrontier, durableRetryFrontier, active,
-                    retryAttempted, crashesRemaining>>
+    /\ workUsed' = workUsed + 1
+    /\ fullScanSeen' = (fullScanSeen \/ (entry = EntryCount))
+    /\ UNCHANGED <<retryFailuresRemaining, durableCursor, retryLedger,
+                    durableRetryLedger, retryFrontier, durableRetryFrontier,
+                    selectedRetry, active, cycleFinished, crashesRemaining,
+                    retryOrderSound>>
 
 ScanNext ==
     /\ active
-    /\ retryAttempted
+    /\ ~cycleFinished
     /\ budget > 0
     /\ cursor < EntryCount
     /\ LET entry == cursor + 1 IN
         \/ ReplayAppliedEntry(entry)
-        \/ DeferBlockedEntry(entry)
-        \/ FailTransientEntry(entry)
         \/ ApplyEntry(entry)
+
+FailBlockedRetry ==
+    /\ selectedRetry = BlockedRetry
+    /\ retryFrontier' = selectedRetry
+    /\ selectedRetry' = 0
+    /\ cursor' = 0
+    /\ cycleFinished' = TRUE
+    /\ budget' = budget - 1
+    /\ workUsed' = workUsed + 1
+    /\ retryOrderSound' = (retryOrderSound /\ (cursor = EntryCount))
+    /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
+                    durableCursor, retryLedger, durableRetryLedger,
+                    durableRetryFrontier, active, crashesRemaining,
+                    fullScanSeen>>
+
+FailTransientRetry ==
+    /\ selectedRetry \in TransientRetries
+    /\ retryFailuresRemaining[selectedRetry] > 0
+    /\ retryFailuresRemaining' =
+        [retryFailuresRemaining EXCEPT ![selectedRetry] = @ - 1]
+    /\ retryFrontier' = selectedRetry
+    /\ selectedRetry' = 0
+    /\ cursor' = 0
+    /\ cycleFinished' = TRUE
+    /\ budget' = budget - 1
+    /\ workUsed' = workUsed + 1
+    /\ retryOrderSound' = (retryOrderSound /\ (cursor = EntryCount))
+    /\ UNCHANGED <<entryState, applyCount, durableCursor, retryLedger,
+                    durableRetryLedger, durableRetryFrontier, active,
+                    crashesRemaining, fullScanSeen>>
+
+ResolveTransientRetry ==
+    /\ selectedRetry \in TransientRetries
+    /\ retryFailuresRemaining[selectedRetry] = 0
+    /\ LET remaining == retryLedger \ {selectedRetry} IN
+        /\ retryLedger' = remaining
+        /\ retryFrontier' = IF remaining = {} THEN 0 ELSE selectedRetry
+    /\ selectedRetry' = 0
+    /\ cursor' = 0
+    /\ cycleFinished' = TRUE
+    /\ budget' = budget - 1
+    /\ workUsed' = workUsed + 1
+    /\ retryOrderSound' = (retryOrderSound /\ (cursor = EntryCount))
+    /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
+                    durableCursor, durableRetryLedger, durableRetryFrontier,
+                    active, crashesRemaining, fullScanSeen>>
+
+RetryAfterScan ==
+    /\ active
+    /\ ~cycleFinished
+    /\ cursor = EntryCount
+    /\ selectedRetry # 0
+    /\ budget > 0
+    /\ \/ FailBlockedRetry
+       \/ FailTransientRetry
+       \/ ResolveTransientRetry
+
+FinishScanWithoutRetry ==
+    /\ active
+    /\ ~cycleFinished
+    /\ cursor = EntryCount
+    /\ selectedRetry = 0
+    /\ cursor' = 0
+    /\ cycleFinished' = TRUE
+    /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
+                    durableCursor, retryLedger, durableRetryLedger,
+                    retryFrontier, durableRetryFrontier, selectedRetry,
+                    active, budget, workUsed, crashesRemaining, fullScanSeen,
+                    retryOrderSound>>
 
 EndPass ==
     /\ active
-    /\ retryAttempted
     /\ \/ budget = 0
-       \/ cursor = EntryCount
+       \/ cycleFinished
     /\ durableCursor' = cursor
     /\ durableRetryLedger' = retryLedger
     /\ durableRetryFrontier' = retryFrontier
+    /\ selectedRetry' = 0
     /\ active' = FALSE
-    /\ retryAttempted' = FALSE
+    /\ cycleFinished' = FALSE
     /\ budget' = 0
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining, cursor,
-                    retryLedger, retryFrontier, crashesRemaining>>
+    /\ workUsed' = 0
+    /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining, cursor,
+                    retryLedger, retryFrontier, crashesRemaining,
+                    fullScanSeen, retryOrderSound>>
 
 CrashAndReopen ==
     /\ crashesRemaining > 0
     /\ cursor' = durableCursor
     /\ retryLedger' = durableRetryLedger
     /\ retryFrontier' = durableRetryFrontier
+    /\ selectedRetry' = 0
     /\ active' = FALSE
-    /\ retryAttempted' = FALSE
+    /\ cycleFinished' = FALSE
     /\ budget' = 0
+    /\ workUsed' = 0
     /\ crashesRemaining' = crashesRemaining - 1
-    /\ UNCHANGED <<entryState, applyCount, failuresRemaining,
-                    durableCursor, durableRetryLedger, durableRetryFrontier>>
+    /\ UNCHANGED <<entryState, applyCount, retryFailuresRemaining,
+                    durableCursor, durableRetryLedger, durableRetryFrontier,
+                    fullScanSeen, retryOrderSound>>
 
 Next ==
     \/ BeginPass
-    \/ PrepareRetry
     \/ ScanNext
+    \/ RetryAfterScan
+    \/ FinishScanWithoutRetry
     \/ EndPass
     \/ CrashAndReopen
 
@@ -254,58 +264,69 @@ Spec == Init /\ [][Next]_Vars
 FairSpec ==
     /\ Spec
     /\ WF_Vars(BeginPass)
-    /\ WF_Vars(PrepareRetry)
     /\ WF_Vars(ScanNext)
+    /\ WF_Vars(RetryAfterScan)
+    /\ WF_Vars(FinishScanWithoutRetry)
     /\ WF_Vars(EndPass)
 
-ClassifiedOrDeferred(entry, ledger) ==
-    \/ entryState[entry] = Applied
-    \/ entry \in ledger
-
-SafeThrough(frontier, ledger) ==
+SafeThrough(frontier) ==
     \A entry \in Entries :
-        entry <= frontier => ClassifiedOrDeferred(entry, ledger)
+        entry <= frontier => entryState[entry] = Applied
 
 (* ---- Invariants ---- *)
 
 VolatileCursorNeverSkipsWork ==
-    SafeThrough(cursor, retryLedger)
+    SafeThrough(cursor)
 
 PersistedCursorNeverSkipsWork ==
-    SafeThrough(durableCursor, durableRetryLedger)
-
-PersistedProgressNeverExceedsVolatileProgress ==
-    durableCursor <= cursor
+    SafeThrough(durableCursor)
 
 ClosedPassUsesOnlyPersistedProgress ==
     ~active =>
         /\ cursor = durableCursor
         /\ retryLedger = durableRetryLedger
         /\ retryFrontier = durableRetryFrontier
-        /\ ~retryAttempted
+        /\ selectedRetry = 0
+        /\ ~cycleFinished
         /\ budget = 0
 
 AppliedEntriesAreIdempotent ==
     \A entry \in Entries :
         (entryState[entry] = Applied) <=> (applyCount[entry] = 1)
 
-PermanentBlockNeverBecomesApplied ==
-    /\ entryState[BlockedEntry] = Pending
-    /\ applyCount[BlockedEntry] = 0
+SharedBudgetAccountsForAllWork ==
+    IF active
+    THEN budget + workUsed = PassBudget
+    ELSE workUsed = 0
+
+RetryRunsOnlyAfterFullScan ==
+    retryOrderSound
+
+LeafAndRetryDomainsAreDisjoint ==
+    /\ retryLedger \cap Entries = {}
+    /\ durableRetryLedger \cap Entries = {}
+    /\ selectedRetry = 0 \/ selectedRetry \notin Entries
+
+PermanentHierarchyRetryRemainsDeferred ==
+    /\ BlockedRetry \in retryLedger
+    /\ BlockedRetry \in durableRetryLedger
+
+SelectedRetryIsPersistedHierarchyWork ==
+    selectedRetry # 0 => selectedRetry \in retryLedger
 
 (* ---- End invariants ---- *)
 
 (* ---- Properties ---- *)
 
-PersistedMainScanEventuallyCompletes ==
-    <> (durableCursor = EntryCount)
+MainScanEventuallyCompletes ==
+    <> fullScanSeen
 
-EligibleWorkEventuallyApplies ==
-    <> (\A entry \in EligibleEntries : entryState[entry] = Applied)
+LeafWorkEventuallyApplies ==
+    <> (\A entry \in Entries : entryState[entry] = Applied)
 
-TransientRetriesEventuallyClear ==
-    [] ((durableRetryLedger \cap EligibleEntries # {}) =>
-        <> (durableRetryLedger \cap EligibleEntries = {}))
+TransientHierarchyRetriesEventuallyClear ==
+    [] ((durableRetryLedger \cap TransientRetries # {}) =>
+        <> (durableRetryLedger \cap TransientRetries = {}))
 
 ActivePassEventuallyCloses ==
     [] (active => <> ~active)
