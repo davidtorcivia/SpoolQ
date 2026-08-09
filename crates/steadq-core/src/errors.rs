@@ -1,5 +1,9 @@
 // SteadQ/1 error and outcome types.
 
+use crate::state_machine::{
+    self, AttemptChange, GenerationChange, Operation as ProtocolOperation, State as ProtocolState,
+};
+
 /// Error categories for all operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -117,6 +121,19 @@ pub enum TransitionOperation {
     Bury,
 }
 
+impl TransitionOperation {
+    fn protocol_operation(self) -> ProtocolOperation {
+        match self {
+            Self::Claim => ProtocolOperation::Claim,
+            Self::Renew => ProtocolOperation::Renew,
+            Self::Acknowledge => ProtocolOperation::Acknowledge,
+            Self::RetryNow => ProtocolOperation::RetryNow,
+            Self::RetryLater => ProtocolOperation::RetryLater,
+            Self::Bury => ProtocolOperation::Bury,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitionPhase {
@@ -134,6 +151,15 @@ pub enum TicketSource {
         boottime_deadline_ns: u64,
         wall_deadline_ns: u64,
     },
+}
+
+impl TicketSource {
+    fn protocol_state(&self) -> ProtocolState {
+        match self {
+            Self::Ready {} => ProtocolState::Ready,
+            Self::Leased { .. } => ProtocolState::Leased,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -155,6 +181,18 @@ pub enum TicketDestination {
         terminal_bucket: u64,
         reason: u16,
     },
+}
+
+impl TicketDestination {
+    fn protocol_state(&self) -> ProtocolState {
+        match self {
+            Self::Ready {} => ProtocolState::Ready,
+            Self::Leased { .. } => ProtocolState::Leased,
+            Self::Delayed { .. } => ProtocolState::Delayed,
+            Self::Receipt { .. } => ProtocolState::Receipt,
+            Self::Dead { .. } => ProtocolState::Dead,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,16 +429,26 @@ impl TransitionTicket {
     }
 
     pub(crate) fn destination_common(&self) -> Result<steadq_names::CommonFields, Error> {
-        let generation = self
-            .source_generation
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidTicket("source generation cannot increment".into()))?;
-        let attempt = if self.operation == TransitionOperation::Claim {
-            self.source_attempt
+        let definition = state_machine::transition(self.operation.protocol_operation());
+        let generation = match definition.generation_change {
+            GenerationChange::Zero => 0,
+            GenerationChange::Increment => self
+                .source_generation
                 .checked_add(1)
-                .ok_or_else(|| Error::InvalidTicket("source attempt cannot increment".into()))?
-        } else {
-            self.source_attempt
+                .ok_or_else(|| Error::InvalidTicket("source generation cannot increment".into()))?,
+            GenerationChange::IncrementOrSame => {
+                return Err(Error::InvalidTicket(
+                    "ticket operation has an indeterminate generation change".into(),
+                ));
+            }
+        };
+        let attempt = match definition.attempt_change {
+            AttemptChange::Zero => 0,
+            AttemptChange::Increment => self
+                .source_attempt
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidTicket("source attempt cannot increment".into()))?,
+            AttemptChange::Unchanged => self.source_attempt,
         };
         Ok(steadq_names::CommonFields {
             job_id: self.job_id,
@@ -431,40 +479,11 @@ impl TransitionTicket {
                 "ticket attempt exceeds maximum_attempts".into(),
             ));
         }
-        self.destination_common()?;
-        let legal = match (&self.operation, &self.source, &self.destination) {
-            (
-                TransitionOperation::Claim,
-                TicketSource::Ready {},
-                TicketDestination::Leased { .. },
-            ) => self.source_attempt < self.maximum_attempts,
-            (
-                TransitionOperation::Renew,
-                TicketSource::Leased { .. },
-                TicketDestination::Leased { .. },
-            )
-            | (
-                TransitionOperation::Acknowledge,
-                TicketSource::Leased { .. },
-                TicketDestination::Receipt { .. },
-            )
-            | (
-                TransitionOperation::RetryNow,
-                TicketSource::Leased { .. },
-                TicketDestination::Ready {},
-            )
-            | (
-                TransitionOperation::RetryLater,
-                TicketSource::Leased { .. },
-                TicketDestination::Delayed { .. },
-            )
-            | (
-                TransitionOperation::Bury,
-                TicketSource::Leased { .. },
-                TicketDestination::Dead { .. },
-            ) => true,
-            _ => false,
-        };
+        let destination_common = self.destination_common()?;
+        let definition = state_machine::transition(self.operation.protocol_operation());
+        let legal = self.source.protocol_state() == definition.source
+            && self.destination.protocol_state() == definition.destination
+            && destination_common.attempt <= self.maximum_attempts;
         if !legal {
             return Err(Error::InvalidTicket(
                 "operation does not permit the ticket source and destination".into(),
@@ -787,6 +806,7 @@ mod tests {
                     boottime_deadline_ns: 30,
                     wall_deadline_ns: 40,
                 },
+                2,
             ),
             (
                 TransitionOperation::Renew,
@@ -796,21 +816,25 @@ mod tests {
                     boottime_deadline_ns: 30,
                     wall_deadline_ns: 40,
                 },
+                1,
             ),
             (
                 TransitionOperation::Acknowledge,
                 leased_source(),
                 TicketDestination::Receipt { terminal_bucket: 5 },
+                1,
             ),
             (
                 TransitionOperation::RetryNow,
                 leased_source(),
                 TicketDestination::Ready {},
+                1,
             ),
             (
                 TransitionOperation::RetryLater,
                 leased_source(),
                 TicketDestination::Delayed { not_before_ns: 50 },
+                1,
             ),
             (
                 TransitionOperation::Bury,
@@ -819,19 +843,26 @@ mod tests {
                     terminal_bucket: 5,
                     reason: 3,
                 },
+                1,
             ),
         ];
 
-        for (operation, source, destination) in cases {
-            assert!(TransitionTicket::new(
+        for (operation, source, destination, expected_attempt) in cases {
+            let definition = state_machine::transition(operation.protocol_operation());
+            assert_eq!(source.protocol_state(), definition.source);
+            assert_eq!(destination.protocol_state(), definition.destination);
+            let ticket = TransitionTicket::new(
                 [1; 16],
                 operation,
                 TransitionPhase::Linearized,
-                TicketIdentity::new([2; 16], 7, 1, 3, [3; 16], TicketEvidence::new([4; 32], 5),),
+                TicketIdentity::new([2; 16], 7, 1, 3, [3; 16], TicketEvidence::new([4; 32], 5)),
                 source,
                 destination,
             )
-            .is_ok());
+            .unwrap();
+            let destination_common = ticket.destination_common().unwrap();
+            assert_eq!(destination_common.generation, 8);
+            assert_eq!(destination_common.attempt, expected_attempt);
         }
 
         let invalid_destinations = [
@@ -853,6 +884,26 @@ mod tests {
                 destination,
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn ticket_operations_map_to_exact_protocol_operations() {
+        for (ticket, protocol) in [
+            (TransitionOperation::Claim, ProtocolOperation::Claim),
+            (TransitionOperation::Renew, ProtocolOperation::Renew),
+            (
+                TransitionOperation::Acknowledge,
+                ProtocolOperation::Acknowledge,
+            ),
+            (TransitionOperation::RetryNow, ProtocolOperation::RetryNow),
+            (
+                TransitionOperation::RetryLater,
+                ProtocolOperation::RetryLater,
+            ),
+            (TransitionOperation::Bury, ProtocolOperation::Bury),
+        ] {
+            assert_eq!(ticket.protocol_operation(), protocol);
         }
     }
 }

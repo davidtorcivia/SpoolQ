@@ -230,8 +230,18 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         )
         .expect("writing to String cannot fail");
     }
+    output.push_str("];\n\n/// Return the complete protocol definition for an operation.\npub fn transition(operation: Operation) -> &'static TransitionDef {\n    match operation {\n");
+    for (index, transition) in spec.transitions.iter().enumerate() {
+        writeln!(
+            output,
+            "        Operation::{} => &TRANSITIONS[{index}],",
+            transition.operation.rust_name(),
+        )
+        .expect("writing to String cannot fail");
+    }
     output.push_str(
-        r#"];
+        r#"    }
+}
 
 /// Check if a transition from source to destination is legal.
 pub fn is_legal_transition(source: State, destination: State) -> bool {
@@ -271,11 +281,11 @@ mod tests {
 mod resolver_probe_tests {
     use super::*;
 
-    fn transition(operation: Operation) -> &'static TransitionDef {
-        TRANSITIONS
-            .iter()
-            .find(|transition| transition.operation == operation)
-            .unwrap()
+    #[test]
+    fn transition_lookup_is_total() {
+        for definition in TRANSITIONS {
+            assert_eq!(transition(definition.operation), definition);
+        }
     }
 
     #[test]
