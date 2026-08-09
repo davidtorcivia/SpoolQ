@@ -9,8 +9,9 @@ use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
 use crate::queue::engine::{
-    move_verified_noreplace, replace_verified, unlink_verified, MoveActor, MoveFailure, MovePhase,
-    ReplaceFailure, ReplaceIdentity, UnlinkFailure,
+    move_verified_noreplace, remove_empty_directory_verified, replace_verified, unlink_verified,
+    MoveActor, MoveFailure, MovePhase, RemoveDirectoryFailure, ReplaceFailure, ReplaceIdentity,
+    UnlinkFailure,
 };
 use crate::queue::{
     open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryHierarchyRetry,
@@ -116,6 +117,10 @@ enum RememberHierarchyRetry {
 
 fn raw_name_for_error(name: &fs::DirEntryName) -> String {
     format!("{name:?}")
+}
+
+fn all_observed_children_absent(absent: usize, observed: usize) -> bool {
+    absent == observed
 }
 
 fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
@@ -356,6 +361,7 @@ pub struct RecoveryStats {
     pub leases_reaped: u32,
     pub leases_to_dead: u32,
     pub buckets_removed: u32,
+    pub shards_removed: u32,
     pub receipts_compacted: u32,
     pub receipts_expired: u32,
     pub quarantined: Vec<RecoveryQuarantine>,
@@ -872,6 +878,30 @@ impl Queue {
             }
             UnlinkFailure::SourceMissing => {
                 ("source_missing", "phase=Unlink: source is missing".into())
+            }
+        };
+        Self::record_error(stats, &format!("{operation}_{category}"), path, &detail);
+    }
+
+    fn record_remove_directory_failure(
+        stats: &mut RecoveryStats,
+        operation: &str,
+        path: &str,
+        failure: RemoveDirectoryFailure,
+    ) {
+        let (category, detail) = match failure {
+            RemoveDirectoryFailure::NotCommitted { phase, source } => {
+                ("not_committed", format!("phase={phase:?}: {source}"))
+            }
+            RemoveDirectoryFailure::OutcomeUnknown { phase, source } => {
+                ("outcome_unknown", format!("phase={phase:?}: {source}"))
+            }
+            RemoveDirectoryFailure::SourceMissing => (
+                "source_missing",
+                "phase=Remove: directory is missing".into(),
+            ),
+            RemoveDirectoryFailure::NotEmpty => {
+                ("not_empty", "phase=Remove: directory is not empty".into())
             }
         };
         Self::record_error(stats, &format!("{operation}_{category}"), path, &detail);
@@ -3127,6 +3157,7 @@ impl Queue {
                 }
             };
             shard_dirs.sort();
+            let mut absent_shards = 0usize;
 
             for shard_entry in &shard_dirs {
                 // Entry level cursor: skip shards before cursor when bucket matches.
@@ -3217,6 +3248,7 @@ impl Queue {
                     }
                 };
                 entries.sort();
+                let mut absent_entries = 0usize;
 
                 for raw_entry in &entries {
                     // Entry level cursor: skip entries at or before cursor when bucket and shard match.
@@ -3323,7 +3355,19 @@ impl Queue {
                     stats.operations_attempted += 1;
                     let relative_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
                     match unlink_verified(shard_fd.as_raw_fd(), entry, MoveActor::Recovery) {
-                        Ok(()) => stats.receipts_expired += 1,
+                        Ok(()) => {
+                            stats.receipts_expired += 1;
+                            absent_entries += 1;
+                        }
+                        Err(UnlinkFailure::SourceMissing) => {
+                            absent_entries += 1;
+                            Self::record_unlink_failure(
+                                stats,
+                                "receipt_delete",
+                                &relative_path,
+                                UnlinkFailure::SourceMissing,
+                            );
+                        }
                         Err(failure) => Self::record_unlink_failure(
                             stats,
                             "receipt_delete",
@@ -3333,23 +3377,57 @@ impl Queue {
                     }
                 }
 
-                // Remove empty shard dir
-                let _ = fs::unlinkat_dir(bucket_fd.as_raw_fd(), shard_name);
+                if !all_observed_children_absent(absent_entries, entries.len()) {
+                    continue;
+                }
+                if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+                    stats.budget_exhausted = true;
+                    return;
+                }
+                stats.operations_attempted += 1;
+                let shard_path = format!("receipts/{bucket_name}/{shard_name}");
+                match remove_empty_directory_verified(
+                    bucket_fd.as_raw_fd(),
+                    shard_name,
+                    MoveActor::Recovery,
+                ) {
+                    Ok(()) => {
+                        stats.shards_removed += 1;
+                        absent_shards += 1;
+                    }
+                    Err(RemoveDirectoryFailure::SourceMissing) => absent_shards += 1,
+                    Err(RemoveDirectoryFailure::NotEmpty) => {}
+                    Err(failure) => Self::record_remove_directory_failure(
+                        stats,
+                        "receipt_shard_remove",
+                        &shard_path,
+                        failure,
+                    ),
+                }
             }
 
-            // Remove empty bucket dir
-            // H15: Only count if removal and sync both succeed
-            if fs::unlinkat_dir(receipts_fd.as_raw_fd(), bucket_name).is_ok() {
-                if fs::fsync_dir_fd(receipts_fd.as_raw_fd()).is_ok() {
-                    stats.buckets_removed += 1;
-                } else {
-                    Self::record_error(
-                        stats,
-                        "bucket_removal_sync",
-                        &format!("receipts/{bucket_name}"),
-                        "receipts dir sync failed after bucket removal",
-                    );
-                }
+            if !all_observed_children_absent(absent_shards, shard_dirs.len()) {
+                continue;
+            }
+            if Self::budget_exhausted(stats, scan.stats, budget, scan.budget, deadline_mono) {
+                stats.budget_exhausted = true;
+                return;
+            }
+            stats.operations_attempted += 1;
+            let bucket_path = format!("receipts/{bucket_name}");
+            match remove_empty_directory_verified(
+                receipts_fd.as_raw_fd(),
+                bucket_name,
+                MoveActor::Recovery,
+            ) {
+                Ok(()) => stats.buckets_removed += 1,
+                Err(RemoveDirectoryFailure::SourceMissing | RemoveDirectoryFailure::NotEmpty) => {}
+                Err(failure) => Self::record_remove_directory_failure(
+                    stats,
+                    "receipt_bucket_remove",
+                    &bucket_path,
+                    failure,
+                ),
             }
         }
 
@@ -3399,6 +3477,23 @@ mod tests {
         )
         .unwrap();
         (tmp, queue)
+    }
+
+    #[test]
+    fn empty_directory_removal_requires_every_observed_child_to_be_absent() {
+        for (absent, observed, expected) in [
+            (0, 0, true),
+            (0, 1, false),
+            (1, 1, true),
+            (1, 2, false),
+            (2, 1, false),
+        ] {
+            assert_eq!(
+                all_observed_children_absent(absent, observed),
+                expected,
+                "absent={absent} observed={observed}"
+            );
+        }
     }
 
     #[test]
@@ -3985,6 +4080,32 @@ mod tests {
         assert_eq!(stats.operations_attempted, 1);
         assert_eq!(stats.errors.len(), 1, "errors: {:?}", stats.errors);
         assert_eq!(stats.errors[0].operation, expected_operation);
+        assert!(
+            stats.errors[0].error.contains(&format!("phase={phase:?}")),
+            "errors: {:?}",
+            stats.errors
+        );
+    }
+
+    fn assert_recorded_remove_directory_failure(
+        stats: &RecoveryStats,
+        operation: &str,
+        relative_path: &str,
+        phase: crate::queue::engine::RemoveDirectoryPhase,
+        outcome_unknown: bool,
+    ) {
+        let expected_operation = format!(
+            "{operation}_{}",
+            if outcome_unknown {
+                "outcome_unknown"
+            } else {
+                "not_committed"
+            }
+        );
+        assert_eq!(stats.operations_attempted, 1, "stats: {stats:?}");
+        assert_eq!(stats.errors.len(), 1, "errors: {:?}", stats.errors);
+        assert_eq!(stats.errors[0].operation, expected_operation);
+        assert_eq!(stats.errors[0].relative_path, relative_path);
         assert!(
             stats.errors[0].error.contains(&format!("phase={phase:?}")),
             "errors: {:?}",
@@ -4884,8 +5005,13 @@ mod tests {
         drop(queue);
         assert!(receipts.iter().all(|path| path.exists()));
 
-        for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
-            let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
+        let mut receipt_pass = 0usize;
+        for pass in 0..(receipts.len() * 3) {
+            let mut queue = open_with_readdir_permutation(
+                &tmp,
+                &options,
+                pass % RECOVERY_READ_PERMUTATIONS.len(),
+            );
             let scan_budget = RecoveryScanBudget::default();
             let mut scan_stats = RecoveryScanStats::default();
             let mut scan = RecoveryScanContext {
@@ -4897,15 +5023,27 @@ mod tests {
             queue.delete_expired_receipts(wall_floor, 0, &budget, &mut scan, &mut stats, u64::MAX);
             fs::fault::reset();
             assert_eq!(stats.operations_attempted, 1, "pass={pass}");
-            assert_eq!(
-                stats.receipts_expired, 1,
-                "pass={pass} errors={:?}",
-                stats.errors
-            );
+            assert!(stats.errors.is_empty(), "pass={pass}: {:?}", stats.errors);
+            if stats.receipts_expired == 1 {
+                assert_eq!(stats.shards_removed, 0, "pass={pass}");
+                assert_eq!(stats.buckets_removed, 0, "pass={pass}");
+                assert_removed_prefix(&receipts, receipt_pass);
+                receipt_pass += 1;
+            } else {
+                assert_eq!(stats.receipts_expired, 0, "pass={pass}");
+                assert_eq!(
+                    stats.shards_removed + stats.buckets_removed,
+                    1,
+                    "pass={pass}"
+                );
+            }
             queue.persist_recovery_cursor().unwrap();
             drop(queue);
-            assert_removed_prefix(&receipts, pass);
+            if receipt_pass == receipts.len() {
+                break;
+            }
         }
+        assert_eq!(receipt_pass, receipts.len());
     }
 
     #[test]
@@ -7286,6 +7424,133 @@ mod tests {
     }
 
     #[test]
+    fn receipt_shard_removal_preserves_phase_and_replays() {
+        for (fault, expected_phase, outcome_unknown, shard_remains) in [
+            (
+                "unlinkat_dir",
+                crate::queue::engine::RemoveDirectoryPhase::Remove,
+                false,
+                true,
+            ),
+            (
+                "fsync_dir_fd",
+                crate::queue::engine::RemoveDirectoryPhase::ParentFsync,
+                true,
+                false,
+            ),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            let bucket_name = "0000000000000000";
+            let shard_name = "0000";
+            let bucket = tmp.path().join("receipts").join(bucket_name);
+            let shard = bucket.join(shard_name);
+            std::fs::create_dir_all(&shard).unwrap();
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, libc::EIO);
+            let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+            fs::fault::reset();
+
+            assert_recorded_remove_directory_failure(
+                &stats,
+                "receipt_shard_remove",
+                &format!("receipts/{bucket_name}/{shard_name}"),
+                expected_phase,
+                outcome_unknown,
+            );
+            assert_eq!(stats.shards_removed, 0);
+            assert_eq!(stats.buckets_removed, 0);
+            assert_eq!(shard.exists(), shard_remains);
+            assert!(bucket.exists());
+
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay_floor = reopened.authenticated_wall_floor().unwrap();
+            let replay = delete_receipts_with_budget(&mut reopened, replay_floor);
+            assert_eq!(
+                replay.operations_attempted,
+                1 + u32::from(shard_remains),
+                "errors: {:?}",
+                replay.errors
+            );
+            assert_eq!(replay.shards_removed, u32::from(shard_remains));
+            assert_eq!(replay.buckets_removed, 1);
+            assert!(!bucket.exists());
+        }
+    }
+
+    #[test]
+    fn receipt_bucket_removal_preserves_phase_and_replays() {
+        for (fault, expected_phase, outcome_unknown, bucket_remains) in [
+            (
+                "unlinkat_dir",
+                crate::queue::engine::RemoveDirectoryPhase::Remove,
+                false,
+                true,
+            ),
+            (
+                "fsync_dir_fd",
+                crate::queue::engine::RemoveDirectoryPhase::ParentFsync,
+                true,
+                false,
+            ),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            let bucket_name = "0000000000000000";
+            let bucket = tmp.path().join("receipts").join(bucket_name);
+            std::fs::create_dir(&bucket).unwrap();
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, libc::EIO);
+            let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+            fs::fault::reset();
+
+            assert_recorded_remove_directory_failure(
+                &stats,
+                "receipt_bucket_remove",
+                &format!("receipts/{bucket_name}"),
+                expected_phase,
+                outcome_unknown,
+            );
+            assert_eq!(stats.shards_removed, 0);
+            assert_eq!(stats.buckets_removed, 0);
+            assert_eq!(bucket.exists(), bucket_remains);
+
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay_floor = reopened.authenticated_wall_floor().unwrap();
+            let replay = delete_receipts_with_budget(&mut reopened, replay_floor);
+            assert_eq!(
+                replay.operations_attempted,
+                u32::from(bucket_remains),
+                "errors: {:?}",
+                replay.errors
+            );
+            assert_eq!(replay.shards_removed, 0);
+            assert_eq!(replay.buckets_removed, u32::from(bucket_remains));
+            assert!(!bucket.exists());
+        }
+    }
+
+    #[test]
     fn recovery_unlink_failure_preserves_category_and_phase() {
         for (failure, expected_operation, expected_detail) in [
             (
@@ -7475,7 +7740,7 @@ mod tests {
                     category == "outcome_unknown",
                 );
             } else {
-                assert_eq!(stats.operations_attempted, 1);
+                assert_eq!(stats.operations_attempted, 2);
                 assert_eq!(stats.errors.len(), 1);
                 assert_eq!(stats.errors[0].operation, "receipt_delete_source_missing");
             }
