@@ -1,8 +1,7 @@
 # Mutation testing configuration.
-# Exclude recovery/scan internals whose counters and skip paths are not
-# asserted by unit tests, and whole-function replacements of multi-path
-# guards that are covered by fault-injection tests as integration paths
-# rather than by cargo-mutants line mutants.
+# Each exclusion is documented in docs/mutation-exclusions.md with a reason
+# and expiry condition. Safety-critical recovery functions are tested by
+# fault-injection integration tests (see docs/mutation-exclusions.md).
 exclude_re = [
     "move_to_dead",
     "receipt_is_authentic",
