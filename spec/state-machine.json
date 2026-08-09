@@ -13,7 +13,8 @@
         "destination_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe destination: observed = committed, absent = not committed"
+      "resolution_behavior": "probe destination: observed = committed, absent = not committed",
+      "notes": null
     },
     {
       "operation": "enqueue_delayed",
@@ -28,7 +29,8 @@
         "destination_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe destination: observed = committed, absent = not committed"
+      "resolution_behavior": "probe destination: observed = committed, absent = not committed",
+      "notes": null
     },
     {
       "operation": "promote",
@@ -43,7 +45,8 @@
         "source_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe both: destination observed = committed, source only = not committed"
+      "resolution_behavior": "probe both: destination observed = committed, source only = not committed",
+      "notes": null
     },
     {
       "operation": "claim",
@@ -58,7 +61,8 @@
         "source_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe both directories"
+      "resolution_behavior": "probe both directories",
+      "notes": null
     },
     {
       "operation": "exhausted_ready_cleanup",
@@ -73,7 +77,8 @@
         "source_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe both"
+      "resolution_behavior": "probe both",
+      "notes": null
     },
     {
       "operation": "renew",
@@ -87,7 +92,8 @@
         "same_or_destination_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe destination: new generation observed = renewed, old gen observed = lease lost"
+      "resolution_behavior": "probe destination: new generation observed = renewed, old gen observed = lease lost",
+      "notes": null
     },
     {
       "operation": "acknowledge",
@@ -102,7 +108,8 @@
         "source_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe receipt buckets by exact name"
+      "resolution_behavior": "probe receipt buckets by exact name",
+      "notes": null
     },
     {
       "operation": "retry_now",
@@ -117,7 +124,8 @@
         "source_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe both"
+      "resolution_behavior": "probe both",
+      "notes": null
     },
     {
       "operation": "retry_later",
@@ -132,7 +140,8 @@
         "source_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe both"
+      "resolution_behavior": "probe both",
+      "notes": null
     },
     {
       "operation": "bury",
@@ -147,7 +156,8 @@
         "source_dir_fsync"
       ],
       "no_overwrite": true,
-      "resolution_behavior": "probe both"
+      "resolution_behavior": "probe both",
+      "notes": null
     },
     {
       "operation": "reap_expired_to_ready",
