@@ -24,6 +24,8 @@ CI runs the same command in the `tla` job.
 
 Bounded configuration: 2 jobs, 2 workers, and MaxAttempts=2. The `Crash` action is not count-bounded.
 
+`model/SteadQProtocol.tla` is generated from the versioned protocol IR. It supplies the model's state values and complete transition, exceptional mutation, and re-entry metadata. The current actions still model only the bounded abstract behavior described below; generating the metadata does not make those actions implementation-complete.
+
 ## Invariants checked
 
 I1: No visible active object has an incomplete envelope (fileSynced must be true).

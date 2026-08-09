@@ -54,6 +54,7 @@ fn temporary_workspace() -> TempDir {
         "crates/steadq-core/src",
         ".github",
         "docs",
+        "model",
     ] {
         fs::create_dir_all(temp.path().join(directory)).unwrap();
     }
@@ -74,6 +75,10 @@ fn temporary_workspace() -> TempDir {
         (
             GENERATED_MARKDOWN,
             include_str!("../../../generated/state-machine.md"),
+        ),
+        (
+            GENERATED_TLA,
+            include_str!("../../../model/SteadQProtocol.tla"),
         ),
         (
             CORE_RUST,
@@ -185,7 +190,13 @@ fn generated_files_match_spec() {
 #[test]
 fn generate_repairs_every_artifact() {
     let temp = temporary_workspace();
-    for artifact in [GENERATED_RUST, GENERATED_GO, GENERATED_MARKDOWN, CORE_RUST] {
+    for artifact in [
+        GENERATED_RUST,
+        GENERATED_GO,
+        GENERATED_MARKDOWN,
+        GENERATED_TLA,
+        CORE_RUST,
+    ] {
         fs::write(temp.path().join(artifact), "corrupt").unwrap();
     }
     assert!(check_generated(temp.path()).is_err());
@@ -202,6 +213,10 @@ fn generate_repairs_every_artifact() {
         (
             GENERATED_MARKDOWN,
             include_str!("../../../generated/state-machine.md"),
+        ),
+        (
+            GENERATED_TLA,
+            include_str!("../../../model/SteadQProtocol.tla"),
         ),
         (
             CORE_RUST,
@@ -425,6 +440,49 @@ fn generated_rust_contains_source_transition() {
         output.contains("clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor")
     );
     assert!(output.contains("pub const REENTRY: &[ReentryDef]"));
+}
+
+#[test]
+fn generated_tla_contains_complete_protocol_metadata() {
+    let output = render_tla(&fixture(), "fixture-digest");
+    assert!(output.contains("MODULE SteadQProtocol"));
+    assert!(output.contains("Source SHA-256: fixture-digest"));
+    assert!(output.contains("ProtocolIRIdentity == \"steadq-state-machine\""));
+    assert!(output.contains("ProtocolIRVersion == 1"));
+    assert!(output.contains("ProtocolOperations =="));
+    assert!(output.contains("ProtocolStates =="));
+    let operations = Operation::ALL
+        .map(|value| format!("Operation{}", value.rust_name()))
+        .join(", ");
+    assert!(output.contains(&format!("ProtocolOperations == {{{operations}}}")));
+    let states = State::ALL
+        .map(|value| format!("State{}", value.rust_name()))
+        .join(", ");
+    assert!(output.contains(&format!("ProtocolStates == {{{states}}}")));
+    assert_eq!(
+        output.matches("    [operation |->").count(),
+        Operation::ALL.len()
+    );
+    assert_eq!(
+        output.matches("    [name |-> Exception").count(),
+        ExceptionName::ALL.len()
+    );
+    assert_eq!(
+        output.matches("    [name |-> Reentry").count(),
+        ReentryName::ALL.len()
+    );
+    assert!(output.contains("requiredSyncs |-> <<SyncStepFile, SyncStepDestinationDirectory>>"));
+    assert!(output.contains("descriptionUtf8Hex |->"));
+}
+
+#[test]
+fn generated_tla_hex_encodes_arbitrary_description_bytes() {
+    let mut spec = fixture();
+    spec.exceptions[0].description = "nul:\u{0}; unicode:\u{1f642}".into();
+    let output = render_tla(&spec, "fixture-digest");
+    assert!(output.contains("descriptionUtf8Hex |-> \"6e756c3a003b20756e69636f64653af09f9982\""));
+    assert!(!output.contains('\u{0}'));
+    assert!(!output.contains('\u{1f642}'));
 }
 
 #[test]
