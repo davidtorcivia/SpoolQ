@@ -2946,7 +2946,9 @@ impl Queue {
                         inode,
                     } = verified_receipt;
                     let header = match kind {
-                        crate::queue::verified::VerifiedReceiptKind::Full(job) => job.header,
+                        crate::queue::verified::VerifiedReceiptKind::Full(job) => {
+                            job.header().clone()
+                        }
                         crate::queue::verified::VerifiedReceiptKind::Compact => continue,
                     };
                     let bucket_start =
