@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: e83f85741adae71434408593f076b82bac478ee42b87a9abc5d59bd38ef053fc
+// Source SHA-256: 51784a8a723ff47b4cdc878dd1eecb55dd23ed71b2111ebfa661768a8e96b478
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -59,6 +59,15 @@ pub enum ReasonClass {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ClockRequirement {
+    None,
+    AuthenticatedWallFloor,
+    BoottimeAndAuthenticatedWallFloor,
+    LeaseExpirationEvidence,
+    LeaseExpirationEvidenceAndAuthenticatedWallFloor,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum SyncStep {
     File,
     DestinationDirectory,
@@ -109,6 +118,7 @@ pub struct TransitionDef {
     pub attempt_change: AttemptChange,
     pub token_change: TokenChange,
     pub reason_class: Option<ReasonClass>,
+    pub clock_requirement: ClockRequirement,
     pub required_syncs: &'static [SyncStep],
     pub linearization: LinearizationPrimitive,
     pub before_linearization_failure: FailureOutcome,
@@ -123,6 +133,7 @@ pub struct TransitionDef {
 pub struct ExceptionDef {
     pub name: ExceptionName,
     pub description: &'static str,
+    pub clock_requirement: ClockRequirement,
     pub mutation_class: MutationClass,
     pub linearization: LinearizationPrimitive,
     pub required_syncs: &'static [SyncStep],
@@ -147,6 +158,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Zero,
         token_change: TokenChange::None,
         reason_class: None,
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         required_syncs: &[SyncStep::File, SyncStep::DestinationDirectory],
         linearization: LinearizationPrimitive::PublishNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -162,6 +174,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Zero,
         token_change: TokenChange::None,
         reason_class: None,
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         required_syncs: &[SyncStep::File, SyncStep::DestinationDirectory],
         linearization: LinearizationPrimitive::PublishNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -177,6 +190,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: None,
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -193,6 +207,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Increment,
         token_change: TokenChange::New,
         reason_class: None,
+        clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -208,6 +223,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::AttemptsExhausted),
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -223,6 +239,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::Same,
         reason_class: None,
+        clock_requirement: ClockRequirement::BoottimeAndAuthenticatedWallFloor,
         required_syncs: &[SyncStep::SameOrDestinationDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -239,6 +256,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::Same,
         reason_class: None,
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -254,6 +272,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: None,
+        clock_requirement: ClockRequirement::None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -269,6 +288,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: None,
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -284,6 +304,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::ApplicationDefined),
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -299,6 +320,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: None,
+        clock_requirement: ClockRequirement::LeaseExpirationEvidence,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -314,6 +336,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::AttemptsExhausted),
+        clock_requirement: ClockRequirement::LeaseExpirationEvidenceAndAuthenticatedWallFloor,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -329,6 +352,7 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         attempt_change: AttemptChange::Unchanged,
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::Corruption),
+        clock_requirement: ClockRequirement::None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
         linearization: LinearizationPrimitive::RenameNoreplace,
         before_linearization_failure: FailureOutcome::NotCommitted,
@@ -342,6 +366,7 @@ pub const EXCEPTIONS: &[ExceptionDef] = &[
     ExceptionDef {
         name: ExceptionName::ReceiptCompaction,
         description: "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname",
+        clock_requirement: ClockRequirement::None,
         mutation_class: MutationClass::ReplacingMove,
         linearization: LinearizationPrimitive::RenameReplace,
         required_syncs: &[SyncStep::File, SyncStep::SameOrDestinationDirectory],
@@ -351,6 +376,7 @@ pub const EXCEPTIONS: &[ExceptionDef] = &[
     ExceptionDef {
         name: ExceptionName::WallWatermarkAdvancement,
         description: "Monotone wall-watermark record replaced under exclusive OFD lock",
+        clock_requirement: ClockRequirement::AuthenticatedWallFloor,
         mutation_class: MutationClass::ReplacingMove,
         linearization: LinearizationPrimitive::RenameReplace,
         required_syncs: &[SyncStep::File, SyncStep::SameOrDestinationDirectory],
@@ -453,6 +479,10 @@ mod tests {
         assert_eq!(claim.token_change, TokenChange::New);
         assert_eq!(claim.reason_class, None);
         assert_eq!(
+            claim.clock_requirement,
+            ClockRequirement::BoottimeAndAuthenticatedWallFloor
+        );
+        assert_eq!(
             claim.required_syncs,
             &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]
         );
@@ -490,6 +520,11 @@ mod tests {
         assert_eq!(reap.reason_class, Some(ReasonClass::AttemptsExhausted));
         assert_eq!(reap.notes, Some("attempt >= maximum_attempts"));
         assert_eq!(EXCEPTIONS[0].name, ExceptionName::ReceiptCompaction);
+        assert_eq!(EXCEPTIONS[0].clock_requirement, ClockRequirement::None);
+        assert_eq!(
+            EXCEPTIONS[1].clock_requirement,
+            ClockRequirement::AuthenticatedWallFloor
+        );
         assert_eq!(REENTRY[0].name, ReentryName::RequeueDead);
         assert_eq!(REENTRY[0].source, State::Dead);
     }

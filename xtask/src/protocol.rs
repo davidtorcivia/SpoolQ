@@ -27,6 +27,7 @@ struct Transition {
     attempt_change: AttemptChange,
     token_change: TokenChange,
     reason_class: Nullable<ReasonClass>,
+    clock_requirement: ClockRequirement,
     required_syncs: Vec<SyncStep>,
     linearization: LinearizationPrimitive,
     before_linearization_failure: FailureOutcome,
@@ -107,6 +108,16 @@ enum ReasonClass {
 
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
 #[serde(rename_all = "snake_case")]
+enum ClockRequirement {
+    None,
+    AuthenticatedWallFloor,
+    BoottimeAndAuthenticatedWallFloor,
+    LeaseExpirationEvidence,
+    LeaseExpirationEvidenceAndAuthenticatedWallFloor,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
 enum SyncStep {
     #[serde(rename = "file_fsync")]
     File,
@@ -138,6 +149,7 @@ enum FailureOutcome {
 struct Exception {
     name: ExceptionName,
     description: String,
+    clock_requirement: ClockRequirement,
     mutation_class: MutationClass,
     linearization: LinearizationPrimitive,
     required_syncs: Vec<SyncStep>,
@@ -189,6 +201,7 @@ struct TransitionInvariant {
 }
 
 struct ExceptionInvariant {
+    clock_requirement: ClockRequirement,
     mutation_class: MutationClass,
     linearization: LinearizationPrimitive,
     required_syncs: &'static [SyncStep],
@@ -338,6 +351,14 @@ fn validate_spec(spec: &StateMachineSpec) -> Result<(), String> {
 
 fn validate_exception_invariant(exception: &Exception) -> Result<(), String> {
     let expected = exception.name.invariant();
+    if exception.clock_requirement != expected.clock_requirement {
+        return Err(format!(
+            "exception {} has clock requirement {}; expected {}",
+            exception.name.as_str(),
+            exception.clock_requirement.as_str(),
+            expected.clock_requirement.as_str()
+        ));
+    }
     if exception.mutation_class != expected.mutation_class {
         return Err(format!(
             "exception {} has mutation class {}; expected {}",
@@ -389,6 +410,15 @@ fn validate_exception_invariant(exception: &Exception) -> Result<(), String> {
 
 fn validate_transition_invariant(transition: &Transition) -> Result<(), String> {
     let expected = transition.operation.invariant();
+    let expected_clock_requirement = transition.operation.clock_requirement();
+    if transition.clock_requirement != expected_clock_requirement {
+        return Err(format!(
+            "transition {} has clock requirement {}; expected {}",
+            transition.operation.as_str(),
+            transition.clock_requirement.as_str(),
+            expected_clock_requirement.as_str()
+        ));
+    }
     let expected_linearization = transition.operation.linearization();
     if transition.linearization != expected_linearization {
         return Err(format!(
@@ -572,6 +602,24 @@ impl Operation {
             | Self::ReapExpiredToReady
             | Self::ReapExpiredToDead
             | Self::Quarantine => LinearizationPrimitive::RenameNoreplace,
+        }
+    }
+
+    fn clock_requirement(self) -> ClockRequirement {
+        match self {
+            Self::EnqueueImmediate
+            | Self::EnqueueDelayed
+            | Self::Promote
+            | Self::ExhaustedReadyCleanup
+            | Self::Acknowledge
+            | Self::RetryLater
+            | Self::Bury => ClockRequirement::AuthenticatedWallFloor,
+            Self::Claim | Self::Renew => ClockRequirement::BoottimeAndAuthenticatedWallFloor,
+            Self::RetryNow | Self::Quarantine => ClockRequirement::None,
+            Self::ReapExpiredToReady => ClockRequirement::LeaseExpirationEvidence,
+            Self::ReapExpiredToDead => {
+                ClockRequirement::LeaseExpirationEvidenceAndAuthenticatedWallFloor
+            }
         }
     }
 
@@ -829,6 +877,40 @@ impl ReasonClass {
     }
 }
 
+impl ClockRequirement {
+    const ALL: [Self; 5] = [
+        Self::None,
+        Self::AuthenticatedWallFloor,
+        Self::BoottimeAndAuthenticatedWallFloor,
+        Self::LeaseExpirationEvidence,
+        Self::LeaseExpirationEvidenceAndAuthenticatedWallFloor,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::AuthenticatedWallFloor => "authenticated_wall_floor",
+            Self::BoottimeAndAuthenticatedWallFloor => "boottime_and_authenticated_wall_floor",
+            Self::LeaseExpirationEvidence => "lease_expiration_evidence",
+            Self::LeaseExpirationEvidenceAndAuthenticatedWallFloor => {
+                "lease_expiration_evidence_and_authenticated_wall_floor"
+            }
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::AuthenticatedWallFloor => "AuthenticatedWallFloor",
+            Self::BoottimeAndAuthenticatedWallFloor => "BoottimeAndAuthenticatedWallFloor",
+            Self::LeaseExpirationEvidence => "LeaseExpirationEvidence",
+            Self::LeaseExpirationEvidenceAndAuthenticatedWallFloor => {
+                "LeaseExpirationEvidenceAndAuthenticatedWallFloor"
+            }
+        }
+    }
+}
+
 impl SyncStep {
     const ALL: [Self; 4] = [
         Self::File,
@@ -948,6 +1030,10 @@ impl ExceptionName {
 
     fn invariant(self) -> ExceptionInvariant {
         ExceptionInvariant {
+            clock_requirement: match self {
+                Self::ReceiptCompaction => ClockRequirement::None,
+                Self::WallWatermarkAdvancement => ClockRequirement::AuthenticatedWallFloor,
+            },
             mutation_class: MutationClass::ReplacingMove,
             linearization: LinearizationPrimitive::RenameReplace,
             required_syncs: &[SyncStep::File, SyncStep::SameOrDestinationDir],

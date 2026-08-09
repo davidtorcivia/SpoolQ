@@ -8,6 +8,7 @@
       "attempt_change": "zero",
       "token_change": "none",
       "reason_class": null,
+      "clock_requirement": "authenticated_wall_floor",
       "required_syncs": [
         "file_fsync",
         "destination_dir_fsync"
@@ -26,6 +27,7 @@
       "attempt_change": "zero",
       "token_change": "none",
       "reason_class": null,
+      "clock_requirement": "authenticated_wall_floor",
       "required_syncs": [
         "file_fsync",
         "destination_dir_fsync"
@@ -44,6 +46,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": null,
+      "clock_requirement": "authenticated_wall_floor",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -62,6 +65,7 @@
       "attempt_change": "increment",
       "token_change": "new",
       "reason_class": null,
+      "clock_requirement": "boottime_and_authenticated_wall_floor",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -80,6 +84,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": "attempts_exhausted",
+      "clock_requirement": "authenticated_wall_floor",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -98,6 +103,7 @@
       "attempt_change": "unchanged",
       "token_change": "same",
       "reason_class": null,
+      "clock_requirement": "boottime_and_authenticated_wall_floor",
       "required_syncs": [
         "same_or_destination_dir_fsync"
       ],
@@ -115,6 +121,7 @@
       "attempt_change": "unchanged",
       "token_change": "same",
       "reason_class": null,
+      "clock_requirement": "authenticated_wall_floor",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -133,6 +140,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": null,
+      "clock_requirement": "none",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -151,6 +159,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": null,
+      "clock_requirement": "authenticated_wall_floor",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -169,6 +178,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": "application_defined",
+      "clock_requirement": "authenticated_wall_floor",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -187,6 +197,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": null,
+      "clock_requirement": "lease_expiration_evidence",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -205,6 +216,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": "attempts_exhausted",
+      "clock_requirement": "lease_expiration_evidence_and_authenticated_wall_floor",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -223,6 +235,7 @@
       "attempt_change": "unchanged",
       "token_change": "none",
       "reason_class": "corruption",
+      "clock_requirement": "none",
       "required_syncs": [
         "destination_dir_fsync",
         "source_dir_fsync"
@@ -238,6 +251,7 @@
     {
       "name": "receipt_compaction",
       "description": "Terminal full-job receipt replaced by byte-deterministic compact receipt at same pathname",
+      "clock_requirement": "none",
       "mutation_class": "replacing_move",
       "linearization": "rename_replace",
       "required_syncs": [
@@ -250,6 +264,7 @@
     {
       "name": "wall_watermark_advancement",
       "description": "Monotone wall-watermark record replaced under exclusive OFD lock",
+      "clock_requirement": "authenticated_wall_floor",
       "mutation_class": "replacing_move",
       "linearization": "rename_replace",
       "required_syncs": [
