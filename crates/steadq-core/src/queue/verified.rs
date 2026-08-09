@@ -46,11 +46,38 @@ impl From<VerificationError> for Error {
 /// A job envelope that has passed full verification on its held fd.
 #[derive(Debug, Clone)]
 pub struct VerifiedJob {
-    pub header: FixedHeader,
-    pub extension: Vec<u8>,
+    header: FixedHeader,
+    extension: Vec<u8>,
+    device: u64,
+    inode: u64,
+    size: u64,
 }
 
-impl VerifiedJob {}
+impl VerifiedJob {
+    pub fn header(&self) -> &FixedHeader {
+        &self.header
+    }
+
+    pub fn extension(&self) -> &[u8] {
+        &self.extension
+    }
+
+    pub fn device(&self) -> u64 {
+        self.device
+    }
+
+    pub fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn identity_matches(&self, stat: &libc::stat) -> bool {
+        stat.st_dev == self.device && stat.st_ino == self.inode
+    }
+}
 
 /// Queue and path context required to authenticate a receipt.
 #[derive(Debug, Clone, Copy)]
@@ -278,8 +305,8 @@ pub(crate) fn verify_receipt_on_fd(
         name,
         bucket_number,
         kind,
-        device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
+        device: stat.st_dev,
+        inode: stat.st_ino,
     })
 }
 
@@ -295,9 +322,13 @@ pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationE
             "envelope digest mismatch".into(),
         ));
     }
+    let stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
     Ok(VerifiedJob {
         header,
         extension: ext,
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        size: stat.st_size as u64,
     })
 }
 
@@ -312,9 +343,13 @@ pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, Verifica
         ));
     }
     verify_size(fd, &header, ext.len())?;
+    let stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
     Ok(VerifiedJob {
         header,
         extension: ext,
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        size: stat.st_size as u64,
     })
 }
 
@@ -512,6 +547,51 @@ mod tests {
         // flip a byte in envelope digest to make invalid
         h.envelope_digest = [0xFF; 32];
         assert!(!is_envelope_digest_valid(&h, &ext));
+    }
+
+    #[test]
+    fn verified_job_retains_identity_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("job.sqj")).unwrap();
+        let header = FixedHeader {
+            format_minor: 1,
+            extension_header_length: 0,
+            payload_length: 4,
+            flags: 0,
+            digest_algorithm: 1,
+            job_id: [0; 16],
+            maximum_attempts: 1,
+            created_at_unix_ns: 0,
+            payload_digest: steadq_format::payload_digest(b"test"),
+            envelope_digest: [0; 32],
+        };
+        let ext = vec![];
+        let digest = steadq_format::envelope_digest(&header, &ext).unwrap();
+        let header = FixedHeader {
+            envelope_digest: digest,
+            ..header
+        };
+        let buf = header.encode(&ext).unwrap();
+        use std::os::unix::fs::FileExt;
+        file.write_at(&buf, 0).unwrap();
+        file.write_at(b"test", 128).unwrap();
+        drop(file);
+
+        let fd = std::fs::File::open(dir.path().join("job.sqj")).unwrap();
+        let verified = verify_job_on_fd(fd.as_fd()).unwrap();
+        let stat = fs::fstat(fd.as_fd()).unwrap();
+        assert_eq!(verified.device(), stat.st_dev);
+        assert_eq!(verified.inode(), stat.st_ino);
+        assert_eq!(verified.size(), stat.st_size as u64);
+        assert!(verified.identity_matches(&stat));
+
+        // Mutated identity (wrong inode) must not match.
+        let mut wrong = stat;
+        wrong.st_ino = wrong.st_ino.wrapping_add(1);
+        assert!(!verified.identity_matches(&wrong));
+
+        // Extension accessor returns the verified bytes.
+        assert!(verified.extension().is_empty());
     }
 
     #[test]

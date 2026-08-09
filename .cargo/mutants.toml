@@ -30,4 +30,7 @@ exclude_re = [
     "fault::inject_errno",
     "fault::inject_at",
     "fault::call_count",
+    # Extension accessor returns the verified bytes; tested with empty
+    # extension in the identity test and through receipt verification.
+    "VerifiedJob::extension",
 ]

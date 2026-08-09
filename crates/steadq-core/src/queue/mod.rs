@@ -2859,7 +2859,7 @@ impl Queue {
         expected_maximum_attempts: u32,
     ) -> Result<TicketEvidence, Error> {
         let verified = verified::verify_envelope_on_fd(file_fd).map_err(Error::from)?;
-        let header = verified.header;
+        let header = verified.header();
         if &header.job_id != expected_job_id {
             return Err(Error::QueueCorrupt("header job_id mismatch".into()));
         }
@@ -3386,7 +3386,7 @@ impl Queue {
         let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let verified = self.verify_envelope_on_fd(file_fd.as_fd())?;
-        let header = verified.header;
+        let header = verified.header();
 
         // R4-H06: Check queue-configured payload limit
         if header.payload_length > self.format.max_payload_length() {
@@ -3510,7 +3510,7 @@ impl Queue {
             )));
         }
 
-        Ok(header)
+        Ok(header.clone())
     }
 
     /// C-23: Bounded duplicate-ack check.
@@ -3899,7 +3899,7 @@ impl Queue {
                 | verified::VerificationError::PayloadCorrupt,
             ) => return ResolveObj::Conflict,
         };
-        let header = verified.header;
+        let header = verified.header();
 
         // R4-B07: Verify header job_id matches the ticket.
         if header.job_id != ticket.job_id() {
