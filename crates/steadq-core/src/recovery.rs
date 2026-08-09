@@ -2726,23 +2726,33 @@ impl Queue {
                     };
 
                     let compact_bytes = compact.encode();
+                    let receipt_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
+
+                    stats.operations_attempted += 1;
+                    let random = match steadq_fs_linux::random_128bit() {
+                        Ok(random) => random,
+                        Err(error) => {
+                            Self::record_error(
+                                stats,
+                                "receipt_compact_temp_name_not_committed",
+                                &receipt_path,
+                                &format!("phase=TempName: {error}"),
+                            );
+                            continue;
+                        }
+                    };
 
                     // Write to a temp file in the same directory
                     let tmp_name = format!(
                         ".compact-{}.tmp",
-                        match steadq_fs_linux::random_128bit() {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        }
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
+                        random
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
                     );
 
-                    let receipt_path = format!("receipts/{bucket_name}/{shard_name}/{entry}");
                     let temp_path = format!("receipts/{bucket_name}/{shard_name}/{tmp_name}");
 
-                    stats.operations_attempted += 1;
                     let tmp_fd = match fs::create_exclusive(shard_fd.as_raw_fd(), &tmp_name, 0o600)
                     {
                         Ok(fd) => fd,
@@ -6649,6 +6659,14 @@ mod tests {
     #[test]
     fn recovery_compaction_fault_matrix_preserves_receipt_and_replays() {
         for (fault, count, errno, expected_operation, expected_phase, replaced) in [
+            (
+                "get_random",
+                1,
+                libc::EIO,
+                "receipt_compact_temp_name_not_committed",
+                "phase=TempName",
+                false,
+            ),
             (
                 "openat",
                 2,
