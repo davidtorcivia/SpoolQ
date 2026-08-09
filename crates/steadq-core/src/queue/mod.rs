@@ -163,7 +163,18 @@ impl FourLevelCursor {
 }
 
 /// Persisted progress for canonical, restartable recovery phases.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RecoveryPhase {
     #[default]
@@ -172,6 +183,36 @@ pub(crate) enum RecoveryPhase {
     CleanupTemp,
     CompactReceipts,
     DeleteReceipts,
+}
+
+/// The directory operation that must succeed before a retry is resolved.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryHierarchyRetryKind {
+    #[default]
+    Open,
+    Enumerate,
+}
+
+/// A hierarchy directory that must be retried independently of the main cursor.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryHierarchyRetry {
+    pub(crate) phase: RecoveryPhase,
+    #[serde(default)]
+    pub(crate) kind: RecoveryHierarchyRetryKind,
+    pub(crate) components: Vec<String>,
 }
 
 /// Persisted progress for canonical, restartable recovery phases.
@@ -184,6 +225,12 @@ pub(crate) struct RecoveryCursor {
     pub(crate) cleanup_temp: Option<ThreeLevelCursor>,
     pub(crate) compact_receipts: Option<ThreeLevelCursor>,
     pub(crate) delete_receipts: Option<ThreeLevelCursor>,
+    #[serde(default)]
+    pub(crate) hierarchy_retries: Vec<RecoveryHierarchyRetry>,
+    #[serde(default)]
+    pub(crate) hierarchy_retry_frontiers: Vec<RecoveryHierarchyRetry>,
+    #[serde(default)]
+    pub(crate) hierarchy_retry_overflow: Vec<RecoveryPhase>,
 }
 
 pub struct Queue {

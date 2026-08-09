@@ -9,8 +9,8 @@ use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
 use crate::queue::{
-    open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryPhase, ThreeLevelCursor,
-    WallFloor,
+    open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryHierarchyRetry,
+    RecoveryHierarchyRetryKind, RecoveryPhase, ThreeLevelCursor, WallFloor,
 };
 
 const RECOVERY_CURSOR_SCHEMA: &str = "steadq-recovery-cursor";
@@ -23,6 +23,7 @@ const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTES: usize = MAX_RECOVERY_DIRECTORY_ENTRIES * 255;
 const MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_ENTRIES as u64 + 1;
 const MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE: u64 = MAX_RECOVERY_DIRECTORY_NAME_BYTES as u64 + 255;
+const MAX_RECOVERY_HIERARCHY_RETRIES: usize = 64;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,6 +96,13 @@ enum RecoveryDirectoryError {
     Io(io::Error),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RememberHierarchyRetry {
+    Exact,
+    Overflow,
+    Invalid,
+}
+
 fn raw_name_for_error(name: &fs::DirEntryName) -> String {
     format!("{name:?}")
 }
@@ -109,6 +117,43 @@ fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
         [&scan.first, &scan.second, &scan.third, &scan.resume_after]
             .into_iter()
             .all(|component| cursor_component_is_valid(component))
+    };
+
+    let retry_depth_is_valid = |retry: &RecoveryHierarchyRetry| {
+        let allowed_depth = match retry.phase {
+            RecoveryPhase::ReapLeases => 1..=3,
+            RecoveryPhase::PromoteDelayed
+            | RecoveryPhase::CleanupTemp
+            | RecoveryPhase::CompactReceipts
+            | RecoveryPhase::DeleteReceipts => 1..=2,
+        };
+        if !allowed_depth.contains(&retry.components.len()) {
+            return false;
+        }
+        retry
+            .components
+            .iter()
+            .enumerate()
+            .all(|(index, component)| match retry.phase {
+                RecoveryPhase::ReapLeases => match index {
+                    0 => steadq_names::boot_id_bytes(component).is_some(),
+                    1 => steadq_names::bucket_from_hex(component).is_some(),
+                    2 => steadq_names::shard_from_hex(component).is_some(),
+                    _ => false,
+                },
+                RecoveryPhase::CleanupTemp => match index {
+                    0 => steadq_names::boot_id_bytes(component).is_some(),
+                    1 => steadq_names::shard_from_hex(component).is_some(),
+                    _ => false,
+                },
+                RecoveryPhase::PromoteDelayed
+                | RecoveryPhase::CompactReceipts
+                | RecoveryPhase::DeleteReceipts => match index {
+                    0 => steadq_names::bucket_from_hex(component).is_some(),
+                    1 => steadq_names::shard_from_hex(component).is_some(),
+                    _ => false,
+                },
+            })
     };
 
     cursor.reap_leases.as_ref().is_none_or(four_level_is_valid)
@@ -128,6 +173,25 @@ fn cursor_is_valid(cursor: &RecoveryCursor) -> bool {
             .delete_receipts
             .as_ref()
             .is_none_or(three_level_is_valid)
+        && cursor.hierarchy_retries.len() <= MAX_RECOVERY_HIERARCHY_RETRIES
+        && cursor.hierarchy_retries.iter().all(retry_depth_is_valid)
+        && cursor
+            .hierarchy_retries
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        && cursor.hierarchy_retry_frontiers.len() <= 5
+        && cursor
+            .hierarchy_retry_frontiers
+            .iter()
+            .all(retry_depth_is_valid)
+        && cursor
+            .hierarchy_retry_frontiers
+            .windows(2)
+            .all(|pair| pair[0].phase < pair[1].phase)
+        && cursor
+            .hierarchy_retry_overflow
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
 }
 
 fn cursor_file_metadata_is_valid(mode: libc::mode_t, link_count: libc::nlink_t) -> bool {
@@ -217,6 +281,8 @@ pub(crate) fn load_recovery_cursor(
 /// Recovery work budget.
 #[derive(Clone, Debug)]
 pub struct WorkBudget {
+    /// Maximum state-changing filesystem operations attempted after an entry
+    /// has passed syntax, eligibility, locking, and identity checks.
     pub max_operations: u32,
     pub max_duration_ms: u64,
 }
@@ -259,6 +325,7 @@ impl Default for RecoveryScanBudget {
 /// Recovery statistics.
 #[derive(Clone, Debug, Default)]
 pub struct RecoveryStats {
+    /// State-changing filesystem operations attempted after classification.
     pub operations_attempted: u32,
     pub temp_files_deleted: u32,
     pub delayed_promoted: u32,
@@ -619,24 +686,300 @@ impl Queue {
         stats.phase_blocked = true;
     }
 
-    fn stop_for_directory_error(
+    fn record_directory_error(
         stats: &mut RecoveryStats,
         op: &str,
         path: &str,
         error: &RecoveryDirectoryError,
-    ) {
+    ) -> bool {
         match error {
-            RecoveryDirectoryError::BudgetExhausted => stats.budget_exhausted = true,
-            RecoveryDirectoryError::Clock(error) => Self::block_phase(
-                stats,
-                "clock_monotonic",
-                path,
-                &format!("directory budget clock unavailable during {op}: {error}"),
-            ),
+            RecoveryDirectoryError::BudgetExhausted => {
+                stats.budget_exhausted = true;
+                true
+            }
+            RecoveryDirectoryError::Clock(error) => {
+                Self::block_phase(
+                    stats,
+                    "clock_monotonic",
+                    path,
+                    &format!("directory budget clock unavailable during {op}: {error}"),
+                );
+                stats.budget_exhausted = true;
+                true
+            }
             RecoveryDirectoryError::Io(error) => {
                 Self::block_phase(stats, op, path, &error.to_string());
+                false
             }
         }
+    }
+
+    fn remember_hierarchy_retry(
+        &mut self,
+        phase: RecoveryPhase,
+        kind: RecoveryHierarchyRetryKind,
+        components: &[&[u8]],
+    ) -> RememberHierarchyRetry {
+        let Some(components) = components
+            .iter()
+            .map(|component| std::str::from_utf8(component).ok().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return RememberHierarchyRetry::Invalid;
+        };
+        let retry = RecoveryHierarchyRetry {
+            phase,
+            kind,
+            components,
+        };
+        match self.recovery_cursor.hierarchy_retries.binary_search(&retry) {
+            Ok(_) => RememberHierarchyRetry::Exact,
+            Err(index)
+                if self.recovery_cursor.hierarchy_retries.len()
+                    < MAX_RECOVERY_HIERARCHY_RETRIES =>
+            {
+                self.recovery_cursor.hierarchy_retries.insert(index, retry);
+                RememberHierarchyRetry::Exact
+            }
+            Err(_) => {
+                if let Err(index) = self
+                    .recovery_cursor
+                    .hierarchy_retry_overflow
+                    .binary_search(&phase)
+                {
+                    self.recovery_cursor
+                        .hierarchy_retry_overflow
+                        .insert(index, phase);
+                }
+                RememberHierarchyRetry::Overflow
+            }
+        }
+    }
+
+    fn remember_hierarchy_retry_or_block(
+        &mut self,
+        phase: RecoveryPhase,
+        kind: RecoveryHierarchyRetryKind,
+        components: &[&[u8]],
+        stats: &mut RecoveryStats,
+        path: &str,
+    ) -> bool {
+        match self.remember_hierarchy_retry(phase, kind, components) {
+            RememberHierarchyRetry::Exact => true,
+            RememberHierarchyRetry::Overflow => {
+                Self::block_phase(
+                    stats,
+                    "hierarchy_retry_overflow",
+                    path,
+                    "recovery hierarchy retry ledger is full; phase will be fully rescanned",
+                );
+                true
+            }
+            RememberHierarchyRetry::Invalid => {
+                Self::block_phase(
+                    stats,
+                    "hierarchy_retry_invalid",
+                    path,
+                    "recovery hierarchy retry path is not canonical UTF-8",
+                );
+                false
+            }
+        }
+    }
+
+    fn clear_phase_cursor(&mut self, phase: RecoveryPhase) {
+        match phase {
+            RecoveryPhase::ReapLeases => self.recovery_cursor.reap_leases = None,
+            RecoveryPhase::PromoteDelayed => self.recovery_cursor.promote_delayed = None,
+            RecoveryPhase::CleanupTemp => self.recovery_cursor.cleanup_temp = None,
+            RecoveryPhase::CompactReceipts => self.recovery_cursor.compact_receipts = None,
+            RecoveryPhase::DeleteReceipts => self.recovery_cursor.delete_receipts = None,
+        }
+    }
+
+    fn prepare_hierarchy_retry_phase(
+        &mut self,
+        phase: RecoveryPhase,
+    ) -> Option<RecoveryHierarchyRetry> {
+        if let Ok(index) = self
+            .recovery_cursor
+            .hierarchy_retry_overflow
+            .binary_search(&phase)
+        {
+            self.recovery_cursor.hierarchy_retry_overflow.remove(index);
+            self.clear_phase_cursor(phase);
+        }
+        self.next_hierarchy_retry(phase)
+    }
+
+    fn next_hierarchy_retry(&self, phase: RecoveryPhase) -> Option<RecoveryHierarchyRetry> {
+        let retries = self
+            .recovery_cursor
+            .hierarchy_retries
+            .iter()
+            .filter(|retry| retry.phase == phase)
+            .collect::<Vec<_>>();
+        let first = (*retries.first()?).clone();
+        let Some(frontier) = self
+            .recovery_cursor
+            .hierarchy_retry_frontiers
+            .iter()
+            .find(|frontier| frontier.phase == phase)
+        else {
+            return Some(first);
+        };
+        retries
+            .into_iter()
+            .find(|retry| *retry > frontier)
+            .cloned()
+            .or(Some(first))
+    }
+
+    fn advance_hierarchy_retry_frontier(&mut self, retry: RecoveryHierarchyRetry) {
+        match self
+            .recovery_cursor
+            .hierarchy_retry_frontiers
+            .binary_search_by_key(&retry.phase, |frontier| frontier.phase)
+        {
+            Ok(index) => self.recovery_cursor.hierarchy_retry_frontiers[index] = retry,
+            Err(index) => self
+                .recovery_cursor
+                .hierarchy_retry_frontiers
+                .insert(index, retry),
+        }
+    }
+
+    fn retry_one_hierarchy_directory(
+        &mut self,
+        phase: RecoveryPhase,
+        retry: Option<RecoveryHierarchyRetry>,
+        phase_root_fd: std::os::unix::io::RawFd,
+        scan: &mut RecoveryScanContext<'_>,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) -> bool {
+        let Some(retry) = retry else {
+            self.recovery_cursor
+                .hierarchy_retry_frontiers
+                .retain(|frontier| frontier.phase != phase);
+            return false;
+        };
+        match Self::budget_time_exceeded(deadline_mono) {
+            Ok(true) => {
+                stats.budget_exhausted = true;
+                return true;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                Self::block_phase(
+                    stats,
+                    "clock_monotonic",
+                    "/",
+                    &format!("recovery retry budget clock unavailable: {error}"),
+                );
+                stats.budget_exhausted = true;
+                return true;
+            }
+        }
+        let mut current = None::<OwnedFd>;
+        let mut failure = None;
+        let mut absent = false;
+        for component in &retry.components {
+            match Self::budget_time_exceeded(deadline_mono) {
+                Ok(true) => {
+                    stats.budget_exhausted = true;
+                    return true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    Self::block_phase(
+                        stats,
+                        "clock_monotonic",
+                        "/",
+                        &format!("recovery retry budget clock unavailable: {error}"),
+                    );
+                    stats.budget_exhausted = true;
+                    return true;
+                }
+            }
+            let parent_fd = current
+                .as_ref()
+                .map_or(phase_root_fd, std::os::fd::AsRawFd::as_raw_fd);
+            match fs::open_directory(parent_fd, component) {
+                Ok(directory) => current = Some(directory),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    absent = true;
+                    break;
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            stats.scan_skips += 1;
+            Self::block_phase(
+                stats,
+                "hierarchy_retry_open",
+                &retry
+                    .components
+                    .iter()
+                    .map(|component| steadq_names::hex_encode(component.as_bytes()))
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                &error.to_string(),
+            );
+            self.advance_hierarchy_retry_frontier(retry);
+            return false;
+        }
+
+        if !absent && retry.kind == RecoveryHierarchyRetryKind::Enumerate {
+            let directory = current
+                .as_ref()
+                .expect("validated retry paths contain at least one component");
+            if let Err(error) = read_recovery_directory(
+                directory.as_raw_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
+                if Self::record_directory_error(
+                    stats,
+                    "hierarchy_retry_read",
+                    &retry
+                        .components
+                        .iter()
+                        .map(|component| steadq_names::hex_encode(component.as_bytes()))
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    &error,
+                ) {
+                    return true;
+                }
+                stats.scan_skips += 1;
+                self.advance_hierarchy_retry_frontier(retry);
+                return false;
+            }
+        }
+
+        self.recovery_cursor
+            .hierarchy_retries
+            .retain(|candidate| candidate != &retry);
+        self.clear_phase_cursor(phase);
+        if self
+            .recovery_cursor
+            .hierarchy_retries
+            .iter()
+            .any(|candidate| candidate.phase == phase)
+        {
+            self.advance_hierarchy_retry_frontier(retry);
+        } else {
+            self.recovery_cursor
+                .hierarchy_retry_frontiers
+                .retain(|frontier| frontier.phase != phase);
+        }
+        false
     }
 
     fn reap_expired_leases(
@@ -667,11 +1010,12 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(e) => {
-                Self::stop_for_directory_error(stats, "read_leased_dirs", "leased", &e);
+                Self::record_directory_error(stats, "read_leased_dirs", "leased", &e);
                 return;
             }
         };
         boot_dirs.sort();
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::ReapLeases);
 
         for boot_dir_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.reap_leases {
@@ -709,7 +1053,16 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "reap_boot_open", boot_dir_name, &error.to_string());
-                    return;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::ReapLeases,
+                        RecoveryHierarchyRetryKind::Open,
+                        &[boot_dir_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
 
@@ -722,13 +1075,24 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "reap_bucket_read",
                         boot_dir_name,
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::ReapLeases,
+                        RecoveryHierarchyRetryKind::Enumerate,
+                        &[boot_dir_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             bucket_dirs.sort();
@@ -792,7 +1156,16 @@ impl Queue {
                             &format!("leased/{boot_dir_name}/{bucket_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::ReapLeases,
+                            RecoveryHierarchyRetryKind::Open,
+                            &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
+                            stats,
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
 
@@ -805,13 +1178,24 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "reap_shard_read",
                             &format!("leased/{boot_dir_name}/{bucket_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::ReapLeases,
+                            RecoveryHierarchyRetryKind::Enumerate,
+                            &[boot_dir_entry.as_bytes(), bucket_entry.as_bytes()],
+                            stats,
+                            &format!("leased/{boot_dir_name}/{bucket_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 shard_dirs.sort();
@@ -862,7 +1246,20 @@ impl Queue {
                                 &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
                                 &error.to_string(),
                             );
-                            return;
+                            if !self.remember_hierarchy_retry_or_block(
+                                RecoveryPhase::ReapLeases,
+                                RecoveryHierarchyRetryKind::Open,
+                                &[
+                                    boot_dir_entry.as_bytes(),
+                                    bucket_entry.as_bytes(),
+                                    shard_entry.as_bytes(),
+                                ],
+                                stats,
+                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                            ) {
+                                return;
+                            }
+                            continue;
                         }
                     };
 
@@ -875,13 +1272,28 @@ impl Queue {
                         Ok(e) => e,
                         Err(error) => {
                             stats.scan_skips += 1;
-                            Self::stop_for_directory_error(
+                            if Self::record_directory_error(
                                 stats,
                                 "reap_entry_read",
                                 &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
                                 &error,
-                            );
-                            return;
+                            ) {
+                                return;
+                            }
+                            if !self.remember_hierarchy_retry_or_block(
+                                RecoveryPhase::ReapLeases,
+                                RecoveryHierarchyRetryKind::Enumerate,
+                                &[
+                                    boot_dir_entry.as_bytes(),
+                                    bucket_entry.as_bytes(),
+                                    shard_entry.as_bytes(),
+                                ],
+                                stats,
+                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                            ) {
+                                return;
+                            }
+                            continue;
                         }
                     };
                     entries.sort();
@@ -926,8 +1338,6 @@ impl Queue {
                         if !entry.ends_with(".sqj") {
                             continue;
                         }
-
-                        stats.operations_attempted += 1;
 
                         // Parse the leased filename to get deadline and attempt info
                         let parsed = match steadq_names::parse_leased(entry) {
@@ -1038,6 +1448,7 @@ impl Queue {
                                 continue;
                             };
                             // Move to dead
+                            stats.operations_attempted += 1;
                             if self
                                 .reap_to_dead(
                                     boot_dir_name,
@@ -1054,6 +1465,7 @@ impl Queue {
                             }
                         } else {
                             // Move to ready
+                            stats.operations_attempted += 1;
                             if self
                                 .reap_to_ready(
                                     boot_dir_name,
@@ -1070,6 +1482,16 @@ impl Queue {
                     }
                 }
             }
+        }
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::ReapLeases,
+            hierarchy_retry,
+            leased_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
         }
         self.recovery_cursor.reap_leases = None;
     }
@@ -1191,11 +1613,12 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "promote_bucket_read", "delayed", &error);
+                Self::record_directory_error(stats, "promote_bucket_read", "delayed", &error);
                 return;
             }
         };
         bucket_dirs.sort();
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::PromoteDelayed);
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -1256,7 +1679,16 @@ impl Queue {
                         &format!("delayed/{bucket_name}"),
                         &error.to_string(),
                     );
-                    return;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::PromoteDelayed,
+                        RecoveryHierarchyRetryKind::Open,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("delayed/{bucket_name}"),
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
 
@@ -1269,13 +1701,24 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "promote_shard_read",
                         &format!("delayed/{bucket_name}"),
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::PromoteDelayed,
+                        RecoveryHierarchyRetryKind::Enumerate,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("delayed/{bucket_name}"),
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -1319,13 +1762,23 @@ impl Queue {
                 let shard_fd = match fs::open_directory(bucket_fd.as_raw_fd(), shard_name) {
                     Ok(fd) => fd,
                     Err(error) => {
+                        stats.scan_skips += 1;
                         Self::block_phase(
                             stats,
                             "promote_shard_open",
                             &format!("{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::PromoteDelayed,
+                            RecoveryHierarchyRetryKind::Open,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("delayed/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
 
@@ -1338,13 +1791,24 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "promote_entry_read",
                             &format!("delayed/{bucket_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::PromoteDelayed,
+                            RecoveryHierarchyRetryKind::Enumerate,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("delayed/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -1383,8 +1847,6 @@ impl Queue {
                     if !entry.ends_with(".sqj") {
                         continue;
                     }
-
-                    stats.operations_attempted += 1;
 
                     let parsed = match steadq_names::parse_delayed(entry) {
                         Ok(p) => p,
@@ -1448,6 +1910,7 @@ impl Queue {
                         Err(_) => continue,
                     };
 
+                    stats.operations_attempted += 1;
                     if fs::renameat2_noreplace(
                         src_fd.as_raw_fd(),
                         entry,
@@ -1476,6 +1939,16 @@ impl Queue {
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::PromoteDelayed,
+            hierarchy_retry,
+            delayed_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.promote_delayed = None;
     }
 
@@ -1504,11 +1977,12 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "temp_boot_read", "tmp", &error);
+                Self::record_directory_error(stats, "temp_boot_read", "tmp", &error);
                 return;
             }
         };
         boot_dirs.sort();
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::CleanupTemp);
 
         for boot_entry in &boot_dirs {
             if let Some(cursor) = &self.recovery_cursor.cleanup_temp {
@@ -1546,7 +2020,16 @@ impl Queue {
                 Err(error) => {
                     stats.scan_skips += 1;
                     Self::block_phase(stats, "temp_boot_open", boot_dir_name, &error.to_string());
-                    return;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CleanupTemp,
+                        RecoveryHierarchyRetryKind::Open,
+                        &[boot_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
 
@@ -1559,8 +2042,20 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(stats, "temp_shard_read", boot_dir_name, &error);
-                    return;
+                    if Self::record_directory_error(stats, "temp_shard_read", boot_dir_name, &error)
+                    {
+                        return;
+                    }
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CleanupTemp,
+                        RecoveryHierarchyRetryKind::Enumerate,
+                        &[boot_entry.as_bytes()],
+                        stats,
+                        boot_dir_name,
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -1610,7 +2105,16 @@ impl Queue {
                             &format!("tmp/{boot_dir_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CleanupTemp,
+                            RecoveryHierarchyRetryKind::Open,
+                            &[boot_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("tmp/{boot_dir_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
 
@@ -1623,13 +2127,24 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "temp_entry_read",
                             &format!("tmp/{boot_dir_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CleanupTemp,
+                            RecoveryHierarchyRetryKind::Enumerate,
+                            &[boot_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("tmp/{boot_dir_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -1668,8 +2183,6 @@ impl Queue {
                         continue;
                     }
 
-                    stats.operations_attempted += 1;
-
                     let should_delete = if !is_current_boot {
                         true
                     } else if let Ok(parsed) = steadq_names::parse_temp(entry) {
@@ -1679,11 +2192,24 @@ impl Queue {
                         false
                     };
 
-                    if should_delete && fs::unlinkat(shard_fd.as_raw_fd(), entry).is_ok() {
-                        stats.temp_files_deleted += 1;
+                    if should_delete {
+                        stats.operations_attempted += 1;
+                        if fs::unlinkat(shard_fd.as_raw_fd(), entry).is_ok() {
+                            stats.temp_files_deleted += 1;
+                        }
                     }
                 }
             }
+        }
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::CleanupTemp,
+            hierarchy_retry,
+            tmp_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
         }
         self.recovery_cursor.cleanup_temp = None;
     }
@@ -1735,11 +2261,12 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "compact_bucket_read", "receipts", &error);
+                Self::record_directory_error(stats, "compact_bucket_read", "receipts", &error);
                 return;
             }
         };
         bucket_dirs.sort();
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::CompactReceipts);
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -1782,7 +2309,16 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
-                    return;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CompactReceipts,
+                        RecoveryHierarchyRetryKind::Open,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
 
@@ -1795,13 +2331,24 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "compact_shard_read",
                         &format!("receipts/{bucket_name}"),
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::CompactReceipts,
+                        RecoveryHierarchyRetryKind::Enumerate,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -1852,7 +2399,16 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CompactReceipts,
+                            RecoveryHierarchyRetryKind::Open,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
 
@@ -1865,13 +2421,24 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "compact_entry_read",
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::CompactReceipts,
+                            RecoveryHierarchyRetryKind::Enumerate,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -1910,8 +2477,6 @@ impl Queue {
                     if !entry.ends_with(".rct") {
                         continue;
                     }
-
-                    stats.operations_attempted += 1;
 
                     // C-35: Open with write-capable mode for OFD write lock
                     let receipt_fd = match fs::openat(
@@ -1994,6 +2559,7 @@ impl Queue {
                         .collect::<String>()
                     );
 
+                    stats.operations_attempted += 1;
                     let tmp_fd = match fs::create_exclusive(shard_fd.as_raw_fd(), &tmp_name, 0o600)
                     {
                         Ok(fd) => fd,
@@ -2043,6 +2609,16 @@ impl Queue {
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            hierarchy_retry,
+            receipts_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.compact_receipts = None;
     }
 
@@ -2075,11 +2651,12 @@ impl Queue {
         ) {
             Ok(e) => e,
             Err(error) => {
-                Self::stop_for_directory_error(stats, "delete_bucket_read", "receipts", &error);
+                Self::record_directory_error(stats, "delete_bucket_read", "receipts", &error);
                 return;
             }
         };
         bucket_dirs.sort();
+        let hierarchy_retry = self.prepare_hierarchy_retry_phase(RecoveryPhase::DeleteReceipts);
 
         for bucket_entry in &bucket_dirs {
             // R4-RES: Skip buckets already processed in a prior pass.
@@ -2145,7 +2722,16 @@ impl Queue {
                         &format!("receipts/{bucket_name}"),
                         &error.to_string(),
                     );
-                    return;
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::DeleteReceipts,
+                        RecoveryHierarchyRetryKind::Open,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
 
@@ -2158,13 +2744,24 @@ impl Queue {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::stop_for_directory_error(
+                    if Self::record_directory_error(
                         stats,
                         "delete_shard_read",
                         &format!("receipts/{bucket_name}"),
                         &error,
-                    );
-                    return;
+                    ) {
+                        return;
+                    }
+                    if !self.remember_hierarchy_retry_or_block(
+                        RecoveryPhase::DeleteReceipts,
+                        RecoveryHierarchyRetryKind::Enumerate,
+                        &[bucket_entry.as_bytes()],
+                        stats,
+                        &format!("receipts/{bucket_name}"),
+                    ) {
+                        return;
+                    }
+                    continue;
                 }
             };
             shard_dirs.sort();
@@ -2215,7 +2812,16 @@ impl Queue {
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error.to_string(),
                         );
-                        return;
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::DeleteReceipts,
+                            RecoveryHierarchyRetryKind::Open,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
 
@@ -2228,13 +2834,24 @@ impl Queue {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::stop_for_directory_error(
+                        if Self::record_directory_error(
                             stats,
                             "delete_entry_read",
                             &format!("receipts/{bucket_name}/{shard_name}"),
                             &error,
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        if !self.remember_hierarchy_retry_or_block(
+                            RecoveryPhase::DeleteReceipts,
+                            RecoveryHierarchyRetryKind::Enumerate,
+                            &[bucket_entry.as_bytes(), shard_entry.as_bytes()],
+                            stats,
+                            &format!("receipts/{bucket_name}/{shard_name}"),
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 entries.sort();
@@ -2273,8 +2890,6 @@ impl Queue {
                     if !entry.ends_with(".rct") {
                         continue;
                     }
-                    stats.operations_attempted += 1;
-
                     // R4-H08: Validate the receipt filename before operating.
                     if steadq_names::parse_receipt(entry).is_err() {
                         Self::record_error(
@@ -2343,6 +2958,7 @@ impl Queue {
                         continue;
                     }
 
+                    stats.operations_attempted += 1;
                     if fs::unlinkat(shard_fd.as_raw_fd(), entry).is_ok() {
                         // P1-11: Only count as durable success after fsync.
                         if fs::fsync_dir_fd(shard_fd.as_raw_fd()).is_ok() {
@@ -2379,6 +2995,16 @@ impl Queue {
         }
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
+        if self.retry_one_hierarchy_directory(
+            RecoveryPhase::DeleteReceipts,
+            hierarchy_retry,
+            receipts_fd.as_raw_fd(),
+            scan,
+            stats,
+            deadline_mono,
+        ) {
+            return;
+        }
         self.recovery_cursor.delete_receipts = None;
     }
 }
@@ -2456,6 +3082,37 @@ mod tests {
         };
         assert!(matches!(queue.ack(&lease), AckOutcome::Acked));
         lease
+    }
+
+    fn reap_expired_with_budget(queue: &mut Queue, budget: &WorkBudget) -> RecoveryStats {
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.reap_expired_leases(
+            u64::MAX,
+            Some(queue.authenticated_wall_floor().unwrap()),
+            budget,
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+        stats
+    }
+
+    fn retry_next_hierarchy_directory(
+        queue: &mut Queue,
+        phase: RecoveryPhase,
+        phase_root_fd: std::os::unix::io::RawFd,
+        scan: &mut RecoveryScanContext<'_>,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) -> bool {
+        let retry = queue.next_hierarchy_retry(phase);
+        queue.retry_one_hierarchy_directory(phase, retry, phase_root_fd, scan, stats, deadline_mono)
     }
 
     fn valid_cursor_record(queue: &Queue) -> RecoveryCursorRecord {
@@ -2576,36 +3233,37 @@ mod tests {
         assert_eq!(stats.errors[1].error, "blocked-error");
 
         let mut timed_out = RecoveryStats::default();
-        Queue::stop_for_directory_error(
+        assert!(Queue::record_directory_error(
             &mut timed_out,
             "read",
             "directory",
             &RecoveryDirectoryError::BudgetExhausted,
-        );
+        ));
         assert!(timed_out.budget_exhausted);
         assert!(!timed_out.phase_blocked);
         assert!(timed_out.errors.is_empty());
 
         let mut io_failed = RecoveryStats::default();
-        Queue::stop_for_directory_error(
+        assert!(!Queue::record_directory_error(
             &mut io_failed,
             "read",
             "directory",
             &RecoveryDirectoryError::Io(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
-        );
+        ));
         assert!(!io_failed.budget_exhausted);
         assert!(io_failed.phase_blocked);
         assert_eq!(io_failed.errors.len(), 1);
         assert_eq!(io_failed.errors[0].operation, "read");
 
         let mut clock_failed = RecoveryStats::default();
-        Queue::stop_for_directory_error(
+        assert!(Queue::record_directory_error(
             &mut clock_failed,
             "read",
             "directory",
             &RecoveryDirectoryError::Clock(io::Error::from_raw_os_error(libc::EIO)),
-        );
-        assert!(!clock_failed.budget_exhausted);
+        ));
+        assert!(clock_failed.budget_exhausted);
+        assert!(!Queue::has_recovery_budget(&clock_failed));
         assert!(clock_failed.phase_blocked);
         assert_eq!(clock_failed.errors.len(), 1);
         assert_eq!(clock_failed.errors[0].operation, "clock_monotonic");
@@ -2614,9 +3272,7 @@ mod tests {
     #[test]
     fn recovery_phase_progress_prevents_early_phase_starvation_after_reopen() {
         let (tmp, mut queue) = create_test_queue();
-        let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
-        std::fs::create_dir_all(&receipt_dir).unwrap();
-        std::fs::write(receipt_dir.join("invalid.rct"), b"invalid").unwrap();
+        enqueue_and_ack(&mut queue);
 
         let budget = WorkBudget {
             max_operations: 1,
@@ -2644,14 +3300,10 @@ mod tests {
 
         let second = reopened.recover(&budget);
         assert_eq!(
-            second.operations_attempted, 1,
+            second.operations_attempted, 0,
             "errors: {:?}",
             second.errors
         );
-        assert!(second
-            .errors
-            .iter()
-            .any(|error| error.operation == "receipt_delete_parse"));
         assert_eq!(reopened.recovery_cursor.phase, RecoveryPhase::ReapLeases);
     }
 
@@ -2666,10 +3318,11 @@ mod tests {
             },
         )
         .unwrap();
-        let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
-        std::fs::create_dir_all(&receipt_dir).unwrap();
-        std::fs::write(receipt_dir.join("a.rct"), b"invalid a").unwrap();
-        std::fs::write(receipt_dir.join("b.rct"), b"invalid b").unwrap();
+        enqueue_and_ack(&mut first);
+        enqueue_and_ack(&mut first);
+        let mut receipts = Vec::new();
+        find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
+        receipts.sort();
         let budget = WorkBudget {
             max_operations: 1,
             max_duration_ms: 5_000,
@@ -2677,24 +3330,16 @@ mod tests {
 
         let first_stats = first.recover(&budget);
         assert!(first_stats.budget_exhausted);
-        assert!(first_stats
-            .errors
-            .iter()
-            .any(|error| error.relative_path.ends_with("/a.rct")));
+        assert_eq!(first_stats.receipts_compacted, 1);
+        assert_eq!(std::fs::metadata(&receipts[0]).unwrap().len(), 128);
 
         let stale_stats = stale.recover(&budget);
-        assert!(stale_stats
-            .errors
-            .iter()
-            .any(|error| error.relative_path.ends_with("/b.rct")));
-        assert!(!stale_stats
-            .errors
-            .iter()
-            .any(|error| error.relative_path.ends_with("/a.rct")));
+        assert_eq!(stale_stats.receipts_compacted, 1);
+        assert_eq!(std::fs::metadata(&receipts[1]).unwrap().len(), 128);
     }
 
     #[test]
-    fn hierarchy_open_failure_cannot_advance_past_unclassified_work() {
+    fn persistent_hierarchy_open_failure_does_not_starve_later_sibling_across_reopen() {
         use std::os::unix::fs::symlink;
 
         let (tmp, mut queue) = create_test_queue();
@@ -2708,33 +3353,204 @@ mod tests {
             EnqueueOutcome::Committed(_)
         ));
         assert!(matches!(
-            queue.lease(0, 1_000_000_000),
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"second later work".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
             LeaseOutcome::Leased(_)
         ));
-        let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
-        std::fs::create_dir_all(&receipt_dir).unwrap();
-        std::fs::write(receipt_dir.join("invalid.rct"), b"invalid").unwrap();
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
         let blocked = tmp
             .path()
             .join("leased/00000000-0000-0000-0000-000000000000");
         symlink(tmp.path(), &blocked).unwrap();
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
 
-        let first = queue.recover(&WorkBudget::default());
+        let first = reap_expired_with_budget(&mut queue, &budget);
         assert!(first.phase_blocked);
+        assert!(first.budget_exhausted);
+        assert_eq!(first.scan_skips, 1);
+        assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
         assert!(first
             .errors
             .iter()
-            .any(|error| error.operation == "receipt_compact_invalid"));
-        assert_eq!(queue.recovery_cursor.phase, RecoveryPhase::ReapLeases);
-        assert!(queue.recovery_cursor.reap_leases.is_none());
+            .any(|error| error.operation == "reap_boot_open"));
+        assert!(queue.recovery_cursor.reap_leases.is_some());
+        assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries[0],
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec!["00000000-0000-0000-0000-000000000000".into()],
+            }
+        );
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
 
-        std::fs::remove_file(blocked).unwrap();
-        let second = queue.recover(&WorkBudget::default());
-        assert!(!second.phase_blocked);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(reopened.recovery_cursor.reap_leases.is_some());
+        assert_eq!(reopened.recovery_cursor.hierarchy_retries.len(), 1);
+        let second = reap_expired_with_budget(&mut reopened, &budget);
+        assert!(second.phase_blocked);
+        assert_eq!(second.scan_skips, 1);
+        assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
         assert!(second
             .errors
             .iter()
-            .any(|error| error.operation == "receipt_compact_invalid"));
+            .any(|error| error.operation == "hierarchy_retry_open"));
+        assert!(blocked.is_symlink());
+
+        std::fs::remove_file(&blocked).unwrap();
+        let third = reap_expired_with_budget(&mut reopened, &WorkBudget::default());
+        assert!(!third.phase_blocked, "errors: {:?}", third.errors);
+        assert!(reopened.recovery_cursor.hierarchy_retries.is_empty());
+    }
+
+    #[test]
+    fn persistent_bucket_open_failure_does_not_starve_receipt_compaction() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        enqueue_and_ack(&mut queue);
+        let blocked = tmp.path().join("receipts/0000000000000000");
+        symlink(tmp.path(), &blocked).unwrap();
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        let scan_budget = RecoveryScanBudget {
+            max_entries_read: MAX_RECOVERY_DIRECTORY_ENTRY_CHARGE * 20,
+            max_name_bytes_read: MAX_RECOVERY_DIRECTORY_NAME_BYTE_CHARGE * 20,
+        };
+        queue.recovery_cursor.phase = RecoveryPhase::CompactReceipts;
+        queue.persist_recovery_cursor().unwrap();
+
+        let first = queue.recover_with_scan_budget(&budget, &scan_budget).stats;
+        assert!(first.phase_blocked);
+        assert!(first.budget_exhausted);
+        assert_eq!(first.scan_skips, 1);
+        assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
+        assert!(first
+            .errors
+            .iter()
+            .any(|error| error.operation == "compact_bucket_open"));
+        assert!(queue.recovery_cursor.compact_receipts.is_some());
+        assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries[0],
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CompactReceipts,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec!["0000000000000000".into()],
+            }
+        );
+        drop(queue);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(reopened.recovery_cursor.compact_receipts.is_some());
+        assert_eq!(reopened.recovery_cursor.hierarchy_retries.len(), 1);
+        let second = reopened
+            .recover_with_scan_budget(&budget, &scan_budget)
+            .stats;
+        assert!(second.phase_blocked);
+        assert_eq!(second.scan_skips, 1);
+        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        assert!(second
+            .errors
+            .iter()
+            .any(|error| error.operation == "hierarchy_retry_open"));
+        assert!(blocked.is_symlink());
+    }
+
+    #[test]
+    fn delayed_shard_open_failure_is_counted_and_does_not_starve_later_shard() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        let not_before = queue
+            .authenticated_wall_floor()
+            .unwrap()
+            .unix_ns()
+            .checked_add(queue.format.delayed_bucket_width_ns)
+            .unwrap();
+        let ticket = (0..128)
+            .find_map(|_| {
+                let ticket = match queue.enqueue(EnqueueInput {
+                    maximum_attempts: 3,
+                    content_type: "x".into(),
+                    initial_not_before: Some(not_before),
+                    payload: b"delayed later shard".to_vec(),
+                    ..Default::default()
+                }) {
+                    EnqueueOutcome::Committed(ticket) => ticket,
+                    outcome => panic!("enqueue failed: {outcome:?}"),
+                };
+                let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
+                if parts[2] != "0000" {
+                    return Some(ticket);
+                }
+                std::fs::remove_file(tmp.path().join(&ticket.expected_relative_path)).unwrap();
+                std::fs::remove_dir(tmp.path().join(format!("delayed/{}/0000", parts[1]))).unwrap();
+                None
+            })
+            .expect("128 random jobs must include a nonzero shard");
+        let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
+        let bucket = parts[1];
+        let blocked = tmp.path().join(format!("delayed/{bucket}/0000"));
+        symlink(tmp.path(), &blocked).unwrap();
+        write_wall_watermark(&tmp, steadq_names::bucket_from_hex(bucket).unwrap());
+
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.promote_delayed(
+            queue.authenticated_wall_floor().unwrap(),
+            &WorkBudget::default(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+
+        assert!(stats.phase_blocked);
+        assert_eq!(stats.scan_skips, 1);
+        assert_eq!(stats.delayed_promoted, 1, "errors: {:?}", stats.errors);
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "promote_shard_open"));
+        assert!(!tmp.path().join(ticket.expected_relative_path).exists());
+        assert!(blocked.is_symlink());
     }
 
     #[test]
@@ -2817,6 +3633,9 @@ mod tests {
             cleanup_temp: Some(valid_three.clone()),
             compact_receipts: Some(valid_three.clone()),
             delete_receipts: Some(valid_three),
+            hierarchy_retries: Vec::new(),
+            hierarchy_retry_frontiers: Vec::new(),
+            hierarchy_retry_overflow: Vec::new(),
         };
         assert!(cursor_is_valid(&valid));
 
@@ -2856,6 +3675,633 @@ mod tests {
         for (index, cursor) in invalid.iter().enumerate() {
             assert!(!cursor_is_valid(cursor), "invalid cursor {index} accepted");
         }
+
+        let retry = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::ReapLeases,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec![
+                "00000000-0000-0000-0000-000000000000".into(),
+                "0000000000000000".into(),
+                "0000".into(),
+            ],
+        };
+        let mut with_retry = valid.clone();
+        with_retry.hierarchy_retries.push(retry.clone());
+        assert!(cursor_is_valid(&with_retry));
+
+        let boot = "00000000-0000-0000-0000-000000000000".to_string();
+        let bucket = "0000000000000000".to_string();
+        let shard = "0000".to_string();
+        let mut all_shapes = valid.clone();
+        all_shapes.hierarchy_retries = vec![
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![boot.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![boot.clone(), bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::ReapLeases,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![boot.clone(), bucket.clone(), shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::PromoteDelayed,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::PromoteDelayed,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![bucket.clone(), shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CleanupTemp,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![boot.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CleanupTemp,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![boot, shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CompactReceipts,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::CompactReceipts,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![bucket.clone(), shard.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::DeleteReceipts,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![bucket.clone()],
+            },
+            RecoveryHierarchyRetry {
+                phase: RecoveryPhase::DeleteReceipts,
+                kind: RecoveryHierarchyRetryKind::Open,
+                components: vec![bucket, shard],
+            },
+        ];
+        assert!(cursor_is_valid(&all_shapes));
+
+        let mut duplicate = with_retry;
+        duplicate.hierarchy_retries.push(retry);
+        assert!(!cursor_is_valid(&duplicate));
+
+        let mut wrong_depth = valid.clone();
+        wrong_depth.hierarchy_retries.push(RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["0000000000000000".into(), "0000".into(), "extra".into()],
+        });
+        assert!(!cursor_is_valid(&wrong_depth));
+
+        let mut wrong_shape = valid;
+        wrong_shape.hierarchy_retries.push(RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CleanupTemp,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["not-a-boot-id".into()],
+        });
+        assert!(!cursor_is_valid(&wrong_shape));
+
+        let duplicate_overflow = RecoveryCursor {
+            hierarchy_retry_overflow: vec![
+                RecoveryPhase::CompactReceipts,
+                RecoveryPhase::CompactReceipts,
+            ],
+            ..Default::default()
+        };
+        assert!(!cursor_is_valid(&duplicate_overflow));
+
+        let ordered_overflow = RecoveryCursor {
+            hierarchy_retry_overflow: vec![
+                RecoveryPhase::ReapLeases,
+                RecoveryPhase::PromoteDelayed,
+                RecoveryPhase::CleanupTemp,
+                RecoveryPhase::CompactReceipts,
+                RecoveryPhase::DeleteReceipts,
+            ],
+            ..Default::default()
+        };
+        assert!(cursor_is_valid(&ordered_overflow));
+
+        let frontier = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Enumerate,
+            components: vec!["0000000000000000".into(), "0000".into()],
+        };
+        let ordered_frontiers = RecoveryCursor {
+            hierarchy_retry_frontiers: vec![
+                RecoveryHierarchyRetry {
+                    phase: RecoveryPhase::ReapLeases,
+                    kind: RecoveryHierarchyRetryKind::Open,
+                    components: vec!["00000000-0000-0000-0000-000000000000".into()],
+                },
+                frontier.clone(),
+            ],
+            ..Default::default()
+        };
+        assert!(cursor_is_valid(&ordered_frontiers));
+
+        let duplicate_frontiers = RecoveryCursor {
+            hierarchy_retry_frontiers: vec![frontier.clone(), frontier],
+            ..Default::default()
+        };
+        assert!(!cursor_is_valid(&duplicate_frontiers));
+    }
+
+    #[test]
+    fn hierarchy_retry_ledger_is_bounded_sorted_and_deduplicated() {
+        let (_tmp, mut queue) = create_test_queue();
+        for bucket in (0..MAX_RECOVERY_HIERARCHY_RETRIES).rev() {
+            let component = format!("{bucket:016x}");
+            assert_eq!(
+                queue.remember_hierarchy_retry(
+                    RecoveryPhase::CompactReceipts,
+                    RecoveryHierarchyRetryKind::Open,
+                    &[component.as_bytes()],
+                ),
+                RememberHierarchyRetry::Exact
+            );
+        }
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries.len(),
+            MAX_RECOVERY_HIERARCHY_RETRIES
+        );
+        assert!(queue
+            .recovery_cursor
+            .hierarchy_retries
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            queue.remember_hierarchy_retry(
+                RecoveryPhase::CompactReceipts,
+                RecoveryHierarchyRetryKind::Open,
+                &[b"0000000000000000"],
+            ),
+            RememberHierarchyRetry::Exact
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries.len(),
+            MAX_RECOVERY_HIERARCHY_RETRIES
+        );
+        assert_eq!(
+            queue.remember_hierarchy_retry(
+                RecoveryPhase::CompactReceipts,
+                RecoveryHierarchyRetryKind::Open,
+                &[b"0000000000000040"],
+            ),
+            RememberHierarchyRetry::Overflow
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_overflow,
+            vec![RecoveryPhase::CompactReceipts]
+        );
+
+        queue.recovery_cursor.hierarchy_retries.clear();
+        queue.recovery_cursor.hierarchy_retry_overflow.clear();
+        for suffix in 0..MAX_RECOVERY_HIERARCHY_RETRIES {
+            let boot = format!("00000000-0000-0000-0000-{suffix:012x}");
+            assert_eq!(
+                queue.remember_hierarchy_retry(
+                    RecoveryPhase::ReapLeases,
+                    RecoveryHierarchyRetryKind::Enumerate,
+                    &[boot.as_bytes(), b"0000000000000000", b"0000"],
+                ),
+                RememberHierarchyRetry::Exact
+            );
+        }
+        queue.recovery_cursor.hierarchy_retry_overflow = vec![
+            RecoveryPhase::ReapLeases,
+            RecoveryPhase::PromoteDelayed,
+            RecoveryPhase::CleanupTemp,
+            RecoveryPhase::CompactReceipts,
+            RecoveryPhase::DeleteReceipts,
+        ];
+        queue.recovery_cursor.hierarchy_retry_frontiers = vec![RecoveryHierarchyRetry {
+            phase: RecoveryPhase::ReapLeases,
+            kind: RecoveryHierarchyRetryKind::Enumerate,
+            components: vec![
+                "00000000-0000-0000-0000-00000000003f".into(),
+                "0000000000000000".into(),
+                "0000".into(),
+            ],
+        }];
+        queue.persist_recovery_cursor().unwrap();
+    }
+
+    #[test]
+    fn enumeration_retry_requires_a_complete_accounted_read() {
+        let (tmp, mut queue) = create_test_queue();
+        std::fs::create_dir_all(tmp.path().join("receipts/0000000000000000/0000")).unwrap();
+        assert_eq!(
+            queue.remember_hierarchy_retry(
+                RecoveryPhase::CompactReceipts,
+                RecoveryHierarchyRetryKind::Enumerate,
+                &[b"0000000000000000"],
+            ),
+            RememberHierarchyRetry::Exact
+        );
+        queue.recovery_cursor.compact_receipts = Some(ThreeLevelCursor::new(
+            b"0000000000000000",
+            b"0000",
+            b"prior.rct",
+        ));
+        let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+        let budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("open_directory", 2, libc::EIO);
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        fs::fault::reset();
+        assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+        assert!(queue.recovery_cursor.compact_receipts.is_some());
+        assert_eq!(stats.scan_skips, 1);
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "hierarchy_retry_read"));
+
+        let mut stats = RecoveryStats::default();
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(scan.stats.entries_read, 1);
+        assert!(queue.recovery_cursor.hierarchy_retries.is_empty());
+        assert!(queue.recovery_cursor.compact_receipts.is_none());
+    }
+
+    #[test]
+    fn open_and_absent_retries_do_not_require_enumeration_budget() {
+        let (tmp, mut queue) = create_test_queue();
+        std::fs::create_dir_all(tmp.path().join("receipts/0000000000000000")).unwrap();
+        assert_eq!(
+            queue.remember_hierarchy_retry(
+                RecoveryPhase::CompactReceipts,
+                RecoveryHierarchyRetryKind::Open,
+                &[b"0000000000000000"],
+            ),
+            RememberHierarchyRetry::Exact
+        );
+        assert_eq!(
+            queue.remember_hierarchy_retry(
+                RecoveryPhase::CompactReceipts,
+                RecoveryHierarchyRetryKind::Enumerate,
+                &[b"0000000000000001"],
+            ),
+            RememberHierarchyRetry::Exact
+        );
+        let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+        let budget = RecoveryScanBudget {
+            max_entries_read: 0,
+            max_name_bytes_read: 0,
+        };
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert!(queue.recovery_cursor.hierarchy_retries.is_empty());
+        assert_eq!(scan.stats.entries_read, 0);
+        assert!(!stats.budget_exhausted);
+    }
+
+    #[test]
+    fn retry_replay_preserves_entry_and_clock_budget_failures() {
+        let (tmp, mut queue) = create_test_queue();
+        std::fs::create_dir_all(tmp.path().join("receipts/0000000000000000")).unwrap();
+        assert_eq!(
+            queue.remember_hierarchy_retry(
+                RecoveryPhase::CompactReceipts,
+                RecoveryHierarchyRetryKind::Open,
+                &[b"0000000000000000"],
+            ),
+            RememberHierarchyRetry::Exact
+        );
+        let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+        let budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+
+        assert!(retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            0,
+        ));
+        assert!(stats.budget_exhausted);
+        assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+
+        let mut stats = RecoveryStats::default();
+        fs::fault::reset();
+        fs::fault::inject("clock_monotonic_ns", 1);
+        assert!(retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        fs::fault::reset();
+        assert!(stats.phase_blocked);
+        assert!(stats.budget_exhausted);
+        assert!(!Queue::has_recovery_budget(&stats));
+        assert!(stats
+            .errors
+            .iter()
+            .any(|error| error.operation == "clock_monotonic"));
+        assert_eq!(queue.recovery_cursor.hierarchy_retries.len(), 1);
+    }
+
+    #[test]
+    fn retry_frontier_rotates_persistently_across_failures() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        for bucket in 0..3 {
+            symlink(
+                tmp.path(),
+                tmp.path().join(format!("receipts/{bucket:016x}")),
+            )
+            .unwrap();
+            assert_eq!(
+                queue.remember_hierarchy_retry(
+                    RecoveryPhase::CompactReceipts,
+                    RecoveryHierarchyRetryKind::Open,
+                    &[format!("{bucket:016x}").as_bytes()],
+                ),
+                RememberHierarchyRetry::Exact
+            );
+        }
+        let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+        let budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &budget,
+            stats: &mut scan_stats,
+        };
+
+        let mut stats = RecoveryStats::default();
+        assert!(!retry_next_hierarchy_directory(
+            &mut queue,
+            RecoveryPhase::CompactReceipts,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers[0].components,
+            vec!["0000000000000000"]
+        );
+        queue.persist_recovery_cursor().unwrap();
+        drop(receipts);
+        drop(queue);
+
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let receipts = fs::open_directory(reopened.root_fd(), "receipts").unwrap();
+        for expected in ["0000000000000001", "0000000000000002", "0000000000000000"] {
+            let mut stats = RecoveryStats::default();
+            assert!(!retry_next_hierarchy_directory(
+                &mut reopened,
+                RecoveryPhase::CompactReceipts,
+                receipts.as_raw_fd(),
+                &mut scan,
+                &mut stats,
+                u64::MAX,
+            ));
+            assert_eq!(
+                reopened.recovery_cursor.hierarchy_retry_frontiers[0].components,
+                vec![expected]
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_retry_updates_only_its_phase_frontier() {
+        let (_tmp, mut queue) = create_test_queue();
+        let receipts = fs::open_directory(queue.root_fd(), "receipts").unwrap();
+        let budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &budget,
+            stats: &mut scan_stats,
+        };
+        let reap_frontier = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::ReapLeases,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["00000000-0000-0000-0000-000000000000".into()],
+        };
+        let compact_frontier = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["000000000000000f".into()],
+        };
+        queue.recovery_cursor.hierarchy_retry_frontiers =
+            vec![reap_frontier.clone(), compact_frontier];
+
+        let mut stats = RecoveryStats::default();
+        assert!(!queue.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            None,
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers,
+            vec![reap_frontier.clone()]
+        );
+
+        let first = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["0000000000000000".into()],
+        };
+        let second = RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Open,
+            components: vec!["0000000000000001".into()],
+        };
+        queue.recovery_cursor.hierarchy_retries = vec![first.clone(), second.clone()];
+        assert!(!queue.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            Some(first.clone()),
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries,
+            vec![second.clone()]
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers,
+            vec![reap_frontier.clone(), first]
+        );
+
+        let other_phase_retry = reap_frontier.clone();
+        queue.recovery_cursor.hierarchy_retries = vec![other_phase_retry.clone(), second.clone()];
+        assert!(!queue.retry_one_hierarchy_directory(
+            RecoveryPhase::CompactReceipts,
+            Some(second),
+            receipts.as_raw_fd(),
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        ));
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries,
+            vec![other_phase_retry]
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_frontiers,
+            vec![reap_frontier]
+        );
+    }
+
+    #[test]
+    fn hierarchy_retry_overflow_rescans_without_starving_later_receipts() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        enqueue_and_ack(&mut queue);
+        for bucket in 0..=MAX_RECOVERY_HIERARCHY_RETRIES {
+            symlink(
+                tmp.path(),
+                tmp.path().join(format!("receipts/{bucket:016x}")),
+            )
+            .unwrap();
+        }
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        queue.recovery_cursor.phase = RecoveryPhase::CompactReceipts;
+        queue.persist_recovery_cursor().unwrap();
+
+        let first = queue.recover(&budget);
+        assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retries.len(),
+            MAX_RECOVERY_HIERARCHY_RETRIES
+        );
+        assert_eq!(
+            queue.recovery_cursor.hierarchy_retry_overflow,
+            vec![RecoveryPhase::CompactReceipts]
+        );
+        drop(queue);
+
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = reopened.recover(&budget);
+        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        assert!(second
+            .errors
+            .iter()
+            .any(|error| error.operation == "hierarchy_retry_overflow"));
+    }
+
+    #[test]
+    fn recovery_cursor_without_retry_ledger_remains_compatible() {
+        let mut value = serde_json::to_value(RecoveryCursor::default()).unwrap();
+        value.as_object_mut().unwrap().remove("hierarchy_retries");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("hierarchy_retry_frontiers");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("hierarchy_retry_overflow");
+        let decoded: RecoveryCursor = serde_json::from_value(value).unwrap();
+        assert!(decoded.hierarchy_retries.is_empty());
+        assert!(decoded.hierarchy_retry_frontiers.is_empty());
+        assert!(decoded.hierarchy_retry_overflow.is_empty());
+
+        let mut cursor = RecoveryCursor::default();
+        cursor.hierarchy_retries.push(RecoveryHierarchyRetry {
+            phase: RecoveryPhase::CompactReceipts,
+            kind: RecoveryHierarchyRetryKind::Enumerate,
+            components: vec!["0000000000000000".into()],
+        });
+        let mut value = serde_json::to_value(cursor).unwrap();
+        value["hierarchy_retries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("kind");
+        let decoded: RecoveryCursor = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.hierarchy_retries[0].kind,
+            RecoveryHierarchyRetryKind::Open
+        );
     }
 
     #[test]
@@ -3260,20 +4706,12 @@ mod tests {
         };
 
         let first = queue.recover(&budget);
-        assert_eq!(first.receipts_compacted, 0);
+        assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
         assert!(first
             .errors
             .iter()
             .any(|error| error.operation == "receipt_compact_invalid"));
-        assert_eq!(
-            queue
-                .recovery_cursor
-                .compact_receipts
-                .as_ref()
-                .unwrap()
-                .resume_after,
-            b"000-malformed.rct"
-        );
+        assert!(queue.recovery_cursor.compact_receipts.is_none());
         drop(queue);
 
         let mut reopened = Queue::open(
@@ -3286,7 +4724,7 @@ mod tests {
         .unwrap();
         let second = reopened.recover(&budget);
 
-        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        assert_eq!(second.receipts_compacted, 0, "errors: {:?}", second.errors);
         assert_eq!(std::fs::metadata(receipt).unwrap().len(), 128);
         assert!(malformed.exists());
     }
@@ -3313,7 +4751,7 @@ mod tests {
         };
 
         let first = queue.recover(&budget);
-        assert_eq!(first.receipts_compacted, 0);
+        assert_eq!(first.receipts_compacted, 1, "errors: {:?}", first.errors);
         drop(queue);
         let mut reopened = Queue::open(
             tmp.path(),
@@ -3325,7 +4763,7 @@ mod tests {
         .unwrap();
         let second = reopened.recover(&budget);
 
-        assert_eq!(second.receipts_compacted, 1, "errors: {:?}", second.errors);
+        assert_eq!(second.receipts_compacted, 0, "errors: {:?}", second.errors);
         assert_eq!(
             std::fs::metadata(&receipts[0]).unwrap().len(),
             held_original_len
