@@ -1516,6 +1516,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_owned_directory_read_returns_exact_names() {
+        let dir_path = unique_test_dir("legacy-directory-read");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("alpha"), b"a").unwrap();
+        std::fs::write(dir_path.join("beta"), b"b").unwrap();
+        let dir = std::fs::File::open(&dir_path).unwrap();
+
+        let mut entries = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        entries.sort();
+        assert_eq!(entries, ["alpha", "beta"]);
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
     fn fault_inject_fsync_fires_once() {
         fault::reset();
         fault::inject("fsync", 1);
