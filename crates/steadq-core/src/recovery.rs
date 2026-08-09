@@ -3115,6 +3115,39 @@ mod tests {
         queue.retry_one_hierarchy_directory(phase, retry, phase_root_fd, scan, stats, deadline_mono)
     }
 
+    const RECOVERY_READ_PERMUTATIONS: [(usize, bool); 3] = [(1, false), (0, true), (2, true)];
+
+    fn open_with_readdir_permutation(tmp: &TempDir, options: &OpenOptions, pass: usize) -> Queue {
+        let queue = Queue::open(tmp.path(), options).unwrap();
+        fs::fault::reset();
+        let (rotation, reversed) = RECOVERY_READ_PERMUTATIONS[pass];
+        fs::fault::permute_readdir(rotation, reversed);
+        queue
+    }
+
+    fn assert_removed_prefix(paths: &[PathBuf], pass: usize) {
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(
+                path.exists(),
+                index > pass,
+                "pass={pass} index={index} path={}",
+                path.display()
+            );
+        }
+    }
+
+    fn assert_compacted_prefix(paths: &[PathBuf], pass: usize) {
+        for (index, path) in paths.iter().enumerate() {
+            let length = std::fs::metadata(path).unwrap().len();
+            assert_eq!(
+                length == steadq_format::COMPACT_RECEIPT_SIZE as u64,
+                index <= pass,
+                "pass={pass} index={index} path={} length={length}",
+                path.display()
+            );
+        }
+    }
+
     fn valid_cursor_record(queue: &Queue) -> RecoveryCursorRecord {
         RecoveryCursorRecord {
             schema: RECOVERY_CURSOR_SCHEMA.into(),
@@ -3551,6 +3584,394 @@ mod tests {
             .any(|error| error.operation == "promote_shard_open"));
         assert!(!tmp.path().join(ticket.expected_relative_path).exists());
         assert!(blocked.is_symlink());
+    }
+
+    #[test]
+    fn readdir_permutations_preserve_reap_budget_boundaries() {
+        let (tmp, mut queue) = create_test_queue();
+        for payload in [b"reap-a", b"reap-b", b"reap-c"] {
+            assert!(matches!(
+                queue.enqueue(EnqueueInput {
+                    maximum_attempts: 3,
+                    content_type: "x".into(),
+                    payload: payload.to_vec(),
+                    ..Default::default()
+                }),
+                EnqueueOutcome::Committed(_)
+            ));
+            assert!(matches!(
+                queue.lease(0, 30_000_000_000),
+                LeaseOutcome::Leased(_)
+            ));
+        }
+        let mut leased = Vec::new();
+        find_files(&tmp.path().join("leased"), "sqj", &mut leased);
+        leased.sort();
+        assert_eq!(leased.len(), RECOVERY_READ_PERMUTATIONS.len());
+        drop(queue);
+
+        let options = OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        };
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        let mut queue = open_with_readdir_permutation(&tmp, &options, 0);
+        let zero = reap_expired_with_budget(
+            &mut queue,
+            &WorkBudget {
+                max_operations: 0,
+                max_duration_ms: 5_000,
+            },
+        );
+        fs::fault::reset();
+        assert_eq!(zero.operations_attempted, 0);
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        assert!(leased.iter().all(|path| path.exists()));
+
+        for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
+            let stats = reap_expired_with_budget(&mut queue, &budget);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            assert_eq!(
+                stats.leases_reaped, 1,
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            assert_removed_prefix(&leased, pass);
+        }
+    }
+
+    #[test]
+    fn readdir_permutations_preserve_promotion_budget_boundaries() {
+        let (tmp, mut queue) = create_test_queue();
+        let not_before = queue
+            .authenticated_wall_floor()
+            .unwrap()
+            .unix_ns()
+            .checked_add(queue.format.delayed_bucket_width_ns * 4)
+            .unwrap();
+        for payload in [b"promote-a", b"promote-b", b"promote-c"] {
+            assert!(matches!(
+                queue.enqueue(EnqueueInput {
+                    maximum_attempts: 3,
+                    content_type: "x".into(),
+                    initial_not_before: Some(not_before),
+                    payload: payload.to_vec(),
+                    ..Default::default()
+                }),
+                EnqueueOutcome::Committed(_)
+            ));
+        }
+        let mut delayed = Vec::new();
+        find_files(&tmp.path().join("delayed"), "sqj", &mut delayed);
+        delayed.sort();
+        assert_eq!(delayed.len(), RECOVERY_READ_PERMUTATIONS.len());
+        let delayed_bucket = delayed[0]
+            .strip_prefix(tmp.path().join("delayed"))
+            .unwrap()
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_str()
+            .and_then(steadq_names::bucket_from_hex)
+            .unwrap();
+        write_wall_watermark(&tmp, delayed_bucket);
+        drop(queue);
+
+        let options = OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        };
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        let mut queue = open_with_readdir_permutation(&tmp, &options, 0);
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut zero = RecoveryStats::default();
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        queue.promote_delayed(
+            wall_floor,
+            &WorkBudget {
+                max_operations: 0,
+                max_duration_ms: 5_000,
+            },
+            &mut scan,
+            &mut zero,
+            u64::MAX,
+        );
+        fs::fault::reset();
+        assert_eq!(zero.operations_attempted, 0);
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        assert!(delayed.iter().all(|path| path.exists()));
+
+        for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
+            let scan_budget = RecoveryScanBudget::default();
+            let mut scan_stats = RecoveryScanStats::default();
+            let mut scan = RecoveryScanContext {
+                budget: &scan_budget,
+                stats: &mut scan_stats,
+            };
+            let mut stats = RecoveryStats::default();
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            queue.promote_delayed(wall_floor, &budget, &mut scan, &mut stats, u64::MAX);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            assert_eq!(
+                stats.delayed_promoted, 1,
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            assert_removed_prefix(&delayed, pass);
+        }
+    }
+
+    #[test]
+    fn readdir_permutations_preserve_temp_cleanup_budget_boundaries() {
+        let (tmp, queue) = create_test_queue();
+        let old_boot = "00000000-0000-0000-0000-000000000000";
+        assert_ne!(queue.boot_id, old_boot);
+        let shard = tmp.path().join(format!("tmp/{old_boot}/0000"));
+        std::fs::create_dir_all(&shard).unwrap();
+        let mut temp_paths = Vec::new();
+        for suffix in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            let filename = steadq_names::temp_filename(0, &[suffix as u8; 16]);
+            let path = shard.join(filename);
+            std::fs::write(&path, b"temp").unwrap();
+            temp_paths.push(path);
+        }
+        temp_paths.sort();
+        drop(queue);
+
+        let options = OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        };
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        let mut queue = open_with_readdir_permutation(&tmp, &options, 0);
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut zero = RecoveryStats::default();
+        queue.cleanup_temp_files(
+            u64::MAX,
+            &WorkBudget {
+                max_operations: 0,
+                max_duration_ms: 5_000,
+            },
+            &mut scan,
+            &mut zero,
+            u64::MAX,
+        );
+        fs::fault::reset();
+        assert_eq!(zero.operations_attempted, 0);
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        assert!(temp_paths.iter().all(|path| path.exists()));
+
+        for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
+            let scan_budget = RecoveryScanBudget::default();
+            let mut scan_stats = RecoveryScanStats::default();
+            let mut scan = RecoveryScanContext {
+                budget: &scan_budget,
+                stats: &mut scan_stats,
+            };
+            let mut stats = RecoveryStats::default();
+            queue.cleanup_temp_files(u64::MAX, &budget, &mut scan, &mut stats, u64::MAX);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            assert_eq!(
+                stats.temp_files_deleted, 1,
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            assert_removed_prefix(&temp_paths, pass);
+        }
+    }
+
+    #[test]
+    fn readdir_permutations_preserve_compaction_budget_boundaries() {
+        let (tmp, mut queue) = create_test_queue();
+        for _ in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            enqueue_and_ack(&mut queue);
+        }
+        let mut receipts = Vec::new();
+        find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
+        receipts.sort();
+        assert_eq!(receipts.len(), RECOVERY_READ_PERMUTATIONS.len());
+        drop(queue);
+
+        let options = OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        };
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        let mut queue = open_with_readdir_permutation(&tmp, &options, 0);
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut zero = RecoveryStats::default();
+        queue.compact_receipts_with_scan_budget(
+            &WorkBudget {
+                max_operations: 0,
+                max_duration_ms: 5_000,
+            },
+            &mut scan,
+            &mut zero,
+            u64::MAX,
+        );
+        fs::fault::reset();
+        assert_eq!(zero.operations_attempted, 0);
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        assert!(receipts.iter().all(|path| {
+            std::fs::metadata(path).unwrap().len() > steadq_format::COMPACT_RECEIPT_SIZE as u64
+        }));
+
+        for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
+            let scan_budget = RecoveryScanBudget::default();
+            let mut scan_stats = RecoveryScanStats::default();
+            let mut scan = RecoveryScanContext {
+                budget: &scan_budget,
+                stats: &mut scan_stats,
+            };
+            let mut stats = RecoveryStats::default();
+            queue.compact_receipts_with_scan_budget(&budget, &mut scan, &mut stats, u64::MAX);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            assert_eq!(
+                stats.receipts_compacted, 1,
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            assert_compacted_prefix(&receipts, pass);
+        }
+    }
+
+    #[test]
+    fn readdir_permutations_preserve_deletion_budget_boundaries() {
+        let (tmp, mut queue) = create_test_queue();
+        for _ in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            enqueue_and_ack(&mut queue);
+        }
+        let mut receipts = Vec::new();
+        find_files(&tmp.path().join("receipts"), "rct", &mut receipts);
+        receipts.sort();
+        assert_eq!(receipts.len(), RECOVERY_READ_PERMUTATIONS.len());
+        let terminal_bucket = receipts[0]
+            .strip_prefix(tmp.path().join("receipts"))
+            .unwrap()
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_str()
+            .and_then(steadq_names::bucket_from_hex)
+            .unwrap();
+        let delayed_buckets_per_terminal = queue
+            .format
+            .terminal_bucket_width_ns
+            .checked_div(queue.format.delayed_bucket_width_ns)
+            .unwrap();
+        let retention_floor_bucket = terminal_bucket
+            .checked_add(1)
+            .and_then(|bucket| bucket.checked_mul(delayed_buckets_per_terminal))
+            .unwrap();
+        write_wall_watermark(&tmp, retention_floor_bucket);
+        drop(queue);
+
+        let options = OpenOptions {
+            allow_unsupported_fs: true,
+            receipt_retention_ns: 0,
+            ..Default::default()
+        };
+        let budget = WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        };
+        let mut queue = open_with_readdir_permutation(&tmp, &options, 0);
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut zero = RecoveryStats::default();
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+        queue.delete_expired_receipts(
+            wall_floor,
+            0,
+            &WorkBudget {
+                max_operations: 0,
+                max_duration_ms: 5_000,
+            },
+            &mut scan,
+            &mut zero,
+            u64::MAX,
+        );
+        fs::fault::reset();
+        assert_eq!(zero.operations_attempted, 0);
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        assert!(receipts.iter().all(|path| path.exists()));
+
+        for pass in 0..RECOVERY_READ_PERMUTATIONS.len() {
+            let mut queue = open_with_readdir_permutation(&tmp, &options, pass);
+            let scan_budget = RecoveryScanBudget::default();
+            let mut scan_stats = RecoveryScanStats::default();
+            let mut scan = RecoveryScanContext {
+                budget: &scan_budget,
+                stats: &mut scan_stats,
+            };
+            let mut stats = RecoveryStats::default();
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            queue.delete_expired_receipts(wall_floor, 0, &budget, &mut scan, &mut stats, u64::MAX);
+            fs::fault::reset();
+            assert_eq!(stats.operations_attempted, 1, "pass={pass}");
+            assert_eq!(
+                stats.receipts_expired, 1,
+                "pass={pass} errors={:?}",
+                stats.errors
+            );
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            assert_removed_prefix(&receipts, pass);
+        }
     }
 
     #[test]
