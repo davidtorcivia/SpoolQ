@@ -3284,6 +3284,51 @@ mod tests {
         parts
     }
 
+    fn ready_destination(
+        queue: &Queue,
+        shard: &str,
+        common: &steadq_names::CommonFields,
+    ) -> String {
+        let ready_common = steadq_names::CommonFields {
+            job_id: common.job_id,
+            generation: common.generation.checked_add(1).unwrap(),
+            attempt: common.attempt,
+            maximum_attempts: common.maximum_attempts,
+        };
+        format!(
+            "ready/{shard}/{}",
+            steadq_names::make_ready_name(&queue.format.queue_id, shard, &ready_common)
+        )
+    }
+
+    fn dead_destination(
+        queue: &Queue,
+        shard: &str,
+        common: &steadq_names::CommonFields,
+        wall_floor: WallFloor,
+    ) -> String {
+        let terminal_bucket =
+            steadq_math::bucket_number(wall_floor.unix_ns(), queue.format.terminal_bucket_width_ns)
+                .unwrap();
+        let bucket = bucket_hex(terminal_bucket);
+        let dead_common = steadq_names::CommonFields {
+            job_id: common.job_id,
+            generation: common.generation.checked_add(1).unwrap(),
+            attempt: common.attempt,
+            maximum_attempts: common.maximum_attempts,
+        };
+        format!(
+            "dead/{bucket}/{shard}/{}",
+            steadq_names::make_dead_name(
+                &queue.format.queue_id,
+                &bucket,
+                shard,
+                &dead_common,
+                DeadReason::AttemptsExhausted as u16,
+            )
+        )
+    }
+
     fn assert_injected_move_phase(
         result: Result<(), MoveFailure>,
         expected_phase: MovePhase,
@@ -3324,6 +3369,13 @@ mod tests {
             "errors: {:?}",
             stats.errors
         );
+    }
+
+    fn assert_recorded_move_category(stats: &RecoveryStats, operation: &str, category: &str) {
+        assert_eq!(stats.operations_attempted, 1);
+        assert_eq!(stats.errors.len(), 1, "errors: {:?}", stats.errors);
+        assert_eq!(stats.errors[0].operation, format!("{operation}_{category}"));
+        assert!(stats.errors[0].error.contains("phase=Rename"));
     }
 
     fn reap_expired_with_budget(queue: &mut Queue, budget: &WorkBudget) -> RecoveryStats {
@@ -5943,14 +5995,42 @@ mod tests {
             ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
             ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
         ] {
-            let (_tmp, mut queue) = create_test_queue();
-            lease_recovery_job(&mut queue, 3);
+            let (tmp, mut queue) = create_test_queue();
+            let lease = lease_recovery_job(&mut queue, 3);
+            let parts = lease_path_parts(&lease);
+            let common = lease_common(&lease);
+            let source = tmp.path().join(&lease.exact_source_path);
+            let destination = tmp
+                .path()
+                .join(ready_destination(&queue, parts[3], &common));
             fs::fault::reset();
             fs::fault::inject_errno(fault, count, libc::EIO);
             let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
             fs::fault::reset();
             assert_eq!(stats.leases_reaped, 0);
             assert_recorded_move_failure(&stats, "reap_to_ready", phase, outcome_unknown);
+            assert_eq!(source.exists(), !outcome_unknown);
+            assert_eq!(destination.exists(), outcome_unknown);
+            if outcome_unknown {
+                assert!(queue
+                    .inspect(&lease.job_id)
+                    .iter()
+                    .any(|snapshot| snapshot.state == "ready"));
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay = reap_expired_with_budget(&mut reopened, &WorkBudget::default());
+            assert_eq!(replay.leases_reaped, u32::from(!outcome_unknown));
+            assert!(!source.exists());
+            assert!(destination.exists());
         }
     }
 
@@ -5961,10 +6041,15 @@ mod tests {
             ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
             ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
         ] {
-            let (_tmp, mut queue) = create_test_queue();
+            let (tmp, mut queue) = create_test_queue();
             let lease = lease_recovery_job(&mut queue, 1);
             let shard = lease.exact_source_path.split('/').nth(3).unwrap();
+            let common = lease_common(&lease);
             let wall_floor = queue.authenticated_wall_floor().unwrap();
+            let source = tmp.path().join(&lease.exact_source_path);
+            let destination = tmp
+                .path()
+                .join(dead_destination(&queue, shard, &common, wall_floor));
             let terminal_bucket = steadq_math::bucket_number(
                 wall_floor.unix_ns(),
                 queue.format.terminal_bucket_width_ns,
@@ -5979,6 +6064,28 @@ mod tests {
             fs::fault::reset();
             assert_eq!(stats.leases_to_dead, 0);
             assert_recorded_move_failure(&stats, "reap_to_dead", phase, outcome_unknown);
+            assert_eq!(source.exists(), !outcome_unknown);
+            assert_eq!(destination.exists(), outcome_unknown);
+            if outcome_unknown {
+                assert!(queue
+                    .inspect(&lease.job_id)
+                    .iter()
+                    .any(|snapshot| snapshot.state == "dead"));
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay = reap_expired_with_budget(&mut reopened, &WorkBudget::default());
+            assert_eq!(replay.leases_to_dead, u32::from(!outcome_unknown));
+            assert!(!source.exists());
+            assert!(destination.exists());
         }
     }
 
@@ -6012,6 +6119,12 @@ mod tests {
                 .nth(1)
                 .and_then(steadq_names::bucket_from_hex)
                 .unwrap();
+            let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
+            let parsed = steadq_names::parse_delayed(parts[3]).unwrap();
+            let source = tmp.path().join(&ticket.expected_relative_path);
+            let destination = tmp
+                .path()
+                .join(ready_destination(&queue, parts[2], &parsed.common));
             write_wall_watermark(&tmp, delayed_bucket);
             let wall_floor = queue.authenticated_wall_floor().unwrap();
             fs::fault::reset();
@@ -6020,6 +6133,209 @@ mod tests {
             fs::fault::reset();
             assert_eq!(stats.delayed_promoted, 0);
             assert_recorded_move_failure(&stats, "promote_delayed", phase, outcome_unknown);
+            assert_eq!(source.exists(), !outcome_unknown);
+            assert_eq!(destination.exists(), outcome_unknown);
+            if outcome_unknown {
+                assert!(queue
+                    .inspect(&ticket.job_id)
+                    .iter()
+                    .any(|snapshot| snapshot.state == "ready"));
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay_floor = reopened.authenticated_wall_floor().unwrap();
+            let replay = promote_eligible_with_budget(&mut reopened, replay_floor);
+            assert_eq!(replay.delayed_promoted, u32::from(!outcome_unknown));
+            assert!(!source.exists());
+            assert!(destination.exists());
+        }
+    }
+
+    #[test]
+    fn reap_to_ready_scanner_handles_collision_and_missing_source() {
+        for collision in [true, false] {
+            let (tmp, mut queue) = create_test_queue();
+            let lease = lease_recovery_job(&mut queue, 3);
+            let parts = lease_path_parts(&lease);
+            let source = tmp.path().join(&lease.exact_source_path);
+            let destination =
+                tmp.path()
+                    .join(ready_destination(&queue, parts[3], &lease_common(&lease)));
+            if collision {
+                std::fs::copy(&source, &destination).unwrap();
+            } else {
+                fs::fault::inject_errno("renameat2_noreplace", 1, libc::ENOENT);
+            }
+            let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+            fs::fault::reset();
+            assert_eq!(stats.leases_reaped, 0);
+            assert_recorded_move_category(
+                &stats,
+                "reap_to_ready",
+                if collision {
+                    "collision"
+                } else {
+                    "source_missing"
+                },
+            );
+            assert!(source.exists());
+            if collision {
+                assert!(destination.exists());
+                std::fs::remove_file(&destination).unwrap();
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay = reap_expired_with_budget(&mut reopened, &WorkBudget::default());
+            assert_eq!(replay.leases_reaped, 1, "errors: {:?}", replay.errors);
+            assert!(!source.exists());
+            assert!(destination.exists());
+        }
+    }
+
+    #[test]
+    fn reap_to_dead_scanner_handles_collision_and_missing_source() {
+        for collision in [true, false] {
+            let (tmp, mut queue) = create_test_queue();
+            let lease = lease_recovery_job(&mut queue, 1);
+            let parts = lease_path_parts(&lease);
+            let common = lease_common(&lease);
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            let source = tmp.path().join(&lease.exact_source_path);
+            let destination = tmp
+                .path()
+                .join(dead_destination(&queue, parts[3], &common, wall_floor));
+            queue
+                .ensure_dir_pub(
+                    destination
+                        .parent()
+                        .unwrap()
+                        .strip_prefix(tmp.path())
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap();
+            if collision {
+                std::fs::copy(&source, &destination).unwrap();
+            } else {
+                fs::fault::inject_errno("renameat2_noreplace", 1, libc::ENOENT);
+            }
+            let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+            fs::fault::reset();
+            assert_eq!(stats.leases_to_dead, 0);
+            assert_recorded_move_category(
+                &stats,
+                "reap_to_dead",
+                if collision {
+                    "collision"
+                } else {
+                    "source_missing"
+                },
+            );
+            assert!(source.exists());
+            if collision {
+                assert!(destination.exists());
+                std::fs::remove_file(&destination).unwrap();
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay = reap_expired_with_budget(&mut reopened, &WorkBudget::default());
+            assert_eq!(replay.leases_to_dead, 1, "errors: {:?}", replay.errors);
+            assert!(!source.exists());
+            assert!(destination.exists());
+        }
+    }
+
+    #[test]
+    fn delayed_promotion_scanner_handles_collision_and_missing_source() {
+        for collision in [true, false] {
+            let (tmp, mut queue) = create_test_queue();
+            let not_before = queue
+                .authenticated_wall_floor()
+                .unwrap()
+                .unix_ns()
+                .checked_add(queue.format.delayed_bucket_width_ns)
+                .unwrap();
+            let ticket = match queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                initial_not_before: Some(not_before),
+                payload: b"delayed collision".to_vec(),
+                ..Default::default()
+            }) {
+                EnqueueOutcome::Committed(ticket) => ticket,
+                outcome => panic!("enqueue failed: {outcome:?}"),
+            };
+            let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
+            let parsed = steadq_names::parse_delayed(parts[3]).unwrap();
+            let source = tmp.path().join(&ticket.expected_relative_path);
+            let destination = tmp
+                .path()
+                .join(ready_destination(&queue, parts[2], &parsed.common));
+            let delayed_bucket = steadq_names::bucket_from_hex(parts[1]).unwrap();
+            write_wall_watermark(&tmp, delayed_bucket);
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            if collision {
+                std::fs::copy(&source, &destination).unwrap();
+            } else {
+                fs::fault::inject_errno("renameat2_noreplace", 1, libc::ENOENT);
+            }
+            let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+            fs::fault::reset();
+            assert_eq!(stats.delayed_promoted, 0);
+            assert_recorded_move_category(
+                &stats,
+                "promote_delayed",
+                if collision {
+                    "collision"
+                } else {
+                    "source_missing"
+                },
+            );
+            assert!(source.exists());
+            if collision {
+                assert!(destination.exists());
+                std::fs::remove_file(&destination).unwrap();
+            }
+            queue.persist_recovery_cursor().unwrap();
+            drop(queue);
+            let mut reopened = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let replay_floor = reopened.authenticated_wall_floor().unwrap();
+            let replay = promote_eligible_with_budget(&mut reopened, replay_floor);
+            assert_eq!(replay.delayed_promoted, 1, "errors: {:?}", replay.errors);
+            assert!(!source.exists());
+            assert!(destination.exists());
         }
     }
 
