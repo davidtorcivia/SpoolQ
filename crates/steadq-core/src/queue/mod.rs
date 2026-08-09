@@ -1492,19 +1492,25 @@ impl Queue {
         let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
-        // Rename with NOREPLACE
-        match fs::renameat2_noreplace(tmp_dir_fd.as_fd(), &temp_name, dest_fd.as_fd(), dest_name) {
+        let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
+        match engine::move_witnessed_noreplace_io(
+            tmp_dir_fd.as_fd(),
+            &temp_name,
+            dest_fd.as_fd(),
+            dest_name,
+            engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
+            engine::MoveActor::Producer,
+        ) {
             Ok(()) => {
-                temp_guard.armed = false; // C-10: disarm on success
-                                          // Sync destination first, then source
-                fs::fsync_dir_fd(dest_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
-                fs::fsync_dir_fd(tmp_dir_fd.as_fd()).map_err(PublishError::classify_post_fsync)?;
+                temp_guard.armed = false;
                 Ok(())
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                Err(PublishError::NotCommitted(Error::IdentityCollision))
+            Err(failure) => {
+                if failure.is_outcome_unknown() {
+                    temp_guard.armed = false;
+                }
+                Err(PublishError::classify_move(failure))
             }
-            Err(e) => Err(PublishError::classify_write(e)),
         }
     }
 
@@ -4029,6 +4035,21 @@ enum PublishError {
 }
 
 impl PublishError {
+    fn classify_move(failure: engine::MoveFailureWith<io::Error>) -> Self {
+        match failure {
+            engine::MoveFailureWith::AlreadyExists => {
+                PublishError::NotCommitted(Error::IdentityCollision)
+            }
+            engine::MoveFailureWith::SourceMissing => PublishError::NotCommitted(Error::IoFailure(
+                "temporary publication source missing".into(),
+            )),
+            engine::MoveFailureWith::NotCommitted { source, .. } => Self::classify_write(source),
+            engine::MoveFailureWith::OutcomeUnknown { source, .. } => {
+                PublishError::OutcomeUnknown(Error::IoFailure(source.to_string()))
+            }
+        }
+    }
+
     fn classify_write(e: io::Error) -> Self {
         match e.raw_os_error() {
             Some(libc::ENOSPC) | Some(libc::EDQUOT) => {
@@ -4178,6 +4199,16 @@ mod tests {
                 )))
                 .unwrap();
             }
+        }
+    }
+
+    fn precreate_named_temp_shards(tmp: &TempDir, queue: &Queue) {
+        for shard in 0..queue.format.shard_count {
+            std::fs::create_dir_all(
+                tmp.path()
+                    .join(format!("tmp/{}/{shard:04x}", queue.boot_id)),
+            )
+            .unwrap();
         }
     }
 
@@ -4433,6 +4464,76 @@ mod tests {
             .unwrap();
         assert_eq!(read, payload.len());
         assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn named_fallback_preserves_prelinearization_errors_and_cleans_temp() {
+        for (errno, expected) in [
+            (libc::EEXIST, "collision"),
+            (libc::ENOSPC, "resource"),
+            (libc::ENOENT, "missing"),
+        ] {
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            let (tmp, mut queue) = create_test_queue();
+            precreate_named_temp_shards(&tmp, &queue);
+            fs::fault::inject_errno("open_tmpfile", 1, libc::EOPNOTSUPP);
+            fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+
+            let outcome = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"named failure".to_vec(),
+                ..Default::default()
+            });
+            fs::fault::reset();
+
+            match expected {
+                "collision" => assert!(matches!(
+                    outcome,
+                    EnqueueOutcome::NotCommitted(_, Error::IdentityCollision)
+                )),
+                "resource" => assert!(matches!(
+                    outcome,
+                    EnqueueOutcome::NotCommitted(_, Error::ResourceExhausted)
+                )),
+                "missing" => assert!(matches!(
+                    outcome,
+                    EnqueueOutcome::NotCommitted(_, Error::IoFailure(_))
+                )),
+                _ => unreachable!(),
+            }
+            assert!(!queue.is_poisoned());
+            assert!(find_file_with_suffix(&tmp.path().join("tmp"), "").is_none());
+            assert!(find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_none());
+        }
+    }
+
+    #[test]
+    fn named_fallback_preserves_each_postlinearization_barrier() {
+        for fsync_call in [1, 2] {
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            let (tmp, mut queue) = create_test_queue();
+            precreate_named_temp_shards(&tmp, &queue);
+            fs::fault::inject_errno("open_tmpfile", 1, libc::EOPNOTSUPP);
+            fs::fault::inject_errno("fsync_dir_fd", fsync_call, libc::EIO);
+
+            let outcome = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"named barrier".to_vec(),
+                ..Default::default()
+            });
+            fs::fault::reset();
+
+            let EnqueueOutcome::OutcomeUnknown(ticket, Error::IoFailure(_)) = outcome else {
+                panic!("expected outcome unknown");
+            };
+            assert!(queue.is_poisoned());
+            assert!(tmp.path().join(ticket.expected_relative_path).exists());
+            assert!(find_file_with_suffix(&tmp.path().join("tmp"), "").is_none());
+        }
     }
 
     #[test]
