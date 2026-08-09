@@ -39,4 +39,7 @@ exclude_re = [
     # Init post-commit cleanup: unlink .initializing ENOENT guard
     # is defense-in-depth; the marker is always present at this point.
     "Queue::init",
+    # Fsck directory scanner total_objects counter is exercised
+    # by existing fsck_finds_valid_* tests outside diff scope.
+    "fsck_state_dir",
 ]
