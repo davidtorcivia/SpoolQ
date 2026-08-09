@@ -1,6 +1,8 @@
 // Linux syscall substrate for SteadQ/1.
 // Confines all unsafe code to this module.
 
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -189,6 +191,7 @@ pub mod fault {
                 return Ok(());
             }
 
+            // SAFETY: Linux `stat` contains only integer fields and may be zero-initialized.
             let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: `statbuf` points to writable storage for one `libc::stat`,
             // and the caller supplies an open descriptor for the duration of
@@ -243,6 +246,7 @@ pub fn open_tmpfile(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     // Fall back to the defined constant if libc does not expose it.
     let o_tmpfile = libc::O_TMPFILE;
     let dot = CString::new(".").unwrap();
+    // SAFETY: `dot` is NUL-terminated and `dir_fd` remains live for the call.
     let fd = unsafe {
         libc::openat(
             dir_fd.as_raw_fd(),
@@ -254,6 +258,7 @@ pub fn open_tmpfile(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: a nonnegative `openat` result is a newly owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -278,6 +283,7 @@ pub fn open_directory(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd>
     fault_check!("open_directory");
     // R2-B06: Use O_NOFOLLOW to prevent symlink traversal on state directories.
     let c_name = cstr_from_name(name)?;
+    // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let fd = unsafe {
         libc::openat(
             dir_fd.as_raw_fd(),
@@ -288,6 +294,7 @@ pub fn open_directory(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd>
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: a nonnegative `openat` result is a newly owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -325,10 +332,12 @@ pub fn open_directory_beneath(
 pub fn openat(dir_fd: BorrowedFd<'_>, name: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
     fault_check!("openat");
     let c_name = cstr_from_name(name)?;
+    // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), c_name.as_ptr(), flags, mode) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: a nonnegative `openat` result is a newly owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -336,6 +345,7 @@ pub fn openat(dir_fd: BorrowedFd<'_>, name: &str, flags: i32, mode: u32) -> io::
 pub fn mkdirat(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<()> {
     fault_check!("mkdirat");
     let c_name = cstr_from_name(name)?;
+    // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let rc = unsafe { libc::mkdirat(dir_fd.as_raw_fd(), c_name.as_ptr(), mode) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -356,6 +366,7 @@ pub fn mkdirat_eexist_ok(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::R
 /// fsync a file descriptor.
 pub fn fsync(fd: BorrowedFd<'_>) -> io::Result<()> {
     fault_check!("fsync");
+    // SAFETY: `fd` remains live for the synchronous syscall.
     let rc = unsafe { libc::fsync(fd.as_raw_fd()) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -388,6 +399,7 @@ pub fn renameat2_noreplace(
     const RENAME_NOREPLACE: u32 = 1 << 0;
     let c_old = cstr_from_name(old_name)?;
     let c_new = cstr_from_name(new_name)?;
+    // SAFETY: both names are NUL-terminated and both directory borrows remain live.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -414,6 +426,7 @@ pub fn renameat(
     fault_check!("renameat");
     let c_old = cstr_from_name(old_name)?;
     let c_new = cstr_from_name(new_name)?;
+    // SAFETY: both names are NUL-terminated and both directory borrows remain live.
     let rc = unsafe {
         libc::renameat(
             old_dir_fd.as_raw_fd(),
@@ -438,6 +451,7 @@ pub fn linkat_empty_path(
     const AT_EMPTY_PATH: i32 = 0x1000;
     let c_dest = cstr_from_name(dest_name)?;
     let empty = CString::new("").unwrap();
+    // SAFETY: both names are NUL-terminated and both descriptor borrows remain live.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
@@ -465,6 +479,7 @@ pub fn linkat_proc_self_fd(
     #[allow(clippy::manual_c_str_literals)]
     let proc_path = format!("/proc/self/fd/{}\0", fd.as_raw_fd());
     let c_dest = cstr_from_name(dest_name)?;
+    // SAFETY: both paths are NUL-terminated and both descriptor borrows remain live.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
@@ -485,6 +500,7 @@ pub fn linkat_proc_self_fd(
 pub fn unlinkat(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     fault_check!("unlinkat");
     let c_name = cstr_from_name(name)?;
+    // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -497,6 +513,7 @@ pub fn unlinkat_dir(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     fault_check!("unlinkat_dir");
     const AT_REMOVEDIR: i32 = 0x200;
     let c_name = cstr_from_name(name)?;
+    // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), AT_REMOVEDIR) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -508,7 +525,9 @@ pub fn unlinkat_dir(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<()> {
 pub fn fstatat(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<libc::stat> {
     fault_check!("fstatat");
     let c_name = cstr_from_name(name)?;
+    // SAFETY: Linux `stat` contains only integer fields and may be zero-initialized.
     let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_name` is NUL-terminated, `statbuf` is writable, and `dir_fd` is live.
     let rc = unsafe {
         libc::fstatat(
             dir_fd.as_raw_fd(),
@@ -526,7 +545,9 @@ pub fn fstatat(dir_fd: BorrowedFd<'_>, name: &str) -> io::Result<libc::stat> {
 /// fstat on an already-open fd.
 pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
     fault_check!("fstat");
+    // SAFETY: Linux `stat` contains only integer fields and may be zero-initialized.
     let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `statbuf` is writable and `fd` remains live for the call.
     let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut statbuf) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -537,7 +558,9 @@ pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
 /// Get filesystem stats using OsStrExt for byte-safe paths.
 pub fn statfs(path: &Path) -> io::Result<libc::statfs> {
     let c_path = cstr_from_bytes(path.as_os_str().as_bytes())?;
+    // SAFETY: Linux `statfs` contains only integer fields and may be zero-initialized.
     let mut statbuf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is NUL-terminated and `statbuf` is writable for the call.
     let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut statbuf) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -553,7 +576,9 @@ pub fn read_boot_id() -> io::Result<String> {
 /// CLOCK_BOOTTIME in nanoseconds.
 pub fn clock_boottime_ns() -> io::Result<u64> {
     fault_check!("clock_boottime_ns");
+    // SAFETY: Linux `timespec` contains integer fields and may be zero-initialized.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `ts` points to writable storage for one `timespec`.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -567,7 +592,9 @@ pub fn clock_realtime_ns() -> io::Result<u64> {
     if let Some(unix_ns) = fault::clock_realtime_ns() {
         return Ok(unix_ns);
     }
+    // SAFETY: Linux `timespec` contains integer fields and may be zero-initialized.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `ts` points to writable storage for one `timespec`.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -585,7 +612,9 @@ pub fn clock_realtime_ns() -> io::Result<u64> {
 /// CLOCK_MONOTONIC in nanoseconds (for budget enforcement).
 pub fn clock_monotonic_ns() -> io::Result<u64> {
     fault_check!("clock_monotonic_ns");
+    // SAFETY: Linux `timespec` contains integer fields and may be zero-initialized.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `ts` points to writable storage for one `timespec`.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -604,6 +633,7 @@ pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; bytes];
     let mut filled = 0usize;
     loop {
+        // SAFETY: the remaining slice is writable for its reported length.
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_getrandom,
@@ -651,6 +681,7 @@ pub fn random_128bit() -> io::Result<[u8; 16]> {
 /// pwrite to a file descriptor at a given offset.
 pub fn pwrite(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<usize> {
     fault_check!("pwrite");
+    // SAFETY: `buf` is readable for its length and `fd` remains live for the call.
     let rc = unsafe {
         libc::pwrite(
             fd.as_raw_fd(),
@@ -675,6 +706,7 @@ pub fn write_all(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < buf.len() {
         let remaining = &buf[written..];
+        // SAFETY: `remaining` is readable for its length and `fd` remains live.
         let rc = unsafe {
             libc::write(
                 fd.as_raw_fd(),
@@ -724,6 +756,7 @@ pub fn pwrite_all(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<()>
 /// Read from a file descriptor.
 pub fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     loop {
+        // SAFETY: `buf` is writable for its length and `fd` remains live for the call.
         let rc = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if rc < 0 {
             let e = io::Error::last_os_error();
@@ -740,6 +773,7 @@ pub fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
 pub fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     fault_check!("pread");
     loop {
+        // SAFETY: `buf` is writable for its length and `fd` remains live for the call.
         let rc = unsafe {
             libc::pread(
                 fd.as_raw_fd(),
@@ -782,6 +816,7 @@ pub fn pread_exact(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Resul
 pub fn open_dir_absolute(path: &Path) -> io::Result<OwnedFd> {
     // R2-B06: Use O_NOFOLLOW to prevent the root from being a symlink.
     let c_path = cstr_from_bytes(path.as_os_str().as_bytes())?;
+    // SAFETY: `c_path` is NUL-terminated and remains live for the call.
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
@@ -791,6 +826,7 @@ pub fn open_dir_absolute(path: &Path) -> io::Result<OwnedFd> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: a nonnegative `open` result is a newly owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -808,11 +844,13 @@ pub fn create_exclusive(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Re
 /// Returns Ok(true) if acquired, Ok(false) if contended.
 pub fn try_ofd_write_lock(fd: BorrowedFd<'_>) -> io::Result<bool> {
     fault_check!("try_ofd_write_lock");
+    // SAFETY: Linux `flock` contains scalar fields and may be zero-initialized.
     let mut flock: libc::flock = unsafe { std::mem::zeroed() };
     flock.l_type = libc::F_WRLCK as i16;
     flock.l_whence = libc::SEEK_SET as i16;
     flock.l_start = 0;
     flock.l_len = 0;
+    // SAFETY: `flock` is readable and `fd` remains live for the call.
     let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_SETLK, &flock) };
     if rc < 0 {
         let e = io::Error::last_os_error();
@@ -827,11 +865,13 @@ pub fn try_ofd_write_lock(fd: BorrowedFd<'_>) -> io::Result<bool> {
 /// Try a nonblocking shared OFD lock on a file.
 pub fn try_ofd_read_lock(fd: BorrowedFd<'_>) -> io::Result<bool> {
     fault_check!("try_ofd_read_lock");
+    // SAFETY: Linux `flock` contains scalar fields and may be zero-initialized.
     let mut flock: libc::flock = unsafe { std::mem::zeroed() };
     flock.l_type = libc::F_RDLCK as i16;
     flock.l_whence = libc::SEEK_SET as i16;
     flock.l_start = 0;
     flock.l_len = 0;
+    // SAFETY: `flock` is readable and `fd` remains live for the call.
     let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_SETLK, &flock) };
     if rc < 0 {
         let e = io::Error::last_os_error();
@@ -1208,6 +1248,7 @@ where
 /// Change file mode relative to a directory fd.
 pub fn fchmodat(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<()> {
     let c_name = cstr_from_name(name)?;
+    // SAFETY: `c_name` is NUL-terminated and `dir_fd` remains live for the call.
     let rc = unsafe { libc::fchmodat(dir_fd.as_raw_fd(), c_name.as_ptr(), mode, 0) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -1217,6 +1258,7 @@ pub fn fchmodat(dir_fd: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<()>
 
 /// Change file mode on an open fd.
 pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
+    // SAFETY: `fd` remains live for the synchronous syscall.
     let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -1287,6 +1329,7 @@ pub fn stabilize_dir(fd: BorrowedFd<'_>) -> io::Result<()> {
 /// syncfs: sync an entire filesystem. Caller must assert the queue owns the mount.
 pub fn syncfs(fd: BorrowedFd<'_>) -> io::Result<()> {
     fault_check!("syncfs");
+    // SAFETY: `fd` remains live for the synchronous syscall.
     let rc = unsafe { libc::syscall(libc::SYS_syncfs, fd.as_raw_fd()) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -1499,6 +1542,7 @@ mod tests {
     use std::os::fd::{AsFd, RawFd};
 
     fn assert_fd_released(fd: RawFd, expected_device: u64, expected_inode: u64) {
+        // SAFETY: Linux `stat` contains only integer fields and may be zero-initialized.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `stat` is writable for the duration of the syscall. The raw
         // descriptor is inspected only to prove the transferred handle was released.
@@ -2161,10 +2205,8 @@ mod tests {
         assert_eq!(fstat(file.as_fd()).unwrap().st_mode & 0o777, 0o700);
         write_all(file.as_fd(), b"data").unwrap();
         // SAFETY: `file` owns this descriptor for the duration of the call.
-        assert_eq!(
-            unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) },
-            0
-        );
+        let offset = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) };
+        assert_eq!(offset, 0);
         let mut sequential = [0u8; 4];
         assert_eq!(read(file.as_fd(), &mut sequential).unwrap(), 4);
         assert_eq!(&sequential, b"data");
