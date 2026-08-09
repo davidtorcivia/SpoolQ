@@ -5,7 +5,7 @@ pub mod layout;
 pub mod verified;
 
 use std::io;
-use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use steadq_format::cbor::ExtensionHeader;
@@ -670,7 +670,7 @@ impl Queue {
             libc::O_RDWR,
             0o600,
         )?;
-        let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())?;
+        let locked = fs::try_ofd_write_lock(lock_fd.as_fd())?;
         if !locked {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -733,7 +733,7 @@ impl Queue {
                         Err(e)
                     }
                 })?;
-            fs::fsync(fd.as_raw_fd())?;
+            fs::fsync(fd.as_fd())?;
         }
         fs::fsync_dir_fd(control_fd.as_raw_fd())?;
         fs::fsync_dir_fd(root_fd.as_raw_fd())?;
@@ -756,8 +756,8 @@ impl Queue {
             steadq_names::hex_encode(&fs::random_128bit()?)
         );
         let wm_tmp = fs::create_exclusive(control_fd.as_raw_fd(), &wm_tmp_name, 0o600)?;
-        fs::write_all(wm_tmp.as_raw_fd(), &wm_bytes)?;
-        fs::fsync(wm_tmp.as_raw_fd())?;
+        fs::write_all(wm_tmp.as_fd(), &wm_bytes)?;
+        fs::fsync(wm_tmp.as_fd())?;
         fs::renameat(
             control_fd.as_raw_fd(),
             &wm_tmp_name,
@@ -774,8 +774,8 @@ impl Queue {
             steadq_names::hex_encode(&fs::random_128bit()?)
         );
         let fmt_tmp = fs::create_exclusive(root_fd.as_raw_fd(), &fmt_tmp_name, 0o600)?;
-        fs::write_all(fmt_tmp.as_raw_fd(), &format_bytes)?;
-        fs::fsync(fmt_tmp.as_raw_fd())?;
+        fs::write_all(fmt_tmp.as_fd(), &format_bytes)?;
+        fs::fsync(fmt_tmp.as_fd())?;
         // R2-B01: Publish FORMAT with RENAME_NOREPLACE so two concurrent
         // initializers cannot overwrite each other.
         match fs::renameat2_noreplace(
@@ -828,7 +828,7 @@ impl Queue {
         {
             let mut buf = [0u8; 4096];
             loop {
-                match fs::read(format_fd.as_raw_fd(), &mut buf) {
+                match fs::read(format_fd.as_fd(), &mut buf) {
                     Ok(0) => break,
                     Ok(n) => format_bytes.extend_from_slice(&buf[..n]),
                     Err(e) => return Err(Error::IoFailure(e.to_string())),
@@ -914,8 +914,8 @@ impl Queue {
         // Acquire shared maintenance lock
         let maint_fd = fs::openat(root_fd.as_raw_fd(), "control/maintenance.lock", 0o0, 0o600)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let locked = fs::try_ofd_read_lock(maint_fd.as_raw_fd())
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let locked =
+            fs::try_ofd_read_lock(maint_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         if !locked {
             return Err(Error::MaintenanceBusy);
         }
@@ -1053,7 +1053,7 @@ impl Queue {
             0o600,
         )
         .map_err(|error| Error::IoFailure(error.to_string()))?;
-        let locked = fs::try_ofd_write_lock(lock_fd.as_raw_fd())
+        let locked = fs::try_ofd_write_lock(lock_fd.as_fd())
             .map_err(|error| Error::IoFailure(error.to_string()))?;
         if !locked {
             return Err(Error::MaintenanceBusy);
@@ -1104,7 +1104,7 @@ impl Queue {
             )));
         }
         let mut buf = [0u8; steadq_format::WATERMARK_SIZE];
-        if let Err(error) = fs::pread_exact(data.as_raw_fd(), &mut buf, 0) {
+        if let Err(error) = fs::pread_exact(data.as_fd(), &mut buf, 0) {
             return if error.kind() == io::ErrorKind::UnexpectedEof {
                 Err(WatermarkReadError::Truncated(error.to_string()))
             } else {
@@ -1170,9 +1170,8 @@ impl Queue {
         );
         let tmp_fd = fs::create_exclusive(control_fd, &tmp_name, 0o600)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::write_all(tmp_fd.as_raw_fd(), &wm_bytes)
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync(tmp_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::write_all(tmp_fd.as_fd(), &wm_bytes).map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync(tmp_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::renameat(control_fd, &tmp_name, control_fd, "wall-watermark")
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::fsync_dir_fd(control_fd).map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -1427,21 +1426,13 @@ impl Queue {
                 let header_bytes = header
                     .encode(ext_bytes)
                     .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
-                fs::write_all(tmp_fd.as_raw_fd(), &header_bytes)
+                fs::write_all(tmp_fd.as_fd(), &header_bytes)
                     .map_err(PublishError::classify_write)?;
-                // Write extension
-                if !ext_bytes.is_empty() {
-                    fs::write_all(tmp_fd.as_raw_fd(), ext_bytes)
-                        .map_err(PublishError::classify_write)?;
-                }
-                // Write payload
-                if !payload.is_empty() {
-                    fs::write_all(tmp_fd.as_raw_fd(), payload)
-                        .map_err(PublishError::classify_write)?;
-                }
+                fs::write_all(tmp_fd.as_fd(), ext_bytes).map_err(PublishError::classify_write)?;
+                fs::write_all(tmp_fd.as_fd(), payload).map_err(PublishError::classify_write)?;
                 // C-13: No redundant pwrite - header was already written correctly above.
                 // fsync file (before publication: NotCommitted on failure)
-                fs::fsync(tmp_fd.as_raw_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
+                fs::fsync(tmp_fd.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
                 // Publish via linkat - C-09: capture errors for capability classification
                 let link1 =
@@ -1532,16 +1523,12 @@ impl Queue {
         let header_bytes = header
             .encode(ext_bytes)
             .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
-        fs::write_all(tmp_file.as_raw_fd(), &header_bytes).map_err(PublishError::classify_write)?;
-        if !ext_bytes.is_empty() {
-            fs::write_all(tmp_file.as_raw_fd(), ext_bytes).map_err(PublishError::classify_write)?;
-        }
-        if !payload.is_empty() {
-            fs::write_all(tmp_file.as_raw_fd(), payload).map_err(PublishError::classify_write)?;
-        }
+        fs::write_all(tmp_file.as_fd(), &header_bytes).map_err(PublishError::classify_write)?;
+        fs::write_all(tmp_file.as_fd(), ext_bytes).map_err(PublishError::classify_write)?;
+        fs::write_all(tmp_file.as_fd(), payload).map_err(PublishError::classify_write)?;
         // C-13: No redundant pwrite - header was written correctly above.
         // fsync file (before publication: NotCommitted on failure)
-        fs::fsync(tmp_file.as_raw_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
+        fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
         // Open destination directory for rename
         let dest_fd = open_relative(self.root_fd.as_raw_fd(), dest_dir_relative)
@@ -1862,7 +1849,7 @@ impl Queue {
                             }
                         };
                         let refreshed_evidence = match Self::read_claim_ticket_evidence(
-                            claim_source.file_fd.as_raw_fd(),
+                            claim_source.file_fd.as_fd(),
                             &parsed.common.job_id,
                             parsed.common.maximum_attempts,
                         ) {
@@ -1923,7 +1910,7 @@ impl Queue {
                         let leased_file = claim_source.file_fd;
 
                         let mut header_buf = [0u8; 128];
-                        if fs::pread_exact(leased_file.as_raw_fd(), &mut header_buf, 0).is_err() {
+                        if fs::pread_exact(leased_file.as_fd(), &mut header_buf, 0).is_err() {
                             self.poison();
                             return LeaseOutcome::OutcomeUnknown(
                                 claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
@@ -1961,9 +1948,8 @@ impl Queue {
                                 );
                             }
                             let mut ext_buf_claim = vec![0u8; ext_len_h];
-                            if ext_len_h > 0
-                                && fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf_claim, 128)
-                                    .is_err()
+                            if fs::pread_exact(leased_file.as_fd(), &mut ext_buf_claim, 128)
+                                .is_err()
                             {
                                 self.poison();
                                 return LeaseOutcome::OutcomeUnknown(
@@ -2017,7 +2003,7 @@ impl Queue {
                                 );
                             }
                             let mut ext_buf = vec![0u8; header.extension_header_length as usize];
-                            match fs::pread_exact(leased_file.as_raw_fd(), &mut ext_buf, 128) {
+                            match fs::pread_exact(leased_file.as_fd(), &mut ext_buf, 128) {
                                 Ok(()) => {
                                     match steadq_format::cbor::ExtensionHeader::decode(&ext_buf) {
                                         Ok(e) => e.content_type,
@@ -2046,7 +2032,7 @@ impl Queue {
                         // P0-01: Verify payload digest on held fd before delivery.
                         // Deterministic PayloadCorrupt is quarantined, not delivered.
                         // Indeterminate I/O poisons and yields OutcomeUnknown.
-                        if let Err(e) = self.verify_payload_on_fd(leased_file.as_raw_fd()) {
+                        if let Err(e) = self.verify_payload_on_fd(leased_file.as_fd()) {
                             match e {
                                 Error::PayloadCorrupt => {
                                     let _ = self.quarantine_corrupt_lease(
@@ -2175,7 +2161,7 @@ impl Queue {
             Err(e) => return AckOutcome::NotCommitted(e),
         };
 
-        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
+        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             self.poison();
             return AckOutcome::NotCommitted(e);
         }
@@ -2741,7 +2727,7 @@ impl Queue {
             ));
         }
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0)
+        fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let header = FixedHeader::decode(&header_buf)
             .map_err(|e| Error::QueueCorrupt(format!("header decode: {e}")))?;
@@ -2785,7 +2771,7 @@ impl Queue {
         // R4-H05: Always verify envelope digest (even when extension is empty).
         let mut ext_buf = vec![0u8; ext_len];
         if verified::is_extension_present(ext_len) {
-            fs::pread_exact(file_fd.as_raw_fd(), &mut ext_buf, 128)
+            fs::pread_exact(file_fd.as_fd(), &mut ext_buf, 128)
                 .map_err(|e| Error::IoFailure(e.to_string()))?;
         }
         if !steadq_format::verify_envelope_digest(&header, &ext_buf) {
@@ -3017,7 +3003,7 @@ impl Queue {
             ));
         }
         let evidence = Self::read_claim_ticket_evidence(
-            file.as_raw_fd(),
+            file.as_fd(),
             expected_job_id,
             expected_maximum_attempts,
         )?;
@@ -3030,7 +3016,7 @@ impl Queue {
     }
 
     fn read_claim_ticket_evidence(
-        file_fd: RawFd,
+        file_fd: BorrowedFd<'_>,
         expected_job_id: &[u8; 16],
         expected_maximum_attempts: u32,
     ) -> Result<TicketEvidence, Error> {
@@ -3110,14 +3096,14 @@ impl Queue {
             Some(source) => source,
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
-        self.verify_payload_on_fd(source.file_fd.as_raw_fd())
+        self.verify_payload_on_fd(source.file_fd.as_fd())
     }
 
     /// R4-H22/H23: Verify the payload digest on an already-open file descriptor.
     /// Central verifier is the single source of truth; this wrapper preserves
     /// the existing Error mapping for callers that have not yet adopted
     /// VerificationError directly.
-    fn verify_payload_on_fd(&self, fd: std::os::unix::io::RawFd) -> Result<(), Error> {
+    fn verify_payload_on_fd(&self, fd: BorrowedFd<'_>) -> Result<(), Error> {
         verified::verify_job_on_fd(fd)
             .map(|_| ())
             .map_err(Error::from)
@@ -3125,10 +3111,7 @@ impl Queue {
 
     /// Verify only the envelope and size, without hashing payload bytes.
     /// Used by inspection paths that have not yet delivered payload.
-    fn verify_envelope_on_fd(
-        &self,
-        fd: std::os::unix::io::RawFd,
-    ) -> Result<verified::VerifiedJob, Error> {
+    fn verify_envelope_on_fd(&self, fd: BorrowedFd<'_>) -> Result<verified::VerifiedJob, Error> {
         verified::verify_envelope_on_fd(fd).map_err(Error::from)
     }
 
@@ -3171,7 +3154,7 @@ impl Queue {
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
         // P0-01: Verify payload before delivering any bytes.
-        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
+        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 let _ = self.quarantine_corrupt_lease(
                     source.directory_fd.as_raw_fd(),
@@ -3182,7 +3165,7 @@ impl Queue {
             return Err(e);
         }
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_raw_fd(), &mut header_buf, 0)
+        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
@@ -3194,7 +3177,7 @@ impl Queue {
         }
         let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
         let abs_offset = payload_start + offset;
-        let n = fs::pread(source.file_fd.as_raw_fd(), &mut buf[..to_read], abs_offset)
+        let n = fs::pread(source.file_fd.as_fd(), &mut buf[..to_read], abs_offset)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         Ok(n)
     }
@@ -3213,7 +3196,7 @@ impl Queue {
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
         // P0-01: Verify payload before streaming any bytes.
-        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_raw_fd()) {
+        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 let _ = self.quarantine_corrupt_lease(
                     source.directory_fd.as_raw_fd(),
@@ -3225,7 +3208,7 @@ impl Queue {
         }
 
         let mut header_buf = [0u8; 128];
-        fs::pread_exact(source.file_fd.as_raw_fd(), &mut header_buf, 0)
+        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let header =
             FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
@@ -3240,7 +3223,7 @@ impl Queue {
         while offset < payload_len {
             let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
             let n = fs::pread(
-                source.file_fd.as_raw_fd(),
+                source.file_fd.as_fd(),
                 &mut buf[..to_read],
                 payload_start + offset,
             )
@@ -3434,7 +3417,7 @@ impl Queue {
                                             Err(_) => continue,
                                         };
                                         if verified::verify_receipt_on_fd(
-                                            file_fd.as_raw_fd(),
+                                            file_fd.as_fd(),
                                             verified::ReceiptContext {
                                                 queue_id: &self.format.queue_id,
                                                 shard_count: self.format.shard_count,
@@ -3518,7 +3501,7 @@ impl Queue {
         // will re-stat the fd for size, which is fine since the fd is held open.
         let file_fd = fs::openat(dir_fd, name, libc::O_RDONLY, 0)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
-        let verified = self.verify_envelope_on_fd(file_fd.as_raw_fd())?;
+        let verified = self.verify_envelope_on_fd(file_fd.as_fd())?;
         let header = verified.header;
 
         // R4-H06: Check queue-configured payload limit
@@ -3683,7 +3666,7 @@ impl Queue {
             Err(_) => return false,
         };
         verified::verify_receipt_on_fd(
-            file_fd.as_raw_fd(),
+            file_fd.as_fd(),
             verified::ReceiptContext {
                 queue_id: &self.format.queue_id,
                 shard_count: self.format.shard_count,
@@ -3750,7 +3733,7 @@ impl Queue {
                     0,
                 ) {
                     if verified::verify_receipt_on_fd(
-                        file_fd.as_raw_fd(),
+                        file_fd.as_fd(),
                         verified::ReceiptContext {
                             queue_id: &self.format.queue_id,
                             shard_count: self.format.shard_count,
@@ -3953,7 +3936,7 @@ impl Queue {
 
         // R4-B07: Read the 128-byte header buffer.
         let mut header_buf = [0u8; 128];
-        if let Err(error) = fs::pread_exact(file_fd.as_raw_fd(), &mut header_buf, 0) {
+        if let Err(error) = fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0) {
             return if error.kind() == io::ErrorKind::UnexpectedEof {
                 ResolveObj::Conflict
             } else {
@@ -3974,7 +3957,7 @@ impl Queue {
                 payload_length: ticket.payload_length(),
             };
             match verified::verify_receipt_on_fd(
-                file_fd.as_raw_fd(),
+                file_fd.as_fd(),
                 verified::ReceiptContext {
                     queue_id: &self.format.queue_id,
                     shard_count: self.format.shard_count,
@@ -4006,7 +3989,7 @@ impl Queue {
             }
         }
 
-        let verified = match verified::verify_job_on_fd(file_fd.as_raw_fd()) {
+        let verified = match verified::verify_job_on_fd(file_fd.as_fd()) {
             Ok(verified) => verified,
             Err(verified::VerificationError::Io(error)) => {
                 return ResolveObj::Error(Error::IoFailure(error));
@@ -4142,7 +4125,7 @@ impl Queue {
         path: &ResolvePath<'_>,
         object: &ResolvedObject,
     ) -> Result<bool, Error> {
-        fs::fsync(object.file_fd.as_raw_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        fs::fsync(object.file_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         fs::fsync_dir_fd(object.directory_fd.as_raw_fd())
             .map_err(|e| Error::IoFailure(e.to_string()))?;
         let current_directory =
@@ -4580,6 +4563,32 @@ mod tests {
     }
 
     #[test]
+    fn named_fallback_publishes_complete_job() {
+        let (_tmp, mut queue) = create_test_queue();
+        fs::fault::inject_errno("open_tmpfile", 1, libc::EOPNOTSUPP);
+        let payload = b"named fallback payload";
+        let enqueue = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        });
+        fs::fault::reset();
+        assert!(matches!(enqueue, EnqueueOutcome::Committed(_)));
+
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("expected lease, got {outcome:?}"),
+        };
+        let mut bytes = vec![0; payload.len()];
+        let read = queue
+            .read_lease_payload_chunk(&lease, &mut bytes, 0)
+            .unwrap();
+        assert_eq!(read, payload.len());
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
     fn ticket_envelope_digest_authenticates_ready_header() {
         let (_tmp, mut queue) = create_test_queue();
         let enqueue = match queue.enqueue(EnqueueInput {
@@ -4842,7 +4851,7 @@ mod tests {
         file.write_at(&[0xff], 0).unwrap();
 
         assert!(matches!(
-            Queue::read_claim_ticket_evidence(witness.file_fd.as_raw_fd(), &enqueue.job_id, 3,),
+            Queue::read_claim_ticket_evidence(witness.file_fd.as_fd(), &enqueue.job_id, 3,),
             Err(Error::QueueCorrupt(_))
         ));
     }
@@ -6862,7 +6871,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(fs::try_ofd_write_lock(lock_fd.as_raw_fd()).unwrap());
+        assert!(fs::try_ofd_write_lock(lock_fd.as_fd()).unwrap());
 
         let outcome = queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
@@ -6891,7 +6900,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(fs::try_ofd_write_lock(lock_fd.as_raw_fd()).unwrap());
+        assert!(fs::try_ofd_write_lock(lock_fd.as_fd()).unwrap());
 
         assert!(matches!(
             queue.ack(&lease),
@@ -6921,7 +6930,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(fs::try_ofd_write_lock(lock_fd.as_raw_fd()).unwrap());
+        assert!(fs::try_ofd_write_lock(lock_fd.as_fd()).unwrap());
 
         let outcome = queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
@@ -7006,7 +7015,7 @@ mod tests {
                 0o600,
             )
             .map_err(|error| Error::IoFailure(error.to_string()))?;
-            let competing_reader = fs::try_ofd_read_lock(competing_fd.as_raw_fd())
+            let competing_reader = fs::try_ofd_read_lock(competing_fd.as_fd())
                 .map_err(|error| Error::IoFailure(error.to_string()))?;
             assert!(!competing_reader, "new readers must wait behind the writer");
             Ok(())
