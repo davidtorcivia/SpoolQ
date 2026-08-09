@@ -8,6 +8,7 @@ use steadq_math;
 use steadq_names::{self, bucket_hex};
 
 use crate::errors::*;
+use crate::queue::engine::{move_verified_noreplace, MoveActor, MoveFailure, MovePhase};
 use crate::queue::{
     open_relative, FourLevelCursor, Queue, RecoveryCursor, RecoveryHierarchyRetry,
     RecoveryHierarchyRetryKind, RecoveryPhase, ThreeLevelCursor, WallFloor,
@@ -693,6 +694,30 @@ impl Queue {
             relative_path: path.into(),
             error: err.into(),
         });
+    }
+
+    fn record_move_failure(
+        stats: &mut RecoveryStats,
+        operation: &str,
+        path: &str,
+        failure: MoveFailure,
+    ) {
+        let (category, detail) = match failure {
+            MoveFailure::NotCommitted { phase, source } => {
+                ("not_committed", format!("phase={phase:?}: {source}"))
+            }
+            MoveFailure::OutcomeUnknown { phase, source } => {
+                ("outcome_unknown", format!("phase={phase:?}: {source}"))
+            }
+            MoveFailure::AlreadyExists => (
+                "collision",
+                "phase=Rename: destination already exists".into(),
+            ),
+            MoveFailure::SourceMissing => {
+                ("source_missing", "phase=Rename: source is missing".into())
+            }
+        };
+        Self::record_error(stats, &format!("{operation}_{category}"), path, &detail);
     }
 
     fn block_phase(stats: &mut RecoveryStats, op: &str, path: &str, err: &str) {
@@ -1462,35 +1487,47 @@ impl Queue {
                                 continue;
                             };
                             // Move to dead
+                            let relative_path = format!(
+                                "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                            );
                             stats.operations_attempted += 1;
-                            if self
-                                .reap_to_dead(
-                                    boot_dir_name,
-                                    bucket_name,
-                                    shard_name,
-                                    entry,
-                                    &parsed.common,
-                                    DeadReason::AttemptsExhausted,
-                                    wall_floor,
-                                )
-                                .is_ok()
-                            {
-                                stats.leases_to_dead += 1;
+                            match self.reap_to_dead(
+                                boot_dir_name,
+                                bucket_name,
+                                shard_name,
+                                entry,
+                                &parsed.common,
+                                DeadReason::AttemptsExhausted,
+                                wall_floor,
+                            ) {
+                                Ok(()) => stats.leases_to_dead += 1,
+                                Err(failure) => Self::record_move_failure(
+                                    stats,
+                                    "reap_to_dead",
+                                    &relative_path,
+                                    failure,
+                                ),
                             }
                         } else {
                             // Move to ready
+                            let relative_path = format!(
+                                "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                            );
                             stats.operations_attempted += 1;
-                            if self
-                                .reap_to_ready(
-                                    boot_dir_name,
-                                    bucket_name,
-                                    shard_name,
-                                    entry,
-                                    &parsed.common,
-                                )
-                                .is_ok()
-                            {
-                                stats.leases_reaped += 1;
+                            match self.reap_to_ready(
+                                boot_dir_name,
+                                bucket_name,
+                                shard_name,
+                                entry,
+                                &parsed.common,
+                            ) {
+                                Ok(()) => stats.leases_reaped += 1,
+                                Err(failure) => Self::record_move_failure(
+                                    stats,
+                                    "reap_to_ready",
+                                    &relative_path,
+                                    failure,
+                                ),
                             }
                         }
                     }
@@ -1517,14 +1554,18 @@ impl Queue {
         shard: &str,
         leased_name: &str,
         common: &steadq_names::CommonFields,
-    ) -> io::Result<()> {
+    ) -> Result<(), MoveFailure> {
         let src_dir = format!("leased/{boot_dir}/{bucket}/{shard}");
         let dest_dir = format!("ready/{shard}");
 
-        let new_gen = common
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "generation overflow"))?;
+        let new_gen =
+            common
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| MoveFailure::NotCommitted {
+                    phase: MovePhase::PreRename,
+                    source: "generation overflow".into(),
+                })?;
         let ready_common = steadq_names::CommonFields {
             job_id: common.job_id,
             generation: new_gen,
@@ -1534,18 +1575,25 @@ impl Queue {
 
         let ready_name = steadq_names::make_ready_name(&self.format.queue_id, shard, &ready_common);
 
-        let src_fd = open_relative(self.root_fd(), &src_dir)?;
-        let dest_fd = open_relative(self.root_fd(), &dest_dir)?;
+        let src_fd =
+            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: error.to_string(),
+            })?;
+        let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
+            MoveFailure::NotCommitted {
+                phase: MovePhase::EnsureDest,
+                source: error.to_string(),
+            }
+        })?;
 
-        fs::renameat2_noreplace(
+        move_verified_noreplace(
             src_fd.as_raw_fd(),
             leased_name,
             dest_fd.as_raw_fd(),
             &ready_name,
-        )?;
-        fs::fsync_dir_fd(dest_fd.as_raw_fd())?;
-        fs::fsync_dir_fd(src_fd.as_raw_fd())?;
-        Ok(())
+            MoveActor::Recovery,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1558,20 +1606,25 @@ impl Queue {
         common: &steadq_names::CommonFields,
         reason: DeadReason,
         wall_floor: WallFloor,
-    ) -> io::Result<()> {
+    ) -> Result<(), MoveFailure> {
         let src_dir = format!("leased/{boot_dir}/{bucket}/{shard}");
         let terminal_bucket =
             steadq_math::bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "terminal bucket overflow")
+                .ok_or_else(|| MoveFailure::NotCommitted {
+                    phase: MovePhase::PreRename,
+                    source: "terminal bucket overflow".into(),
                 })?;
         let bucket_str = bucket_hex(terminal_bucket);
         let dest_dir = format!("dead/{bucket_str}/{shard}");
 
-        let new_gen = common
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "generation overflow"))?;
+        let new_gen =
+            common
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| MoveFailure::NotCommitted {
+                    phase: MovePhase::PreRename,
+                    source: "generation overflow".into(),
+                })?;
         let dead_common = steadq_names::CommonFields {
             job_id: common.job_id,
             generation: new_gen,
@@ -1587,19 +1640,30 @@ impl Queue {
             reason as u16,
         );
 
-        let _ = self.ensure_dir_pub(&dest_dir);
-        let src_fd = open_relative(self.root_fd(), &src_dir)?;
-        let dest_fd = open_relative(self.root_fd(), &dest_dir)?;
+        self.ensure_dir_pub(&dest_dir)
+            .map_err(|error| MoveFailure::NotCommitted {
+                phase: MovePhase::EnsureDest,
+                source: error.to_string(),
+            })?;
+        let src_fd =
+            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: error.to_string(),
+            })?;
+        let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
+            MoveFailure::NotCommitted {
+                phase: MovePhase::EnsureDest,
+                source: error.to_string(),
+            }
+        })?;
 
-        fs::renameat2_noreplace(
+        move_verified_noreplace(
             src_fd.as_raw_fd(),
             leased_name,
             dest_fd.as_raw_fd(),
             &dead_name,
-        )?;
-        fs::fsync_dir_fd(dest_fd.as_raw_fd())?;
-        fs::fsync_dir_fd(src_fd.as_raw_fd())?;
-        Ok(())
+            MoveActor::Recovery,
+        )
     }
 
     fn promote_delayed(
@@ -1894,59 +1958,16 @@ impl Queue {
                         }
                     }
 
-                    // Promote: move delayed -> ready
-                    let src_dir = format!("delayed/{bucket_name}/{shard_name}");
-                    let dest_dir = format!("ready/{shard_name}");
-
-                    let new_gen = match parsed.common.generation.checked_add(1) {
-                        Some(g) => g,
-                        None => continue,
-                    };
-                    let ready_common = steadq_names::CommonFields {
-                        job_id: parsed.common.job_id,
-                        generation: new_gen,
-                        attempt: parsed.common.attempt,
-                        maximum_attempts: parsed.common.maximum_attempts,
-                    };
-
-                    let ready_name = steadq_names::make_ready_name(
-                        &self.format.queue_id,
-                        shard_name,
-                        &ready_common,
-                    );
-
-                    let src_fd = match open_relative(self.root_fd(), &src_dir) {
-                        Ok(fd) => fd,
-                        Err(_) => continue,
-                    };
-                    let dest_fd = match open_relative(self.root_fd(), &dest_dir) {
-                        Ok(fd) => fd,
-                        Err(_) => continue,
-                    };
-
                     stats.operations_attempted += 1;
-                    if fs::renameat2_noreplace(
-                        src_fd.as_raw_fd(),
-                        entry,
-                        dest_fd.as_raw_fd(),
-                        &ready_name,
-                    )
-                    .is_ok()
-                    {
-                        // B-06: Only count as success if syncs complete
-                        let dest_ok = fs::fsync_dir_fd(dest_fd.as_raw_fd()).is_ok();
-                        let src_ok = fs::fsync_dir_fd(src_fd.as_raw_fd()).is_ok();
-                        if dest_ok && src_ok {
-                            stats.delayed_promoted += 1;
-                        } else {
-                            stats.errors.push(RecoveryError {
-                                operation: "promote_sync".into(),
-                                relative_path: format!(
-                                    "delayed/{bucket_name}/{shard_name}/{entry}"
-                                ),
-                                error: "directory sync failed after promotion".into(),
-                            });
-                        }
+                    let relative_path = format!("delayed/{bucket_name}/{shard_name}/{entry}");
+                    match self.promote_to_ready(bucket_name, shard_name, entry, &parsed.common) {
+                        Ok(()) => stats.delayed_promoted += 1,
+                        Err(failure) => Self::record_move_failure(
+                            stats,
+                            "promote_delayed",
+                            &relative_path,
+                            failure,
+                        ),
                     }
                 }
             }
@@ -1964,6 +1985,51 @@ impl Queue {
             return;
         }
         self.recovery_cursor.promote_delayed = None;
+    }
+
+    fn promote_to_ready(
+        &self,
+        bucket: &str,
+        shard: &str,
+        delayed_name: &str,
+        common: &steadq_names::CommonFields,
+    ) -> Result<(), MoveFailure> {
+        let new_gen =
+            common
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| MoveFailure::NotCommitted {
+                    phase: MovePhase::PreRename,
+                    source: "generation overflow".into(),
+                })?;
+        let ready_common = steadq_names::CommonFields {
+            job_id: common.job_id,
+            generation: new_gen,
+            attempt: common.attempt,
+            maximum_attempts: common.maximum_attempts,
+        };
+        let ready_name = steadq_names::make_ready_name(&self.format.queue_id, shard, &ready_common);
+        let src_dir = format!("delayed/{bucket}/{shard}");
+        let dest_dir = format!("ready/{shard}");
+        let src_fd =
+            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: error.to_string(),
+            })?;
+        let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
+            MoveFailure::NotCommitted {
+                phase: MovePhase::EnsureDest,
+                source: error.to_string(),
+            }
+        })?;
+
+        move_verified_noreplace(
+            src_fd.as_raw_fd(),
+            delayed_name,
+            dest_fd.as_raw_fd(),
+            &ready_name,
+            MoveActor::Recovery,
+        )
     }
 
     fn cleanup_temp_files(
@@ -3186,6 +3252,80 @@ mod tests {
         lease
     }
 
+    fn lease_recovery_job(queue: &mut Queue, maximum_attempts: u32) -> crate::LeaseInfo {
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts,
+                content_type: "x".into(),
+                payload: b"recovery move".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("lease failed: {outcome:?}"),
+        }
+    }
+
+    fn lease_common(lease: &crate::LeaseInfo) -> steadq_names::CommonFields {
+        steadq_names::CommonFields {
+            job_id: lease.job_id,
+            generation: lease.generation,
+            attempt: lease.attempt,
+            maximum_attempts: lease.maximum_attempts,
+        }
+    }
+
+    fn lease_path_parts(lease: &crate::LeaseInfo) -> Vec<&str> {
+        let parts = lease.exact_source_path.split('/').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0], "leased");
+        parts
+    }
+
+    fn assert_injected_move_phase(
+        result: Result<(), MoveFailure>,
+        expected_phase: MovePhase,
+        outcome_unknown: bool,
+    ) {
+        match result {
+            Err(MoveFailure::OutcomeUnknown { phase, .. }) if outcome_unknown => {
+                assert_eq!(phase, expected_phase)
+            }
+            Err(MoveFailure::NotCommitted { phase, .. }) if !outcome_unknown => {
+                assert_eq!(phase, expected_phase)
+            }
+            result => panic!("unexpected move result: {result:?}"),
+        }
+    }
+
+    fn assert_recorded_move_failure(
+        stats: &RecoveryStats,
+        operation: &str,
+        expected_phase: MovePhase,
+        outcome_unknown: bool,
+    ) {
+        let expected_operation = format!(
+            "{operation}_{}",
+            if outcome_unknown {
+                "outcome_unknown"
+            } else {
+                "not_committed"
+            }
+        );
+        assert_eq!(stats.operations_attempted, 1);
+        assert_eq!(stats.errors.len(), 1, "errors: {:?}", stats.errors);
+        assert_eq!(stats.errors[0].operation, expected_operation);
+        assert!(
+            stats.errors[0]
+                .error
+                .contains(&format!("phase={expected_phase:?}")),
+            "errors: {:?}",
+            stats.errors
+        );
+    }
+
     fn reap_expired_with_budget(queue: &mut Queue, budget: &WorkBudget) -> RecoveryStats {
         let scan_budget = RecoveryScanBudget::default();
         let mut scan_stats = RecoveryScanStats::default();
@@ -3198,6 +3338,24 @@ mod tests {
             u64::MAX,
             Some(queue.authenticated_wall_floor().unwrap()),
             budget,
+            &mut scan,
+            &mut stats,
+            u64::MAX,
+        );
+        stats
+    }
+
+    fn promote_eligible_with_budget(queue: &mut Queue, wall_floor: WallFloor) -> RecoveryStats {
+        let scan_budget = RecoveryScanBudget::default();
+        let mut scan_stats = RecoveryScanStats::default();
+        let mut scan = RecoveryScanContext {
+            budget: &scan_budget,
+            stats: &mut scan_stats,
+        };
+        let mut stats = RecoveryStats::default();
+        queue.promote_delayed(
+            wall_floor,
+            &WorkBudget::default(),
             &mut scan,
             &mut stats,
             u64::MAX,
@@ -5642,6 +5800,227 @@ mod tests {
             queue.authenticated_wall_floor().unwrap(),
         );
         assert!(res.is_err(), "generation overflow must be Err, got {res:?}");
+    }
+
+    #[test]
+    fn recovery_move_failure_preserves_category_and_phase() {
+        for (failure, expected_operation, expected_detail) in [
+            (
+                MoveFailure::NotCommitted {
+                    phase: MovePhase::Rename,
+                    source: "rename failed".into(),
+                },
+                "move_not_committed",
+                "phase=Rename",
+            ),
+            (
+                MoveFailure::OutcomeUnknown {
+                    phase: MovePhase::DestFsync,
+                    source: "sync failed".into(),
+                },
+                "move_outcome_unknown",
+                "phase=DestFsync",
+            ),
+            (
+                MoveFailure::AlreadyExists,
+                "move_collision",
+                "destination already exists",
+            ),
+            (
+                MoveFailure::SourceMissing,
+                "move_source_missing",
+                "source is missing",
+            ),
+        ] {
+            let mut stats = RecoveryStats::default();
+            Queue::record_move_failure(&mut stats, "move", "source/path", failure);
+            assert_eq!(stats.errors.len(), 1);
+            assert_eq!(stats.errors[0].operation, expected_operation);
+            assert_eq!(stats.errors[0].relative_path, "source/path");
+            assert!(stats.errors[0].error.contains(expected_detail));
+        }
+    }
+
+    #[test]
+    fn reap_to_ready_uses_phase_aware_move_executor() {
+        for (fault, count, phase, outcome_unknown) in [
+            ("renameat2_noreplace", 1, MovePhase::Rename, false),
+            ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
+            ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
+        ] {
+            let (_tmp, mut queue) = create_test_queue();
+            let lease = lease_recovery_job(&mut queue, 3);
+            let common = lease_common(&lease);
+            let parts = lease_path_parts(&lease);
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let result = queue.reap_to_ready(parts[1], parts[2], parts[3], parts[4], &common);
+            fs::fault::reset();
+            assert_injected_move_phase(result, phase, outcome_unknown);
+        }
+    }
+
+    #[test]
+    fn reap_to_dead_uses_phase_aware_move_executor() {
+        for (fault, count, phase, outcome_unknown) in [
+            ("renameat2_noreplace", 1, MovePhase::Rename, false),
+            ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
+            ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
+        ] {
+            let (_tmp, mut queue) = create_test_queue();
+            let lease = lease_recovery_job(&mut queue, 1);
+            let common = lease_common(&lease);
+            let parts = lease_path_parts(&lease);
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            let terminal_bucket = steadq_math::bucket_number(
+                wall_floor.unix_ns(),
+                queue.format.terminal_bucket_width_ns,
+            )
+            .unwrap();
+            queue
+                .ensure_dir_pub(&format!(
+                    "dead/{}/{}",
+                    bucket_hex(terminal_bucket),
+                    parts[3]
+                ))
+                .unwrap();
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let result = queue.reap_to_dead(
+                parts[1],
+                parts[2],
+                parts[3],
+                parts[4],
+                &common,
+                DeadReason::AttemptsExhausted,
+                wall_floor,
+            );
+            fs::fault::reset();
+            assert_injected_move_phase(result, phase, outcome_unknown);
+        }
+    }
+
+    #[test]
+    fn delayed_promotion_uses_phase_aware_move_executor() {
+        for (fault, count, phase, outcome_unknown) in [
+            ("renameat2_noreplace", 1, MovePhase::Rename, false),
+            ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
+            ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            let not_before = queue
+                .authenticated_wall_floor()
+                .unwrap()
+                .unix_ns()
+                .checked_add(queue.format.delayed_bucket_width_ns)
+                .unwrap();
+            let ticket = match queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                initial_not_before: Some(not_before),
+                payload: b"delayed move".to_vec(),
+                ..Default::default()
+            }) {
+                EnqueueOutcome::Committed(ticket) => ticket,
+                outcome => panic!("enqueue failed: {outcome:?}"),
+            };
+            let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
+            assert_eq!(parts.len(), 4);
+            let parsed = steadq_names::parse_delayed(parts[3]).unwrap();
+            assert!(tmp.path().join(&ticket.expected_relative_path).exists());
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let result = queue.promote_to_ready(parts[1], parts[2], parts[3], &parsed.common);
+            fs::fault::reset();
+            assert_injected_move_phase(result, phase, outcome_unknown);
+        }
+    }
+
+    #[test]
+    fn reap_to_ready_records_executor_failure_without_counting_commit() {
+        for (fault, count, phase, outcome_unknown) in [
+            ("renameat2_noreplace", 1, MovePhase::Rename, false),
+            ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
+            ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
+        ] {
+            let (_tmp, mut queue) = create_test_queue();
+            lease_recovery_job(&mut queue, 3);
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+            fs::fault::reset();
+            assert_eq!(stats.leases_reaped, 0);
+            assert_recorded_move_failure(&stats, "reap_to_ready", phase, outcome_unknown);
+        }
+    }
+
+    #[test]
+    fn reap_to_dead_records_executor_failure_without_counting_commit() {
+        for (fault, count, phase, outcome_unknown) in [
+            ("renameat2_noreplace", 1, MovePhase::Rename, false),
+            ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
+            ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
+        ] {
+            let (_tmp, mut queue) = create_test_queue();
+            let lease = lease_recovery_job(&mut queue, 1);
+            let shard = lease.exact_source_path.split('/').nth(3).unwrap();
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            let terminal_bucket = steadq_math::bucket_number(
+                wall_floor.unix_ns(),
+                queue.format.terminal_bucket_width_ns,
+            )
+            .unwrap();
+            queue
+                .ensure_dir_pub(&format!("dead/{}/{shard}", bucket_hex(terminal_bucket)))
+                .unwrap();
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+            fs::fault::reset();
+            assert_eq!(stats.leases_to_dead, 0);
+            assert_recorded_move_failure(&stats, "reap_to_dead", phase, outcome_unknown);
+        }
+    }
+
+    #[test]
+    fn delayed_promotion_records_executor_failure_without_counting_commit() {
+        for (fault, count, phase, outcome_unknown) in [
+            ("renameat2_noreplace", 1, MovePhase::Rename, false),
+            ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
+            ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
+        ] {
+            let (tmp, mut queue) = create_test_queue();
+            let not_before = queue
+                .authenticated_wall_floor()
+                .unwrap()
+                .unix_ns()
+                .checked_add(queue.format.delayed_bucket_width_ns)
+                .unwrap();
+            let ticket = match queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                initial_not_before: Some(not_before),
+                payload: b"delayed recovery".to_vec(),
+                ..Default::default()
+            }) {
+                EnqueueOutcome::Committed(ticket) => ticket,
+                outcome => panic!("enqueue failed: {outcome:?}"),
+            };
+            let delayed_bucket = ticket
+                .expected_relative_path
+                .split('/')
+                .nth(1)
+                .and_then(steadq_names::bucket_from_hex)
+                .unwrap();
+            write_wall_watermark(&tmp, delayed_bucket);
+            let wall_floor = queue.authenticated_wall_floor().unwrap();
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, count, libc::EIO);
+            let stats = promote_eligible_with_budget(&mut queue, wall_floor);
+            fs::fault::reset();
+            assert_eq!(stats.delayed_promoted, 0);
+            assert_recorded_move_failure(&stats, "promote_delayed", phase, outcome_unknown);
+        }
     }
 
     #[test]
