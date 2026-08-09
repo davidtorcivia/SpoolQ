@@ -1651,6 +1651,10 @@ impl Queue {
             };
 
             for entry in &entries {
+                let Some(entry) = entry.as_ascii_str() else {
+                    scan_had_error = true;
+                    continue;
+                };
                 if !entry.ends_with(".sqj") {
                     continue;
                 }
@@ -3262,7 +3266,10 @@ impl Queue {
         if let Ok(dir_fd) = open_relative(self.root_fd.as_raw_fd(), &ready_dir) {
             if let Ok(entries) = fs::read_dir_entries_owned(dir_fd.as_raw_fd()) {
                 for entry in entries {
-                    if let Ok(parsed) = steadq_names::parse_ready(&entry) {
+                    let Some(entry) = entry.as_ascii_str() else {
+                        continue;
+                    };
+                    if let Ok(parsed) = steadq_names::parse_ready(entry) {
                         if parsed.common.job_id == *job_id {
                             results.push(Snapshot {
                                 job_id: *job_id,
@@ -3284,10 +3291,16 @@ impl Queue {
         if let Ok(leased_root) = fs::open_directory(self.root_fd.as_raw_fd(), "leased") {
             if let Ok(boot_dirs) = fs::read_dir_entries_owned(leased_root.as_raw_fd()) {
                 for boot_dir in boot_dirs {
+                    let Some(boot_dir) = boot_dir.as_ascii_str() else {
+                        continue;
+                    };
                     let boot_path = format!("leased/{boot_dir}");
                     if let Ok(boot_fd) = open_relative(self.root_fd.as_raw_fd(), &boot_path) {
                         if let Ok(bucket_dirs) = fs::read_dir_entries_owned(boot_fd.as_raw_fd()) {
                             for bucket_dir in bucket_dirs {
+                                let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
+                                    continue;
+                                };
                                 let shard_path = format!("{boot_path}/{bucket_dir}/{shard_str}");
                                 if let Ok(shard_fd) =
                                     open_relative(self.root_fd.as_raw_fd(), &shard_path)
@@ -3296,7 +3309,10 @@ impl Queue {
                                         fs::read_dir_entries_owned(shard_fd.as_raw_fd())
                                     {
                                         for entry in entries {
-                                            if let Ok(parsed) = steadq_names::parse_leased(&entry) {
+                                            let Some(entry) = entry.as_ascii_str() else {
+                                                continue;
+                                            };
+                                            if let Ok(parsed) = steadq_names::parse_leased(entry) {
                                                 if parsed.common.job_id == *job_id {
                                                     results.push(Snapshot {
                                                         job_id: *job_id,
@@ -3328,11 +3344,17 @@ impl Queue {
         if let Ok(delayed_root) = fs::open_directory(self.root_fd.as_raw_fd(), "delayed") {
             if let Ok(bucket_dirs) = fs::read_dir_entries_owned(delayed_root.as_raw_fd()) {
                 for bucket_dir in bucket_dirs {
+                    let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
+                        continue;
+                    };
                     let shard_path = format!("delayed/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                             for entry in entries {
-                                if let Ok(parsed) = steadq_names::parse_delayed(&entry) {
+                                let Some(entry) = entry.as_ascii_str() else {
+                                    continue;
+                                };
+                                if let Ok(parsed) = steadq_names::parse_delayed(entry) {
                                     if parsed.common.job_id == *job_id {
                                         results.push(Snapshot {
                                             job_id: *job_id,
@@ -3357,11 +3379,17 @@ impl Queue {
         if let Ok(dead_root) = fs::open_directory(self.root_fd.as_raw_fd(), "dead") {
             if let Ok(bucket_dirs) = fs::read_dir_entries_owned(dead_root.as_raw_fd()) {
                 for bucket_dir in bucket_dirs {
+                    let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
+                        continue;
+                    };
                     let shard_path = format!("dead/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                             for entry in entries {
-                                if let Ok(parsed) = steadq_names::parse_dead(&entry) {
+                                let Some(entry) = entry.as_ascii_str() else {
+                                    continue;
+                                };
+                                if let Ok(parsed) = steadq_names::parse_dead(entry) {
                                     if parsed.common.job_id == *job_id {
                                         results.push(Snapshot {
                                             job_id: *job_id,
@@ -3386,15 +3414,21 @@ impl Queue {
         if let Ok(receipts_root) = fs::open_directory(self.root_fd.as_raw_fd(), "receipts") {
             if let Ok(bucket_dirs) = fs::read_dir_entries_owned(receipts_root.as_raw_fd()) {
                 for bucket_dir in bucket_dirs {
+                    let Some(bucket_dir) = bucket_dir.as_ascii_str() else {
+                        continue;
+                    };
                     let shard_path = format!("receipts/{bucket_dir}/{shard_str}");
                     if let Ok(shard_fd) = open_relative(self.root_fd.as_raw_fd(), &shard_path) {
                         if let Ok(entries) = fs::read_dir_entries_owned(shard_fd.as_raw_fd()) {
                             for entry in entries {
-                                if let Ok(parsed) = steadq_names::parse_receipt(&entry) {
+                                let Some(entry) = entry.as_ascii_str() else {
+                                    continue;
+                                };
+                                if let Ok(parsed) = steadq_names::parse_receipt(entry) {
                                     if parsed.common.job_id == *job_id {
                                         let file_fd = match fs::openat(
                                             shard_fd.as_raw_fd(),
-                                            &entry,
+                                            entry,
                                             verified::receipt_read_open_flags(),
                                             0,
                                         ) {
@@ -3410,9 +3444,9 @@ impl Queue {
                                                     .format
                                                     .terminal_bucket_width_ns,
                                                 max_payload_length: self.format.max_payload_length,
-                                                bucket: &bucket_dir,
+                                                bucket: bucket_dir,
                                                 shard: &shard_str,
-                                                filename: &entry,
+                                                filename: entry,
                                             },
                                             None,
                                         )
@@ -7751,10 +7785,10 @@ mod tests {
         for bucket in std::fs::read_dir(&delayed_root).unwrap().flatten() {
             for shard in std::fs::read_dir(bucket.path()).unwrap().flatten() {
                 for entry in std::fs::read_dir(shard.path()).unwrap().flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
+                    let name = entry.file_name().into_string().unwrap();
                     if name.ends_with(".sqj") {
-                        let bucket_name = bucket.file_name().to_string_lossy().to_string();
-                        let shard_name = shard.file_name().to_string_lossy().to_string();
+                        let bucket_name = bucket.file_name().into_string().unwrap();
+                        let shard_name = shard.file_name().into_string().unwrap();
                         delayed_file = Some((bucket_name, shard_name, name));
                         break;
                     }
@@ -7817,9 +7851,9 @@ mod tests {
         let mut found: Option<(String, String)> = None;
         for shard in std::fs::read_dir(&ready_root).unwrap().flatten() {
             for entry in std::fs::read_dir(shard.path()).unwrap().flatten() {
-                let n = entry.file_name().to_string_lossy().to_string();
+                let n = entry.file_name().into_string().unwrap();
                 if n.ends_with(".sqj") {
-                    found = Some((shard.file_name().to_string_lossy().to_string(), n));
+                    found = Some((shard.file_name().into_string().unwrap(), n));
                     break;
                 }
             }

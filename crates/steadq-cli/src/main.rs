@@ -1,5 +1,6 @@
 // SteadQ command-line interface.
 
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,6 +24,15 @@ const EXIT_IO_FAILURE: u8 = 6;
 #[allow(dead_code)]
 const EXIT_UNSUPPORTED: u8 = 64;
 use steadq_core::{CreateOptions, EnqueueInput, EnqueueOutcome, LeaseOutcome, OpenOptions, Queue};
+
+fn escape_os_bytes(value: &std::ffi::OsStr) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
+}
 
 #[derive(Parser)]
 #[command(name = "steadq", about = "Crash-safe filesystem queue")]
@@ -1017,13 +1027,11 @@ fn main() -> ExitCode {
                             for shard in shards.flatten() {
                                 if let Ok(files) = std::fs::read_dir(shard.path()) {
                                     for file in files.flatten() {
-                                        let name = file.file_name().to_string_lossy().to_string();
-                                        let rp = file
-                                            .path()
-                                            .strip_prefix(&path)
-                                            .unwrap_or(&file.path())
-                                            .display()
-                                            .to_string();
+                                        let name = escape_os_bytes(&file.file_name());
+                                        let file_path = file.path();
+                                        let relative_path =
+                                            file_path.strip_prefix(&path).unwrap_or(&file_path);
+                                        let rp = escape_os_bytes(relative_path.as_os_str());
                                         println!("{name} {rp}");
                                     }
                                 }
@@ -1388,4 +1396,16 @@ fn load_handle(
         expected_inode: handle.expected_inode,
         exact_source_path: handle.exact_source_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn os_byte_escaping_preserves_distinct_names() {
+        assert_eq!(escape_os_bytes(OsStr::from_bytes(b"bad-\x80")), "bad-\\x80");
+        assert_eq!(escape_os_bytes(OsStr::from_bytes(b"bad-\x81")), "bad-\\x81");
+    }
 }

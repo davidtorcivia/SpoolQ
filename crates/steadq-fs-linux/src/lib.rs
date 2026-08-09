@@ -794,12 +794,23 @@ pub fn try_ofd_read_lock(fd: RawFd) -> io::Result<bool> {
 pub struct DirEntryName(Vec<u8>);
 
 impl DirEntryName {
+    /// Returns the exact bytes supplied by the directory stream.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
+    /// Returns the name when it is valid UTF-8.
     pub fn as_str(&self) -> Option<&str> {
         std::str::from_utf8(&self.0).ok()
+    }
+
+    /// Returns the name only when it belongs to the protocol's ASCII alphabet.
+    pub fn as_ascii_str(&self) -> Option<&str> {
+        if self.0.is_ascii() {
+            self.as_str()
+        } else {
+            None
+        }
     }
 }
 
@@ -1018,33 +1029,30 @@ where
     Ok(DirectoryEnumeration { entries, progress })
 }
 
-/// Read directory entries as strings for legacy callers.
+/// Read byte-preserving directory entries.
 /// Consumes the fd via fdopendir.
-fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
+fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
     read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX, || Ok(false))
         .map_err(DirectoryEnumerationProgressError::into_legacy)
         .map_err(DirectoryEnumerationError::into_io_error)
-        .map(|enumeration| {
-            enumeration
-                .entries
-                .into_iter()
-                .map(|entry| String::from_utf8_lossy(entry.as_bytes()).into_owned())
-                .collect()
-        })
+        .map(|enumeration| enumeration.entries)
 }
 
 /// R4-PERF: Iterate directory entries with a callback, avoiding full
 /// materialization. The callback returns true to continue, false to stop.
 /// Returns the number of entries processed.
-pub fn read_dir_for_each<F: FnMut(&str) -> bool>(dir_fd: RawFd, mut f: F) -> io::Result<usize> {
-    let dup_fd = unsafe { libc::dup(dir_fd) };
-    if dup_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let dir = unsafe { libc::fdopendir(dup_fd) };
+pub fn read_dir_for_each<F: FnMut(&DirEntryName) -> bool>(
+    dir_fd: RawFd,
+    mut f: F,
+) -> io::Result<usize> {
+    let reopened = open_directory(dir_fd, ".")?;
+    let reopened_fd = reopened.into_raw_fd();
+    // SAFETY: `reopened_fd` is a live directory descriptor. `fdopendir`
+    // takes ownership on success and leaves ownership with the caller on failure.
+    let dir = unsafe { libc::fdopendir(reopened_fd) };
     if dir.is_null() {
-        // P1-16: Close the dup'd fd before returning to avoid descriptor leak.
-        unsafe { libc::close(dup_fd) };
+        // SAFETY: `fdopendir` failed, so `reopened_fd` remains caller-owned.
+        unsafe { libc::close(reopened_fd) };
         return Err(io::Error::last_os_error());
     }
     let mut count = 0usize;
@@ -1064,8 +1072,8 @@ pub fn read_dir_for_each<F: FnMut(&str) -> bool>(dir_fd: RawFd, mut f: F) -> io:
             let len = libc::strlen(name_ptr);
             std::slice::from_raw_parts(name_ptr as *const u8, len)
         };
-        let name = String::from_utf8_lossy(name_bytes);
-        if name != "." && name != ".." {
+        if name_bytes != b"." && name_bytes != b".." {
+            let name = DirEntryName(name_bytes.to_vec());
             count += 1;
             if !f(&name) {
                 break;
@@ -1077,8 +1085,8 @@ pub fn read_dir_for_each<F: FnMut(&str) -> bool>(dir_fd: RawFd, mut f: F) -> io:
 }
 
 /// Read directory entries. Consumes the fd (fdopendir takes ownership).
-/// Prefer read_dir_entries_owned which dups the fd first.
-pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<String>> {
+/// Prefer `read_dir_entries_owned`, which reopens the directory first.
+pub fn read_dir_entries(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
     read_dir_entries_impl(dir_fd)
 }
 
@@ -1096,14 +1104,10 @@ pub const NFS_SUPER_MAGIC: i64 = 0x6969;
 pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const FUSE_SUPER_MAGIC: i64 = 0x65735546;
 
-/// Read directory entries without consuming the fd (uses dup first).
-pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<String>> {
-    // dup the fd so fdopendir doesn't consume the original
-    let dup_fd = unsafe { libc::dup(dir_fd) };
-    if dup_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    read_dir_entries_impl(dup_fd)
+/// Read directory entries without consuming the fd or its directory position.
+pub fn read_dir_entries_owned(dir_fd: RawFd) -> io::Result<Vec<DirEntryName>> {
+    let reopened = open_directory(dir_fd, ".")?;
+    read_dir_entries_impl(reopened.into_raw_fd())
 }
 
 /// Read byte-preserving directory entries without consuming the caller's fd.
@@ -1693,13 +1697,13 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let mut names = Vec::new();
         let count = read_dir_for_each(fd.as_raw_fd(), |name| {
-            names.push(name.to_string());
+            names.push(name.as_bytes().to_vec());
             true
         })
         .unwrap();
         assert_eq!(count, 2);
-        assert!(names.contains(&"a.txt".to_string()));
-        assert!(names.contains(&"b.txt".to_string()));
+        assert!(names.contains(&b"a.txt".to_vec()));
+        assert!(names.contains(&b"b.txt".to_vec()));
 
         std::fs::remove_dir_all(&dir_path).ok();
     }
@@ -1723,6 +1727,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count_seen, 1);
+
+        let mut entries = read_dir_entries_owned(fd.as_raw_fd()).unwrap();
+        entries.sort();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].as_bytes(), b"a.txt");
+        assert_eq!(entries[1].as_bytes(), b"b.txt");
+        assert_eq!(entries[2].as_bytes(), b"c.txt");
 
         std::fs::remove_dir_all(&dir_path).ok();
     }
@@ -1749,8 +1760,32 @@ mod tests {
         assert_eq!(entries[0].as_str(), None);
         assert_eq!(entries[1].as_str(), None);
         assert_eq!(entries[2].as_str(), Some("plain"));
+        assert_eq!(entries[2].as_ascii_str(), Some("plain"));
         assert_eq!(format!("{:?}", entries[0]), "b\"bad-\\x80\"");
+
+        let mut owned = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        owned.sort();
+        assert_eq!(owned[0].as_bytes(), b"bad-\x80");
+        assert_eq!(owned[1].as_bytes(), b"bad-\x81");
+
+        let callback_dir = std::fs::File::open(&dir_path).unwrap();
+        let mut visited = Vec::new();
+        read_dir_for_each(callback_dir.as_raw_fd(), |entry| {
+            visited.push(entry.as_bytes().to_vec());
+            true
+        })
+        .unwrap();
+        visited.sort();
+        assert_eq!(visited[0], b"bad-\x80");
+        assert_eq!(visited[1], b"bad-\x81");
         std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn protocol_text_rejects_non_ascii_utf8() {
+        let name = DirEntryName("café".as_bytes().to_vec());
+        assert_eq!(name.as_str(), Some("café"));
+        assert_eq!(name.as_ascii_str(), None);
     }
 
     #[test]
@@ -1806,16 +1841,20 @@ mod tests {
     }
 
     #[test]
-    fn legacy_owned_directory_read_returns_exact_names() {
-        let dir_path = unique_test_dir("legacy-directory-read");
+    fn owned_directory_read_returns_exact_name_bytes() {
+        let dir_path = unique_test_dir("owned-directory-read");
         std::fs::create_dir(&dir_path).unwrap();
         std::fs::write(dir_path.join("alpha"), b"a").unwrap();
         std::fs::write(dir_path.join("beta"), b"b").unwrap();
         let dir = std::fs::File::open(&dir_path).unwrap();
 
-        let mut entries = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
-        entries.sort();
-        assert_eq!(entries, ["alpha", "beta"]);
+        let mut first = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        let mut second = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
+        first.sort();
+        second.sort();
+        assert_eq!(first, second);
+        assert_eq!(first[0].as_bytes(), b"alpha");
+        assert_eq!(first[1].as_bytes(), b"beta");
         std::fs::remove_dir_all(dir_path).unwrap();
     }
 
