@@ -40,11 +40,15 @@ fn cursor_component_is_valid(component: &[u8]) -> bool {
         && !component.contains(&b'\0')
 }
 
-fn read_recovery_directory(dir_fd: std::os::unix::io::RawFd) -> io::Result<Vec<fs::DirEntryName>> {
-    fs::read_dir_entry_names_bounded_owned(
+fn read_recovery_directory(
+    dir_fd: std::os::unix::io::RawFd,
+    deadline_mono: u64,
+) -> io::Result<Vec<fs::DirEntryName>> {
+    fs::read_dir_entry_names_bounded_owned_until(
         dir_fd,
         MAX_RECOVERY_DIRECTORY_ENTRIES,
         MAX_RECOVERY_DIRECTORY_NAME_BYTES,
+        || Queue::budget_time_exceeded(deadline_mono),
     )
 }
 
@@ -444,7 +448,7 @@ impl Queue {
     }
 
     fn has_recovery_budget(stats: &RecoveryStats) -> bool {
-        !stats.budget_exhausted && !stats.phase_blocked
+        !stats.budget_exhausted
     }
 
     /// R2-H06: Record a recovery error with full context.
@@ -460,6 +464,19 @@ impl Queue {
     fn block_phase(stats: &mut RecoveryStats, op: &str, path: &str, err: &str) {
         Self::record_error(stats, op, path, err);
         stats.phase_blocked = true;
+    }
+
+    fn stop_for_directory_error(
+        stats: &mut RecoveryStats,
+        op: &str,
+        path: &str,
+        error: &io::Error,
+    ) {
+        if error.kind() == io::ErrorKind::TimedOut {
+            stats.budget_exhausted = true;
+        } else {
+            Self::block_phase(stats, op, path, &error.to_string());
+        }
     }
 
     fn reap_expired_leases(
@@ -481,10 +498,10 @@ impl Queue {
             }
         };
 
-        let mut boot_dirs = match read_recovery_directory(leased_fd.as_raw_fd()) {
+        let mut boot_dirs = match read_recovery_directory(leased_fd.as_raw_fd(), deadline_mono) {
             Ok(e) => e,
             Err(e) => {
-                Self::block_phase(stats, "read_leased_dirs", "leased", &e.to_string());
+                Self::stop_for_directory_error(stats, "read_leased_dirs", "leased", &e);
                 return;
             }
         };
@@ -530,14 +547,20 @@ impl Queue {
                 }
             };
 
-            let mut bucket_dirs = match read_recovery_directory(boot_dir_fd.as_raw_fd()) {
-                Ok(e) => e,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(stats, "reap_bucket_read", boot_dir_name, &error.to_string());
-                    return;
-                }
-            };
+            let mut bucket_dirs =
+                match read_recovery_directory(boot_dir_fd.as_raw_fd(), deadline_mono) {
+                    Ok(e) => e,
+                    Err(error) => {
+                        stats.scan_skips += 1;
+                        Self::stop_for_directory_error(
+                            stats,
+                            "reap_bucket_read",
+                            boot_dir_name,
+                            &error,
+                        );
+                        return;
+                    }
+                };
             bucket_dirs.sort();
 
             for bucket_entry in &bucket_dirs {
@@ -603,19 +626,20 @@ impl Queue {
                     }
                 };
 
-                let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
-                    Ok(e) => e,
-                    Err(error) => {
-                        stats.scan_skips += 1;
-                        Self::block_phase(
-                            stats,
-                            "reap_shard_read",
-                            &format!("leased/{boot_dir_name}/{bucket_name}"),
-                            &error.to_string(),
-                        );
-                        return;
-                    }
-                };
+                let mut shard_dirs =
+                    match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono) {
+                        Ok(e) => e,
+                        Err(error) => {
+                            stats.scan_skips += 1;
+                            Self::stop_for_directory_error(
+                                stats,
+                                "reap_shard_read",
+                                &format!("leased/{boot_dir_name}/{bucket_name}"),
+                                &error,
+                            );
+                            return;
+                        }
+                    };
                 shard_dirs.sort();
 
                 for shard_entry in &shard_dirs {
@@ -668,19 +692,20 @@ impl Queue {
                         }
                     };
 
-                    let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
-                        Ok(e) => e,
-                        Err(error) => {
-                            stats.scan_skips += 1;
-                            Self::block_phase(
-                                stats,
-                                "reap_entry_read",
-                                &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
-                                &error.to_string(),
-                            );
-                            return;
-                        }
-                    };
+                    let mut entries =
+                        match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono) {
+                            Ok(e) => e,
+                            Err(error) => {
+                                stats.scan_skips += 1;
+                                Self::stop_for_directory_error(
+                                    stats,
+                                    "reap_entry_read",
+                                    &format!("leased/{boot_dir_name}/{bucket_name}/{shard_name}"),
+                                    &error,
+                                );
+                                return;
+                            }
+                        };
                     entries.sort();
 
                     for raw_entry in &entries {
@@ -973,10 +998,10 @@ impl Queue {
             }
         };
 
-        let mut bucket_dirs = match read_recovery_directory(delayed_fd.as_raw_fd()) {
+        let mut bucket_dirs = match read_recovery_directory(delayed_fd.as_raw_fd(), deadline_mono) {
             Ok(e) => e,
             Err(error) => {
-                Self::block_phase(stats, "promote_bucket_read", "delayed", &error.to_string());
+                Self::stop_for_directory_error(stats, "promote_bucket_read", "delayed", &error);
                 return;
             }
         };
@@ -1045,15 +1070,16 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono)
+            {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::block_phase(
+                    Self::stop_for_directory_error(
                         stats,
                         "promote_shard_read",
                         &format!("delayed/{bucket_name}"),
-                        &error.to_string(),
+                        &error,
                     );
                     return;
                 }
@@ -1109,15 +1135,16 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
+                {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::block_phase(
+                        Self::stop_for_directory_error(
                             stats,
                             "promote_entry_read",
                             &format!("delayed/{bucket_name}/{shard_name}"),
-                            &error.to_string(),
+                            &error,
                         );
                         return;
                     }
@@ -1269,10 +1296,10 @@ impl Queue {
             }
         };
 
-        let mut boot_dirs = match read_recovery_directory(tmp_fd.as_raw_fd()) {
+        let mut boot_dirs = match read_recovery_directory(tmp_fd.as_raw_fd(), deadline_mono) {
             Ok(e) => e,
             Err(error) => {
-                Self::block_phase(stats, "temp_boot_read", "tmp", &error.to_string());
+                Self::stop_for_directory_error(stats, "temp_boot_read", "tmp", &error);
                 return;
             }
         };
@@ -1318,14 +1345,20 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs = match read_recovery_directory(boot_dir_fd.as_raw_fd()) {
-                Ok(e) => e,
-                Err(error) => {
-                    stats.scan_skips += 1;
-                    Self::block_phase(stats, "temp_shard_read", boot_dir_name, &error.to_string());
-                    return;
-                }
-            };
+            let mut shard_dirs =
+                match read_recovery_directory(boot_dir_fd.as_raw_fd(), deadline_mono) {
+                    Ok(e) => e,
+                    Err(error) => {
+                        stats.scan_skips += 1;
+                        Self::stop_for_directory_error(
+                            stats,
+                            "temp_shard_read",
+                            boot_dir_name,
+                            &error,
+                        );
+                        return;
+                    }
+                };
             shard_dirs.sort();
 
             for shard_entry in &shard_dirs {
@@ -1377,15 +1410,16 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
+                {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::block_phase(
+                        Self::stop_for_directory_error(
                             stats,
                             "temp_entry_read",
                             &format!("tmp/{boot_dir_name}/{shard_name}"),
-                            &error.to_string(),
+                            &error,
                         );
                         return;
                     }
@@ -1468,10 +1502,11 @@ impl Queue {
             }
         };
 
-        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd(), deadline_mono)
+        {
             Ok(e) => e,
             Err(error) => {
-                Self::block_phase(stats, "compact_bucket_read", "receipts", &error.to_string());
+                Self::stop_for_directory_error(stats, "compact_bucket_read", "receipts", &error);
                 return;
             }
         };
@@ -1522,15 +1557,16 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono)
+            {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::block_phase(
+                    Self::stop_for_directory_error(
                         stats,
                         "compact_shard_read",
                         &format!("receipts/{bucket_name}"),
-                        &error.to_string(),
+                        &error,
                     );
                     return;
                 }
@@ -1587,15 +1623,16 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
+                {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::block_phase(
+                        Self::stop_for_directory_error(
                             stats,
                             "compact_entry_read",
                             &format!("receipts/{bucket_name}/{shard_name}"),
-                            &error.to_string(),
+                            &error,
                         );
                         return;
                     }
@@ -1791,10 +1828,11 @@ impl Queue {
             }
         };
 
-        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd()) {
+        let mut bucket_dirs = match read_recovery_directory(receipts_fd.as_raw_fd(), deadline_mono)
+        {
             Ok(e) => e,
             Err(error) => {
-                Self::block_phase(stats, "delete_bucket_read", "receipts", &error.to_string());
+                Self::stop_for_directory_error(stats, "delete_bucket_read", "receipts", &error);
                 return;
             }
         };
@@ -1868,15 +1906,16 @@ impl Queue {
                 }
             };
 
-            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd()) {
+            let mut shard_dirs = match read_recovery_directory(bucket_fd.as_raw_fd(), deadline_mono)
+            {
                 Ok(e) => e,
                 Err(error) => {
                     stats.scan_skips += 1;
-                    Self::block_phase(
+                    Self::stop_for_directory_error(
                         stats,
                         "delete_shard_read",
                         &format!("receipts/{bucket_name}"),
-                        &error.to_string(),
+                        &error,
                     );
                     return;
                 }
@@ -1933,15 +1972,16 @@ impl Queue {
                     }
                 };
 
-                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd()) {
+                let mut entries = match read_recovery_directory(shard_fd.as_raw_fd(), deadline_mono)
+                {
                     Ok(e) => e,
                     Err(error) => {
                         stats.scan_skips += 1;
-                        Self::block_phase(
+                        Self::stop_for_directory_error(
                             stats,
                             "delete_entry_read",
                             &format!("receipts/{bucket_name}/{shard_name}"),
-                            &error.to_string(),
+                            &error,
                         );
                         return;
                     }
@@ -2183,7 +2223,7 @@ mod tests {
         assert!(!Queue::has_recovery_budget(&stats));
         stats.budget_exhausted = false;
         stats.phase_blocked = true;
-        assert!(!Queue::has_recovery_budget(&stats));
+        assert!(Queue::has_recovery_budget(&stats));
     }
 
     #[test]
@@ -2230,6 +2270,28 @@ mod tests {
         assert_eq!(stats.errors[1].operation, "blocked");
         assert_eq!(stats.errors[1].relative_path, "blocked-path");
         assert_eq!(stats.errors[1].error, "blocked-error");
+
+        let mut timed_out = RecoveryStats::default();
+        Queue::stop_for_directory_error(
+            &mut timed_out,
+            "read",
+            "directory",
+            &io::Error::new(io::ErrorKind::TimedOut, "deadline"),
+        );
+        assert!(timed_out.budget_exhausted);
+        assert!(!timed_out.phase_blocked);
+        assert!(timed_out.errors.is_empty());
+
+        let mut io_failed = RecoveryStats::default();
+        Queue::stop_for_directory_error(
+            &mut io_failed,
+            "read",
+            "directory",
+            &io::Error::from_raw_os_error(libc::EIO),
+        );
+        assert!(!io_failed.budget_exhausted);
+        assert!(io_failed.phase_blocked);
+        assert_eq!(io_failed.errors.len(), 1);
     }
 
     #[test]
@@ -2344,6 +2406,9 @@ mod tests {
             queue.lease(0, 1_000_000_000),
             LeaseOutcome::Leased(_)
         ));
+        let receipt_dir = tmp.path().join("receipts/0000000000000000/0000");
+        std::fs::create_dir_all(&receipt_dir).unwrap();
+        std::fs::write(receipt_dir.join("invalid.rct"), b"invalid").unwrap();
         let blocked = tmp
             .path()
             .join("leased/00000000-0000-0000-0000-000000000000");
@@ -2351,14 +2416,20 @@ mod tests {
 
         let first = queue.recover(&WorkBudget::default());
         assert!(first.phase_blocked);
-        assert_eq!(first.operations_attempted, 0);
+        assert!(first
+            .errors
+            .iter()
+            .any(|error| error.operation == "receipt_compact_invalid"));
         assert_eq!(queue.recovery_cursor.phase, RecoveryPhase::ReapLeases);
         assert!(queue.recovery_cursor.reap_leases.is_none());
 
         std::fs::remove_file(blocked).unwrap();
         let second = queue.recover(&WorkBudget::default());
         assert!(!second.phase_blocked);
-        assert_eq!(second.operations_attempted, 1);
+        assert!(second
+            .errors
+            .iter()
+            .any(|error| error.operation == "receipt_compact_invalid"));
     }
 
     #[test]
@@ -2545,9 +2616,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(OsStr::from_bytes(b"bad-\x80")), b"x").unwrap();
         let dir = std::fs::File::open(tmp.path()).unwrap();
-        let entries = read_recovery_directory(dir.as_raw_fd()).unwrap();
+        let entries = read_recovery_directory(dir.as_raw_fd(), u64::MAX).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(raw_name_for_error(&entries[0]), "b\"bad-\\x80\"");
+    }
+
+    #[test]
+    fn recovery_directory_read_observes_expired_deadline_before_enumeration() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("entry"), b"x").unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+
+        let error = read_recovery_directory(dir.as_raw_fd(), 0).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

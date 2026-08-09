@@ -749,11 +749,15 @@ impl std::fmt::Debug for DirEntryName {
 /// Read directory entries without losing non-UTF-8 names.
 /// Consumes the fd via fdopendir and rejects directories exceeding either
 /// bound before retaining an unbounded collection.
-fn read_dir_entry_names_impl(
+fn read_dir_entry_names_impl<F>(
     dir_fd: RawFd,
     max_entries: usize,
     max_name_bytes: usize,
-) -> io::Result<Vec<DirEntryName>> {
+    mut should_stop: F,
+) -> io::Result<Vec<DirEntryName>>
+where
+    F: FnMut() -> bool,
+{
     let mut entries = Vec::new();
     let mut name_bytes_read = 0usize;
     let dir = unsafe { libc::fdopendir(dir_fd) };
@@ -765,6 +769,13 @@ fn read_dir_entry_names_impl(
     }
 
     loop {
+        if should_stop() {
+            unsafe { libc::closedir(dir) };
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "directory enumeration exceeded its deadline",
+            ));
+        }
         // B5: Set errno to 0 before readdir to distinguish EOF from error.
         unsafe { *libc::__errno_location() = 0 };
         let entry = unsafe { libc::readdir(dir) };
@@ -810,7 +821,7 @@ fn read_dir_entry_names_impl(
 /// Read directory entries as strings for legacy callers.
 /// Consumes the fd via fdopendir.
 fn read_dir_entries_impl(dir_fd: RawFd) -> io::Result<Vec<String>> {
-    read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX).map(|entries| {
+    read_dir_entry_names_impl(dir_fd, usize::MAX, usize::MAX, || false).map(|entries| {
         entries
             .into_iter()
             .map(|entry| String::from_utf8_lossy(entry.as_bytes()).into_owned())
@@ -899,8 +910,26 @@ pub fn read_dir_entry_names_bounded_owned(
     max_entries: usize,
     max_name_bytes: usize,
 ) -> io::Result<Vec<DirEntryName>> {
+    read_dir_entry_names_bounded_owned_until(dir_fd, max_entries, max_name_bytes, || false)
+}
+
+/// Read bounded byte-preserving directory entries with cooperative cancellation.
+pub fn read_dir_entry_names_bounded_owned_until<F>(
+    dir_fd: RawFd,
+    max_entries: usize,
+    max_name_bytes: usize,
+    should_stop: F,
+) -> io::Result<Vec<DirEntryName>>
+where
+    F: FnMut() -> bool,
+{
     let reopened = open_directory(dir_fd, ".")?;
-    read_dir_entry_names_impl(reopened.into_raw_fd(), max_entries, max_name_bytes)
+    read_dir_entry_names_impl(
+        reopened.into_raw_fd(),
+        max_entries,
+        max_name_bytes,
+        should_stop,
+    )
 }
 
 /// Change file mode relative to a directory fd.
@@ -1526,6 +1555,30 @@ mod tests {
         let mut entries = read_dir_entries_owned(dir.as_raw_fd()).unwrap();
         entries.sort();
         assert_eq!(entries, ["alpha", "beta"]);
+        std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn bounded_directory_read_stops_at_cooperative_deadline() {
+        let dir_path = unique_test_dir("bounded-directory-deadline");
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("alpha"), b"a").unwrap();
+        let dir = std::fs::File::open(&dir_path).unwrap();
+        let mut checks = 0;
+
+        let error = read_dir_entry_names_bounded_owned_until(
+            dir.as_raw_fd(),
+            usize::MAX,
+            usize::MAX,
+            || {
+                checks += 1;
+                checks == 1
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(checks, 1);
         std::fs::remove_dir_all(dir_path).unwrap();
     }
 
