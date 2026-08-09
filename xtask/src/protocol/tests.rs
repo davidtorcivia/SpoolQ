@@ -1,5 +1,7 @@
 use super::render::*;
-use super::schema::{validate_schema, validate_schema_domain, validate_schema_value, SCHEMA};
+use super::schema::{
+    validate_schema, validate_schema_const, validate_schema_domain, validate_schema_value, SCHEMA,
+};
 use super::*;
 use crate::{check_all, check_target, dispatch_command, run_command, workspace_root};
 use serde_json::Value;
@@ -13,6 +15,20 @@ fn fixture() -> StateMachineSpec {
 
 fn fixture_value() -> Value {
     serde_json::from_str(include_str!("../../../spec/state-machine.json")).unwrap()
+}
+
+#[test]
+fn rejects_schema_const_drift() {
+    let schema = serde_json::json!({"outcome": {"const": "not_committed"}});
+    assert!(validate_schema_const(&schema, "/outcome/const", "not_committed").is_ok());
+    assert_eq!(
+        validate_schema_const(&schema, "/outcome/const", "outcome_unknown").unwrap_err(),
+        "spec/state-machine.schema.json const at /outcome/const differs from xtask: expected outcome_unknown, got not_committed"
+    );
+    assert_eq!(
+        validate_schema_const(&schema, "/missing/const", "not_committed").unwrap_err(),
+        "spec/state-machine.schema.json has no string const at /missing/const"
+    );
 }
 
 fn temporary_workspace() -> TempDir {
@@ -171,7 +187,9 @@ fn rejects_duplicate_operation() {
         token_change: TokenChange::New,
         reason_class: Nullable::Null,
         required_syncs: vec![SyncStep::DestinationDir],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both".into(),
         notes: Nullable::Null,
     });
@@ -194,12 +212,29 @@ fn rejects_duplicate_sync() {
 }
 
 #[test]
-fn rejects_overwriting_transition() {
+fn rejects_wrong_linearization_primitive() {
     let mut spec = fixture();
-    spec.transitions[0].no_overwrite = false;
+    spec.transitions[0].linearization = LinearizationPrimitive::RenameNoreplace;
     assert_eq!(
         validate_spec(&spec).unwrap_err(),
-        "transition enqueue_immediate must prohibit overwrite"
+        "transition enqueue_immediate has linearization rename_noreplace; expected publish_noreplace"
+    );
+}
+
+#[test]
+fn rejects_wrong_linearization_failure_outcomes() {
+    let mut spec = fixture();
+    spec.transitions[0].before_linearization_failure = FailureOutcome::OutcomeUnknown;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition enqueue_immediate must classify pre-linearization failure as not_committed"
+    );
+
+    let mut spec = fixture();
+    spec.transitions[0].after_linearization_failure = FailureOutcome::NotCommitted;
+    assert_eq!(
+        validate_spec(&spec).unwrap_err(),
+        "transition enqueue_immediate must classify post-linearization failure as outcome_unknown"
     );
 }
 
@@ -289,7 +324,13 @@ fn every_transition_field_affects_every_projection() {
         spec.transitions[0].required_syncs = vec![SyncStep::SourceDir];
     });
     assert_every_projection_changes(|spec| {
-        spec.transitions[0].no_overwrite = false;
+        spec.transitions[0].linearization = LinearizationPrimitive::RenameNoreplace;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].before_linearization_failure = FailureOutcome::OutcomeUnknown;
+    });
+    assert_every_projection_changes(|spec| {
+        spec.transitions[0].after_linearization_failure = FailureOutcome::NotCommitted;
     });
     assert_every_projection_changes(|spec| {
         spec.transitions[0].resolution_behavior = "different resolver documentation".into();
@@ -360,6 +401,11 @@ fn rejects_unknown_protocol_domains() {
         ("/transitions/0/source", "invented_state"),
         ("/transitions/0/reason_class", "invented_reason"),
         ("/transitions/0/required_syncs/0", "invented_sync"),
+        ("/transitions/0/linearization", "invented_linearization"),
+        (
+            "/transitions/0/before_linearization_failure",
+            "invented_outcome",
+        ),
         ("/exceptions/0/name", "invented_exception"),
         ("/reentry/0/name", "invented_reentry"),
     ] {
@@ -383,7 +429,9 @@ fn rejects_omitted_semantic_fields() {
         "token_change",
         "reason_class",
         "required_syncs",
-        "no_overwrite",
+        "linearization",
+        "before_linearization_failure",
+        "after_linearization_failure",
         "resolution_behavior",
         "notes",
     ] {
@@ -471,13 +519,25 @@ fn rejects_each_cross_field_transition_mutation() {
             "/transitions/3/required_syncs",
             serde_json::json!(["source_dir_fsync", "destination_dir_fsync"]),
         ),
+        (
+            "/transitions/3/linearization",
+            serde_json::json!("publish_noreplace"),
+        ),
+        (
+            "/transitions/3/before_linearization_failure",
+            serde_json::json!("outcome_unknown"),
+        ),
+        (
+            "/transitions/3/after_linearization_failure",
+            serde_json::json!("not_committed"),
+        ),
     ] {
         let mut input = fixture_value();
         *input.pointer_mut(pointer).unwrap() = value;
         let spec: StateMachineSpec = serde_json::from_value(input).unwrap();
         let error = validate_spec(&spec).unwrap_err();
         assert!(
-            error.starts_with("transition claim has "),
+            error.starts_with("transition claim "),
             "{pointer} produced unexpected validation error: {error}"
         );
     }

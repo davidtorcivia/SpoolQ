@@ -1,5 +1,5 @@
 // Auto-generated from spec/state-machine.json. Do not edit by hand.
-// Source SHA-256: ef2e7b2b1da9c377a7dc8737dd1ba8adb6275ef674315cac43c85df18ff8be3f
+// Source SHA-256: 98d2c334df4679cf27cbc45ce270590345f7dd1050305e46ce8fd1b960948e93
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Operation {
@@ -67,6 +67,18 @@ pub enum SyncStep {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum LinearizationPrimitive {
+    PublishNoreplace,
+    RenameNoreplace,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum FailureOutcome {
+    NotCommitted,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ExceptionName {
     ReceiptCompaction,
     WallWatermarkAdvancement,
@@ -88,7 +100,9 @@ pub struct TransitionDef {
     pub token_change: TokenChange,
     pub reason_class: Option<ReasonClass>,
     pub required_syncs: &'static [SyncStep],
-    pub no_overwrite: bool,
+    pub linearization: LinearizationPrimitive,
+    pub before_linearization_failure: FailureOutcome,
+    pub after_linearization_failure: FailureOutcome,
     /// Human-readable resolver documentation, not an executable rule.
     pub resolution_behavior: &'static str,
     /// Human-readable qualification, not an executable precondition.
@@ -120,7 +134,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: None,
         required_syncs: &[SyncStep::File, SyncStep::DestinationDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::PublishNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe destination: observed = committed, absent = not committed",
         notes: None,
     },
@@ -133,7 +149,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: None,
         required_syncs: &[SyncStep::File, SyncStep::DestinationDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::PublishNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe destination: observed = committed, absent = not committed",
         notes: None,
     },
@@ -146,7 +164,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior:
             "probe both: destination observed = committed, source only = not committed",
         notes: None,
@@ -160,7 +180,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::New,
         reason_class: None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both directories",
         notes: None,
     },
@@ -173,7 +195,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::AttemptsExhausted),
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
         notes: None,
     },
@@ -186,7 +210,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::Same,
         reason_class: None,
         required_syncs: &[SyncStep::SameOrDestinationDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior:
             "probe destination: new generation observed = renewed, old gen observed = lease lost",
         notes: None,
@@ -200,7 +226,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::Same,
         reason_class: None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe receipt buckets by exact name",
         notes: None,
     },
@@ -213,7 +241,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
         notes: None,
     },
@@ -226,7 +256,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
         notes: None,
     },
@@ -239,7 +271,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::ApplicationDefined),
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
         notes: None,
     },
@@ -252,7 +286,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: None,
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
         notes: Some("attempt < maximum_attempts"),
     },
@@ -265,7 +301,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::AttemptsExhausted),
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
         notes: Some("attempt >= maximum_attempts"),
     },
@@ -278,7 +316,9 @@ pub const TRANSITIONS: &[TransitionDef] = &[
         token_change: TokenChange::None,
         reason_class: Some(ReasonClass::Corruption),
         required_syncs: &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory],
-        no_overwrite: true,
+        linearization: LinearizationPrimitive::RenameNoreplace,
+        before_linearization_failure: FailureOutcome::NotCommitted,
+        after_linearization_failure: FailureOutcome::OutcomeUnknown,
         resolution_behavior: "probe both",
         notes: Some("raw bytes preserved"),
     },
@@ -365,7 +405,10 @@ mod tests {
         assert!(TRANSITIONS
             .iter()
             .all(|transition| !transition.resolution_behavior.is_empty()));
-        assert!(TRANSITIONS.iter().all(|transition| transition.no_overwrite));
+        assert!(TRANSITIONS.iter().all(|transition| {
+            transition.before_linearization_failure == FailureOutcome::NotCommitted
+                && transition.after_linearization_failure == FailureOutcome::OutcomeUnknown
+        }));
         assert!(EXCEPTIONS
             .iter()
             .all(|exception| exception.uses_replacing_rename));
@@ -388,8 +431,29 @@ mod tests {
             claim.required_syncs,
             &[SyncStep::DestinationDirectory, SyncStep::SourceDirectory]
         );
+        assert_eq!(claim.linearization, LinearizationPrimitive::RenameNoreplace);
+        assert_eq!(
+            claim.before_linearization_failure,
+            FailureOutcome::NotCommitted
+        );
+        assert_eq!(
+            claim.after_linearization_failure,
+            FailureOutcome::OutcomeUnknown
+        );
         assert!(claim.resolution_behavior.contains("both"));
         assert_eq!(claim.notes, None);
+    }
+
+    #[test]
+    fn enqueue_uses_no_overwrite_publication() {
+        let enqueue = TRANSITIONS
+            .iter()
+            .find(|transition| transition.operation == Operation::EnqueueImmediate)
+            .unwrap();
+        assert_eq!(
+            enqueue.linearization,
+            LinearizationPrimitive::PublishNoreplace
+        );
     }
 
     #[test]

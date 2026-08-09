@@ -24,7 +24,9 @@
           "token_change",
           "reason_class",
           "required_syncs",
-          "no_overwrite",
+          "linearization",
+          "before_linearization_failure",
+          "after_linearization_failure",
           "resolution_behavior",
           "notes"
         ],
@@ -124,8 +126,18 @@
               ]
             }
           },
-          "no_overwrite": {
-            "const": true
+          "linearization": {
+            "type": "string",
+            "enum": [
+              "publish_noreplace",
+              "rename_noreplace"
+            ]
+          },
+          "before_linearization_failure": {
+            "const": "not_committed"
+          },
+          "after_linearization_failure": {
+            "const": "outcome_unknown"
           },
           "resolution_behavior": {
             "type": "string",

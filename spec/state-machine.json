@@ -12,7 +12,9 @@
         "file_fsync",
         "destination_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "publish_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe destination: observed = committed, absent = not committed",
       "notes": null
     },
@@ -28,7 +30,9 @@
         "file_fsync",
         "destination_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "publish_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe destination: observed = committed, absent = not committed",
       "notes": null
     },
@@ -44,7 +48,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both: destination observed = committed, source only = not committed",
       "notes": null
     },
@@ -60,7 +66,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both directories",
       "notes": null
     },
@@ -76,7 +84,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
       "notes": null
     },
@@ -91,7 +101,9 @@
       "required_syncs": [
         "same_or_destination_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe destination: new generation observed = renewed, old gen observed = lease lost",
       "notes": null
     },
@@ -107,7 +119,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe receipt buckets by exact name",
       "notes": null
     },
@@ -123,7 +137,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
       "notes": null
     },
@@ -139,7 +155,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
       "notes": null
     },
@@ -155,7 +173,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
       "notes": null
     },
@@ -171,7 +191,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
       "notes": "attempt < maximum_attempts"
     },
@@ -187,7 +209,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
       "notes": "attempt >= maximum_attempts"
     },
@@ -203,7 +227,9 @@
         "destination_dir_fsync",
         "source_dir_fsync"
       ],
-      "no_overwrite": true,
+      "linearization": "rename_noreplace",
+      "before_linearization_failure": "not_committed",
+      "after_linearization_failure": "outcome_unknown",
       "resolution_behavior": "probe both",
       "notes": "raw bytes preserved"
     }
