@@ -60,6 +60,26 @@ pub enum UnlinkFailure {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoveDirectoryPhase {
+    Remove,
+    ParentFsync,
+}
+
+#[derive(Clone, Debug)]
+pub enum RemoveDirectoryFailure {
+    NotCommitted {
+        phase: RemoveDirectoryPhase,
+        source: String,
+    },
+    OutcomeUnknown {
+        phase: RemoveDirectoryPhase,
+        source: String,
+    },
+    SourceMissing,
+    NotEmpty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplacePhase {
     DestinationIdentity,
     Rename,
@@ -110,6 +130,19 @@ impl UnlinkFailure {
         match self {
             Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
             Self::SourceMissing => None,
+        }
+    }
+
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown { .. })
+    }
+}
+
+impl RemoveDirectoryFailure {
+    pub fn phase(&self) -> Option<RemoveDirectoryPhase> {
+        match self {
+            Self::NotCommitted { phase, .. } | Self::OutcomeUnknown { phase, .. } => Some(*phase),
+            Self::SourceMissing | Self::NotEmpty => None,
         }
     }
 
@@ -200,6 +233,39 @@ pub fn unlink_verified(
     }
     fs::fsync_dir_fd(directory_fd).map_err(|error| UnlinkFailure::OutcomeUnknown {
         phase: UnlinkPhase::DirectoryFsync,
+        source: error.to_string(),
+    })
+}
+
+fn is_directory_not_empty(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+    )
+}
+
+pub fn remove_empty_directory_verified(
+    parent_directory_fd: std::os::unix::io::RawFd,
+    name: &str,
+    _actor: MoveActor,
+) -> Result<(), RemoveDirectoryFailure> {
+    match fs::unlinkat_dir(parent_directory_fd, name) {
+        Ok(()) => {}
+        Err(error) if is_not_found_io_kind(error.kind()) => {
+            return Err(RemoveDirectoryFailure::SourceMissing);
+        }
+        Err(error) if is_directory_not_empty(&error) => {
+            return Err(RemoveDirectoryFailure::NotEmpty);
+        }
+        Err(error) => {
+            return Err(RemoveDirectoryFailure::NotCommitted {
+                phase: RemoveDirectoryPhase::Remove,
+                source: error.to_string(),
+            });
+        }
+    }
+    fs::fsync_dir_fd(parent_directory_fd).map_err(|error| RemoveDirectoryFailure::OutcomeUnknown {
+        phase: RemoveDirectoryPhase::ParentFsync,
         source: error.to_string(),
     })
 }
@@ -527,6 +593,96 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn directory_not_empty_error_classification_is_exact() {
+        assert!(is_directory_not_empty(&std::io::Error::from_raw_os_error(
+            libc::ENOTEMPTY
+        )));
+        assert!(is_directory_not_empty(&std::io::Error::from_raw_os_error(
+            libc::EEXIST
+        )));
+        assert!(!is_directory_not_empty(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(!is_directory_not_empty(&std::io::Error::from_raw_os_error(
+            libc::EIO
+        )));
+    }
+
+    #[test]
+    fn remove_empty_directory_preserves_linearization_phase_and_replays() {
+        for (fault, expected_phase, outcome_unknown, directory_remains) in [
+            ("unlinkat_dir", RemoveDirectoryPhase::Remove, false, true),
+            (
+                "fsync_dir_fd",
+                RemoveDirectoryPhase::ParentFsync,
+                true,
+                false,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("empty")).unwrap();
+            std::fs::write(root.path().join("sibling"), b"distinct").unwrap();
+            let parent = std::fs::OpenOptions::new()
+                .read(true)
+                .open(root.path())
+                .unwrap();
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, 1, libc::EIO);
+            let result =
+                remove_empty_directory_verified(parent.as_raw_fd(), "empty", MoveActor::Recovery);
+            fs::fault::reset();
+            let failure = result.unwrap_err();
+            assert_eq!(failure.phase(), Some(expected_phase));
+            assert_eq!(failure.is_outcome_unknown(), outcome_unknown);
+            assert_eq!(root.path().join("empty").exists(), directory_remains);
+            assert_eq!(
+                std::fs::read(root.path().join("sibling")).unwrap(),
+                b"distinct"
+            );
+
+            drop(parent);
+            let reopened = std::fs::OpenOptions::new()
+                .read(true)
+                .open(root.path())
+                .unwrap();
+            let replay =
+                remove_empty_directory_verified(reopened.as_raw_fd(), "empty", MoveActor::Recovery);
+            if directory_remains {
+                assert!(replay.is_ok());
+            } else {
+                assert!(matches!(replay, Err(RemoveDirectoryFailure::SourceMissing)));
+            }
+        }
+    }
+
+    #[test]
+    fn remove_empty_directory_distinguishes_missing_nonempty_and_io() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nonempty")).unwrap();
+        std::fs::write(root.path().join("nonempty/object"), b"object").unwrap();
+        let parent = std::fs::OpenOptions::new()
+            .read(true)
+            .open(root.path())
+            .unwrap();
+        assert!(matches!(
+            remove_empty_directory_verified(parent.as_raw_fd(), "missing", MoveActor::Recovery),
+            Err(RemoveDirectoryFailure::SourceMissing)
+        ));
+        assert!(matches!(
+            remove_empty_directory_verified(parent.as_raw_fd(), "nonempty", MoveActor::Recovery),
+            Err(RemoveDirectoryFailure::NotEmpty)
+        ));
+        assert!(matches!(
+            remove_empty_directory_verified(-1, "missing", MoveActor::Recovery),
+            Err(RemoveDirectoryFailure::NotCommitted {
+                phase: RemoveDirectoryPhase::Remove,
+                ..
+            })
+        ));
+        assert!(root.path().join("nonempty/object").exists());
     }
 
     #[test]
