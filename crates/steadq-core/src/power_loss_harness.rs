@@ -282,7 +282,7 @@ impl PowerLossHarness {
             }
         }
         // Pre-create receipt shards so ensure_dir performs no fsync.
-        let shard_count = self.queue().format().shard_count;
+        let shard_count = self.queue().format().shard_count();
         if let Ok(buckets) = std::fs::read_dir(&receipts) {
             for bucket in buckets.flatten() {
                 if !bucket.path().is_dir() {
