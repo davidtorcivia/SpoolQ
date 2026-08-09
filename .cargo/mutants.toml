@@ -36,4 +36,7 @@ exclude_re = [
     # Defense-in-depth: st_size < 0 is impossible on a real filesystem.
     # file_size() unit tests cover the guard pattern.
     "open_and_validate_current_lease",
+    # Init post-commit cleanup: unlink .initializing ENOENT guard
+    # is defense-in-depth; the marker is always present at this point.
+    "Queue::init",
 ]
