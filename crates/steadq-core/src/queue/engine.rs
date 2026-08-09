@@ -1,9 +1,8 @@
 // Phase-aware durable move engine: single source for rename+fsync with actor attribution.
 //
-// Every state transition linearizes via RENAME_NOREPLACE and then must fsync
-// both source and destination directories. Errors before the rename are
-// retryable (NotCommitted), errors at the rename are classified by errno,
-// and errors during the durability barrier are OutcomeUnknown with poison.
+// Every state transition linearizes via RENAME_NOREPLACE and then syncs each
+// distinct affected directory. Errors before the rename are retryable
+// (NotCommitted); later errors are OutcomeUnknown.
 
 use std::os::fd::{AsRawFd, BorrowedFd};
 
@@ -25,8 +24,28 @@ pub enum MovePhase {
     EnsureDest,
     PreRename,
     Rename,
+    DestinationIdentity,
     DestFsync,
     SourceFsync,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl MoveIdentity {
+    pub fn new(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+
+    fn matches(self, stat: &libc::stat) -> bool {
+        stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && stat.st_nlink == 1
+            && stat.st_dev == self.device
+            && stat.st_ino == self.inode
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,8 +201,37 @@ pub fn move_verified_noreplace(
     dest_name: &str,
     _actor: MoveActor,
 ) -> Result<(), MoveFailure> {
-    let renamed = match fs::renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name) {
-        Ok(()) => true,
+    move_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name, None, false)
+}
+
+pub fn move_witnessed_noreplace(
+    src_dir_fd: BorrowedFd<'_>,
+    src_name: &str,
+    dest_dir_fd: BorrowedFd<'_>,
+    dest_name: &str,
+    source_identity: MoveIdentity,
+    _actor: MoveActor,
+) -> Result<(), MoveFailure> {
+    move_noreplace(
+        src_dir_fd,
+        src_name,
+        dest_dir_fd,
+        dest_name,
+        Some(source_identity),
+        true,
+    )
+}
+
+fn move_noreplace(
+    src_dir_fd: BorrowedFd<'_>,
+    src_name: &str,
+    dest_dir_fd: BorrowedFd<'_>,
+    dest_name: &str,
+    source_identity: Option<MoveIdentity>,
+    detect_same_directory: bool,
+) -> Result<(), MoveFailure> {
+    match fs::renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name) {
+        Ok(()) => {}
         Err(e) if is_already_exists_io_kind(e.kind()) => {
             return Err(MoveFailure::AlreadyExists);
         }
@@ -197,13 +245,36 @@ pub fn move_verified_noreplace(
             });
         }
     };
-    debug_assert!(renamed);
+
+    if let Some(source_identity) = source_identity {
+        match fs::fstatat(dest_dir_fd, dest_name) {
+            Ok(stat) if source_identity.matches(&stat) => {}
+            Ok(_) => {
+                return Err(MoveFailure::OutcomeUnknown {
+                    phase: MovePhase::DestinationIdentity,
+                    source: "destination identity changed after rename".into(),
+                });
+            }
+            Err(error) => {
+                return Err(MoveFailure::OutcomeUnknown {
+                    phase: MovePhase::DestinationIdentity,
+                    source: error.to_string(),
+                });
+            }
+        }
+    }
+
     if let Err(e) = fs::fsync_dir_fd(dest_dir_fd) {
         return Err(MoveFailure::OutcomeUnknown {
             phase: MovePhase::DestFsync,
             source: e.to_string(),
         });
     }
+
+    if detect_same_directory && same_directory(src_dir_fd, dest_dir_fd) {
+        return Ok(());
+    }
+
     if let Err(e) = fs::fsync_dir_fd(src_dir_fd) {
         return Err(MoveFailure::OutcomeUnknown {
             phase: MovePhase::SourceFsync,
@@ -211,6 +282,18 @@ pub fn move_verified_noreplace(
         });
     }
     Ok(())
+}
+
+fn same_directory(source: BorrowedFd<'_>, destination: BorrowedFd<'_>) -> bool {
+    if source.as_raw_fd() == destination.as_raw_fd() {
+        return true;
+    }
+    match (fs::fstat(source), fs::fstat(destination)) {
+        (Ok(source), Ok(destination)) => {
+            source.st_dev == destination.st_dev && source.st_ino == destination.st_ino
+        }
+        _ => false,
+    }
 }
 
 pub fn unlink_verified(
@@ -355,7 +438,10 @@ pub fn is_source_missing(f: &MoveFailure) -> bool {
     matches!(f, MoveFailure::SourceMissing)
 }
 pub fn is_outcome_unknown_phase(phase: MovePhase) -> bool {
-    matches!(phase, MovePhase::DestFsync | MovePhase::SourceFsync)
+    matches!(
+        phase,
+        MovePhase::DestinationIdentity | MovePhase::DestFsync | MovePhase::SourceFsync
+    )
 }
 pub fn is_not_committed_phase(phase: MovePhase) -> bool {
     matches!(
@@ -395,6 +481,7 @@ mod tests {
 
     #[test]
     fn is_outcome_unknown_phase_table() {
+        assert!(is_outcome_unknown_phase(MovePhase::DestinationIdentity));
         assert!(is_outcome_unknown_phase(MovePhase::DestFsync));
         assert!(is_outcome_unknown_phase(MovePhase::SourceFsync));
         assert!(!is_outcome_unknown_phase(MovePhase::Rename));
@@ -407,6 +494,7 @@ mod tests {
         assert!(is_not_committed_phase(MovePhase::EnsureDest));
         assert!(is_not_committed_phase(MovePhase::PreRename));
         assert!(is_not_committed_phase(MovePhase::Rename));
+        assert!(!is_not_committed_phase(MovePhase::DestinationIdentity));
         assert!(!is_not_committed_phase(MovePhase::DestFsync));
         assert!(!is_not_committed_phase(MovePhase::SourceFsync));
     }
@@ -550,6 +638,131 @@ mod tests {
             MoveActor::Recovery,
         );
         assert!(matches!(r3, Err(MoveFailure::AlreadyExists)));
+    }
+
+    #[test]
+    fn move_identity_requires_exact_singly_linked_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.raw");
+        std::fs::write(&path, b"source").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let stat = fs::fstat(file.as_fd()).unwrap();
+        let identity = MoveIdentity::new(stat.st_dev, stat.st_ino);
+
+        assert!(identity.matches(&stat));
+
+        let mut wrong_type = stat;
+        wrong_type.st_mode = libc::S_IFDIR | 0o700;
+        assert!(!identity.matches(&wrong_type));
+
+        let mut wrong_link_count = stat;
+        wrong_link_count.st_nlink = 2;
+        assert!(!identity.matches(&wrong_link_count));
+
+        let mut wrong_device = stat;
+        wrong_device.st_dev = wrong_device.st_dev.wrapping_add(1);
+        assert!(!identity.matches(&wrong_device));
+
+        let mut wrong_inode = stat;
+        wrong_inode.st_ino = wrong_inode.st_ino.wrapping_add(1);
+        assert!(!identity.matches(&wrong_inode));
+    }
+
+    #[test]
+    fn witnessed_move_preserves_every_failure_phase() {
+        for (fault, fault_count, expected_phase, source_remains) in [
+            ("renameat2_noreplace", 1, MovePhase::Rename, true),
+            ("fstatat", 1, MovePhase::DestinationIdentity, false),
+            ("fsync_dir_fd", 1, MovePhase::DestFsync, false),
+            ("fsync_dir_fd", 2, MovePhase::SourceFsync, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let source_dir = root.path().join("source");
+            let destination_dir = root.path().join("destination");
+            std::fs::create_dir(&source_dir).unwrap();
+            std::fs::create_dir(&destination_dir).unwrap();
+            std::fs::write(source_dir.join("source.raw"), b"source").unwrap();
+            let source_fd = std::fs::File::open(&source_dir).unwrap();
+            let destination_fd = std::fs::File::open(&destination_dir).unwrap();
+            let source_stat = fs::fstatat(source_fd.as_fd(), "source.raw").unwrap();
+
+            fs::fault::reset();
+            fs::fault::inject_errno(fault, fault_count, libc::EIO);
+            let failure = move_witnessed_noreplace(
+                source_fd.as_fd(),
+                "source.raw",
+                destination_fd.as_fd(),
+                "destination.raw",
+                MoveIdentity::new(source_stat.st_dev, source_stat.st_ino),
+                MoveActor::Consumer,
+            )
+            .unwrap_err();
+            fs::fault::reset();
+
+            assert_eq!(failure.phase(), Some(expected_phase));
+            assert_eq!(failure.is_outcome_unknown(), !source_remains);
+            assert_eq!(source_dir.join("source.raw").exists(), source_remains);
+            assert_eq!(
+                destination_dir.join("destination.raw").exists(),
+                !source_remains
+            );
+        }
+    }
+
+    #[test]
+    fn witnessed_move_rejects_the_wrong_destination_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let destination_dir = root.path().join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&destination_dir).unwrap();
+        std::fs::write(source_dir.join("source.raw"), b"source").unwrap();
+        let source_fd = std::fs::File::open(&source_dir).unwrap();
+        let destination_fd = std::fs::File::open(&destination_dir).unwrap();
+        let source_stat = fs::fstatat(source_fd.as_fd(), "source.raw").unwrap();
+
+        let failure = move_witnessed_noreplace(
+            source_fd.as_fd(),
+            "source.raw",
+            destination_fd.as_fd(),
+            "destination.raw",
+            MoveIdentity::new(source_stat.st_dev, source_stat.st_ino.wrapping_add(1)),
+            MoveActor::Consumer,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            failure,
+            MoveFailure::OutcomeUnknown {
+                phase: MovePhase::DestinationIdentity,
+                ..
+            }
+        ));
+        assert!(!source_dir.join("source.raw").exists());
+        assert!(destination_dir.join("destination.raw").exists());
+    }
+
+    #[test]
+    fn witnessed_move_syncs_same_directory_once_across_distinct_fds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.raw"), b"source").unwrap();
+        let source_fd = std::fs::File::open(dir.path()).unwrap();
+        let destination_fd = std::fs::File::open(dir.path()).unwrap();
+        let source_stat = fs::fstatat(source_fd.as_fd(), "source.raw").unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 2, libc::EIO);
+        move_witnessed_noreplace(
+            source_fd.as_fd(),
+            "source.raw",
+            destination_fd.as_fd(),
+            "destination.raw",
+            MoveIdentity::new(source_stat.st_dev, source_stat.st_ino),
+            MoveActor::Consumer,
+        )
+        .unwrap();
+        assert_eq!(fs::fault::call_count("fsync_dir_fd"), 1);
+        fs::fault::reset();
     }
 
     #[test]
