@@ -1872,6 +1872,17 @@ mod tests {
             error: io::Error::from_raw_os_error(libc::EIO),
             progress,
         };
+        assert_eq!(
+            progress_error.to_string(),
+            io::Error::from_raw_os_error(libc::EIO).to_string()
+        );
+        assert_eq!(
+            progress_error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .and_then(io::Error::raw_os_error),
+            Some(libc::EIO)
+        );
         assert_eq!(progress_error.progress(), progress);
     }
 
