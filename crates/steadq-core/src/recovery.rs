@@ -5,7 +5,7 @@ use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 
 use steadq_fs_linux as fs;
 use steadq_math;
-use steadq_names::{self, bucket_hex};
+use steadq_names;
 
 use crate::errors::*;
 use crate::queue::engine::{
@@ -1843,8 +1843,16 @@ impl Queue {
         leased_name: &str,
         common: &steadq_names::CommonFields,
     ) -> Result<(), MoveFailure> {
-        let src_dir = format!("leased/{boot_dir}/{bucket}/{shard}");
-        let dest_dir = format!("ready/{shard}");
+        let leased_bucket =
+            steadq_names::bucket_from_hex(bucket).ok_or_else(|| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: format!("invalid bucket: {bucket}"),
+            })?;
+        let shard_num = u32::from_str_radix(shard, 16).unwrap_or(0);
+        let src_dir = self
+            .layout()
+            .leased_shard_dir(boot_dir, leased_bucket, shard_num);
+        let dest_dir = self.layout().ready_shard_dir(shard_num);
 
         let new_gen =
             common
@@ -1861,8 +1869,8 @@ impl Queue {
             maximum_attempts: common.maximum_attempts,
         };
 
-        let ready_name =
-            steadq_names::make_ready_name(self.format.queue_id(), shard, &ready_common);
+        let ready_target = self.layout().ready(&ready_common);
+        let ready_name = ready_target.filename;
 
         let src_fd =
             open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
@@ -1896,7 +1904,15 @@ impl Queue {
         reason: DeadReason,
         wall_floor: WallFloor,
     ) -> Result<(), MoveFailure> {
-        let src_dir = format!("leased/{boot_dir}/{bucket}/{shard}");
+        let leased_bucket =
+            steadq_names::bucket_from_hex(bucket).ok_or_else(|| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: format!("invalid bucket: {bucket}"),
+            })?;
+        let shard_num = u32::from_str_radix(shard, 16).unwrap_or(0);
+        let src_dir = self
+            .layout()
+            .leased_shard_dir(boot_dir, leased_bucket, shard_num);
         let terminal_bucket = steadq_math::bucket_number(
             wall_floor.unix_ns(),
             self.format.terminal_bucket_width_ns(),
@@ -1905,8 +1921,6 @@ impl Queue {
             phase: MovePhase::PreRename,
             source: "terminal bucket overflow".into(),
         })?;
-        let bucket_str = bucket_hex(terminal_bucket);
-        let dest_dir = format!("dead/{bucket_str}/{shard}");
 
         let new_gen =
             common
@@ -1923,13 +1937,11 @@ impl Queue {
             maximum_attempts: common.maximum_attempts,
         };
 
-        let dead_name = steadq_names::make_dead_name(
-            self.format.queue_id(),
-            &bucket_str,
-            shard,
-            &dead_common,
-            reason as u16,
-        );
+        let dead_target =
+            self.layout()
+                .dead_in_bucket(&dead_common, reason as u16, terminal_bucket);
+        let dest_dir = dead_target.directory();
+        let dead_name = dead_target.filename;
 
         self.ensure_dir_pub(&dest_dir)
             .map_err(|error| MoveFailure::NotCommitted {
@@ -3955,7 +3967,7 @@ mod tests {
             queue.format.terminal_bucket_width_ns(),
         )
         .unwrap();
-        let bucket = bucket_hex(terminal_bucket);
+        let bucket = steadq_names::bucket_hex(terminal_bucket);
         let dead_common = steadq_names::CommonFields {
             job_id: common.job_id,
             generation: common.generation.checked_add(1).unwrap(),
@@ -6833,7 +6845,7 @@ mod tests {
             queue
                 .ensure_dir_pub(&format!(
                     "dead/{}/{}",
-                    bucket_hex(terminal_bucket),
+                    steadq_names::bucket_hex(terminal_bucket),
                     parts[3]
                 ))
                 .unwrap();
@@ -6957,7 +6969,10 @@ mod tests {
             )
             .unwrap();
             queue
-                .ensure_dir_pub(&format!("dead/{}/{shard}", bucket_hex(terminal_bucket)))
+                .ensure_dir_pub(&format!(
+                    "dead/{}/{shard}",
+                    steadq_names::bucket_hex(terminal_bucket)
+                ))
                 .unwrap();
             fs::fault::reset();
             fs::fault::inject_errno(fault, count, libc::EIO);
