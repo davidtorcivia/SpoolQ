@@ -66,6 +66,20 @@ int main(void) {
 
     steadq_reader_free(reader);
 
+    /* Verify output pointers are zero-initialized on error paths. */
+    SteadqJobId err_id = { .bytes = { 0xFF } };
+    int rc2 = steadq_enqueue(NULL, NULL, 0, NULL, 0, &err_id);
+    /* enqueue with NULL queue should fail, and err_id should be zeroed. */
+    int all_zero = 1;
+    for (int i = 0; i < 16; i++) {
+        if (err_id.bytes[i] != 0) { all_zero = 0; break; }
+    }
+    if (!all_zero) {
+        fprintf(stderr, "job_id_out not zero-initialized on error\n");
+        return 1;
+    }
+    (void)rc2;
+
     rc = steadq_ack(q, lease);
     if (rc != STEADQ_OK) { fprintf(stderr, "ack failed: %d\n", rc); return 1; }
     printf("acked\n");
