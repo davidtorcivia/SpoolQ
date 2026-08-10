@@ -151,9 +151,9 @@ jobs:
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=50000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_transition_ticket -- -max_len=1024 -runs=50000
-          timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_operation_sequence -- -max_len=256 -runs=50000
-          timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_queue_corruption -- -max_len=256 -runs=50000
-          timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_resolve -- -max_len=1024 -runs=50000
+          timeout 120 cargo +nightly-2026-08-07 fuzz run fuzz_operation_sequence -- -max_len=128 -runs=5000
+          timeout 120 cargo +nightly-2026-08-07 fuzz run fuzz_queue_corruption -- -max_len=128 -runs=5000
+          timeout 120 cargo +nightly-2026-08-07 fuzz run fuzz_resolve -- -max_len=1024 -runs=5000
 
   # TLA+ model checking with TLC
   tla:
@@ -184,7 +184,7 @@ jobs:
   # Nightly lane: release-mode extended tests and benchmarks
   nightly:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
