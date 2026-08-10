@@ -326,6 +326,83 @@ fn bench_concurrent_completed(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_deferred_completed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deferred_completed");
+    for &payload_size in &[64usize, 16384] {
+        group.throughput(criterion::Throughput::Bytes(payload_size as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(payload_size),
+            &payload_size,
+            |b, &size| {
+                let tmp = TempDir::new().unwrap();
+                Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                let mut q = Queue::open(
+                    tmp.path(),
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        deferred_dir_sync: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let payload = vec![0xABu8; size];
+                b.iter(|| {
+                    q.enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".to_string(),
+                        payload: payload.clone(),
+                        ..Default::default()
+                    });
+                    let lease = match q.lease(0, 30_000_000_000) {
+                        LeaseOutcome::Leased(l) => l,
+                        _ => panic!("lease failed"),
+                    };
+                    q.verify_lease_payload(&lease).unwrap();
+                    q.ack(&lease);
+                    q.sync().unwrap();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_batch_deferred(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_deferred");
+    for &batch_size in &[1u32, 10, 50] {
+        group.throughput(criterion::Throughput::Elements(batch_size as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            &batch_size,
+            |b, &n| {
+                let tmp = TempDir::new().unwrap();
+                Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                let mut q = Queue::open(
+                    tmp.path(),
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        deferred_dir_sync: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                b.iter(|| {
+                    for _ in 0..n {
+                        q.enqueue(EnqueueInput {
+                            maximum_attempts: 3,
+                            content_type: "x".to_string(),
+                            payload: b"data".to_vec(),
+                            ..Default::default()
+                        });
+                    }
+                    q.sync().unwrap();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_enqueue,
@@ -337,6 +414,8 @@ criterion_group!(
     bench_concurrent_throughput,
     bench_sustained_completed,
     bench_concurrent_completed,
+    bench_deferred_completed,
+    bench_batch_deferred,
 );
 criterion_main!(benches);
 
