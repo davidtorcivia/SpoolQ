@@ -8,6 +8,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+io-uring = []
+
 [dependencies]
 sha2.workspace = true
 thiserror = "1"
@@ -25,4 +28,8 @@ criterion.workspace = true
 
 [[bench]]
 name = "queue_ops"
+harness = false
+
+[[bench]]
+name = "strict_batch"
 harness = false
