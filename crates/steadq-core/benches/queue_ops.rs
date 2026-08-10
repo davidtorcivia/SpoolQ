@@ -228,6 +228,72 @@ criterion_group!(
     bench_lease_hit,
     bench_ack,
     bench_sustained_enqueue,
-    bench_sustained_ack
+    bench_sustained_ack,
+    bench_concurrent_throughput
 );
 criterion_main!(benches);
+
+fn bench_concurrent_throughput(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent");
+    for n_threads in [1u32, 2, 4, 8].iter() {
+        group.throughput(criterion::Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(n_threads),
+            n_threads,
+            |b, &n| {
+                b.iter_custom(|iters| {
+                    let tmp = TempDir::new().unwrap();
+                    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                    let path = tmp.path().to_path_buf();
+                    let total = Arc::new(AtomicUsize::new(0));
+                    let start = std::time::Instant::now();
+
+                    let handles: Vec<_> = (0..n)
+                        .map(|_| {
+                            let p = path.clone();
+                            let t = total.clone();
+                            thread::spawn(move || {
+                                let queue = Queue::open(
+                                    &p,
+                                    &OpenOptions {
+                                        allow_unsupported_fs: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .unwrap();
+                                let mut queue = queue;
+                                let mut local = 0usize;
+                                for _ in 0..iters {
+                                    if matches!(
+                                        queue.enqueue(EnqueueInput {
+                                            maximum_attempts: 3,
+                                            content_type: "x".to_string(),
+                                            payload: b"data".to_vec(),
+                                            ..Default::default()
+                                        }),
+                                        EnqueueOutcome::Committed(_)
+                                    ) {
+                                        local += 1;
+                                    }
+                                }
+                                t.fetch_add(local, Ordering::Relaxed);
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                    let elapsed = start.elapsed();
+                    // Keep temp dir alive for the measurement
+                    drop(tmp);
+                    elapsed
+                });
+            },
+        );
+    }
+    group.finish();
+}
