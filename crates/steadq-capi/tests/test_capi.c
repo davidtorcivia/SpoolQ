@@ -1,5 +1,6 @@
 /* SteadQ/1 C ABI test program - hermetic with unique temp dir */
 #include "steadq.h"
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -86,6 +87,38 @@ int main(void) {
 
     steadq_lease_free(lease);
     steadq_close(q);
+
+    /* Edge case: null pointer rejection. */
+    assert(steadq_enqueue(NULL, NULL, 0, NULL, 0, NULL) != STEADQ_OK);
+    assert(steadq_lease(NULL, 0, NULL) != STEADQ_OK);
+    assert(steadq_ack(NULL, NULL) != STEADQ_OK);
+    assert(steadq_reader_read(NULL, NULL, 0, 0, NULL) != STEADQ_OK);
+    assert(steadq_reader_payload_len(NULL) == 0);
+
+    /* Edge case: resolve with invalid ticket JSON. */
+    SteadqQueue *q2 = steadq_open(path);
+    if (!q2) { fprintf(stderr, "reopen failed\n"); return 1; }
+    const char *bad_json = "not valid json";
+    int resolve_rc = steadq_resolve(q2, (const uint8_t *)bad_json, strlen(bad_json), 0);
+    assert(resolve_rc != STEADQ_OK);
+    steadq_close(q2);
+
+    /* Edge case: zero-length payload enqueue. */
+    SteadqQueue *q3 = steadq_open(path);
+    if (!q3) { fprintf(stderr, "reopen failed\n"); return 1; }
+    SteadqJobId zero_id;
+    int zero_rc = steadq_enqueue(q3, NULL, 0, "empty", 1, &zero_id);
+    assert(zero_rc == STEADQ_OK);
+    int zero_all = 1;
+    for (int i = 0; i < 16; i++) {
+        /* job_id should be non-zero (randomly generated). */
+        if (zero_id.bytes[i] != 0) { zero_all = 0; break; }
+    }
+    /* Having all-zero job_id is extremely unlikely but not impossible.
+     * Just verify the call succeeded. */
+    (void)zero_all;
+    steadq_close(q3);
+
     printf("C ABI test passed\n");
     /* P1-24: Cleanup temp directory for repeatability. */
     rmrf(d);
