@@ -25,3 +25,4 @@ Thumbs.db
 merge_pr.sh
 mutants.out/
 mutants.out.old/
+fuzz/target/
