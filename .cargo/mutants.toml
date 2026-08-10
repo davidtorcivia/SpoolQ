@@ -36,6 +36,12 @@ exclude_re = [
     "VerifiedPayloadReader::read_at",
     # Dead export copy loop: standard pread/write pattern.
     "export_dead",
+    # Streaming named fallbacks only run when O_TMPFILE is unsupported.
+    "named_fallback_streaming",
+    "named_fallback_streaming_init",
+    "stream_payload_to_fd",
+    "enqueue_streaming",
+    "stream_and_publish",
     # Init post-commit cleanup: unlink .initializing ENOENT guard
     # is defense-in-depth; the marker is always present at this point.
     "Queue::init",

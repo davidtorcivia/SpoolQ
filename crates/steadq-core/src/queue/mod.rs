@@ -8,7 +8,9 @@ use std::io;
 use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use steadq_format::cbor::ExtensionHeader;
+
 use steadq_format::{
     envelope_digest, payload_digest, FixedHeader, FormatRecord, WatermarkRecord,
     DIGEST_ALGORITHM_SHA256, FORMAT_MINOR, MAX_PAYLOAD_LENGTH,
@@ -1596,6 +1598,477 @@ impl Queue {
         }
         Ok(())
     }
+
+    /// Enqueue a job from a streaming payload source. The payload is written
+    /// to the temp file in 64 KiB chunks without buffering the full payload
+    /// in memory. The header (including payload digest) is computed from the
+    /// streamed bytes using a placeholder-then-pwrite strategy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_streaming(
+        &mut self,
+        maximum_attempts: u32,
+        content_type: String,
+        metadata: std::collections::BTreeMap<String, steadq_format::cbor::MetadataValue>,
+        producer_id: Option<String>,
+        trace_context: Option<Vec<u8>>,
+        initial_not_before: Option<u64>,
+        mut reader: impl std::io::Read,
+    ) -> EnqueueOutcome {
+        if let Err(e) = self.check_not_poisoned() {
+            return EnqueueOutcome::NotCommitted(
+                EnqueueTicket {
+                    job_id: [0; 16],
+                    envelope_digest: [0; 32],
+                    expected_initial_state: InitialState::Ready,
+                    expected_relative_path: String::new(),
+                },
+                e,
+            );
+        }
+
+        if maximum_attempts == 0 {
+            return EnqueueOutcome::NotCommitted(
+                EnqueueTicket {
+                    job_id: [0; 16],
+                    envelope_digest: [0; 32],
+                    expected_initial_state: InitialState::Ready,
+                    expected_relative_path: String::new(),
+                },
+                Error::InvalidInput("maximum_attempts must be >= 1".into()),
+            );
+        }
+
+        let wall_floor = match self.wall_floor_for_mutation() {
+            Ok(floor) => floor,
+            Err(error) => {
+                return EnqueueOutcome::NotCommitted(
+                    EnqueueTicket {
+                        job_id: [0; 16],
+                        envelope_digest: [0; 32],
+                        expected_initial_state: InitialState::Ready,
+                        expected_relative_path: String::new(),
+                    },
+                    error,
+                )
+            }
+        };
+        let created_at = wall_floor.unix_ns();
+        let job_id = fs::random_128bit().unwrap_or([0; 16]);
+
+        let ext = ExtensionHeader {
+            initial_not_before_unix_ns: initial_not_before,
+            content_type,
+            metadata,
+            producer_id,
+            trace_context,
+        };
+        let ext_bytes = match ext.encode() {
+            Ok(b) => b,
+            Err(e) => {
+                return EnqueueOutcome::NotCommitted(
+                    EnqueueTicket {
+                        job_id,
+                        envelope_digest: [0; 32],
+                        expected_initial_state: InitialState::Ready,
+                        expected_relative_path: String::new(),
+                    },
+                    Error::InvalidInput(e.to_string()),
+                )
+            }
+        };
+
+        // Write placeholder header, extension, then stream payload while hashing.
+        // After streaming, pwrite the real header at offset 0.
+        let now_wall = wall_floor.unix_ns();
+        let (expected_initial_state, _) = match initial_not_before {
+            Some(nb) if nb > now_wall => (InitialState::Delayed, 0u64),
+            _ => (InitialState::Ready, 0),
+        };
+
+        let common = CommonFields {
+            job_id,
+            generation: 0,
+            attempt: 0,
+            maximum_attempts,
+        };
+        let (dest_dir_relative, filename, expected_path) = match expected_initial_state {
+            InitialState::Ready => {
+                let target = self.layout().ready(&common);
+                {
+                    let d = target.directory();
+                    let p = target.relative_path();
+                    (d, target.filename, p)
+                }
+            }
+            InitialState::Delayed => {
+                let Some(not_before_ns) = initial_not_before else {
+                    return EnqueueOutcome::NotCommitted(
+                        EnqueueTicket {
+                            job_id,
+                            envelope_digest: [0; 32],
+                            expected_initial_state: InitialState::Ready,
+                            expected_relative_path: String::new(),
+                        },
+                        Error::QueueCorrupt("delayed enqueue lost its deadline".into()),
+                    );
+                };
+                let target = match self.layout().delayed(&common, not_before_ns) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return EnqueueOutcome::NotCommitted(
+                            EnqueueTicket {
+                                job_id,
+                                envelope_digest: [0; 32],
+                                expected_initial_state: InitialState::Ready,
+                                expected_relative_path: String::new(),
+                            },
+                            e,
+                        )
+                    }
+                };
+                {
+                    let d = target.directory();
+                    let p = target.relative_path();
+                    (d, target.filename, p)
+                }
+            }
+        };
+
+        let result = self.stream_and_publish(
+            &dest_dir_relative,
+            &filename,
+            job_id,
+            maximum_attempts,
+            created_at,
+            &ext_bytes,
+            &mut reader,
+        );
+
+        let env_dig = match &result {
+            Ok(d) => *d,
+            Err(PublishError::NotCommitted(e)) => {
+                return EnqueueOutcome::NotCommitted(
+                    EnqueueTicket {
+                        job_id,
+                        envelope_digest: [0; 32],
+                        expected_initial_state,
+                        expected_relative_path: expected_path,
+                    },
+                    e.clone(),
+                )
+            }
+            Err(PublishError::OutcomeUnknown(e)) => {
+                self.poison();
+                return EnqueueOutcome::OutcomeUnknown(
+                    EnqueueTicket {
+                        job_id,
+                        envelope_digest: [0; 32],
+                        expected_initial_state,
+                        expected_relative_path: expected_path,
+                    },
+                    e.clone(),
+                );
+            }
+        };
+
+        EnqueueOutcome::Committed(EnqueueTicket {
+            job_id,
+            envelope_digest: env_dig,
+            expected_initial_state,
+            expected_relative_path: expected_path,
+        })
+    }
+
+    /// Stream payload to a temp file while computing the digest, then publish.
+    /// Returns the envelope digest on success.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_and_publish(
+        &mut self,
+        dest_dir_relative: &str,
+        dest_name: &str,
+        job_id: [u8; 16],
+        maximum_attempts: u32,
+        created_at: u64,
+        ext_bytes: &[u8],
+        reader: &mut dyn std::io::Read,
+    ) -> Result<[u8; 32], PublishError> {
+        self.ensure_dir(dest_dir_relative)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+
+        match fs::open_tmpfile(dest_fd.as_fd()) {
+            Ok(tmp_fd) => {
+                let (payload_len, payload_digest) =
+                    Self::stream_payload_to_fd(tmp_fd.as_fd(), ext_bytes, reader)?;
+
+                // Validate payload size.
+                if payload_len > self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH) {
+                    return Err(PublishError::NotCommitted(Error::InvalidInput(
+                        "payload exceeds limit".into(),
+                    )));
+                }
+
+                // Construct and pwrite the real header.
+                let mut header = FixedHeader {
+                    format_minor: FORMAT_MINOR,
+                    extension_header_length: ext_bytes.len() as u32,
+                    payload_length: payload_len,
+                    flags: 0,
+                    digest_algorithm: DIGEST_ALGORITHM_SHA256,
+                    job_id,
+                    maximum_attempts,
+                    created_at_unix_ns: created_at,
+                    payload_digest,
+                    envelope_digest: [0; 32],
+                };
+                let env_dig = envelope_digest(&header, ext_bytes).ok_or_else(|| {
+                    PublishError::NotCommitted(Error::InvalidInput(
+                        "extension length mismatch".into(),
+                    ))
+                })?;
+                header.envelope_digest = env_dig;
+                let header_bytes = header
+                    .encode(ext_bytes)
+                    .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
+                fs::pwrite_all(tmp_fd.as_fd(), &header_bytes, 0)
+                    .map_err(PublishError::classify_write)?;
+                fs::fsync(tmp_fd.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
+
+                match engine::publish_tmpfile_noreplace(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name)
+                {
+                    Ok(engine::TmpfilePublishOutcome::Published) => {}
+                    Ok(engine::TmpfilePublishOutcome::Unsupported) => {
+                        // O_TMPFILE not supported: need named fallback.
+                        // Read back from the tmpfile and use the standard path.
+                        return self.named_fallback_streaming(
+                            dest_dir_relative,
+                            dest_fd.as_fd(),
+                            dest_name,
+                            &header,
+                            ext_bytes,
+                            tmp_fd.as_fd(),
+                            payload_len,
+                        );
+                    }
+                    Err(failure) => return Err(PublishError::classify_tmpfile(failure)),
+                }
+                fs::fsync_dir_fd(dest_fd.as_fd())
+                    .map_err(|e| PublishError::OutcomeUnknown(Error::IoFailure(e.to_string())))?;
+                Ok(env_dig)
+            }
+            Err(e) => {
+                if engine::is_tmpfile_open_unsupported(&e) {
+                    // O_TMPFILE not supported: stream to a named temp file instead.
+                    self.named_fallback_streaming_init(
+                        dest_dir_relative,
+                        dest_fd.as_fd(),
+                        dest_name,
+                        job_id,
+                        maximum_attempts,
+                        created_at,
+                        ext_bytes,
+                        reader,
+                    )
+                } else {
+                    Err(PublishError::classify_write(e))
+                }
+            }
+        }
+    }
+
+    /// Stream payload to a temp fd: write placeholder header, extension, then
+    /// payload chunks while hashing. Returns (payload_length, payload_digest).
+    fn stream_payload_to_fd(
+        fd: BorrowedFd<'_>,
+        ext_bytes: &[u8],
+        reader: &mut dyn std::io::Read,
+    ) -> Result<(u64, [u8; 32]), PublishError> {
+        // Placeholder header: 128 zero bytes.
+        let placeholder = [0u8; 128];
+        fs::write_all(fd, &placeholder).map_err(PublishError::classify_write)?;
+        fs::write_all(fd, ext_bytes).map_err(PublishError::classify_write)?;
+
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            fs::write_all(fd, &buf[..n]).map_err(PublishError::classify_write)?;
+            total = total.checked_add(n as u64).ok_or_else(|| {
+                PublishError::NotCommitted(Error::InvalidInput("payload length overflow".into()))
+            })?;
+        }
+        Ok((total, hasher.finalize().into()))
+    }
+
+    /// Named fallback for streaming when O_TMPFILE is unsupported.
+    /// Reads back from the O_TMPFILE fd and writes to a named temp file.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn named_fallback_streaming(
+        &mut self,
+        dest_dir_relative: &str,
+        dest_fd: BorrowedFd<'_>,
+        dest_name: &str,
+        header: &FixedHeader,
+        ext_bytes: &[u8],
+        tmpfile_fd: BorrowedFd<'_>,
+        payload_len: u64,
+    ) -> Result<[u8; 32], PublishError> {
+        // The tmpfile already has the full content (placeholder header + ext + payload).
+        // We need a named temp file that we can publish via rename.
+        let tmp_dir = format!("tmp/{}", self.boot_id);
+        let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
+        let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
+        self.ensure_dir(&tmp_shard_dir)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let boottime = fs::clock_boottime_ns()
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let random = fs::random_128bit()
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let temp_name = temp_filename(boottime, &random);
+
+        let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+
+        // Write the real header to the named temp.
+        let header_bytes = header
+            .encode(ext_bytes)
+            .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
+        fs::write_all(tmp_file.as_fd(), &header_bytes).map_err(PublishError::classify_write)?;
+        fs::write_all(tmp_file.as_fd(), ext_bytes).map_err(PublishError::classify_write)?;
+
+        // Copy payload from tmpfile_fd (offset 128 + ext_len) to named temp.
+        let data_offset = (128 + ext_bytes.len()) as u64;
+        let mut copied: u64 = 0;
+        let mut buf = vec![0u8; 65536];
+        while copied < payload_len {
+            let to_read = (buf.len() as u64).min(payload_len - copied) as usize;
+            let n = fs::pread(tmpfile_fd, &mut buf[..to_read], data_offset + copied)
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+            if n == 0 {
+                break;
+            }
+            fs::write_all(tmp_file.as_fd(), &buf[..n]).map_err(PublishError::classify_write)?;
+            copied += n as u64;
+        }
+
+        fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
+
+        let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
+        match engine::move_witnessed_noreplace_io(
+            tmp_dir_fd.as_fd(),
+            &temp_name,
+            dest_fd,
+            dest_name,
+            engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
+            engine::MoveActor::Producer,
+        ) {
+            Ok(()) => {}
+            Err(failure) => {
+                if failure.is_outcome_unknown() {
+                    let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
+                }
+                return Err(PublishError::classify_move(failure));
+            }
+        }
+        Ok(header.envelope_digest)
+    }
+
+    /// Named fallback for streaming when O_TMPFILE open fails entirely.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn named_fallback_streaming_init(
+        &mut self,
+        dest_dir_relative: &str,
+        dest_fd: BorrowedFd<'_>,
+        dest_name: &str,
+        job_id: [u8; 16],
+        maximum_attempts: u32,
+        created_at: u64,
+        ext_bytes: &[u8],
+        reader: &mut dyn std::io::Read,
+    ) -> Result<[u8; 32], PublishError> {
+        let tmp_dir = format!("tmp/{}", self.boot_id);
+        let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
+        let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
+        self.ensure_dir(&tmp_shard_dir)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let boottime = fs::clock_boottime_ns()
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let random = fs::random_128bit()
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        let temp_name = temp_filename(boottime, &random);
+
+        let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
+            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+
+        // Stream payload to named temp while hashing.
+        // Write placeholder header first, then extension, then payload.
+        // After streaming, pwrite real header.
+        let (payload_len, payload_digest) =
+            Self::stream_payload_to_fd(tmp_file.as_fd(), ext_bytes, reader)?;
+
+        if payload_len > self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH) {
+            let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
+            return Err(PublishError::NotCommitted(Error::InvalidInput(
+                "payload exceeds limit".into(),
+            )));
+        }
+
+        let mut header = FixedHeader {
+            format_minor: FORMAT_MINOR,
+            extension_header_length: ext_bytes.len() as u32,
+            payload_length: payload_len,
+            flags: 0,
+            digest_algorithm: DIGEST_ALGORITHM_SHA256,
+            job_id,
+            maximum_attempts,
+            created_at_unix_ns: created_at,
+            payload_digest,
+            envelope_digest: [0; 32],
+        };
+        let env_dig = envelope_digest(&header, ext_bytes).ok_or_else(|| {
+            PublishError::NotCommitted(Error::InvalidInput("extension length mismatch".into()))
+        })?;
+        header.envelope_digest = env_dig;
+        let header_bytes = header
+            .encode(ext_bytes)
+            .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
+        fs::pwrite_all(tmp_file.as_fd(), &header_bytes, 0).map_err(PublishError::classify_write)?;
+        fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
+
+        let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
+        match engine::move_witnessed_noreplace_io(
+            tmp_dir_fd.as_fd(),
+            &temp_name,
+            dest_fd,
+            dest_name,
+            engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
+            engine::MoveActor::Producer,
+        ) {
+            Ok(()) => {}
+            Err(failure) => {
+                if failure.is_outcome_unknown() {
+                    let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
+                }
+                return Err(PublishError::classify_move(failure));
+            }
+        }
+        Ok(env_dig)
+    }
+
     /// Claim a ready job, returning a lease.
     /// max_wait_ns is accepted for API compatibility but currently performs
     /// a single immediate scan (C-14: bounded wait/backoff not yet implemented).
@@ -5907,6 +6380,51 @@ mod tests {
             }
             _ => panic!("zero-payload enqueue should succeed"),
         }
+    }
+
+    #[test]
+    fn streaming_enqueue_writes_and_reads_payload() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload = vec![0x42u8; 100_000];
+
+        let cursor = std::io::Cursor::new(payload.clone());
+        let outcome = queue.enqueue_streaming(
+            3,
+            "x".to_string(),
+            Default::default(),
+            None,
+            None,
+            None,
+            cursor,
+        );
+        let _ticket = match outcome {
+            EnqueueOutcome::Committed(t) => t,
+            o => panic!("streaming enqueue failed: {o:?}"),
+        };
+
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            o => panic!("lease failed: {o:?}"),
+        };
+
+        let reader = queue
+            .open_verified_payload_reader(&lease)
+            .unwrap()
+            .expect("reader");
+        assert_eq!(reader.payload_len(), 100_000);
+
+        let mut read_data = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        let mut offset = 0u64;
+        loop {
+            let n = reader.read_at(&mut buf, offset).unwrap();
+            if n == 0 {
+                break;
+            }
+            read_data.extend_from_slice(&buf[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(read_data, payload);
     }
 
     #[test]
