@@ -252,6 +252,7 @@ pub struct Queue {
     pub(crate) recovery_cursor: RecoveryCursor,
     pub(crate) cached_wall_floor: Option<WallFloor>,
     pub(crate) known_dirs: std::cell::RefCell<std::collections::HashSet<String>>,
+    pub(crate) cached_dest_fd: Option<(String, std::os::fd::OwnedFd)>,
 }
 
 /// Internal helper enum for resolver object authentication.
@@ -976,6 +977,7 @@ impl Queue {
             recovery_cursor,
             cached_wall_floor: None,
             known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
+            cached_dest_fd: None,
         })
     }
 
@@ -1462,6 +1464,27 @@ impl Queue {
         }
     }
 
+    fn open_or_cache_dir(&mut self, relative: &str) -> io::Result<std::os::fd::OwnedFd> {
+        if let Some((ref cached_path, ref cached_fd)) = self.cached_dest_fd {
+            if cached_path == relative {
+                // Re-open the cached fd to get a fresh OwnedFd (the caller needs its own).
+                // dup is one syscall, cheaper than 2 openat calls.
+                return cached_fd
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_err(|e| io::Error::other(e.to_string()));
+            }
+        }
+        let fd = open_relative(self.root_fd.as_fd(), relative)?;
+        self.cached_dest_fd = Some((
+            relative.to_string(),
+            fd.as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| io::Error::other(e.to_string()))?,
+        ));
+        Ok(fd)
+    }
+
     /// Write the job envelope to a temp file and publish via rename.
     fn write_and_publish(
         &mut self,
@@ -1475,8 +1498,9 @@ impl Queue {
         self.ensure_dir(dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
-        // Open destination directory
-        let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
+        // Open destination directory (cached if same as last operation)
+        let dest_fd = self
+            .open_or_cache_dir(dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
         // Try O_TMPFILE path first
