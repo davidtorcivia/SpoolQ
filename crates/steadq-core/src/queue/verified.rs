@@ -335,7 +335,7 @@ pub(crate) fn verify_receipt_on_fd(
 /// open across any subsequent operation to prevent TOCTOU swap.
 pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationError> {
     let header = read_and_verify_header(fd)?;
-    verify_size(fd, &header, header.extension_header_length as usize)?;
+    let stat = verify_size(fd, &header, header.extension_header_length as usize)?;
     verify_payload(fd, &header, header.extension_header_length as usize)?;
     let ext = read_extension(fd, header.extension_header_length as usize)?;
     if !steadq_format::verify_envelope_digest(&header, &ext) {
@@ -343,7 +343,6 @@ pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationE
             "envelope digest mismatch".into(),
         ));
     }
-    let stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
     Ok(VerifiedJob {
         header,
         extension: ext,
@@ -363,8 +362,7 @@ pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, Verifica
             "envelope digest mismatch".into(),
         ));
     }
-    verify_size(fd, &header, ext.len())?;
-    let stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
+    let stat = verify_size(fd, &header, ext.len())?;
     Ok(VerifiedJob {
         header,
         extension: ext,
@@ -400,7 +398,7 @@ fn verify_size(
     fd: BorrowedFd<'_>,
     header: &FixedHeader,
     ext_len: usize,
-) -> Result<(), VerificationError> {
+) -> Result<libc::stat, VerificationError> {
     let file_stat = fs::fstat(fd).map_err(|e| VerificationError::Io(e.to_string()))?;
     let actual_size = file_size(&file_stat)?;
     let expected_size = checked_total_size(ext_len, header.payload_length)?;
@@ -410,7 +408,7 @@ fn verify_size(
             expected_size, file_stat.st_size
         )));
     }
-    Ok(())
+    Ok(file_stat)
 }
 
 fn verify_payload(

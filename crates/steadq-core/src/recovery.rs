@@ -1848,7 +1848,15 @@ impl Queue {
                 phase: MovePhase::PreRename,
                 source: std::io::Error::other(format!("invalid bucket: {bucket}")),
             })?;
-        let shard_num = u32::from_str_radix(shard, 16).unwrap_or(0);
+        let shard_num = match u32::from_str_radix(shard, 16) {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(MoveFailure::NotCommitted {
+                    phase: MovePhase::PreRename,
+                    source: std::io::Error::other(format!("invalid shard: {shard}")),
+                })
+            }
+        };
         let src_dir = self
             .layout()
             .leased_shard_dir(boot_dir, leased_bucket, shard_num);
@@ -1909,7 +1917,15 @@ impl Queue {
                 phase: MovePhase::PreRename,
                 source: std::io::Error::other(format!("invalid bucket: {bucket}")),
             })?;
-        let shard_num = u32::from_str_radix(shard, 16).unwrap_or(0);
+        let shard_num = match u32::from_str_radix(shard, 16) {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(MoveFailure::NotCommitted {
+                    phase: MovePhase::PreRename,
+                    source: std::io::Error::other(format!("invalid shard: {shard}")),
+                })
+            }
+        };
         let src_dir = self
             .layout()
             .leased_shard_dir(boot_dir, leased_bucket, shard_num);
