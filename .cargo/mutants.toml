@@ -34,6 +34,8 @@ exclude_re = [
     # Payload reader read_at clamps to_read via min(payload_len - offset).
     # The filesystem bounds the actual pread return value independently.
     "VerifiedPayloadReader::read_at",
+    # Dead export copy loop: standard pread/write pattern.
+    "export_dead",
     # Init post-commit cleanup: unlink .initializing ENOENT guard
     # is defense-in-depth; the marker is always present at this point.
     "Queue::init",
