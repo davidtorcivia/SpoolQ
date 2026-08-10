@@ -23,7 +23,6 @@ These guards protect against states that cannot occur on a real filesystem.
 
 | Pattern | Reason | Expiry |
 | --- | --- | --- |
-| `stabilize_both` | Unreachable while `is_singly_linked_regular` rejects hard-linked pairs (link count > 1) as Conflict before the both-same path runs. The function wires `fsync`, identity checks, and `unlink_verified`, each independently tested. | Until A-012 delivers quarantine-by-swap |
 | `open_and_validate_current_lease` | `st_size < 0` guard is impossible on a real filesystem. `file_size()` unit tests in `verified.rs` cover the guard pattern with synthetic stat values. | Permanent |
 | `Queue::init` | Post-commit `.initializing` unlink ENOENT guard: the marker is always present at this point because it was created earlier in the same function. | Permanent |
 

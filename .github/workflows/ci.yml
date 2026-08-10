@@ -184,8 +184,14 @@ jobs:
         run: cargo test -p steadq-core --release -- fd_leak_stress
       - name: Benchmarks (P2-35 tracking only, no regression gate)
         run: cargo bench -p steadq-core --bench queue_ops -- --warm-up-time 1 --measurement-time 3
-      - name: Full mutation suite (all crates, no timeout cap)
+      - name: Full mutation suite (steadq-format, steadq-names, steadq-math)
         continue-on-error: true
         run: |
           cargo install cargo-mutants --version 27.1.0 --locked
-          cargo mutants --workspace -j 2 --cap-lints true || true
+          cargo mutants -p steadq-format -p steadq-names -p steadq-math -j 2 --timeout 30 --cap-lints true
+      - name: Full mutation suite (steadq-fs-linux)
+        continue-on-error: true
+        run: cargo mutants -p steadq-fs-linux -j 2 --timeout 30 --cap-lints true
+      - name: Full mutation suite (steadq-core)
+        continue-on-error: true
+        run: cargo mutants -p steadq-core -j 2 --timeout 120 --cap-lints true
