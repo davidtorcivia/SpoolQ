@@ -1025,21 +1025,29 @@ fn main() -> ExitCode {
         Commands::Admin { command } => match command {
             AdminCommands::DeadList { path } => {
                 let qroot = path.join("dead");
-                if let Ok(entries) = std::fs::read_dir(&qroot) {
-                    for bucket in entries.flatten() {
-                        if let Ok(shards) = std::fs::read_dir(bucket.path()) {
-                            for shard in shards.flatten() {
-                                if let Ok(files) = std::fs::read_dir(shard.path()) {
-                                    for file in files.flatten() {
-                                        let name = escape_os_bytes(&file.file_name());
-                                        let file_path = file.path();
-                                        let relative_path =
-                                            file_path.strip_prefix(&path).unwrap_or(&file_path);
-                                        let rp = escape_os_bytes(relative_path.as_os_str());
-                                        println!("{name} {rp}");
-                                    }
-                                }
-                            }
+                let entries = match std::fs::read_dir(&qroot) {
+                    Ok(e) => e,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return ExitCode::from(EXIT_SUCCESS);
+                    }
+                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                };
+                for bucket in entries.flatten() {
+                    let shards = match std::fs::read_dir(bucket.path()) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    for shard in shards.flatten() {
+                        let files = match std::fs::read_dir(shard.path()) {
+                            Ok(f) => f,
+                            Err(_) => continue,
+                        };
+                        for file in files.flatten() {
+                            let name = escape_os_bytes(&file.file_name());
+                            let file_path = file.path();
+                            let relative_path = file_path.strip_prefix(&path).unwrap_or(&file_path);
+                            let rp = escape_os_bytes(relative_path.as_os_str());
+                            println!("{name} {rp}");
                         }
                     }
                 }
@@ -1283,8 +1291,25 @@ fn write_ticket_file(
         .map(|b| steadq_names::hex_encode(&b))
         .unwrap_or_else(|_| format!("{}", std::process::id()));
     let tmp_path = path.with_extension(format!("tmp.{rand_bytes}"));
-    std::fs::write(&tmp_path, json)?;
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(parent_dir) = std::fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+    }
     Ok(())
 }
 
