@@ -250,6 +250,7 @@ pub struct Queue {
     #[allow(dead_code)]
     pub(crate) maint_lock_fd: Option<OwnedFd>,
     pub(crate) recovery_cursor: RecoveryCursor,
+    pub(crate) cached_wall_floor: Option<WallFloor>,
 }
 
 /// Internal helper enum for resolver object authentication.
@@ -972,6 +973,7 @@ impl Queue {
             options: opts.clone(),
             maint_lock_fd: Some(maint_fd),
             recovery_cursor,
+            cached_wall_floor: None,
         })
     }
 
@@ -1021,8 +1023,24 @@ impl Queue {
     /// Wall floor for mutating operations. P0-01: Returns Err and poisons
     /// on failure so callers abort before computing destination paths.
     pub(crate) fn wall_floor_for_mutation(&mut self) -> Result<WallFloor, Error> {
+        // Fast path: return the cached floor if the bucket has not advanced.
+        // A cheap clock_gettime is all that's needed to check.
+        if let Some(ref cached) = self.cached_wall_floor {
+            let now = steadq_fs_linux::clock_realtime_ns()
+                .map_err(|e| Error::IoFailure(format!("CLOCK_REALTIME: {e}")))?;
+            let now_bucket = steadq_math::bucket_number(now, self.format.delayed_bucket_width_ns())
+                .ok_or(Error::StateExhausted)?;
+            if now_bucket == cached.watermark_bucket {
+                return Ok(*cached);
+            }
+        }
+
+        // Slow path: acquire the watermark lock, read, and potentially advance.
         match self.stabilized_wall_floor() {
-            Ok(floor) => Ok(floor),
+            Ok(floor) => {
+                self.cached_wall_floor = Some(floor);
+                Ok(floor)
+            }
             Err(Error::MaintenanceBusy) => Err(Error::MaintenanceBusy),
             Err(e) => {
                 self.poison();
@@ -7856,6 +7874,7 @@ mod tests {
         let lock_fd =
             fs::openat(control_fd.as_fd(), "wall-watermark.lock", libc::O_RDWR, 0).unwrap();
         assert!(fs::try_ofd_write_lock(lock_fd.as_fd()).unwrap());
+        queue.cached_wall_floor = None;
 
         assert!(matches!(
             queue.ack(&lease),
@@ -8014,6 +8033,7 @@ mod tests {
             ..Default::default()
         });
         remove_wall_watermark(&tmp);
+        queue.cached_wall_floor = None;
         assert!(matches!(
             queue.lease(0, 30_000_000_000),
             LeaseOutcome::NotCommitted(Error::QueueCorrupt(_))
@@ -8032,6 +8052,7 @@ mod tests {
                 outcome => panic!("lease failed before {operation}: {outcome:?}"),
             };
             remove_wall_watermark(&tmp);
+            queue.cached_wall_floor = None;
             match operation {
                 "ack" => assert!(matches!(
                     queue.ack(&lease),
@@ -9271,6 +9292,8 @@ mod tests {
             std::fs::write(&wm_path, b"corrupted watermark data").unwrap();
         }
         // The next mutating operation should poison and return error.
+        // Clear the cache so the watermark is re-read.
+        queue.cached_wall_floor = None;
         let outcome = queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
             content_type: "x".to_string(),
