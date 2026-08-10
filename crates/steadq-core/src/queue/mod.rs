@@ -787,14 +787,11 @@ impl Queue {
 
         // FORMAT is now the linearization point. The executor has synced the
         // root directory. Remove the init marker and sync once more. These are
-        // post-commit operations: FORMAT is published and the queue is usable.
+        // post-commit operations: FORMAT is published and the queue is usable,
+        // so cleanup failures do not change the init outcome.
         init_guard.armed = false;
-        match fs::unlinkat(root_fd.as_fd(), ".initializing") {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
-            Err(e) => return Err(e),
-        }
-        fs::fsync_dir_fd(root_fd.as_fd())?;
+        let _ = fs::unlinkat(root_fd.as_fd(), ".initializing");
+        let _ = fs::fsync_dir_fd(root_fd.as_fd());
 
         Ok(format_rec)
     }
