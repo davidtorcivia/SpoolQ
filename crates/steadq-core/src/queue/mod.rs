@@ -746,6 +746,10 @@ impl Queue {
         let fmt_tmp = fs::create_exclusive(root_fd.as_fd(), &fmt_tmp_name, 0o600)?;
         fs::write_all(fmt_tmp.as_fd(), &format_bytes)?;
         fs::fsync(fmt_tmp.as_fd())?;
+        // C-02: Set FORMAT temp file to read-only before publication so the
+        // published FORMAT is read-only even if the post-rename chmod is
+        // skipped by an OutcomeUnknown return.
+        fs::fchmodat(root_fd.as_fd(), &fmt_tmp_name, 0o400)?;
         // Publish FORMAT through the phase-aware executor so post-linearization
         // failures are classified correctly.
         match engine::move_verified_noreplace(
@@ -782,8 +786,6 @@ impl Queue {
                 ));
             }
         }
-        // C-02: Set FORMAT to read-only.
-        fs::fchmodat(root_fd.as_fd(), "FORMAT", 0o400)?;
 
         // FORMAT is now the linearization point. The executor has synced the
         // root directory. Remove the init marker and sync once more. These are
@@ -3746,25 +3748,7 @@ impl Queue {
                 }
             }
             (ResolveObj::Absent, ResolveObj::Absent) => ResolutionOutcome::NeitherObserved,
-            (ResolveObj::Match(source), ResolveObj::Match(destination)) => {
-                if identity_matches(
-                    source.device,
-                    source.inode,
-                    destination.device,
-                    destination.inode,
-                ) {
-                    if stabilize {
-                        match self.stabilize_both(&source_path, &source, &destination) {
-                            Ok(()) => ResolutionOutcome::BothStabilized,
-                            Err(error) => ResolutionOutcome::ResolutionFailed(error),
-                        }
-                    } else {
-                        ResolutionOutcome::BothObserved
-                    }
-                } else {
-                    ResolutionOutcome::ConflictingObject
-                }
-            }
+            (ResolveObj::Match(_), ResolveObj::Match(_)) => ResolutionOutcome::BothObserved,
             // Any conflict
             (ResolveObj::Conflict, _) | (_, ResolveObj::Conflict) => {
                 ResolutionOutcome::ConflictingObject
@@ -4104,79 +4088,6 @@ impl Queue {
             object.device,
             object.inode,
         ))
-    }
-
-    /// Stabilize a both-same observation: the same object appears at both source
-    /// and destination after a crash. Sync the destination directory, then remove
-    /// the stale source entry through the phase-aware unlink executor.
-    fn stabilize_both(
-        &self,
-        source_path: &ResolvePath<'_>,
-        source: &ResolvedObject,
-        destination: &ResolvedObject,
-    ) -> Result<(), Error> {
-        fs::fsync(destination.file_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
-        fs::fsync_dir_fd(destination.directory_fd.as_fd())
-            .map_err(|e| Error::IoFailure(e.to_string()))?;
-
-        let current_directory =
-            match fs::open_directory_beneath(self.root_fd.as_fd(), source_path.directory) {
-                Ok(directory) => directory,
-                Err(error) => {
-                    if resolver_error_is_not_found(&error) {
-                        return Ok(());
-                    }
-                    return Err(Error::IoFailure(error.to_string()));
-                }
-            };
-        let dir_stat = fs::fstat(current_directory.as_fd())
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
-        if !identity_matches(
-            dir_stat.st_dev as u64,
-            dir_stat.st_ino as u64,
-            source.directory_device,
-            source.directory_inode,
-        ) {
-            return Ok(());
-        }
-        let entry = match fs::fstatat(current_directory.as_fd(), source_path.name) {
-            Ok(stat) => stat,
-            Err(error) => {
-                if resolver_error_is_not_found(&error) {
-                    return Ok(());
-                }
-                return Err(Error::IoFailure(error.to_string()));
-            }
-        };
-        if !identity_matches(
-            entry.st_dev as u64,
-            entry.st_ino as u64,
-            source.device,
-            source.inode,
-        ) {
-            return Ok(());
-        }
-
-        match engine::unlink_verified(
-            current_directory.as_fd(),
-            source_path.name,
-            engine::MoveActor::Consumer,
-        ) {
-            Ok(()) => Ok(()),
-            Err(engine::UnlinkFailure::SourceMissing) => Ok(()),
-            Err(engine::UnlinkFailure::NotCommitted {
-                phase,
-                source: detail,
-            }) => Err(Error::IoFailure(format!(
-                "both-same source removal failed at {phase:?}: {detail}"
-            ))),
-            Err(engine::UnlinkFailure::OutcomeUnknown {
-                phase,
-                source: detail,
-            }) => Err(Error::IoFailure(format!(
-                "both-same source removal indeterminate at {phase:?}: {detail}"
-            ))),
-        }
     }
 }
 

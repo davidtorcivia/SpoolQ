@@ -898,10 +898,6 @@ fn main() -> ExitCode {
                     eprintln!("both source and destination observed (corruption)");
                     ExitCode::from(EXIT_CORRUPTION)
                 }
-                steadq_core::ResolutionOutcome::BothStabilized => {
-                    eprintln!("both observed with same identity, source removed");
-                    ExitCode::SUCCESS
-                }
                 steadq_core::ResolutionOutcome::NeitherObserved => {
                     eprintln!("neither source nor destination observed");
                     ExitCode::from(EXIT_ORDINARY)

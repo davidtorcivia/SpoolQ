@@ -338,7 +338,15 @@ impl Queue {
             };
             let boot_fd = match fs::open_directory(leased_fd.as_fd(), boot_dir) {
                 Ok(fd) => fd,
-                Err(_) => continue,
+                Err(_) => {
+                    report.findings.push(CorruptionFinding {
+                        relative_path: format!("leased/{boot_dir}"),
+                        finding_type: "unexpected_entry".into(),
+                        severity: FindingSeverity::Warning,
+                        details: format!("non-directory entry in leased: {boot_dir}"),
+                    });
+                    continue;
+                }
             };
             let bucket_dirs = match fs::read_dir_entries(boot_fd.as_fd()) {
                 Ok(e) => e,
@@ -352,7 +360,17 @@ impl Queue {
                 };
                 let bucket_fd = match fs::open_directory(boot_fd.as_fd(), bucket_dir) {
                     Ok(fd) => fd,
-                    Err(_) => continue,
+                    Err(_) => {
+                        report.findings.push(CorruptionFinding {
+                            relative_path: format!("leased/{boot_dir}/{bucket_dir}"),
+                            finding_type: "unexpected_entry".into(),
+                            severity: FindingSeverity::Warning,
+                            details: format!(
+                                "non-directory entry in leased boot dir: {bucket_dir}"
+                            ),
+                        });
+                        continue;
+                    }
                 };
                 let shard_dirs = match fs::read_dir_entries(bucket_fd.as_fd()) {
                     Ok(e) => e,
@@ -366,7 +384,17 @@ impl Queue {
                     };
                     let shard_fd = match fs::open_directory(bucket_fd.as_fd(), shard_dir) {
                         Ok(fd) => fd,
-                        Err(_) => continue,
+                        Err(_) => {
+                            report.findings.push(CorruptionFinding {
+                                relative_path: format!("{bucket_parent}/{shard_dir}"),
+                                finding_type: "unexpected_entry".into(),
+                                severity: FindingSeverity::Warning,
+                                details: format!(
+                                    "non-directory entry in leased bucket: {shard_dir}"
+                                ),
+                            });
+                            continue;
+                        }
                     };
                     let files = match fs::read_dir_entries(shard_fd.as_fd()) {
                         Ok(e) => e,
@@ -1673,6 +1701,9 @@ mod tests {
             b"garbage",
         )
         .unwrap();
+        // Place an unexpected non-directory file in a leased boot dir.
+        std::fs::create_dir_all(tmp.path().join(" leased/boot-test")).unwrap();
+        std::fs::write(tmp.path().join("leased/not-a-dir.txt"), b"garbage").unwrap();
 
         let report = queue.fsck(&FsckOptions::default());
         let unexpected: Vec<_> = report
