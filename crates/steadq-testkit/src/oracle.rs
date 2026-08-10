@@ -194,6 +194,11 @@ impl Oracle {
         self.jobs.get(job_id)
     }
 
+    /// Get a mutable reference to a job's state.
+    pub fn get_mut(&mut self, job_id: &[u8; 16]) -> Option<&mut OracleJob> {
+        self.jobs.get_mut(job_id)
+    }
+
     /// List all jobs.
     pub fn jobs(&self) -> impl Iterator<Item = &OracleJob> {
         self.jobs.values()
