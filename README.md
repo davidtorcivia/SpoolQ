@@ -146,16 +146,18 @@ Single-threaded sustained throughput on NVMe (ZFS):
 |---|---|---|
 | Enqueue (64B) | 150 us | ~6,600 ops/sec |
 | Enqueue (16KB) | 180 us | ~5,500 ops/sec |
-| Ack (4B payload) | 530 us | ~1,900 ops/sec |
+| Completed job (64B) | 524 us | ~1,900 jobs/sec |
+| Completed job (16KB) | 579 us | ~1,730 jobs/sec |
 
-Concurrent enqueue throughput (multiple Queue handles):
+A completed job is the full lifecycle: enqueue, lease, verify payload, acknowledge.
+
+Concurrent completed-job throughput (multiple Queue handles):
 
 | Threads | Throughput | Scaling |
 |---|---|---|
-| 1 | ~5,500 ops/sec | 1.0x |
-| 2 | ~9,300 ops/sec | 1.7x |
-| 4 | ~12,900 ops/sec | 2.4x |
-| 8 | ~19,200 ops/sec | 3.5x |
+| 1 | ~1,840 jobs/sec | 1.0x |
+| 4 | ~4,690 jobs/sec | 2.5x |
+| 8 | ~6,370 jobs/sec | 3.5x |
 
 Each operation requires 2 fsync calls (file data + directory entry) for
 crash safety. The wall floor cache eliminates redundant watermark reads
