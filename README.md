@@ -138,6 +138,30 @@ SteadQ has 622 tests across unit, integration, conformance, and formal model che
 - Mutation testing (cargo-mutants) runs on every pull request, scoped to the changed lines
 - Fuzz testing covers format parsing, filename parsing, CBOR decoding, and arithmetic
 
+## Performance
+
+Single-threaded sustained throughput on NVMe (ZFS):
+
+| Operation | Latency | Throughput |
+|---|---|---|
+| Enqueue (64B) | 150 us | ~6,600 ops/sec |
+| Enqueue (16KB) | 180 us | ~5,500 ops/sec |
+| Ack (4B payload) | 530 us | ~1,900 ops/sec |
+
+Concurrent enqueue throughput (multiple Queue handles):
+
+| Threads | Throughput | Scaling |
+|---|---|---|
+| 1 | ~5,500 ops/sec | 1.0x |
+| 2 | ~9,300 ops/sec | 1.7x |
+| 4 | ~12,900 ops/sec | 2.4x |
+| 8 | ~19,200 ops/sec | 3.5x |
+
+Each operation requires 2 fsync calls (file data + directory entry) for
+crash safety. The wall floor cache eliminates redundant watermark reads
+on the hot path. Concurrent scaling comes from the filesystem-level
+atomicity of `renameat2` with `RENAME_NOREPLACE`.
+
 ## Documentation
 
 - [`spec/contract.md`](spec/contract.md) - Assumptions, guarantees, and terminology
