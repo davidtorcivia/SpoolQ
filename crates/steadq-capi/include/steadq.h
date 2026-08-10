@@ -20,6 +20,7 @@ extern "C" {
 
 typedef struct SteadqQueue SteadqQueue;
 typedef struct SteadqLease SteadqLease;
+typedef struct SteadqPayloadReader SteadqPayloadReader;
 
 typedef struct {
     uint8_t bytes[16];
@@ -65,6 +66,16 @@ int steadq_lease_content_type(const SteadqLease *lease, char *out, size_t out_le
 int steadq_lease_source_path(const SteadqLease *lease, char *out, size_t out_len);
 
 void steadq_lease_free(SteadqLease *lease);
+
+/* Payload reading: verify once, read many. */
+int steadq_lease_open_reader(SteadqQueue *queue,
+                             const SteadqLease *lease,
+                             SteadqPayloadReader **reader_out);
+int steadq_reader_read(SteadqPayloadReader *reader,
+                       uint8_t *buf, size_t buf_len,
+                       uint64_t offset, size_t *bytes_read_out);
+uint64_t steadq_reader_payload_len(const SteadqPayloadReader *reader);
+void steadq_reader_free(SteadqPayloadReader *reader);
 
 /* Last-error mechanism. Returns pointer to thread-local storage.
  * Valid until the next SteadQ call on the same thread. Do not free.
