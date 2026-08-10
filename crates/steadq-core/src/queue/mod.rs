@@ -288,6 +288,37 @@ struct LeasedSourceWitness {
     inode: u64,
 }
 
+/// A reader for a verified lease payload that does not re-hash on each read.
+///
+/// The payload is verified once at construction. Subsequent `read_at` calls
+/// perform direct pread on the held fd, avoiding the O(n^2) cost of calling
+/// `read_lease_payload_chunk` repeatedly.
+pub struct VerifiedPayloadReader {
+    file_fd: OwnedFd,
+    payload_start: u64,
+    payload_len: u64,
+}
+
+impl VerifiedPayloadReader {
+    /// Read payload bytes at the given offset into buf.
+    /// Returns the number of bytes read (0 at EOF).
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        if offset >= self.payload_len {
+            return Ok(0);
+        }
+        let to_read = (buf.len() as u64).min(self.payload_len - offset) as usize;
+        let abs_offset = self.payload_start + offset;
+        let n = fs::pread(self.file_fd.as_fd(), &mut buf[..to_read], abs_offset)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// Total payload length in bytes.
+    pub fn payload_len(&self) -> u64 {
+        self.payload_len
+    }
+}
+
 #[derive(Debug)]
 enum LeasedMoveOutcome {
     Committed,
@@ -3159,6 +3190,47 @@ impl Queue {
             offset += n as u64;
         }
         Ok(())
+    }
+
+    /// Open a verified payload reader for a lease. The payload is hashed
+    /// once at construction; subsequent `read_at` calls do not re-hash.
+    pub fn open_verified_payload_reader(
+        &self,
+        lease: &LeaseInfo,
+    ) -> Result<Option<VerifiedPayloadReader>, Error> {
+        let source = match self.open_and_validate_current_lease(lease)? {
+            Some(source) => source,
+            None => return Ok(None),
+        };
+        // P0-01: Verify payload before allowing reads.
+        if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
+            if matches!(e, Error::PayloadCorrupt) {
+                if let Err(engine::MoveFailure::OutcomeUnknown {
+                    phase,
+                    source: detail,
+                }) = self.quarantine_corrupt_lease(
+                    source.directory_fd.as_fd(),
+                    &source.name,
+                    source.file_fd.as_fd(),
+                ) {
+                    return Err(Error::QueueCorrupt(format!(
+                        "payload is corrupt and quarantine is indeterminate at {phase:?}: {detail}"
+                    )));
+                }
+            }
+            return Err(e);
+        }
+        let mut header_buf = [0u8; 128];
+        fs::pread_exact(source.file_fd.as_fd(), &mut header_buf, 0)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let header =
+            FixedHeader::decode(&header_buf).map_err(|e| Error::QueueCorrupt(e.to_string()))?;
+        let ext_len = header.extension_header_length as usize;
+        Ok(Some(VerifiedPayloadReader {
+            file_fd: source.file_fd,
+            payload_start: (128 + ext_len) as u64,
+            payload_len: header.payload_length,
+        }))
     }
 
     /// Diagnostic lookup: find all states for a job_id.
@@ -6146,6 +6218,55 @@ mod tests {
     }
 
     // ===== R4-PERF: streaming payload read =====
+    #[test]
+    fn verified_payload_reader_reads_sequential_and_random_access() {
+        let (_tmp, mut queue) = create_test_queue();
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.clone(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            o => panic!("lease failed: {o:?}"),
+        };
+
+        let reader = queue
+            .open_verified_payload_reader(&lease)
+            .unwrap()
+            .expect("reader should exist");
+        assert_eq!(reader.payload_len(), 100_000);
+
+        // Sequential read in 4KB chunks.
+        let mut offset = 0u64;
+        let mut read_data = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = reader.read_at(&mut buf, offset).unwrap();
+            if n == 0 {
+                break;
+            }
+            read_data.extend_from_slice(&buf[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(read_data, payload);
+
+        // Random-access read at offset 50_000.
+        let mut specific = [0u8; 4];
+        assert_eq!(reader.read_at(&mut specific, 50_000).unwrap(), 4);
+        assert_eq!(&specific, &payload[50_000..50_004]);
+
+        // Read at end is capped to remaining bytes.
+        let mut tail = vec![0u8; 10_000];
+        assert_eq!(reader.read_at(&mut tail, 99_998).unwrap(), 2);
+        assert_eq!(&tail[..2], &payload[99_998..100_000]);
+
+        // Read past end returns 0.
+        assert_eq!(reader.read_at(&mut tail, 100_000).unwrap(), 0);
+    }
+
     #[test]
     fn stream_lease_payload_reads_all_data() {
         let (_tmp, mut queue) = create_test_queue();
