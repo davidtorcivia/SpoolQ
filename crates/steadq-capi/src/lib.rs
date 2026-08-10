@@ -197,6 +197,9 @@ pub extern "C" fn steadq_enqueue(
     job_id_out: *mut SteadqJobId,
 ) -> c_int {
     clear_last_error();
+    if !job_id_out.is_null() {
+        unsafe { (*job_id_out).bytes = [0; 16] };
+    }
     if queue.is_null() {
         set_last_error("null queue");
         return STEADQ_NOT_COMMITTED;
@@ -276,6 +279,7 @@ pub extern "C" fn steadq_lease(
         set_last_error("null queue or lease_out");
         return STEADQ_NOT_COMMITTED;
     }
+    unsafe { *lease_out = std::ptr::null_mut() };
     let result = std::panic::catch_unwind(|| {
         let queue = unsafe { &*queue };
         let mut guard = match queue.inner.lock() {
@@ -642,6 +646,7 @@ pub extern "C" fn steadq_lease_open_reader(
         return STEADQ_NOT_COMMITTED;
     }
     clear_last_error();
+    unsafe { *reader_out = std::ptr::null_mut() };
     let steadq = unsafe { &*queue };
     let lease_inner = unsafe { &(*lease).inner };
     let guard = steadq.inner.lock();
