@@ -54,6 +54,11 @@ int steadq_retry(SteadqQueue *queue, SteadqLease *lease);
 int steadq_bury(SteadqQueue *queue, SteadqLease *lease, unsigned int reason);
 int steadq_recover(SteadqQueue *queue);
 
+/* Resolve an indeterminate operation from a ticket (JSON bytes). */
+int steadq_resolve(SteadqQueue *queue,
+                   const uint8_t *ticket_json, size_t ticket_len,
+                   int stabilize);
+
 void steadq_lease_job_id(const SteadqLease *lease, SteadqJobId *out);
 uint64_t steadq_lease_generation(const SteadqLease *lease);
 unsigned int steadq_lease_attempt(const SteadqLease *lease);

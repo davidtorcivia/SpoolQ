@@ -12,7 +12,8 @@ use std::sync::Mutex;
 
 use steadq_core::{
     CreateOptions, EnqueueInput, EnqueueOutcome, Error, LeaseInfo, LeaseOutcome, OpenOptions,
-    Queue, TransitionOutcome, VerifiedPayloadReader, WorkBudget,
+    Queue, ResolutionOutcome, TransitionOutcome, TransitionTicket, VerifiedPayloadReader,
+    WorkBudget,
 };
 
 thread_local! {
@@ -706,6 +707,49 @@ pub extern "C" fn steadq_reader_free(reader: *mut SteadqPayloadReader) {
         return;
     }
     unsafe { drop(Box::from_raw(reader)) };
+}
+
+/// Resolve an indeterminate operation from a ticket. The ticket is provided
+/// as JSON bytes. If stabilize is non-zero, the resolver attempts to complete
+/// any pending barriers. Returns STEADQ_OK on successful resolution.
+#[no_mangle]
+pub extern "C" fn steadq_resolve(
+    queue: *mut SteadqQueue,
+    ticket_json: *const u8,
+    ticket_len: usize,
+    stabilize: c_int,
+) -> c_int {
+    if queue.is_null() || ticket_json.is_null() || ticket_len == 0 {
+        return STEADQ_NOT_COMMITTED;
+    }
+    clear_last_error();
+    let steadq = unsafe { &*queue };
+    let json = unsafe { std::slice::from_raw_parts(ticket_json, ticket_len) };
+    let ticket = match TransitionTicket::from_json(json) {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(&format!("invalid ticket: {e}"));
+            return STEADQ_NOT_COMMITTED;
+        }
+    };
+    let guard = steadq.inner.lock();
+    let Ok(queue) = guard else {
+        return STEADQ_CORRUPTION;
+    };
+    let outcome = queue.resolve(&ticket, stabilize != 0);
+    match outcome {
+        ResolutionOutcome::SourceObserved
+        | ResolutionOutcome::SourceStabilized
+        | ResolutionOutcome::DestinationObserved
+        | ResolutionOutcome::DestinationStabilized => STEADQ_OK,
+        ResolutionOutcome::BothObserved => STEADQ_INDETERMINATE,
+        ResolutionOutcome::NeitherObserved => STEADQ_NOT_COMMITTED,
+        ResolutionOutcome::ConflictingObject => STEADQ_CORRUPTION,
+        ResolutionOutcome::ResolutionFailed(e) => {
+            set_last_error(&format!("{e}"));
+            error_to_code(&e)
+        }
+    }
 }
 
 /// Format an error for the thread-local last-error store.
