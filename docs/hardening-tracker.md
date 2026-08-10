@@ -36,7 +36,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P1-013 Self-referential testkit](https://github.com/davidtorcivia/SteadQ/issues/73) | A-014 | Open |
 | [SQ-P1-014 Missing stateful fuzzing](https://github.com/davidtorcivia/SteadQ/issues/74) | A-014/A-019 | Open |
 | [SQ-P1-015 Incomplete C ABI](https://github.com/davidtorcivia/SteadQ/issues/75) | A-018 | Open |
-| [SQ-P1-016 CLI bypasses core safety](https://github.com/davidtorcivia/SteadQ/issues/76) | A-017 | Open |
+| [SQ-P1-016 CLI bypasses core safety](https://github.com/davidtorcivia/SteadQ/issues/76) | A-017 | Partially in [#187](https://github.com/davidtorcivia/SteadQ/pull/187): ticket file durability fixed, dead-list error classification fixed; remaining dead-export/remove use std::fs on terminal jobs |
 | [SQ-P1-017 Streaming inefficiency/ambiguity](https://github.com/davidtorcivia/SteadQ/issues/77) | A-011/A-016 | Open |
 | [SQ-P1-018 Missing target/toolchain/version policy](https://github.com/davidtorcivia/SteadQ/issues/78) | A-000 | Complete in #51: release/certification target is x86_64-unknown-linux-gnu; the compile guard admits its sanitizer-target cfg family; other target configurations fail compilation |
 
