@@ -52,6 +52,11 @@ jobs:
           ./target/capi_test
       - name: Generated file drift check
         run: cargo xtask check-generated
+      - name: Generated C header drift check
+        run: |
+          cargo install cbindgen --version 0.27.0 --locked
+          cbindgen --crate steadq-capi --output /tmp/steadq_generated.h --config crates/steadq-capi/cbindgen.toml
+          diff /tmp/steadq_generated.h crates/steadq-capi/include/steadq.h
 
   # Fuzz smoke test - gating on PRs
   fuzz-smoke:

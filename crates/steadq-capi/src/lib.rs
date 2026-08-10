@@ -62,20 +62,17 @@ pub const STEADQ_PERMISSION_DENIED: c_int = 5;
 pub const STEADQ_IO_FAILURE: c_int = 6;
 pub const STEADQ_UNSUPPORTED: c_int = 64;
 
-/// Opaque queue handle. R2-B07: Wrapped in Mutex for thread safety.
-#[repr(C)]
+/// Opaque queue handle. Safe to share across C threads.
 pub struct SteadqQueue {
     inner: Mutex<Queue>,
 }
 
-/// Opaque lease handle.
-#[repr(C)]
+/// Opaque lease handle. Not thread-safe; use from one thread at a time.
 pub struct SteadqLease {
     inner: LeaseInfo,
 }
 
-/// Opaque payload reader handle.
-#[repr(C)]
+/// Opaque payload reader handle. Not thread-safe.
 pub struct SteadqPayloadReader {
     inner: VerifiedPayloadReader,
 }
