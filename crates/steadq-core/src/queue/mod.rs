@@ -593,11 +593,14 @@ impl Queue {
         let magic = fs::statfs(check_path).map_err(|e| io::Error::other(format!("statfs: {e}")))?;
         let ft = magic.f_type as i64;
         match ft {
-            fs::EXT4_SUPER_MAGIC | fs::XFS_SUPER_MAGIC | fs::BTRFS_SUPER_MAGIC => {}
+            fs::EXT4_SUPER_MAGIC
+            | fs::XFS_SUPER_MAGIC
+            | fs::BTRFS_SUPER_MAGIC
+            | fs::F2FS_SUPER_MAGIC => {}
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "filesystem type not supported for queue (requires ext4 or xfs)",
+                    "filesystem type not supported for queue (requires ext4, xfs, btrfs, or f2fs)",
                 ));
             }
         }
@@ -891,7 +894,10 @@ impl Queue {
             let magic = fs::statfs(root).map_err(|e| Error::IoFailure(e.to_string()))?;
             let ft = magic.f_type as i64;
             match ft {
-                fs::EXT4_SUPER_MAGIC | fs::XFS_SUPER_MAGIC | fs::BTRFS_SUPER_MAGIC => {}
+                fs::EXT4_SUPER_MAGIC
+                | fs::XFS_SUPER_MAGIC
+                | fs::BTRFS_SUPER_MAGIC
+                | fs::F2FS_SUPER_MAGIC => {}
                 fs::TMPFS_MAGIC => {
                     return Err(Error::UnsupportedFilesystem);
                 }

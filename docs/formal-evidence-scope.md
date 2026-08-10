@@ -12,7 +12,7 @@ SteadQ is not formally verified, crash-certified, or production-certified.
 - The simulator models selected directory-entry durability behavior independently of the Linux executor.
 - Fuzz CI uses bounded parser smoke runs.
 - Pull-request mutation testing is diff-scoped; broad nightly mutation is advisory and excludes critical paths listed in `.cargo/mutants.toml`.
-- No ext4 or XFS power-cut matrix has been independently run for this repository snapshot.
+- No filesystem power-cut matrix has been independently run for this repository snapshot.
 
 ## Claim rule
 

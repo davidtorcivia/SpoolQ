@@ -425,6 +425,10 @@ fn main() -> ExitCode {
                             ("ext4", true)
                         } else if ft == steadq_fs_linux::XFS_SUPER_MAGIC {
                             ("xfs", true)
+                        } else if ft == steadq_fs_linux::BTRFS_SUPER_MAGIC {
+                            ("btrfs", true)
+                        } else if ft == steadq_fs_linux::F2FS_SUPER_MAGIC {
+                            ("f2fs", true)
                         } else if ft == steadq_fs_linux::TMPFS_MAGIC {
                             ("tmpfs_not_certified", false)
                         } else if ft == steadq_fs_linux::NFS_SUPER_MAGIC {

@@ -96,7 +96,7 @@ steadq_close(q);
 
 ## How It Works
 
-A queue lives in a directory on a local Linux filesystem (ext4 or XFS). The layout is:
+A queue lives in a directory on a local Linux filesystem (ext4, XFS, btrfs, or f2fs). The layout is:
 
     queue/
       FORMAT                  Queue identity and configuration
@@ -153,7 +153,7 @@ SteadQ has 622 tests across unit, integration, conformance, and formal model che
 
 - Linux x86_64 (glibc)
 - Rust 1.97.1
-- ext4, XFS, or btrfs filesystem
+- ext4, XFS, btrfs, or f2fs filesystem
 
 ## License
 
