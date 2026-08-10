@@ -79,6 +79,12 @@ jobs:
         run: timeout 90 cargo +nightly-2026-08-07 fuzz run fuzz_bucket_arithmetic -- -max_len=64 -runs=5000
       - name: Fuzz smoke (transition ticket)
         run: timeout 90 cargo +nightly-2026-08-07 fuzz run fuzz_transition_ticket -- -max_len=1024 -runs=5000
+      - name: Fuzz smoke (operation sequence)
+        run: timeout 120 cargo +nightly-2026-08-07 fuzz run fuzz_operation_sequence -- -max_len=128 -runs=2000
+      - name: Fuzz smoke (queue corruption)
+        run: timeout 120 cargo +nightly-2026-08-07 fuzz run fuzz_queue_corruption -- -max_len=128 -runs=2000
+      - name: Fuzz smoke (resolve)
+        run: timeout 120 cargo +nightly-2026-08-07 fuzz run fuzz_resolve -- -max_len=1024 -runs=2000
 
   # Mutation testing - diff-based, gating, parallelized by crate
   mutants:
@@ -145,6 +151,9 @@ jobs:
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=50000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_transition_ticket -- -max_len=1024 -runs=50000
+          timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_operation_sequence -- -max_len=256 -runs=50000
+          timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_queue_corruption -- -max_len=256 -runs=50000
+          timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_resolve -- -max_len=1024 -runs=50000
 
   # TLA+ model checking with TLC
   tla:

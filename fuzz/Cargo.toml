@@ -13,6 +13,7 @@ steadq-format = { path = "../crates/steadq-format" }
 steadq-names = { path = "../crates/steadq-names" }
 steadq-math = { path = "../crates/steadq-math" }
 steadq-core = { path = "../crates/steadq-core" }
+tempfile = "3"
 
 [[bin]]
 name = "fuzz_format_header"
@@ -41,6 +42,24 @@ doc = false
 [[bin]]
 name = "fuzz_transition_ticket"
 path = "fuzz_targets/fuzz_transition_ticket.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_operation_sequence"
+path = "fuzz_targets/fuzz_operation_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_queue_corruption"
+path = "fuzz_targets/fuzz_queue_corruption.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_resolve"
+path = "fuzz_targets/fuzz_resolve.rs"
 test = false
 doc = false
 
