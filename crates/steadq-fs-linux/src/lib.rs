@@ -1190,6 +1190,7 @@ pub fn fs_type_magic(path: &Path) -> io::Result<i64> {
 /// Known filesystem magic numbers.
 pub const EXT4_SUPER_MAGIC: i64 = 0xEF53;
 pub const XFS_SUPER_MAGIC: i64 = 0x58465342;
+pub const BTRFS_SUPER_MAGIC: i64 = 0x9123683E;
 pub const TMPFS_MAGIC: i64 = 0x01021994;
 pub const NFS_SUPER_MAGIC: i64 = 0x6969;
 pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;

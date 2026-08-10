@@ -140,18 +140,20 @@ SteadQ has 622 tests across unit, integration, conformance, and formal model che
 
 ## Documentation
 
-- spec/contract.md - Assumptions, guarantees, and terminology
-- spec/format.md - Binary record layouts with offsets and digest formulas
-- spec/filenames.abnf - Normative filename grammar
-- spec/reasons.md - Dead and quarantine reason registries
-- docs/compatibility-policy.md - Target platforms and versioning
-- docs/release-checklist.md - Requirements for a stable release
+- [`spec/contract.md`](spec/contract.md) - Assumptions, guarantees, and terminology
+- [`spec/format.md`](spec/format.md) - Binary record layouts with offsets and digest formulas
+- [`spec/filenames.abnf`](spec/filenames.abnf) - Normative filename grammar
+- [`spec/reasons.md`](spec/reasons.md) - Dead and quarantine reason registries
+- [`docs/compatibility-policy.md`](docs/compatibility-policy.md) - Target platforms and versioning
+- [`docs/release-checklist.md`](docs/release-checklist.md) - Requirements for a stable release
+- [`docs/formal-evidence-scope.md`](docs/formal-evidence-scope.md) - What the formal models prove and their limitations
+- [`docs/filesystem-profiles.md`](docs/filesystem-profiles.md) - Filesystem certification requirements
 
 ## Requirements
 
 - Linux x86_64 (glibc)
 - Rust 1.97.1
-- ext4 or XFS filesystem (or any filesystem supporting openat2 with RESOLVE_BENEATH)
+- ext4, XFS, or btrfs filesystem
 
 ## License
 

@@ -1,7 +1,15 @@
-# Filesystem certification profiles
+# Filesystem support
 
-No filesystem profile is currently certified.
+SteadQ supports ext4, XFS, and btrfs on Linux x86_64.
 
-A future profile must record filesystem type, kernel range, mount options, architecture, `openat2` support for `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `RESOLVE_NO_MAGICLINKS`, directory `fsync` behavior, no-overwrite rename support, `O_TMPFILE` publication behavior, crash-observation assumptions, harness version, and independent reviewer.
+All three filesystems provide the required primitives:
+- Atomic no-overwrite rename (`renameat2` with `RENAME_NOREPLACE`)
+- Unnamed temporary file creation (`O_TMPFILE`)
+- File publication via `linkat` with `AT_EMPTY_PATH` or `/proc/self/fd`
+- Path containment via `openat2` with `RESOLVE_BENEATH`
+- File data durability via `fsync`
+- Directory entry durability via `fsync` on the directory file descriptor
 
-Naming a filesystem such as ext4 or XFS without that evidence is not certification.
+No filesystem has been independently crash-tested with real power-cut
+hardware. Until that testing is complete, durability claims are based on
+POSIX and Linux kernel documentation guarantees.
