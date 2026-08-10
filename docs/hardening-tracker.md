@@ -33,7 +33,7 @@ This tracker uses the audit finding IDs as stable identifiers and links each fin
 | [SQ-P1-010 Destructive maintenance TOCTOU](https://github.com/davidtorcivia/SteadQ/issues/70) | A-008/A-012 | Complete: maintenance paths authenticate path-to-inode identity via fstatat before mutation; residual POSIX TOCTOU window documented |
 | [SQ-P1-011 String-flattened errors](https://github.com/davidtorcivia/SteadQ/issues/71) | A-008/A-017/A-018 | Complete in [#186](https://github.com/davidtorcivia/SteadQ/pull/186): engine failure types carry io::Error instead of String, preserving errno |
 | [SQ-P1-012 Critical mutation exclusions](https://github.com/davidtorcivia/SteadQ/issues/72) | A-019 | Documented: each exclusion has rationale, testing evidence, and expiry condition in docs/mutation-exclusions.md |
-| [SQ-P1-013 Self-referential testkit](https://github.com/davidtorcivia/SteadQ/issues/73) | A-014 | Open |
+| [SQ-P1-013 Self-referential testkit](https://github.com/davidtorcivia/SteadQ/issues/73) | A-014 | In progress in [#200](https://github.com/davidtorcivia/SteadQ/pull/200): ProductionDriver executes real Queue API against logical oracle with differential verify_consistency |
 | [SQ-P1-014 Missing stateful fuzzing](https://github.com/davidtorcivia/SteadQ/issues/74) | A-014/A-019 | Open |
 | [SQ-P1-015 Incomplete C ABI](https://github.com/davidtorcivia/SteadQ/issues/75) | A-018 | Open |
 | [SQ-P1-016 CLI bypasses core safety](https://github.com/davidtorcivia/SteadQ/issues/76) | A-017 | Partially in [#187](https://github.com/davidtorcivia/SteadQ/pull/187): ticket file durability fixed, dead-list error classification fixed; remaining dead-export/remove use std::fs on terminal jobs |
