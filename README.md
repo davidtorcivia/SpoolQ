@@ -142,22 +142,20 @@ SteadQ has 622 tests across unit, integration, conformance, and formal model che
 
 Single-threaded sustained throughput on NVMe (ZFS):
 
-| Operation | Latency | Throughput |
+| Operation | 64B payload | 16KB payload |
 |---|---|---|
-| Enqueue (64B) | 150 us | ~6,600 ops/sec |
-| Enqueue (16KB) | 180 us | ~5,500 ops/sec |
-| Completed job (64B) | 524 us | ~1,900 jobs/sec |
-| Completed job (16KB) | 579 us | ~1,730 jobs/sec |
+| Enqueue | 150 us (~6,600/s) | 180 us (~5,500/s) |
+| Completed job | 484 us (~2,100/s) | 602 us (~1,700/s) |
 
 A completed job is the full lifecycle: enqueue, lease, verify payload, acknowledge.
 
 Concurrent completed-job throughput (multiple Queue handles):
 
-| Threads | Throughput | Scaling |
+| Threads | 64B payload | 16KB payload |
 |---|---|---|
-| 1 | ~1,840 jobs/sec | 1.0x |
-| 4 | ~4,690 jobs/sec | 2.5x |
-| 8 | ~6,370 jobs/sec | 3.5x |
+| 1 | ~1,770 jobs/sec (1.0x) | ~1,680 jobs/sec (1.0x) |
+| 4 | ~4,760 jobs/sec (2.7x) | ~4,250 jobs/sec (2.5x) |
+| 8 | ~6,480 jobs/sec (3.7x) | ~5,990 jobs/sec (3.6x) |
 
 Each operation requires 2 fsync calls (file data + directory entry) for
 crash safety. The wall floor cache eliminates redundant watermark reads

@@ -267,57 +267,61 @@ fn bench_concurrent_completed(c: &mut Criterion) {
     use std::thread;
 
     let mut group = c.benchmark_group("concurrent_completed");
-    for n_threads in [1u32, 2, 4, 8].iter() {
-        group.throughput(criterion::Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_threads),
-            n_threads,
-            |b, &n| {
-                b.iter_custom(|iters| {
-                    let tmp = TempDir::new().unwrap();
-                    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
-                    let path = tmp.path().to_path_buf();
-                    let start = std::time::Instant::now();
+    for &payload_size in &[64usize, 16384] {
+        for &n_threads in &[1u32, 4, 8] {
+            group.throughput(criterion::Throughput::Elements(1));
+            let label = format!("{payload_size}B_{n_threads}t");
+            group.bench_with_input(
+                BenchmarkId::from_parameter(label),
+                &(payload_size, n_threads),
+                |b, &(size, n)| {
+                    b.iter_custom(|iters| {
+                        let tmp = TempDir::new().unwrap();
+                        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                        let path = tmp.path().to_path_buf();
+                        let start = std::time::Instant::now();
 
-                    let handles: Vec<_> = (0..n)
-                        .map(|_| {
-                            let p = path.clone();
-                            thread::spawn(move || {
-                                let queue = Queue::open(
-                                    &p,
-                                    &OpenOptions {
-                                        allow_unsupported_fs: true,
-                                        ..Default::default()
-                                    },
-                                )
-                                .unwrap();
-                                let mut queue = queue;
-                                for _ in 0..iters {
-                                    queue.enqueue(EnqueueInput {
-                                        maximum_attempts: 3,
-                                        content_type: "x".to_string(),
-                                        payload: b"data".to_vec(),
-                                        ..Default::default()
-                                    });
-                                    if let LeaseOutcome::Leased(lease) =
-                                        queue.lease(0, 30_000_000_000)
-                                    {
-                                        let _ = queue.verify_lease_payload(&lease);
-                                        let _ = queue.ack(&lease);
+                        let handles: Vec<_> = (0..n)
+                            .map(|_| {
+                                let p = path.clone();
+                                thread::spawn(move || {
+                                    let queue = Queue::open(
+                                        &p,
+                                        &OpenOptions {
+                                            allow_unsupported_fs: true,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .unwrap();
+                                    let mut queue = queue;
+                                    let payload = vec![0xABu8; size];
+                                    for _ in 0..iters {
+                                        queue.enqueue(EnqueueInput {
+                                            maximum_attempts: 3,
+                                            content_type: "x".to_string(),
+                                            payload: payload.clone(),
+                                            ..Default::default()
+                                        });
+                                        if let LeaseOutcome::Leased(lease) =
+                                            queue.lease(0, 30_000_000_000)
+                                        {
+                                            let _ = queue.verify_lease_payload(&lease);
+                                            let _ = queue.ack(&lease);
+                                        }
                                     }
-                                }
+                                })
                             })
-                        })
-                        .collect();
-                    for h in handles {
-                        h.join().unwrap();
-                    }
-                    let elapsed = start.elapsed();
-                    drop(tmp);
-                    elapsed
-                });
-            },
-        );
+                            .collect();
+                        for h in handles {
+                            h.join().unwrap();
+                        }
+                        let elapsed = start.elapsed();
+                        drop(tmp);
+                        elapsed
+                    });
+                },
+            );
+        }
     }
     group.finish();
 }
