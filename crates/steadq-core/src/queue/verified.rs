@@ -4,7 +4,7 @@
 // header decode, extension length bound, envelope digest, size, and payload digest.
 // This prevents delivery of corrupt objects via lease or read paths.
 
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use sha2::Digest;
 
@@ -65,8 +65,9 @@ impl From<VerificationError> for Error {
 }
 
 /// A job envelope that has passed full verification on its held fd.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VerifiedJob {
+    fd: OwnedFd,
     header: FixedHeader,
     extension: Vec<u8>,
     device: u64,
@@ -93,6 +94,11 @@ impl VerifiedJob {
 
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Borrow the verified file descriptor for direct reads.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 
     pub fn identity_matches(&self, stat: &libc::stat) -> bool {
@@ -122,13 +128,13 @@ pub(crate) struct ExpectedReceipt {
 }
 
 /// A receipt authenticated against its queue path and wire contents.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum VerifiedReceiptKind {
     Full(VerifiedJob),
     Compact,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct VerifiedReceipt {
     pub(crate) name: ReceiptName,
     pub(crate) bucket_number: u64,
@@ -334,6 +340,9 @@ pub(crate) fn verify_receipt_on_fd(
 /// Verify the envelope and payload on an already-open fd. The fd must remain
 /// open across any subsequent operation to prevent TOCTOU swap.
 pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationError> {
+    let owned = fd
+        .try_clone_to_owned()
+        .map_err(|e| VerificationError::Io(e.to_string()))?;
     let header = read_and_verify_header(fd)?;
     let stat = verify_size(fd, &header, header.extension_header_length as usize)?;
     verify_payload(fd, &header, header.extension_header_length as usize)?;
@@ -344,6 +353,7 @@ pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationE
         ));
     }
     Ok(VerifiedJob {
+        fd: owned,
         header,
         extension: ext,
         device: stat.st_dev,
@@ -355,6 +365,9 @@ pub fn verify_job_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationE
 /// Light envelope-only verification (no payload hash). Used for inspection paths
 /// that have not yet delivered payload to a consumer.
 pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, VerificationError> {
+    let owned = fd
+        .try_clone_to_owned()
+        .map_err(|e| VerificationError::Io(e.to_string()))?;
     let header = read_and_verify_header(fd)?;
     let ext = read_extension(fd, header.extension_header_length as usize)?;
     if !steadq_format::verify_envelope_digest(&header, &ext) {
@@ -364,6 +377,7 @@ pub fn verify_envelope_on_fd(fd: BorrowedFd<'_>) -> Result<VerifiedJob, Verifica
     }
     let stat = verify_size(fd, &header, ext.len())?;
     Ok(VerifiedJob {
+        fd: owned,
         header,
         extension: ext,
         device: stat.st_dev,
@@ -635,6 +649,11 @@ mod tests {
 
         // Extension accessor returns the verified bytes.
         assert!(verified.extension().is_empty());
+
+        // The witness owns a dup'd fd that can read the same file.
+        let witness_stat = fs::fstat(verified.as_fd()).unwrap();
+        assert_eq!(witness_stat.st_dev, stat.st_dev);
+        assert_eq!(witness_stat.st_ino, stat.st_ino);
     }
 
     #[test]
