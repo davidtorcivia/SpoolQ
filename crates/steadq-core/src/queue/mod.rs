@@ -3454,6 +3454,83 @@ impl Queue {
         results
     }
 
+    /// Export a dead job's raw bytes to an output file. Opens the job through
+    /// the root capability with O_NOFOLLOW, not via a pathname.
+    pub fn export_dead(&self, job_id: &[u8; 16], output: &std::path::Path) -> Result<u64, Error> {
+        let snapshot = self
+            .inspect(job_id)
+            .into_iter()
+            .find(|s| s.state == "dead")
+            .ok_or_else(|| Error::QueueCorrupt("dead job not found".into()))?;
+
+        let (dir_rel, name) = snapshot
+            .relative_path
+            .rsplit_once('/')
+            .ok_or_else(|| Error::QueueCorrupt("invalid dead path".into()))?;
+
+        let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        let file_fd = fs::openat(
+            dir_fd.as_fd(),
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        let stat = fs::fstat(file_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
+        if stat.st_size < 0 {
+            return Err(Error::QueueCorrupt("negative file size".into()));
+        }
+        let size = stat.st_size as u64;
+
+        let mut out = std::fs::File::create(output).map_err(|e| Error::IoFailure(e.to_string()))?;
+        let mut offset = 0u64;
+        let mut buf = vec![0u8; 65536];
+        while offset < size {
+            let n = fs::pread(file_fd.as_fd(), &mut buf, offset)
+                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            use std::io::Write;
+            out.write_all(&buf[..n])
+                .map_err(|e| Error::IoFailure(e.to_string()))?;
+            offset += n as u64;
+        }
+        out.sync_all()
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+        Ok(offset)
+    }
+
+    /// Remove a dead job through the phase-aware unlink executor.
+    pub fn remove_dead(&self, job_id: &[u8; 16]) -> Result<bool, Error> {
+        let snapshot = self
+            .inspect(job_id)
+            .into_iter()
+            .find(|s| s.state == "dead")
+            .ok_or_else(|| Error::QueueCorrupt("dead job not found".into()))?;
+
+        let (dir_rel, name) = snapshot
+            .relative_path
+            .rsplit_once('/')
+            .ok_or_else(|| Error::QueueCorrupt("invalid dead path".into()))?;
+
+        let dir_fd = open_relative(self.root_fd.as_fd(), dir_rel)
+            .map_err(|e| Error::IoFailure(e.to_string()))?;
+
+        match engine::unlink_verified(dir_fd.as_fd(), name, engine::MoveActor::Consumer) {
+            Ok(()) => Ok(true),
+            Err(engine::UnlinkFailure::SourceMissing) => Ok(false),
+            Err(engine::UnlinkFailure::NotCommitted { phase, source }) => Err(Error::IoFailure(
+                format!("dead removal failed at {phase:?}: {source}"),
+            )),
+            Err(engine::UnlinkFailure::OutcomeUnknown { phase, source }) => Err(Error::IoFailure(
+                format!("dead removal indeterminate at {phase:?}: {source}"),
+            )),
+        }
+    }
+
     /// Duplicate acknowledgment probe: check if a receipt exists for this lease.
     /// Probes exact receipt filenames across retained terminal buckets.
     pub fn check_duplicate_ack(&self, lease: &LeaseInfo) -> AckOutcome {
@@ -8186,6 +8263,73 @@ mod tests {
             matches!(res, Err(engine::MoveFailure::SourceMissing)),
             "quarantine with mismatched held fd should be SourceMissing, got {res:?}"
         );
+    }
+
+    #[test]
+    fn export_dead_copies_file_content_through_core() {
+        let (tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"dead job payload".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            o => panic!("lease failed: {o:?}"),
+        };
+        // Exhaust attempts to send to dead.
+        queue.bury(&lease, DeadReason::AdministrativeBury);
+
+        let output = tmp.path().join("exported.bin");
+        let n = queue.export_dead(&lease.job_id, &output).unwrap();
+        assert!(n > b"dead job payload".len() as u64);
+        let data = std::fs::read(&output).unwrap();
+        assert!(data.ends_with(b"dead job payload"));
+    }
+
+    #[test]
+    fn export_dead_returns_error_for_missing_job() {
+        let (_tmp, queue) = create_test_queue();
+        let result = queue.export_dead(&[0xFF; 16], std::path::Path::new("/tmp/nonexistent"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_dead_deletes_file_through_core() {
+        let (tmp, mut queue) = create_test_queue();
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            payload: b"removable".to_vec(),
+            ..Default::default()
+        });
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            o => panic!("lease failed: {o:?}"),
+        };
+        let outcome = queue.bury(&lease, DeadReason::AdministrativeBury);
+        assert!(
+            matches!(outcome, TransitionOutcome::Committed),
+            "bury failed: {outcome:?}"
+        );
+
+        // Job should be in dead.
+        let snapshots = queue.inspect(&lease.job_id);
+        assert!(snapshots.iter().any(|s| s.state == "dead"));
+
+        // Remove it.
+        let removed = queue.remove_dead(&lease.job_id).unwrap();
+        assert!(removed);
+
+        // Job should be gone.
+        let snapshots2 = queue.inspect(&lease.job_id);
+        assert!(snapshots2.is_empty());
+
+        // Remove again returns error (not found by inspect).
+        assert!(queue.remove_dead(&lease.job_id).is_err());
+
+        drop(tmp);
     }
 
     #[test]

@@ -1080,22 +1080,16 @@ fn main() -> ExitCode {
                     Ok(q) => q,
                     Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
                 };
-                match queue
-                    .inspect(&job_id_bytes)
-                    .iter()
-                    .find(|s| s.state == "dead")
-                {
-                    Some(s) => match std::fs::copy(path.join(&s.relative_path), &output) {
-                        Ok(n) => {
-                            eprintln!("exported {n} bytes");
-                            ExitCode::from(EXIT_SUCCESS)
-                        }
-                        Err(_) => ExitCode::from(EXIT_IO_FAILURE),
-                    },
-                    None => {
+                match queue.export_dead(&job_id_bytes, &output) {
+                    Ok(n) => {
+                        eprintln!("exported {n} bytes");
+                        ExitCode::from(EXIT_SUCCESS)
+                    }
+                    Err(steadq_core::Error::QueueCorrupt(_)) => {
                         eprintln!("not found");
                         ExitCode::from(EXIT_ORDINARY)
                     }
+                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
                 }
             }
             AdminCommands::DeadRemove { path, job_id } => {
@@ -1104,22 +1098,20 @@ fn main() -> ExitCode {
                     Ok(q) => q,
                     Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
                 };
-                match queue
-                    .inspect(&job_id_bytes)
-                    .iter()
-                    .find(|s| s.state == "dead")
-                {
-                    Some(s) => match std::fs::remove_file(path.join(&s.relative_path)) {
-                        Ok(()) => {
-                            eprintln!("removed");
-                            ExitCode::from(EXIT_SUCCESS)
-                        }
-                        Err(_) => ExitCode::from(EXIT_IO_FAILURE),
-                    },
-                    None => {
+                match queue.remove_dead(&job_id_bytes) {
+                    Ok(true) => {
+                        eprintln!("removed");
+                        ExitCode::from(EXIT_SUCCESS)
+                    }
+                    Ok(false) => {
                         eprintln!("not found");
                         ExitCode::from(EXIT_ORDINARY)
                     }
+                    Err(steadq_core::Error::QueueCorrupt(_)) => {
+                        eprintln!("not found");
+                        ExitCode::from(EXIT_ORDINARY)
+                    }
+                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
                 }
             }
             AdminCommands::QuarantineList { path } => {
