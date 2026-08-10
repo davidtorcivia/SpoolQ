@@ -434,7 +434,8 @@ fn verify_payload(
     let mut hasher = sha2::Sha256::new();
     let mut offset = data_offset;
     let mut remaining = header.payload_length as usize;
-    let mut buf = vec![0u8; 65536];
+    let buf_size = remaining.clamp(1, 65536);
+    let mut buf = vec![0u8; buf_size];
     while remaining > 0 {
         let to_read = remaining.min(buf.len());
         let n = fs::pread(fd, &mut buf[..to_read], offset)
