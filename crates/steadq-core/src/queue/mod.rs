@@ -251,6 +251,7 @@ pub struct Queue {
     pub(crate) maint_lock_fd: Option<OwnedFd>,
     pub(crate) recovery_cursor: RecoveryCursor,
     pub(crate) cached_wall_floor: Option<WallFloor>,
+    pub(crate) known_dirs: std::cell::RefCell<std::collections::HashSet<String>>,
 }
 
 /// Internal helper enum for resolver object authentication.
@@ -974,6 +975,7 @@ impl Queue {
             maint_lock_fd: Some(maint_fd),
             recovery_cursor,
             cached_wall_floor: None,
+            known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1602,6 +1604,9 @@ impl Queue {
 
     /// Create a directory path recursively, syncing parents.
     pub(crate) fn ensure_dir(&self, relative: &str) -> io::Result<()> {
+        if self.known_dirs.borrow().contains(relative) {
+            return Ok(());
+        }
         let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
         let mut current = None::<OwnedFd>;
 
@@ -1618,6 +1623,7 @@ impl Queue {
             }
             current = Some(child);
         }
+        self.known_dirs.borrow_mut().insert(relative.to_string());
         Ok(())
     }
 
