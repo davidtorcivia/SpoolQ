@@ -47,6 +47,25 @@ int main(void) {
     if (rc != STEADQ_OK) { fprintf(stderr, "verify failed: %d\n", rc); return 1; }
     printf("payload verified\n");
 
+    /* Read payload through the verified reader. */
+    SteadqPayloadReader *reader = NULL;
+    rc = steadq_lease_open_reader(q, lease, &reader);
+    if (rc != STEADQ_OK || !reader) { fprintf(stderr, "open_reader failed: %d\n", rc); return 1; }
+
+    uint64_t plen = steadq_reader_payload_len(reader);
+    if (plen != strlen(payload)) { fprintf(stderr, "payload_len mismatch: %llu\n", (unsigned long long)plen); return 1; }
+
+    uint8_t readbuf[256];
+    size_t bytes_read = 0;
+    rc = steadq_reader_read(reader, readbuf, sizeof(readbuf), 0, &bytes_read);
+    if (rc != STEADQ_OK) { fprintf(stderr, "reader_read failed: %d\n", rc); return 1; }
+    if (bytes_read != strlen(payload)) { fprintf(stderr, "bytes_read mismatch: %zu\n", bytes_read); return 1; }
+    readbuf[bytes_read] = 0;
+    if (strcmp((char *)readbuf, payload) != 0) { fprintf(stderr, "payload content mismatch\n"); return 1; }
+    printf("payload read: %s\n", readbuf);
+
+    steadq_reader_free(reader);
+
     rc = steadq_ack(q, lease);
     if (rc != STEADQ_OK) { fprintf(stderr, "ack failed: %d\n", rc); return 1; }
     printf("acked\n");

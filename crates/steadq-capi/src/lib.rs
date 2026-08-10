@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use steadq_core::{
     CreateOptions, EnqueueInput, EnqueueOutcome, Error, LeaseInfo, LeaseOutcome, OpenOptions,
-    Queue, TransitionOutcome, WorkBudget,
+    Queue, TransitionOutcome, VerifiedPayloadReader, WorkBudget,
 };
 
 thread_local! {
@@ -71,6 +71,12 @@ pub struct SteadqQueue {
 #[repr(C)]
 pub struct SteadqLease {
     inner: LeaseInfo,
+}
+
+/// Opaque payload reader handle.
+#[repr(C)]
+pub struct SteadqPayloadReader {
+    inner: VerifiedPayloadReader,
 }
 
 /// Job ID (128 bits = 16 bytes).
@@ -620,6 +626,86 @@ pub extern "C" fn steadq_lease_source_path(
         *out.add(path.len()) = 0;
     }
     STEADQ_OK
+}
+
+/// Open a verified payload reader for a lease. The payload is hashed once.
+/// Returns STEADQ_OK and sets *reader_out on success.
+/// The caller must free the reader with steadq_reader_free.
+#[no_mangle]
+pub extern "C" fn steadq_lease_open_reader(
+    queue: *mut SteadqQueue,
+    lease: *const SteadqLease,
+    reader_out: *mut *mut SteadqPayloadReader,
+) -> c_int {
+    if queue.is_null() || lease.is_null() || reader_out.is_null() {
+        return STEADQ_NOT_COMMITTED;
+    }
+    clear_last_error();
+    let steadq = unsafe { &*queue };
+    let lease_inner = unsafe { &(*lease).inner };
+    let guard = steadq.inner.lock();
+    let Ok(queue) = guard else {
+        return STEADQ_CORRUPTION;
+    };
+    match queue.open_verified_payload_reader(lease_inner) {
+        Ok(Some(reader)) => {
+            let boxed = Box::new(SteadqPayloadReader { inner: reader });
+            unsafe { *reader_out = Box::into_raw(boxed) };
+            STEADQ_OK
+        }
+        Ok(None) => STEADQ_NOT_COMMITTED,
+        Err(e) => {
+            set_last_error(&format!("{e}"));
+            error_to_code(&e)
+        }
+    }
+}
+
+/// Read payload bytes at the given offset.
+/// Sets *bytes_read_out to bytes read (0 at EOF).
+#[no_mangle]
+pub extern "C" fn steadq_reader_read(
+    reader: *const SteadqPayloadReader,
+    buf: *mut u8,
+    buf_len: usize,
+    offset: u64,
+    bytes_read_out: *mut usize,
+) -> c_int {
+    if reader.is_null() || buf.is_null() || bytes_read_out.is_null() {
+        return STEADQ_NOT_COMMITTED;
+    }
+    clear_last_error();
+    let reader = unsafe { &*reader };
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
+    match reader.inner.read_at(slice, offset) {
+        Ok(n) => {
+            unsafe { *bytes_read_out = n };
+            STEADQ_OK
+        }
+        Err(e) => {
+            set_last_error(&format!("{e}"));
+            error_to_code(&e)
+        }
+    }
+}
+
+/// Return the total payload length in bytes.
+#[no_mangle]
+pub extern "C" fn steadq_reader_payload_len(reader: *const SteadqPayloadReader) -> u64 {
+    if reader.is_null() {
+        return 0;
+    }
+    let reader = unsafe { &*reader };
+    reader.inner.payload_len()
+}
+
+/// Free a payload reader handle.
+#[no_mangle]
+pub extern "C" fn steadq_reader_free(reader: *mut SteadqPayloadReader) {
+    if reader.is_null() {
+        return;
+    }
+    unsafe { drop(Box::from_raw(reader)) };
 }
 
 /// Format an error for the thread-local last-error store.
