@@ -3846,6 +3846,7 @@ mod tests {
             .and_then(|bucket| bucket.checked_mul(delayed_buckets_per_terminal))
             .unwrap();
         write_wall_watermark(tmp, high_floor_bucket);
+        queue.cached_wall_floor = None;
         for (shard, payload) in [(0, b"high-a"), (1, b"high-b")] {
             ack_for_shard(queue, tmp, shard, payload);
         }
