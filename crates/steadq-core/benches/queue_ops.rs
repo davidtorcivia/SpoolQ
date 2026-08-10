@@ -221,6 +221,107 @@ fn bench_sustained_ack(c: &mut Criterion) {
     });
 }
 
+fn bench_sustained_completed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sustained_completed");
+    for payload_size in [64usize, 1024, 16384].iter() {
+        group.throughput(criterion::Throughput::Bytes(*payload_size as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(payload_size),
+            payload_size,
+            |b, &size| {
+                let tmp = TempDir::new().unwrap();
+                Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                let mut q = Queue::open(
+                    tmp.path(),
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let payload = vec![0xABu8; size];
+                b.iter(|| {
+                    // Enqueue
+                    q.enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".to_string(),
+                        payload: payload.clone(),
+                        ..Default::default()
+                    });
+                    // Lease
+                    let lease = match q.lease(0, 30_000_000_000) {
+                        LeaseOutcome::Leased(l) => l,
+                        _ => panic!("lease failed in completed benchmark"),
+                    };
+                    // Verify + Ack (full payload verification)
+                    q.verify_lease_payload(&lease).unwrap();
+                    q.ack(&lease);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_concurrent_completed(c: &mut Criterion) {
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent_completed");
+    for n_threads in [1u32, 2, 4, 8].iter() {
+        group.throughput(criterion::Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(n_threads),
+            n_threads,
+            |b, &n| {
+                b.iter_custom(|iters| {
+                    let tmp = TempDir::new().unwrap();
+                    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                    let path = tmp.path().to_path_buf();
+                    let start = std::time::Instant::now();
+
+                    let handles: Vec<_> = (0..n)
+                        .map(|_| {
+                            let p = path.clone();
+                            thread::spawn(move || {
+                                let queue = Queue::open(
+                                    &p,
+                                    &OpenOptions {
+                                        allow_unsupported_fs: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .unwrap();
+                                let mut queue = queue;
+                                for _ in 0..iters {
+                                    queue.enqueue(EnqueueInput {
+                                        maximum_attempts: 3,
+                                        content_type: "x".to_string(),
+                                        payload: b"data".to_vec(),
+                                        ..Default::default()
+                                    });
+                                    if let LeaseOutcome::Leased(lease) =
+                                        queue.lease(0, 30_000_000_000)
+                                    {
+                                        let _ = queue.verify_lease_payload(&lease);
+                                        let _ = queue.ack(&lease);
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                    let elapsed = start.elapsed();
+                    drop(tmp);
+                    elapsed
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_enqueue,
@@ -229,7 +330,9 @@ criterion_group!(
     bench_ack,
     bench_sustained_enqueue,
     bench_sustained_ack,
-    bench_concurrent_throughput
+    bench_concurrent_throughput,
+    bench_sustained_completed,
+    bench_concurrent_completed,
 );
 criterion_main!(benches);
 
