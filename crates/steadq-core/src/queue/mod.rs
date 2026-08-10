@@ -1484,10 +1484,8 @@ impl Queue {
                 let header_bytes = header
                     .encode(ext_bytes)
                     .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
-                fs::write_all(tmp_fd.as_fd(), &header_bytes)
+                fs::writev_all(tmp_fd.as_fd(), &[&header_bytes, ext_bytes, payload])
                     .map_err(PublishError::classify_write)?;
-                fs::write_all(tmp_fd.as_fd(), ext_bytes).map_err(PublishError::classify_write)?;
-                fs::write_all(tmp_fd.as_fd(), payload).map_err(PublishError::classify_write)?;
                 match engine::publish_tmpfile_noreplace(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name)
                 {
                     Ok(engine::TmpfilePublishOutcome::Published) => Ok(()),

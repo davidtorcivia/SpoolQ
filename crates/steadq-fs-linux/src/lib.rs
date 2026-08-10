@@ -734,6 +734,50 @@ pub fn write_all(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Write multiple buffers in a single syscall using writev(2).
+pub fn writev_all(fd: BorrowedFd<'_>, bufs: &[&[u8]]) -> io::Result<()> {
+    if bufs.iter().all(|b| b.is_empty()) {
+        return Ok(());
+    }
+    fault_check!("write_all");
+
+    let mut iovs: Vec<libc::iovec> = bufs
+        .iter()
+        .filter(|b| !b.is_empty())
+        .map(|b| libc::iovec {
+            iov_base: b.as_ptr() as *mut _,
+            iov_len: b.len(),
+        })
+        .collect();
+
+    while !iovs.is_empty() {
+        // SAFETY: `iovs` contains valid pointers and lengths from live slices,
+        // and `fd` is live.
+        let rc = unsafe { libc::writev(fd.as_raw_fd(), iovs.as_ptr(), iovs.len() as i32) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+
+        let mut written = rc as usize;
+        while written > 0 && !iovs.is_empty() {
+            if written >= iovs[0].iov_len {
+                written -= iovs[0].iov_len;
+                iovs.remove(0);
+            } else {
+                // SAFETY: advancing the base pointer by `written` bytes within the original buffer.
+                iovs[0].iov_base = unsafe { (iovs[0].iov_base as *mut u8).add(written) as *mut _ };
+                iovs[0].iov_len -= written;
+                written = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write all bytes at a given offset using pwrite, retrying on partial writes.
 /// Returns an error if pwrite returns 0 (no progress).
 pub fn pwrite_all(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<()> {
@@ -1609,6 +1653,42 @@ mod tests {
         let a = random_128bit().unwrap();
         let b = random_128bit().unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn writev_writes_all_buffers_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("writev_test");
+        let fd = create_exclusive(
+            std::fs::File::open(tmp.path()).unwrap().as_fd(),
+            "writev_test",
+            0o600,
+        )
+        .unwrap();
+        let part1 = b"hello ";
+        let part2 = b"world ";
+        let part3 = b"writev!";
+        writev_all(fd.as_fd(), &[part1, part2, part3]).unwrap();
+        drop(fd);
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data, b"hello world writev!");
+    }
+
+    #[test]
+    fn writev_handles_empty_buffers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fd = create_exclusive(
+            std::fs::File::open(tmp.path()).unwrap().as_fd(),
+            "writev_empty",
+            0o600,
+        )
+        .unwrap();
+        writev_all(fd.as_fd(), &[b"", b"data", b""]).unwrap();
+        drop(fd);
+
+        let data = std::fs::read(tmp.path().join("writev_empty")).unwrap();
+        assert_eq!(data, b"data");
     }
 
     #[test]
