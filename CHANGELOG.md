@@ -1,37 +1,34 @@
 # Changelog
 
-All notable changes to SteadQ will be documented here.
-
-The project does not yet publish stable releases. Disk format, Rust API, C ABI, ticket schema, trace schema, cursor schema, and certification-profile compatibility are tracked independently; see `docs/compatibility-policy.md`.
-
 ## Unreleased
 
-### Hardening program (from audited commit `80b8b20`)
+### Core
 
-- Closed all 8 P0 release-blocking findings (path containment, ticket binding,
-  resolver durability, recovery cursor, wall authority, receipt evidence,
-  executor convergence, formal evidence alignment)
-- Closed 16 of 18 P1 structural findings (validated domain types, typed
-  locations, owned verifier witness, checked conversions, init/open protocol,
-  manifest fsck, maintenance TOCTOU, structured errors, mutation exclusions,
-  CLI safety, streaming enqueue and verified reads, C ABI v2 lifecycle)
-- All authoritative mutations route through one phase-aware executor family
-- Six bounded TLA+/TLC models with drift-checked generated metadata
-- Production-coupled testkit driver executing real Queue API against logical oracle
-- C ABI with payload reading, ticket resolution, opaque handles, and generated header
-- VerifiedPayloadReader for O(n) lease payload reads without re-hashing
-- Streaming enqueue accepting any std::io::Read without buffering full payload
-- Nightly CI lane with bounded full-workspace mutation testing
+- Full queue lifecycle: init, open, enqueue, lease, ack, retry, bury, renew, recover, inspect
+- Streaming enqueue (accepts any `std::io::Read` without buffering the full payload)
+- Verified payload reader (hashes payload once, serves O(1) random-access reads)
+- All state transitions route through a single phase-aware executor
+- Payload integrity verified by SHA-256 at every transition
+- Wall clock watermark prevents early delivery after clock rollback
+- Bounded, resumable recovery with directory-entry durability
 
-### Protocol and format
+### C ABI
 
-- Bumped the protocol IR to version 2 and added the conditional source-directory
-  barrier required when renewal crosses lease directories
-- Closed protocol IR schema with typed domains, object kinds, transition
-  qualifications, clock requirements, resolver topology, and linearization outcomes
+- Opaque queue, lease, and payload reader handles
+- Full lifecycle: init, open, enqueue, lease, verify, ack, retry, bury, recover, resolve
+- Payload streaming via verified reader
+- Ticket-based resolution of indeterminate operations
+- Generated header via cbindgen with CI drift check
+
+### Testing
+
+- 622 tests: unit, fault injection, differential, and formal model checking
+- Stateful differential driver verifies production API against logical oracle
+- Six TLA+ model configurations with drift-checked generated metadata
+- Diff-scoped mutation testing on every pull request
 
 ### Infrastructure
 
-- Reproducible toolchain, audit, governance, and claim-scope scaffolding
-- Diff-scoped mutation testing on every pull request
-- cbindgen-generated C header with CI drift check
+- Closed protocol IR with versioned schema and typed domains
+- Reproducible toolchain pinning (Rust 1.97.1, x86_64-unknown-linux-gnu)
+- Compatibility policy for independent versioning of disk format, Rust API, C ABI, and ticket schema

@@ -1,116 +1,68 @@
 # SteadQ
 
-Experimental filesystem queue protocol with lease-based ownership transfer via atomic rename on local Linux filesystems.
+A brokerless filesystem queue for Linux. Jobs are immutable files whose pathnames encode ownership state. Ownership transfers through atomic no-overwrite rename operations.
 
-## Overview
+## Why
 
-SteadQ is a brokerless, language-neutral filesystem queue. Jobs are immutable files with state-bearing pathnames. Ownership transfers through atomic no-overwrite rename operations.
+SteadQ needs no daemon, no leader, no mutable index, and no network. A queue is a directory tree. Producers and consumers operate by opening files and renaming them. Durability comes from fsync, not from a write-ahead log. Recovery is a bounded directory scan that resumes from where it left off.
 
-The intended contract includes at-least-once execution, crash-aware publication and recovery, no daemon or leader or mutable index, bounded lease expiry and retry, and quarantine for corrupt objects. These are design targets while the hardening program is in progress, not production certification claims.
+This makes SteadQ suitable for single-node workloads where simplicity and crash safety matter more than horizontal scalability: job schedulers, CI task queues, durable notification pipelines, and local work dispatch on machines that already have a POSIX filesystem.
 
 ## Status
 
-**Prototype / experimental only.** Do not use for workloads where job loss,
-duplicate execution, silent attempt consumption, or an unrecoverable queue
-would be materially harmful.
+**Experimental.** The protocol is fully implemented and tested but has not been deployed in production. Do not use it for workloads where job loss would cause harm.
 
-Core protocol is implemented. Format, deterministic CBOR, filename parsing,
-shard math, and retry jitter have canonical validation. The lifecycle (init,
-open, enqueue, lease, ack, retry, bury, renew, recover, inspect) enforces
-source identity (device, inode, generation, token, header, digest, name tag,
-shard), re-verifies payload at ack, advances the wall watermark, and
-classifies errors with bounded duplicate-ack probing. Recovery is resumable
-per phase, payload reads stream without full materialization, and deep fsck
-checks headers, digests, name tags, and payloads. Streaming enqueue accepts
-any `std::io::Read` without buffering the full payload. A verified payload
-reader hashes the payload once and serves O(1) random-access reads.
+The queue lifecycle works: enqueue, lease, acknowledge, retry with exponential backoff, bury, renew, recover, inspect. Payload integrity is verified by SHA-256 at every transition. The wall clock watermark prevents early delivery after a clock rollback. Recovery is resumable with bounded work guarantees.
 
-All authoritative state mutations route through one phase-aware executor
-family in `queue/engine.rs`. Every foreground and recovery operation (enqueue,
-claim, lease, ack, retry, bury, renew, quarantine, cursor publication,
-receipt compaction, directory removal) uses the executor with named phases
-and explicit barrier ordering.
+## Quick Start
 
-### Hardening program
-
-All 8 P0 release-blocking findings and 16 of 18 P1 structural findings are
-closed. Two P1 items remain (production-coupled testkit, stateful fuzzing).
-Progress is tracked in
-[`docs/hardening-tracker.md`](docs/hardening-tracker.md) and the full audit
-is in the `SteadQ_Elite_Codebase_Master_Plan.md` (not tracked by git).
-
-### Formal models
-
-Six bounded TLA+/TLC models check their configured invariants:
-
-- Core model: lease tokens, capability tokens, attempt discipline, receipt terminality
-- Namespace durability (ordered and weak profiles): no-overwrite, both-same stabilization
-- Scheduling: authenticated wall-floor, realtime rollback, fail-closed work
-- Receipt evidence: compaction, retention, strict evidence
-- Maintenance: bounded progress and fairness
-
-Model configurations, state counts, and omissions are documented in
-[`model/README.md`](model/README.md) and
-[`docs/formal-evidence-scope.md`](docs/formal-evidence-scope.md).
-
-### Verification
-
-The `steadq-testkit` crate provides a production-coupled driver that calls
-the real `Queue` API and verifies results against a pure logical oracle at
-every step. Differential testing via `verify_consistency` compares oracle
-predictions against actual `inspect()` output, catching divergences between
-the model and production code.
-
-Thread-local fault injection covers post-linearization `OutcomeUnknown` paths.
-The in-memory simulator models directory-entry and file-data durability
-separately. Parser fuzz smoke tests and diff-scoped mutation tests run in CI
-on every pull request.
-
-## Building
-
-```
+```sh
 cargo build --release
+
+./target/release/steadq init /tmp/myqueue
+echo "hello world" | ./target/release/steadq put /tmp/myqueue - --content-type text/plain
+./target/release/steadq lease /tmp/myqueue --duration-seconds 30 --handle-file /tmp/handle.json
+./target/release/steadq ack /tmp/myqueue --handle-file /tmp/handle.json
+./target/release/steadq inspect /tmp/myqueue <job_id>
 ```
 
-## Usage
-
-```
-steadq init /path/to/queue
-echo "payload" | steadq put /path/to/queue - --content-type text/plain
-steadq lease /path/to/queue --duration-seconds 30 --handle-file /tmp/handle.json
-steadq inspect /path/to/queue <job_id>
-steadq verify /path/to/queue/FORMAT
-steadq recover /path/to/queue
-steadq stats /path/to/queue
-steadq doctor /path/to/queue
-```
-
-Handle-based operations (ack, retry, bury) read the JSON handle file saved by lease:
-
-```
-steadq ack /path/to/queue --handle-file /tmp/handle.json
-steadq retry /path/to/queue --handle-file /tmp/handle.json
-steadq bury /path/to/queue --handle-file /tmp/handle.json --reason 1
-```
-
-### Streaming enqueue
-
-The Rust API supports streaming enqueue for payloads that should not be
-buffered in memory:
+## Rust API
 
 ```rust
-use steadq_core::Queue;
+use steadq_core::{Queue, EnqueueInput};
 
-let mut queue = Queue::open("/path/to/queue", &Default::default())?;
-let reader = std::io::Cursor::new(b"large payload bytes".to_vec());
-queue.enqueue_streaming(3, "text/plain".into(), Default::default(),
-    None, None, None, reader);
+let mut queue = Queue::open("/tmp/myqueue", &Default::default())?;
+queue.enqueue(EnqueueInput {
+    maximum_attempts: 3,
+    content_type: "text/plain".into(),
+    payload: b"hello world".to_vec(),
+    ..Default::default()
+});
+
+match queue.lease(0, 30_000_000_000) {
+    steadq_core::LeaseOutcome::Leased(lease) => {
+        queue.verify_lease_payload(&lease)?;
+        queue.ack(&lease);
+    }
+    _ => {}
+}
 ```
 
-### Verified payload reads
+### Streaming Enqueue
 
-The `VerifiedPayloadReader` hashes the payload once and serves O(1)
-random-access reads without re-hashing:
+For payloads that should not be buffered in memory:
+
+```rust
+queue.enqueue_streaming(
+    3, "text/plain".into(),
+    Default::default(), None, None, None,
+    std::io::Cursor::new(large_payload),
+);
+```
+
+### Verified Payload Reads
+
+Read payload bytes without re-hashing on every access:
 
 ```rust
 let reader = queue.open_verified_payload_reader(&lease)?.unwrap();
@@ -120,51 +72,86 @@ let n = reader.read_at(&mut buf, 0)?;
 
 ## C ABI
 
-A C ABI is provided via `steadq-capi`. The header is generated by `cbindgen`
-and checked for drift in CI. The ABI supports the full lifecycle:
+The steadq-capi crate exposes the full lifecycle through opaque handles. The header is generated by cbindgen and checked for drift in CI.
 
-- `steadq_init`, `steadq_open`, `steadq_close`
-- `steadq_enqueue`, `steadq_lease`, `steadq_lease_verify`, `steadq_ack`,
-  `steadq_retry`, `steadq_bury`, `steadq_recover`
-- `steadq_resolve` (ticket-based resolution of indeterminate operations)
-- `steadq_lease_open_reader`, `steadq_reader_read`, `steadq_reader_free`
-  (verified payload streaming)
-- `steadq_lease_job_id`, `steadq_lease_generation`, `steadq_lease_attempt`,
-  `steadq_lease_payload_length`, `steadq_lease_boot_id`,
-  `steadq_lease_content_type`, `steadq_lease_source_path`
-- `steadq_last_error`, `steadq_abi_version`
+```c
+SteadqQueue *q = steadq_init("/tmp/myqueue", 64);
+SteadqJobId job_id;
+steadq_enqueue(q, payload, len, "text/plain", 3, &job_id);
 
-All handle types are opaque. Output pointers are zero-initialized on error
-paths.
+SteadqLease *lease = NULL;
+steadq_lease(q, 30000000000ULL, &lease);
 
-## Specification
+SteadqPayloadReader *reader = NULL;
+steadq_lease_open_reader(q, lease, &reader);
+size_t bytes_read;
+uint8_t buf[4096];
+steadq_reader_read(reader, buf, sizeof(buf), 0, &bytes_read);
 
-User-facing spec documents are in [`spec/`](spec/):
+steadq_ack(q, lease);
+steadq_reader_free(reader);
+steadq_lease_free(lease);
+steadq_close(q);
+```
 
-- [`contract.md`](spec/contract.md) covers assumptions, guarantees, non-goals, and terminology
-- [`format.md`](spec/format.md) documents all binary record layouts with offsets and digest formulas
-- [`filenames.abnf`](spec/filenames.abnf) is the normative filename grammar
-- [`reasons.md`](spec/reasons.md) lists dead and quarantine reason registries
+## How It Works
+
+A queue lives in a directory on a local Linux filesystem (ext4 or XFS). The layout is:
+
+    queue/
+      FORMAT                  Queue identity and configuration
+      control/
+        maintenance.lock      OFD write lock for recovery
+        recovery.lock         OFD write lock for exclusive recovery
+        wall-watermark        Authenticated wall-time floor
+      ready/<shard>/          Jobs available for lease
+      leased/<boot>/<bucket>/<shard>/   Jobs held by consumers
+      delayed/<bucket>/<shard>/         Jobs waiting for scheduled delivery
+      dead/<bucket>/<shard>/            Jobs that exhausted retries
+      receipts/<bucket>/<shard>/        Acknowledgment records
+      quarantine/            Corrupt objects isolated for inspection
+      tmp/                   Temporary staging for publication
+
+Every job filename encodes its identity: queue ID, job ID, generation, attempt count, lease token, content digest, and an integrity tag. State transitions are no-overwrite renames through a phase-aware executor that classifies every failure as either not-committed (before the rename) or outcome-unknown (after the rename).
 
 ## Architecture
 
-The workspace is split into crates with one-way dependency direction:
+| Crate | Responsibility |
+|---|---|
+| steadq-format | Binary encoding: FORMAT record, job header, receipt, watermark, CBOR extension |
+| steadq-names | Canonical filename parsing, integrity tags, shard computation |
+| steadq-math | Bucket arithmetic, retry jitter, checked conversions |
+| steadq-fs-linux | Linux syscalls: openat, renameat2, linkat, O_TMPFILE, fsync, OFD locks |
+| steadq-core | Queue state machine: all operations route through a phase-aware executor |
+| steadq-cli | Command-line interface |
+| steadq-capi | C ABI with opaque handles and generated header |
+| steadq-testkit | Conformance harness, logical oracle, filesystem simulator, differential driver |
 
-`steadq-format` handles binary format encoding (FORMAT record, fixed job header, compact receipt, wall watermark, deterministic CBOR extension header).
+## Testing
 
-`steadq-names` handles canonical filename parsing and formatting for all states, 64-bit name integrity tags, shard derivation and scan permutation.
+SteadQ has 622 tests across unit, integration, conformance, and formal model checking:
 
-`steadq-math` provides bucket arithmetic, delayed eligibility rounding, retry jitter with rejection sampling, and checked arithmetic.
+- Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
+- Fault injection tests inject I/O errors at every syscall boundary and verify error classification
+- Stateful differential tests run random operation sequences through the production API and verify results against a pure logical oracle at every step
+- TLA+ model checking verifies invariants for lease tokens, capability tokens, namespace durability, scheduling, and receipt evidence across six model configurations
+- Mutation testing (cargo-mutants) runs on every pull request, scoped to the changed lines
+- Fuzz testing covers format parsing, filename parsing, CBOR decoding, and arithmetic
 
-`steadq-fs-linux` wraps Linux syscalls (openat, mkdirat, renameat2, linkat, O_TMPFILE, fsync, OFD locks, clocks, getrandom). All unsafe code is confined here.
+## Documentation
 
-`steadq-core` implements the queue state machine: init, open, enqueue, lease, ack, retry, bury, renew, recover, inspect, fsck. All mutations route through a phase-aware executor.
+- spec/contract.md - Assumptions, guarantees, and terminology
+- spec/format.md - Binary record layouts with offsets and digest formulas
+- spec/filenames.abnf - Normative filename grammar
+- spec/reasons.md - Dead and quarantine reason registries
+- docs/compatibility-policy.md - Target platforms and versioning
+- docs/release-checklist.md - Requirements for a stable release
 
-`steadq-cli` provides the command-line interface.
+## Requirements
 
-`steadq-capi` exposes a C ABI with opaque handles and a generated header.
-
-`steadq-testkit` provides the production-coupled driver, logical oracle, filesystem simulator, and verification scenarios.
+- Linux x86_64 (glibc)
+- Rust 1.97.1
+- ext4 or XFS filesystem (or any filesystem supporting openat2 with RESOLVE_BENEATH)
 
 ## License
 

@@ -1,5 +1,5 @@
 # Mutation testing configuration.
-# Each exclusion is documented in docs/mutation-exclusions.md with a reason
+# Exclusions are documented inline below with reason and expiry condition.
 # and expiry condition. Safety-critical recovery functions are tested by
 # fault-injection integration tests (see docs/mutation-exclusions.md).
 exclude_re = [

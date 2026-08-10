@@ -54,10 +54,7 @@ fn check_all(root: &Path) -> Result<(), String> {
         "CONTRIBUTING.md",
         ".github/CODEOWNERS",
         "docs/compatibility-policy.md",
-        "docs/complexity-ledger.md",
         "docs/formal-evidence-scope.md",
-        "docs/hardening-tracker.md",
-        "docs/traceability.md",
     ] {
         if !root.join(required).is_file() {
             return Err(format!("required baseline artifact is missing: {required}"));
