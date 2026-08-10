@@ -88,6 +88,11 @@ pub struct OpenOptions {
     pub allow_unsupported_fs: bool,
     pub receipt_retention_ns: u64,
     pub temporary_file_ttl_ns: u64,
+    /// When true, directory fsync calls after state transitions are deferred.
+    /// The caller must call `sync()` to make directory changes durable.
+    /// File data is always synced before publication regardless of this flag.
+    /// Default: false (maximum durability).
+    pub deferred_dir_sync: bool,
 }
 
 impl Default for OpenOptions {
@@ -96,6 +101,7 @@ impl Default for OpenOptions {
             allow_unsupported_fs: false,
             receipt_retention_ns: 7 * 24 * 60 * 60 * 1_000_000_000,
             temporary_file_ttl_ns: 24 * 60 * 60 * 1_000_000_000,
+            deferred_dir_sync: false,
         }
     }
 }
@@ -253,6 +259,7 @@ pub struct Queue {
     pub(crate) cached_wall_floor: Option<WallFloor>,
     pub(crate) known_dirs: std::cell::RefCell<std::collections::HashSet<String>>,
     pub(crate) cached_dest_fd: Option<(String, std::os::fd::OwnedFd)>,
+    pub(crate) deferred_dir_sync: bool,
 }
 
 /// Internal helper enum for resolver object authentication.
@@ -978,6 +985,7 @@ impl Queue {
             cached_wall_floor: None,
             known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
             cached_dest_fd: None,
+            deferred_dir_sync: opts.deferred_dir_sync,
         })
     }
 
@@ -1247,6 +1255,14 @@ impl Queue {
 
     /// Enqueue a job with the given payload and metadata.
     pub fn enqueue(&mut self, job: EnqueueInput) -> EnqueueOutcome {
+        let prev = steadq_fs_linux::dir_sync_is_deferred();
+        steadq_fs_linux::defer_dir_sync(self.deferred_dir_sync);
+        let result = self.enqueue_inner(job);
+        steadq_fs_linux::defer_dir_sync(prev);
+        result
+    }
+
+    fn enqueue_inner(&mut self, job: EnqueueInput) -> EnqueueOutcome {
         if let Err(e) = self.check_not_poisoned() {
             let ticket = EnqueueTicket {
                 job_id: [0; 16],
@@ -1483,6 +1499,27 @@ impl Queue {
                 .map_err(|e| io::Error::other(e.to_string()))?,
         ));
         Ok(fd)
+    }
+
+    /// Flush all deferred directory fsync operations. Call this after a batch
+    /// of operations when using deferred_dir_sync mode. This fsyncs all known
+    /// state directories to make directory entries durable.
+    pub fn sync(&self) -> io::Result<()> {
+        for dir in [
+            "ready",
+            "leased",
+            "delayed",
+            "dead",
+            "receipts",
+            "quarantine",
+            "control",
+        ] {
+            if let Ok(fd) = open_relative(self.root_fd.as_fd(), dir) {
+                fs::fsync_dir_fd(fd.as_fd())?;
+            }
+        }
+        fs::fsync_dir_fd(self.root_fd.as_fd())?;
+        Ok(())
     }
 
     /// Write the job envelope to a temp file and publish via rename.
@@ -2125,6 +2162,14 @@ impl Queue {
     /// max_wait_ns is accepted for API compatibility but currently performs
     /// a single immediate scan (C-14: bounded wait/backoff not yet implemented).
     pub fn lease(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
+        let prev = steadq_fs_linux::dir_sync_is_deferred();
+        steadq_fs_linux::defer_dir_sync(self.deferred_dir_sync);
+        let result = self.lease_inner(_max_wait_ns, lease_duration_ns);
+        steadq_fs_linux::defer_dir_sync(prev);
+        result
+    }
+
+    fn lease_inner(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return LeaseOutcome::NotCommitted(e);
         }
@@ -2592,6 +2637,14 @@ impl Queue {
     /// window between lease delivery and terminal publication. SteadQ/1 has no
     /// public unverified acknowledgment path.
     pub fn ack(&mut self, lease: &LeaseInfo) -> AckOutcome {
+        let prev = steadq_fs_linux::dir_sync_is_deferred();
+        steadq_fs_linux::defer_dir_sync(self.deferred_dir_sync);
+        let result = self.ack_inner(lease);
+        steadq_fs_linux::defer_dir_sync(prev);
+        result
+    }
+
+    fn ack_inner(&mut self, lease: &LeaseInfo) -> AckOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return AckOutcome::NotCommitted(e);
         }
@@ -5203,6 +5256,51 @@ mod tests {
     fn init_and_open() {
         let (_tmp, queue) = create_test_queue();
         assert_eq!(queue.format().shard_count(), 64);
+    }
+
+    #[test]
+    fn sync_flushes_deferred_directory_changes() {
+        let (tmp, mut queue) = {
+            let tmp = TempDir::new().unwrap();
+            Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+            let queue = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    deferred_dir_sync: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (tmp, queue)
+        };
+
+        // Enqueue with deferred sync
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"deferred".to_vec(),
+            ..Default::default()
+        });
+        assert!(matches!(outcome, EnqueueOutcome::Committed(_)));
+
+        // sync() should succeed and make changes durable
+        assert!(queue.sync().is_ok());
+
+        // Job should be visible after sync
+        let mut queue2 = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let lease = match queue2.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(l) => l,
+            o => panic!("lease failed: {o:?}"),
+        };
+        assert_eq!(lease.attempt, 1);
     }
 
     #[test]

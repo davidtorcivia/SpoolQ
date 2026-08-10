@@ -12,6 +12,10 @@ use std::ptr::NonNull;
 
 const MAX_COMPONENT_BYTES: usize = 255;
 const MAX_RELATIVE_PATH_BYTES: usize = 4095;
+
+thread_local! {
+    static DIR_SYNC_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
@@ -625,6 +629,17 @@ pub fn clock_monotonic_ns() -> io::Result<u64> {
 /// Generate random bytes from the OS crypto source.
 /// Loops until the entire buffer is filled. Handles short reads, EINTR,
 /// and EAGAIN. Returns an error (not zero data) on any failure.
+/// Defer directory fsync calls on the current thread. When enabled,
+/// fsync_dir_fd becomes a no-op. Call sync_deferred_dirs() to flush.
+pub fn defer_dir_sync(enabled: bool) {
+    DIR_SYNC_DEFERRED.with(|cell| cell.set(enabled));
+}
+
+/// Whether directory fsync is deferred on the current thread.
+pub fn dir_sync_is_deferred() -> bool {
+    DIR_SYNC_DEFERRED.with(|cell| cell.get())
+}
+
 pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
     fault_check!("get_random");
     if bytes == 0 {
@@ -1653,6 +1668,30 @@ mod tests {
         let a = random_128bit().unwrap();
         let b = random_128bit().unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn defer_dir_sync_controls_fsync_dir_fd() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ready/0000")).unwrap();
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        let ready_fd = open_directory(root.as_fd(), "ready").unwrap();
+        let fd = open_directory(ready_fd.as_fd(), "0000").unwrap();
+
+        // Default: sync is not deferred
+        assert!(!dir_sync_is_deferred());
+
+        // Enable deferred sync
+        defer_dir_sync(true);
+        assert!(dir_sync_is_deferred());
+
+        // fsync_dir_fd should be a no-op (return Ok)
+        assert!(fsync_dir_fd(fd.as_fd()).is_ok());
+
+        // Disable and verify it actually syncs again
+        defer_dir_sync(false);
+        assert!(!dir_sync_is_deferred());
+        assert!(fsync_dir_fd(fd.as_fd()).is_ok());
     }
 
     #[test]
