@@ -113,6 +113,18 @@ pub struct MoveIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Copy)]
+enum DirectoryDurability {
+    Strict,
+    Deferred,
+}
+
+#[derive(Clone, Copy)]
+struct MoveOptions {
+    source_identity: Option<MoveIdentity>,
+    directory_durability: DirectoryDurability,
+}
+
 impl MoveIdentity {
     pub fn new(device: u64, inode: u64) -> Self {
         Self { device, inode }
@@ -402,7 +414,10 @@ pub fn move_verified_noreplace(
         src_name,
         dest_dir_fd,
         dest_name,
-        None,
+        MoveOptions {
+            source_identity: None,
+            directory_durability: DirectoryDurability::Strict,
+        },
         |error| error,
         |_| Ok(()),
     )
@@ -443,7 +458,10 @@ pub fn move_witnessed_noreplace_with<T>(
         src_name,
         dest_dir_fd,
         dest_name,
-        Some(source_identity),
+        MoveOptions {
+            source_identity: Some(source_identity),
+            directory_durability: DirectoryDurability::Strict,
+        },
         |error| error,
         move |moved| {
             let moved = moved.expect("witnessed move authenticates its destination");
@@ -466,7 +484,10 @@ pub(super) fn move_witnessed_noreplace_io(
         src_name,
         dest_dir_fd,
         dest_name,
-        Some(source_identity),
+        MoveOptions {
+            source_identity: Some(source_identity),
+            directory_durability: DirectoryDurability::Strict,
+        },
         |error| error,
         |_| Ok(()),
     )
@@ -477,7 +498,7 @@ fn move_noreplace<T, E>(
     src_name: &str,
     dest_dir_fd: BorrowedFd<'_>,
     dest_name: &str,
-    source_identity: Option<MoveIdentity>,
+    options: MoveOptions,
     map_io_error: impl Fn(std::io::Error) -> E,
     after_linearization: impl FnOnce(Option<MovedObject>) -> Result<T, E>,
 ) -> Result<T, MoveFailureWith<E>> {
@@ -497,8 +518,8 @@ fn move_noreplace<T, E>(
         }
     };
 
-    let detect_same_directory = source_identity.is_some();
-    let moved = if let Some(source_identity) = source_identity {
+    let detect_same_directory = options.source_identity.is_some();
+    let moved = if let Some(source_identity) = options.source_identity {
         match fs::fstatat(dest_dir_fd, dest_name) {
             Ok(stat) if source_identity.matches(&stat) => Some(MovedObject {
                 device: stat.st_dev,
@@ -528,6 +549,10 @@ fn move_noreplace<T, E>(
         phase: MovePhase::PostLinearization,
         source,
     })?;
+
+    if matches!(options.directory_durability, DirectoryDurability::Deferred) {
+        return Ok(output);
+    }
 
     if let Err(e) = fs::fsync_dir_fd(dest_dir_fd) {
         return Err(MoveFailureWith::OutcomeUnknown {
@@ -921,12 +946,15 @@ pub fn move_witnessed_noreplace_deferred<T>(
     source_identity: MoveIdentity,
     after_linearization: impl FnOnce(MovedObject) -> Result<T, std::io::Error>,
 ) -> Result<(MovedObject, T), MoveFailure> {
-    move_noreplace_deferred(
+    move_noreplace(
         src_dir_fd,
         src_name,
         dest_dir_fd,
         dest_name,
-        Some(source_identity),
+        MoveOptions {
+            source_identity: Some(source_identity),
+            directory_durability: DirectoryDurability::Deferred,
+        },
         |e| e,
         move |moved| {
             let moved = moved.expect("witnessed move authenticates its destination");
@@ -934,62 +962,6 @@ pub fn move_witnessed_noreplace_deferred<T>(
         },
     )
     .map_err(MoveFailure::from)
-}
-
-fn move_noreplace_deferred<T, E>(
-    src_dir_fd: BorrowedFd<'_>,
-    src_name: &str,
-    dest_dir_fd: BorrowedFd<'_>,
-    dest_name: &str,
-    source_identity: Option<MoveIdentity>,
-    map_io_error: impl Fn(std::io::Error) -> E,
-    after_linearization: impl FnOnce(Option<MovedObject>) -> Result<T, E>,
-) -> Result<T, MoveFailureWith<E>> {
-    match fs::renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name) {
-        Ok(()) => {}
-        Err(e) if is_already_exists_io_kind(e.kind()) => {
-            return Err(MoveFailureWith::AlreadyExists);
-        }
-        Err(e) if is_not_found_io_kind(e.kind()) => {
-            return Err(MoveFailureWith::SourceMissing);
-        }
-        Err(e) => {
-            return Err(MoveFailureWith::NotCommitted {
-                phase: MovePhase::Rename,
-                source: map_io_error(e),
-            });
-        }
-    };
-    let moved = if let Some(source_identity) = source_identity {
-        match fs::fstatat(dest_dir_fd, dest_name) {
-            Ok(stat) if source_identity.matches(&stat) => Some(MovedObject {
-                device: stat.st_dev,
-                inode: stat.st_ino,
-                size: stat.st_size.max(0) as u64,
-            }),
-            Ok(_) => {
-                return Err(MoveFailureWith::OutcomeUnknown {
-                    phase: MovePhase::DestinationIdentity,
-                    source: map_io_error(std::io::Error::other(
-                        "destination identity changed after rename",
-                    )),
-                });
-            }
-            Err(error) => {
-                return Err(MoveFailureWith::OutcomeUnknown {
-                    phase: MovePhase::DestinationIdentity,
-                    source: map_io_error(error),
-                });
-            }
-        }
-    } else {
-        None
-    };
-    let output = after_linearization(moved).map_err(|source| MoveFailureWith::OutcomeUnknown {
-        phase: MovePhase::PostLinearization,
-        source,
-    })?;
-    Ok(output)
 }
 
 pub(super) fn publish_tmpfile_noreplace_deferred_with_mode(

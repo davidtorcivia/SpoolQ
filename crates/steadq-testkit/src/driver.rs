@@ -107,6 +107,20 @@ impl ProductionDriver {
                 self.traces.push(trace);
                 Ok(job_id)
             }
+            EnqueueOutcome::Deferred(ticket) => {
+                let job_id = ticket.job_id;
+                self.queue
+                    .sync()
+                    .map_err(|error| Error::IoFailure(error.to_string()))?;
+                self.oracle.record_enqueue(job_id, max_attempts);
+                self.oracle.record_file_sync(&job_id);
+                self.oracle.record_publish(&job_id, true);
+                self.oracle.record_dest_sync(&job_id);
+                trace.job_id_hex = hex(&job_id);
+                trace.syscall_result = Some("committed_after_sync".into());
+                self.traces.push(trace);
+                Ok(job_id)
+            }
             EnqueueOutcome::NotCommitted(_, e) => {
                 trace.syscall_result = Some(format!("not_committed: {e}"));
                 self.traces.push(trace);

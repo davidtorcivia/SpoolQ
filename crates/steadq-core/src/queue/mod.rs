@@ -90,6 +90,7 @@ pub struct OpenOptions {
     pub temporary_file_ttl_ns: u64,
     /// When true, directory fsync calls after state transitions are deferred.
     /// The caller must call `sync()` to make directory changes durable.
+    /// Enqueue returns `EnqueueOutcome::Deferred` until that barrier is run.
     /// File data is always synced before publication regardless of this flag.
     /// Default: false (maximum durability).
     pub deferred_dir_sync: bool,
@@ -280,6 +281,7 @@ pub struct Batch<'a> {
 pub enum BatchEnqueueOutcome {
     Pending(EnqueueTicket),
     NotCommitted(EnqueueTicket, Error),
+    OutcomeUnknown(EnqueueTicket, Error),
 }
 
 #[derive(Debug)]
@@ -287,12 +289,14 @@ pub enum BatchLeaseOutcome {
     Pending(LeaseInfo),
     Empty,
     NotCommitted(Error),
+    OutcomeUnknown(TransitionTicket),
 }
 
 #[derive(Debug)]
 pub enum BatchAckOutcome {
     Pending,
     NotCommitted(Error),
+    OutcomeUnknown(TransitionTicket),
 }
 
 struct PreparedEnqueue {
@@ -325,11 +329,15 @@ impl<'a> Batch<'a> {
                 self.pending_enqueues.push(ticket.clone());
                 BatchEnqueueOutcome::Pending(ticket)
             }
+            EnqueueOutcome::Deferred(ticket) => {
+                self.pending_enqueues.push(ticket.clone());
+                BatchEnqueueOutcome::Pending(ticket)
+            }
             EnqueueOutcome::NotCommitted(ticket, err) => {
                 BatchEnqueueOutcome::NotCommitted(ticket, err)
             }
             EnqueueOutcome::OutcomeUnknown(ticket, err) => {
-                BatchEnqueueOutcome::NotCommitted(ticket, err)
+                BatchEnqueueOutcome::OutcomeUnknown(ticket, err)
             }
         }
     }
@@ -346,13 +354,13 @@ impl<'a> Batch<'a> {
             }
             LeaseOutcome::Empty => BatchLeaseOutcome::Empty,
             LeaseOutcome::NotCommitted(err) => BatchLeaseOutcome::NotCommitted(err),
-            LeaseOutcome::OutcomeUnknown(ticket) => {
-                // Treat as NotCommitted for batch; commit will handle.
-                BatchLeaseOutcome::NotCommitted(Error::IoFailure(format!(
-                    "lease outcome unknown before commit: {ticket:?}"
-                )))
-            }
+            LeaseOutcome::OutcomeUnknown(ticket) => BatchLeaseOutcome::OutcomeUnknown(ticket),
         }
+    }
+
+    /// Verify a pending lease's payload before additional batch work.
+    pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<(), Error> {
+        self.queue.verify_lease_payload(lease)
     }
 
     /// Ack within the batch.
@@ -367,9 +375,7 @@ impl<'a> Batch<'a> {
                 BatchAckOutcome::NotCommitted(Error::InvalidInput("lease lost".into()))
             }
             AckOutcome::NotCommitted(err) => BatchAckOutcome::NotCommitted(err),
-            AckOutcome::OutcomeUnknown(ticket) => BatchAckOutcome::NotCommitted(Error::IoFailure(
-                format!("ack outcome unknown before commit: {ticket:?}"),
-            )),
+            AckOutcome::OutcomeUnknown(ticket) => BatchAckOutcome::OutcomeUnknown(ticket),
         }
     }
 
@@ -1214,15 +1220,32 @@ impl Queue {
     /// Wall floor for mutating operations. P0-01: Returns Err and poisons
     /// on failure so callers abort before computing destination paths.
     pub(crate) fn wall_floor_for_mutation(&mut self) -> Result<WallFloor, Error> {
-        // Fast path: return the cached floor if the bucket has not advanced.
-        // A cheap clock_gettime is all that's needed to check.
-        if let Some(ref cached) = self.cached_wall_floor {
-            let now = steadq_fs_linux::clock_realtime_ns()
-                .map_err(|e| Error::IoFailure(format!("CLOCK_REALTIME: {e}")))?;
-            let now_bucket = steadq_math::bucket_number(now, self.format.delayed_bucket_width_ns())
-                .ok_or(Error::StateExhausted)?;
-            if now_bucket == cached.watermark_bucket {
-                return Ok(*cached);
+        // A process-local cache cannot establish the shared durable floor: another
+        // handle may advance the watermark while realtime rolls back into this
+        // handle's cached bucket. Authenticate shared state before using the cache.
+        if let Some(cached) = self.cached_wall_floor {
+            let authenticated = match self.authenticated_wall_floor() {
+                Ok(floor) => floor,
+                Err(error) => {
+                    self.poison();
+                    return Err(error);
+                }
+            };
+            let observed_bucket = steadq_math::bucket_number(
+                authenticated.unix_ns(),
+                self.format.delayed_bucket_width_ns(),
+            )
+            .ok_or(Error::StateExhausted)?;
+            if observed_bucket == authenticated.watermark_bucket
+                && cached.watermark_bucket == authenticated.watermark_bucket
+                && cached.watermark_sequence == authenticated.watermark_sequence
+            {
+                let floor = WallFloor {
+                    unix_ns: cached.unix_ns.max(authenticated.unix_ns),
+                    ..authenticated
+                };
+                self.cached_wall_floor = Some(floor);
+                return Ok(floor);
             }
         }
 
@@ -1439,7 +1462,10 @@ impl Queue {
             let outcome = self.enqueue_with_dirty(job, Some(&mut tmp));
             let prev = self.dirty.replace(tmp);
             drop(prev);
-            return outcome;
+            return match outcome {
+                EnqueueOutcome::Committed(ticket) => EnqueueOutcome::Deferred(ticket),
+                outcome => outcome,
+            };
         }
         self.enqueue_inner(job)
     }
@@ -2209,12 +2235,17 @@ impl Queue {
             }
         };
 
-        EnqueueOutcome::Committed(EnqueueTicket {
+        let ticket = EnqueueTicket {
             job_id,
             envelope_digest: env_dig,
             expected_initial_state,
             expected_relative_path: expected_path,
-        })
+        };
+        if self.deferred_dir_sync {
+            EnqueueOutcome::Deferred(ticket)
+        } else {
+            EnqueueOutcome::Committed(ticket)
+        }
     }
 
     /// Stream payload to a temp file while computing the digest, then publish.
@@ -2525,16 +2556,44 @@ impl Queue {
         Ok(env_dig)
     }
 
-    /// Claim a ready job, returning a lease.
-    /// max_wait_ns is accepted for API compatibility but currently performs
-    /// a single immediate scan (C-14: bounded wait/backoff not yet implemented).
-    pub fn lease(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
-        self.lease_inner_with_dirty(_max_wait_ns, lease_duration_ns, None)
+    /// Claim a ready job, returning a lease. Empty scans and transient watermark
+    /// lock contention retry with bounded exponential backoff until `max_wait_ns`.
+    pub fn lease(&mut self, max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
+        self.lease_inner_with_dirty(max_wait_ns, lease_duration_ns, None)
     }
 
     fn lease_inner_with_dirty(
         &mut self,
-        _max_wait_ns: u64,
+        max_wait_ns: u64,
+        lease_duration_ns: u64,
+        mut dirty: Option<&mut engine::DirtySet>,
+    ) -> LeaseOutcome {
+        let started = std::time::Instant::now();
+        let wait = std::time::Duration::from_nanos(max_wait_ns);
+        let mut backoff = std::time::Duration::from_micros(50);
+        let max_backoff = std::time::Duration::from_millis(10);
+
+        loop {
+            let outcome = self.lease_once_with_dirty(lease_duration_ns, dirty.as_deref_mut());
+            let retryable = matches!(
+                outcome,
+                LeaseOutcome::Empty | LeaseOutcome::NotCommitted(Error::MaintenanceBusy)
+            );
+            if max_wait_ns == 0 || !retryable {
+                return outcome;
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= wait {
+                return outcome;
+            }
+            std::thread::sleep(backoff.min(wait.saturating_sub(elapsed)));
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
+    }
+
+    fn lease_once_with_dirty(
+        &mut self,
         lease_duration_ns: u64,
         mut _dirty: Option<&mut engine::DirtySet>,
     ) -> LeaseOutcome {
@@ -5766,14 +5825,14 @@ mod tests {
             (tmp, queue)
         };
 
-        // Enqueue with deferred sync
+        // Publication is visible but cannot be reported Committed yet.
         let outcome = queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
             content_type: "x".to_string(),
             payload: b"deferred".to_vec(),
             ..Default::default()
         });
-        assert!(matches!(outcome, EnqueueOutcome::Committed(_)));
+        assert!(matches!(outcome, EnqueueOutcome::Deferred(_)));
 
         // sync() should succeed and make changes durable
         assert!(queue.sync().is_ok());
@@ -5792,6 +5851,54 @@ mod tests {
             o => panic!("lease failed: {o:?}"),
         };
         assert_eq!(lease.attempt, 1);
+    }
+
+    #[test]
+    fn deferred_enqueue_may_be_lost_before_sync_without_claiming_commit() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                deferred_dir_sync: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject("fsync_dir_fd", u64::MAX);
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".into(),
+            payload: b"volatile publication".to_vec(),
+            ..Default::default()
+        });
+        let fsyncs_before_sync = fs::fault::call_count("fsync_dir_fd");
+        fs::fault::reset();
+        let ticket = match outcome {
+            EnqueueOutcome::Deferred(ticket) => ticket,
+            other => panic!("deferred enqueue claimed the wrong outcome: {other:?}"),
+        };
+        assert_eq!(fsyncs_before_sync, 0);
+
+        // Model the certified crash window in which the unsynced directory entry
+        // is absent after restart. The API did not promise Committed for this job.
+        std::fs::remove_file(tmp.path().join(ticket.expected_relative_path)).unwrap();
+        drop(queue);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.lease(0, 30_000_000_000),
+            LeaseOutcome::Empty
+        ));
     }
 
     #[test]
@@ -5833,6 +5940,9 @@ mod tests {
             BatchLeaseOutcome::Pending(info) => info,
             BatchLeaseOutcome::Empty => panic!("should have a job to lease"),
             BatchLeaseOutcome::NotCommitted(e) => panic!("batch lease failed: {e:?}"),
+            BatchLeaseOutcome::OutcomeUnknown(ticket) => {
+                panic!("batch lease outcome unknown: {ticket:?}")
+            }
         };
         assert_eq!(lease.attempt, 1);
 
@@ -5892,6 +6002,59 @@ mod tests {
         let outcome = batch2.commit().expect("lease+ack commit");
         assert_eq!(outcome.committed_leases, 4);
         assert_eq!(outcome.committed_acks, 4);
+    }
+
+    #[test]
+    fn batch_payload_verification_propagates_corruption() {
+        let (tmp, mut queue) = create_test_queue();
+        let lease = enqueue_and_lease(&mut queue);
+        let source = tmp.path().join(&lease.exact_source_path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(source)
+            .unwrap();
+        let last_payload_byte = file.metadata().unwrap().len().checked_sub(1).unwrap();
+        file.write_all_at(&[0], last_payload_byte).unwrap();
+
+        let batch = queue.batch();
+        assert_eq!(
+            batch.verify_lease_payload(&lease),
+            Err(Error::PayloadCorrupt)
+        );
+    }
+
+    #[test]
+    fn batch_commit_barrier_failure_marks_every_pending_lifecycle_unknown() {
+        let (_tmp, mut queue) = create_test_queue();
+        let mut batch = queue.batch();
+        assert!(matches!(
+            batch.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"batch barrier".to_vec(),
+                ..Default::default()
+            }),
+            BatchEnqueueOutcome::Pending(_)
+        ));
+        let lease = match batch.lease(0, 30_000_000_000) {
+            BatchLeaseOutcome::Pending(lease) => lease,
+            other => panic!("batch lease failed: {other:?}"),
+        };
+        batch.verify_lease_payload(&lease).unwrap();
+        assert!(matches!(batch.ack(&lease), BatchAckOutcome::Pending));
+
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+        let outcome = batch.commit().expect_err("batch barrier should fail");
+        fs::fault::reset();
+
+        assert!(outcome.committed_enqueues.is_empty());
+        assert_eq!(outcome.outcome_unknown_enqueues.len(), 1);
+        assert_eq!(outcome.committed_leases, 0);
+        assert_eq!(outcome.outcome_unknown_leases.len(), 1);
+        assert_eq!(outcome.committed_acks, 0);
+        assert_eq!(outcome.outcome_unknown_acks.len(), 1);
+        assert!(queue.is_poisoned());
     }
 
     #[test]
@@ -6037,6 +6200,14 @@ mod tests {
         fs::fault::reset();
 
         assert!(result.is_err(), "sync() must call fsync_dir_fd when dirty");
+
+        // A failed barrier retains the exact dirty set. A later successful sync
+        // promotes the deferred publication and clears the pending barriers.
+        assert!(queue.sync().is_ok());
+        fs::fault::inject("fsync_dir_fd", u64::MAX);
+        assert!(queue.sync().is_ok());
+        assert_eq!(fs::fault::call_count("fsync_dir_fd"), 0);
+        fs::fault::reset();
     }
 
     #[test]
@@ -6100,6 +6271,176 @@ mod tests {
                 (BatchLeaseOutcome::NotCommitted(_), "empty_or_not_committed") => {}
                 other => panic!("unexpected for errno {errno}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn batch_enqueue_preserves_every_injected_postlinearization_failure() {
+        for named_fallback in [false, true] {
+            for fault in ["fstatat", "fstat"] {
+                let count_calls = || {
+                    let (_tmp, mut queue) = create_test_queue();
+                    if named_fallback {
+                        queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+                    } else if !tmpfile_supported(&queue) {
+                        return 0;
+                    }
+                    fs::fault::reset();
+                    fs::fault::inject(fault, u64::MAX);
+                    let outcome = queue.batch().enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".into(),
+                        payload: b"batch enqueue fault matrix".to_vec(),
+                        ..Default::default()
+                    });
+                    let calls = fs::fault::call_count(fault);
+                    fs::fault::reset();
+                    assert!(matches!(outcome, BatchEnqueueOutcome::Pending(_)));
+                    calls
+                };
+                let calls = count_calls();
+                if calls == 0 {
+                    continue;
+                }
+
+                let mut exercised = 0;
+                for target in 1..=calls {
+                    let (tmp, mut queue) = create_test_queue();
+                    if named_fallback {
+                        queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+                    }
+                    fs::fault::reset();
+                    fs::fault::inject_errno(fault, target, libc::EIO);
+                    let outcome = queue.batch().enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".into(),
+                        payload: b"batch enqueue fault matrix".to_vec(),
+                        ..Default::default()
+                    });
+                    fs::fault::reset();
+                    let linearized =
+                        find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_some();
+                    if linearized {
+                        exercised += 1;
+                        assert!(
+                            matches!(outcome, BatchEnqueueOutcome::OutcomeUnknown(_, _)),
+                            "{fault} call {target} after publication became {outcome:?}"
+                        );
+                    }
+                }
+                assert!(
+                    exercised > 0,
+                    "no postlinearization {fault} failure was exercised"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_lease_preserves_every_injected_postlinearization_failure() {
+        for fault in ["fstatat", "fstat", "pread"] {
+            let count_calls = || {
+                let (_tmp, mut queue) = create_test_queue();
+                assert!(matches!(
+                    queue.enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".into(),
+                        payload: b"batch lease fault matrix".to_vec(),
+                        ..Default::default()
+                    }),
+                    EnqueueOutcome::Committed(_)
+                ));
+                fs::fault::reset();
+                fs::fault::inject(fault, u64::MAX);
+                let outcome = queue.batch().lease(0, 30_000_000_000);
+                let calls = fs::fault::call_count(fault);
+                fs::fault::reset();
+                assert!(matches!(outcome, BatchLeaseOutcome::Pending(_)));
+                calls
+            };
+            let calls = count_calls();
+            let mut exercised = 0;
+            for target in 1..=calls {
+                let (tmp, mut queue) = create_test_queue();
+                assert!(matches!(
+                    queue.enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".into(),
+                        payload: b"batch lease fault matrix".to_vec(),
+                        ..Default::default()
+                    }),
+                    EnqueueOutcome::Committed(_)
+                ));
+                fs::fault::reset();
+                fs::fault::inject_errno(fault, target, libc::EIO);
+                let outcome = queue.batch().lease(0, 30_000_000_000);
+                fs::fault::reset();
+                let linearized =
+                    find_file_with_suffix(&tmp.path().join("leased"), ".sqj").is_some();
+                if linearized {
+                    match outcome {
+                        BatchLeaseOutcome::OutcomeUnknown(_) => exercised += 1,
+                        BatchLeaseOutcome::Pending(_) => {}
+                        other => panic!("{fault} call {target} after claim became {other:?}"),
+                    }
+                }
+            }
+            assert!(
+                exercised > 0,
+                "no postlinearization {fault} failure was exercised"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_ack_preserves_every_injected_postlinearization_failure() {
+        for fault in ["fstatat", "fstat"] {
+            let prepare = || {
+                let (tmp, mut queue) = create_test_queue();
+                assert!(matches!(
+                    queue.enqueue(EnqueueInput {
+                        maximum_attempts: 3,
+                        content_type: "x".into(),
+                        payload: b"batch ack fault matrix".to_vec(),
+                        ..Default::default()
+                    }),
+                    EnqueueOutcome::Committed(_)
+                ));
+                let lease = match queue.lease(0, 30_000_000_000) {
+                    LeaseOutcome::Leased(lease) => lease,
+                    other => panic!("lease setup failed: {other:?}"),
+                };
+                (tmp, queue, lease)
+            };
+            let (_tmp, mut queue, lease) = prepare();
+            fs::fault::reset();
+            fs::fault::inject(fault, u64::MAX);
+            let outcome = queue.batch().ack(&lease);
+            let calls = fs::fault::call_count(fault);
+            fs::fault::reset();
+            assert!(matches!(outcome, BatchAckOutcome::Pending));
+
+            let mut exercised = 0;
+            for target in 1..=calls {
+                let (tmp, mut queue, lease) = prepare();
+                fs::fault::reset();
+                fs::fault::inject_errno(fault, target, libc::EIO);
+                let outcome = queue.batch().ack(&lease);
+                fs::fault::reset();
+                let linearized =
+                    find_file_with_suffix(&tmp.path().join("receipts"), ".rct").is_some();
+                if linearized {
+                    match outcome {
+                        BatchAckOutcome::OutcomeUnknown(_) => exercised += 1,
+                        BatchAckOutcome::Pending => {}
+                        other => panic!("{fault} call {target} after ack became {other:?}"),
+                    }
+                }
+            }
+            assert!(
+                exercised > 0,
+                "no postlinearization {fault} failure was exercised"
+            );
         }
     }
 
@@ -7446,6 +7787,32 @@ mod tests {
     }
 
     #[test]
+    fn streaming_enqueue_reports_deferred_until_queue_sync() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut queue = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                deferred_dir_sync: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = queue.enqueue_streaming(
+            3,
+            "x".into(),
+            Default::default(),
+            None,
+            None,
+            None,
+            std::io::Cursor::new(b"streamed deferred"),
+        );
+        assert!(matches!(outcome, EnqueueOutcome::Deferred(_)));
+        queue.sync().unwrap();
+    }
+
+    #[test]
     fn preferred_named_streaming_publication_bypasses_tmpfiles() {
         let (_tmp, mut queue) = create_test_queue();
         queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
@@ -8707,6 +9074,86 @@ mod tests {
     }
 
     #[test]
+    fn cached_wall_floor_observes_another_handles_durable_advance_after_rollback() {
+        let (tmp, mut handle_a) = create_test_queue();
+        let mut handle_b = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let width = handle_a.format.delayed_bucket_width_ns();
+        let initial = handle_a.read_wall_watermark().unwrap();
+        let bucket_n = initial.highest_observed_bucket;
+        let time_n = bucket_n.checked_mul(width).unwrap();
+        let time_n_plus_one = bucket_n.checked_add(1).unwrap().checked_mul(width).unwrap();
+
+        fs::fault::reset();
+        fs::fault::set_clock_realtime_ns(time_n);
+        let cached = handle_a.wall_floor_for_mutation().unwrap();
+        assert_eq!(cached.watermark_bucket(), bucket_n);
+
+        fs::fault::set_clock_realtime_ns(time_n_plus_one);
+        let advanced = handle_b.wall_floor_for_mutation().unwrap();
+        assert_eq!(advanced.watermark_bucket(), bucket_n + 1);
+
+        fs::fault::set_clock_realtime_ns(time_n);
+        let after_rollback = handle_a.wall_floor_for_mutation().unwrap();
+        fs::fault::reset();
+
+        assert_eq!(after_rollback.watermark_bucket(), bucket_n + 1);
+        assert!(after_rollback.unix_ns() >= time_n_plus_one);
+        assert!(after_rollback.watermark_sequence() > cached.watermark_sequence());
+    }
+
+    #[test]
+    fn cached_wall_floor_reenters_lock_when_shared_sequence_changes() {
+        let (tmp, mut queue) = create_test_queue();
+        let current = queue.wall_floor_for_mutation().unwrap();
+        write_wall_watermark(
+            &tmp,
+            current.watermark_bucket(),
+            current.watermark_sequence().checked_add(1).unwrap(),
+        );
+        let control = fs::open_directory(queue.root_fd(), "control").unwrap();
+        let lock = fs::openat(control.as_fd(), "wall-watermark.lock", libc::O_RDWR, 0).unwrap();
+        assert!(fs::try_ofd_write_lock(lock.as_fd()).unwrap());
+
+        assert_eq!(queue.wall_floor_for_mutation(), Err(Error::MaintenanceBusy));
+        assert!(!queue.is_poisoned());
+    }
+
+    #[test]
+    fn cached_wall_floor_preserves_sub_bucket_floor_after_realtime_rollback() {
+        let (_tmp, mut queue) = create_test_queue();
+        let watermark = queue.read_wall_watermark().unwrap();
+        let width = queue.format.delayed_bucket_width_ns();
+        let bucket_start = watermark
+            .highest_observed_bucket
+            .checked_mul(width)
+            .unwrap();
+        let higher_time = bucket_start.checked_add(width - 1).unwrap();
+
+        fs::fault::reset();
+        fs::fault::set_clock_realtime_ns(higher_time);
+        let cached = queue.wall_floor_for_mutation().unwrap();
+        assert_eq!(cached.unix_ns(), higher_time);
+
+        fs::fault::set_clock_realtime_ns(bucket_start);
+        let after_rollback = queue.wall_floor_for_mutation().unwrap();
+        fs::fault::reset();
+
+        assert_eq!(after_rollback.unix_ns(), higher_time);
+        assert_eq!(after_rollback.watermark_bucket(), cached.watermark_bucket());
+        assert_eq!(
+            after_rollback.watermark_sequence(),
+            cached.watermark_sequence()
+        );
+    }
+
+    #[test]
     fn mutation_wall_floor_is_durable_before_return() {
         let (tmp, mut queue) = create_test_queue();
         write_wall_watermark(&tmp, 0, 1);
@@ -9287,6 +9734,79 @@ mod tests {
         let (_tmp, mut queue) = create_test_queue();
         let result = queue.lease(0, 30_000_000_000);
         assert!(matches!(result, LeaseOutcome::Empty));
+    }
+
+    #[test]
+    fn zero_wait_lease_performs_exactly_one_scan() {
+        let (_tmp, mut queue) = create_test_queue();
+        let before = queue.scan_round;
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Empty
+        ));
+        assert_eq!(queue.scan_round, before.wrapping_add(1));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn bounded_wait_retries_empty_scans_without_busy_spinning() {
+        let (_tmp, mut queue) = create_test_queue();
+        let before = queue.scan_round;
+        let wait = std::time::Duration::from_millis(25);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            queue.lease(wait.as_nanos() as u64, 30_000_000_000),
+            LeaseOutcome::Empty
+        ));
+        let elapsed = started.elapsed();
+        let scans = queue.scan_round.wrapping_sub(before);
+
+        assert!(elapsed >= wait, "returned before deadline: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "bounded wait substantially exceeded its deadline: {elapsed:?}"
+        );
+        assert!(scans > 1, "bounded wait did not retry");
+        assert!(scans < 50, "bounded wait busy-spun with {scans} scans");
+    }
+
+    #[test]
+    fn bounded_wait_survives_transient_watermark_lock_contention() {
+        let (tmp, mut queue) = create_test_queue();
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: b"contention".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        let current = queue.read_wall_watermark().unwrap();
+        let next_bucket = current.highest_observed_bucket.checked_add(1).unwrap();
+        fs::fault::set_clock_realtime_ns(
+            next_bucket
+                .checked_mul(queue.format.delayed_bucket_width_ns())
+                .unwrap(),
+        );
+
+        let root = fs::open_dir_absolute(tmp.path()).unwrap();
+        let control = fs::open_directory(root.as_fd(), "control").unwrap();
+        let lock = fs::openat(control.as_fd(), "wall-watermark.lock", libc::O_RDWR, 0o600).unwrap();
+        assert!(fs::try_ofd_write_lock(lock.as_fd()).unwrap());
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            drop(lock);
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = queue.lease(500_000_000, 30_000_000_000);
+        fs::fault::reset();
+        releaser.join().unwrap();
+
+        assert!(matches!(outcome, LeaseOutcome::Leased(_)), "{outcome:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(20));
     }
 
     // ===== B-12: Unexpected ack errors are not LeaseLost =====

@@ -279,6 +279,12 @@ fn main() -> ExitCode {
                     println!("path: {}", ticket.expected_relative_path);
                     ExitCode::SUCCESS
                 }
+                EnqueueOutcome::Deferred(ticket) => {
+                    eprintln!("durability deferred; operation is not committed");
+                    eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id));
+                    eprintln!("path: {}", ticket.expected_relative_path);
+                    ExitCode::from(2)
+                }
                 EnqueueOutcome::NotCommitted(ticket, err) => {
                     eprintln!("not committed: {err}");
                     if ticket.job_id != [0; 16] {
