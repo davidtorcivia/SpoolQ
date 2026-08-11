@@ -74,63 +74,6 @@ impl DirtySet {
             Ok(())
         }
     }
-
-    /// Fsync using io_uring to submit directory fsyncs concurrently.
-    /// Falls back to sequential fsync when io_uring is unavailable.
-    /// TODO: Implement with io_uring crate when the `io-uring` feature is enabled.
-    pub fn sync_all_concurrent(&self) -> io::Result<()> {
-        self.sync_all()
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-fn try_sync_all_uring<'a>(fds: impl Iterator<Item = BorrowedFd<'a>>) -> io::Result<()> {
-    use io_uring::{opcode, types};
-    let fds: Vec<BorrowedFd<'a>> = fds.collect();
-    if fds.is_empty() {
-        return Ok(());
-    }
-    let entries = fds.len().next_power_of_two().max(8) as u32;
-    let mut ring = io_uring::IoUring::new(entries).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("io_uring unavailable: {e}"),
-        )
-    })?;
-    for fd in &fds {
-        let sqe = opcode::Fsync::new(types::Fd(fd.as_raw_fd())).build();
-        // SAFETY: submission queue entry is written via io_uring API
-        unsafe {
-            ring.submission()
-                .push(&sqe)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "uring submission queue full"))?;
-        }
-    }
-    ring.submit_and_wait(fds.len())
-        .map_err(|e| io::Error::other(format!("uring submit: {e}")))?;
-    let mut first_err: Option<io::Error> = None;
-    for cqe in ring.completion() {
-        let res = cqe.result();
-        if res < 0 {
-            let err = io::Error::from_raw_os_error(-res);
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
-        }
-    }
-    if let Some(e) = first_err {
-        Err(e)
-    } else {
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-fn sync_dir(fd: BorrowedFd, dirty: Option<&mut DirtySet>) -> io::Result<()> {
-    match dirty {
-        Some(set) => set.record(fd),
-        None => fs::fsync_dir_fd(fd),
-    }
 }
 
 /// Actor attribution for poisoning decisions.
@@ -1029,64 +972,6 @@ pub(super) fn publish_tmpfile_noreplace_deferred(
         }
     })?;
     Ok(TmpfilePublishOutcome::Published)
-}
-
-pub fn unlink_verified_deferred(
-    directory_fd: BorrowedFd<'_>,
-    name: &str,
-) -> Result<(), UnlinkFailure> {
-    match fs::unlinkat(directory_fd, name) {
-        Ok(()) => Ok(()),
-        Err(error) if is_not_found_io_kind(error.kind()) => Err(UnlinkFailure::SourceMissing),
-        Err(error) => Err(UnlinkFailure::NotCommitted {
-            phase: UnlinkPhase::Unlink,
-            source: error,
-        }),
-    }
-}
-
-pub fn remove_empty_directory_verified_deferred(
-    parent_directory_fd: BorrowedFd<'_>,
-    name: &str,
-) -> Result<(), RemoveDirectoryFailure> {
-    match fs::unlinkat_dir(parent_directory_fd, name) {
-        Ok(()) => Ok(()),
-        Err(error) if is_not_found_io_kind(error.kind()) => {
-            Err(RemoveDirectoryFailure::SourceMissing)
-        }
-        Err(error) if is_directory_not_empty(&error) => Err(RemoveDirectoryFailure::NotEmpty),
-        Err(error) => Err(RemoveDirectoryFailure::NotCommitted {
-            phase: RemoveDirectoryPhase::Remove,
-            source: error,
-        }),
-    }
-}
-
-pub fn replace_verified_deferred(
-    src_dir_fd: BorrowedFd<'_>,
-    src_name: &str,
-    dest_dir_fd: BorrowedFd<'_>,
-    dest_name: &str,
-    expected_destination: Option<ReplaceIdentity>,
-) -> Result<(), ReplaceFailure> {
-    if let Some(expected_destination) = expected_destination {
-        let destination =
-            fs::fstatat(dest_dir_fd, dest_name).map_err(|error| ReplaceFailure::NotCommitted {
-                phase: ReplacePhase::DestinationIdentity,
-                source: error,
-            })?;
-        if !expected_destination.matches(&destination) {
-            return Err(ReplaceFailure::DestinationChanged);
-        }
-    }
-    match fs::renameat(src_dir_fd, src_name, dest_dir_fd, dest_name) {
-        Ok(()) => Ok(()),
-        Err(error) if is_not_found_io_kind(error.kind()) => Err(ReplaceFailure::SourceMissing),
-        Err(error) => Err(ReplaceFailure::NotCommitted {
-            phase: ReplacePhase::Rename,
-            source: error,
-        }),
-    }
 }
 
 /// Convert a MoveFailure into the public Error / poison decision.

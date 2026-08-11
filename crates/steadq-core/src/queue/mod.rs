@@ -381,16 +381,7 @@ impl<'a> Batch<'a> {
             pending_acks,
         } = self;
 
-        let sync_result = {
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            {
-                dirty.sync_all_concurrent()
-            }
-            #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-            {
-                dirty.sync_all()
-            }
-        };
+        let sync_result = dirty.sync_all();
 
         if let Err(e) = sync_result {
             queue.poison();
@@ -1713,14 +1704,7 @@ impl Queue {
                 if dirty.is_empty() {
                     return Ok(());
                 }
-                #[cfg(all(target_os = "linux", feature = "io-uring"))]
-                {
-                    dirty.sync_all_concurrent()
-                }
-                #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-                {
-                    dirty.sync_all()
-                }
+                dirty.sync_all()
             };
             if result.is_ok() {
                 self.dirty.borrow_mut().clear();
@@ -1758,39 +1742,6 @@ impl Queue {
     }
 
     /// Write the job envelope to a temp file and publish via rename.
-    #[allow(dead_code)]
-    fn write_and_publish(
-        &mut self,
-        dest_dir_relative: &str,
-        dest_name: &str,
-        header: &FixedHeader,
-        ext_bytes: &[u8],
-        payload: &[u8],
-    ) -> Result<(), PublishError> {
-        if self.deferred_dir_sync {
-            let mut tmp = self.dirty.replace(engine::DirtySet::new());
-            let result = self.write_and_publish_with_dirty(
-                dest_dir_relative,
-                dest_name,
-                header,
-                ext_bytes,
-                payload,
-                Some(&mut tmp),
-            );
-            let prev = self.dirty.replace(tmp);
-            drop(prev);
-            return result;
-        }
-        self.write_and_publish_with_dirty(
-            dest_dir_relative,
-            dest_name,
-            header,
-            ext_bytes,
-            payload,
-            None,
-        )
-    }
-
     fn write_and_publish_with_dirty(
         &mut self,
         dest_dir_relative: &str,
@@ -1870,89 +1821,6 @@ impl Queue {
     }
 
     /// Named temporary file fallback for enqueue.
-    #[allow(dead_code)]
-    fn named_fallback(
-        &self,
-        dest_dir_relative: &str,
-        dest_fd: BorrowedFd<'_>,
-        dest_name: &str,
-        header: &FixedHeader,
-        ext_bytes: &[u8],
-        payload: &[u8],
-    ) -> Result<(), PublishError> {
-        // Ensure tmp/<boot-id>/<shard>/ exists
-        // Extract shard from dest_dir
-        let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
-        let tmp_dir = format!("tmp/{}/{}", self.boot_id, shard_part);
-
-        self.ensure_dir(&tmp_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-
-        let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-
-        // Create temp file name
-        let boottime = fs::clock_boottime_ns()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let random = fs::random_128bit()
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-        let temp_name = temp_filename(boottime, &random);
-
-        let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-
-        // C-10: RAII guard to unlink temp file on early return
-        struct TempGuard<'a, 'fd> {
-            dir_fd: BorrowedFd<'fd>,
-            name: &'a str,
-            armed: bool,
-        }
-        impl Drop for TempGuard<'_, '_> {
-            fn drop(&mut self) {
-                if self.armed {
-                    let _ = fs::unlinkat(self.dir_fd, self.name);
-                }
-            }
-        }
-        let mut temp_guard = TempGuard {
-            dir_fd: tmp_dir_fd.as_fd(),
-            name: &temp_name,
-            armed: true,
-        };
-
-        // Write header
-        let header_bytes = header
-            .encode(ext_bytes)
-            .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
-        fs::write_all(tmp_file.as_fd(), &header_bytes).map_err(PublishError::classify_write)?;
-        fs::write_all(tmp_file.as_fd(), ext_bytes).map_err(PublishError::classify_write)?;
-        fs::write_all(tmp_file.as_fd(), payload).map_err(PublishError::classify_write)?;
-        // C-13: No redundant pwrite - header was written correctly above.
-        // fsync file (before publication: NotCommitted on failure)
-        fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
-
-        let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
-        match engine::move_witnessed_noreplace_io(
-            tmp_dir_fd.as_fd(),
-            &temp_name,
-            dest_fd,
-            dest_name,
-            engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
-            engine::MoveActor::Producer,
-        ) {
-            Ok(()) => {
-                temp_guard.armed = false;
-                Ok(())
-            }
-            Err(failure) => {
-                if failure.is_outcome_unknown() {
-                    temp_guard.armed = false;
-                }
-                Err(PublishError::classify_move(failure))
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn named_fallback_with_dirty(
         &self,
@@ -2588,11 +2456,6 @@ impl Queue {
         self.lease_inner_with_dirty(_max_wait_ns, lease_duration_ns, None)
     }
 
-    #[allow(dead_code)]
-    fn lease_inner(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
-        self.lease_inner_with_dirty(_max_wait_ns, lease_duration_ns, None)
-    }
-
     fn lease_inner_with_dirty(
         &mut self,
         _max_wait_ns: u64,
@@ -2829,7 +2692,7 @@ impl Queue {
                 }
 
                 let move_result = if _dirty.is_some() {
-                    engine::move_witnessed_noreplace_deferred(
+                    let result = engine::move_witnessed_noreplace_deferred(
                         shard_fd.as_fd(),
                         entry,
                         leased_dir_fd.as_fd(),
@@ -2853,30 +2716,13 @@ impl Queue {
                                 .map_err(|error| std::io::Error::other(error.to_string()))?;
                             Ok(())
                         },
-                    )
-                    .map(|(_, ())| {
-                        // Deferred path does not yet have MovedObject size; use dummy.
-                        // The size check below will be skipped for batched leases by
-                        // reconstructing from fstat after commit. For now use 0.
-                        (
-                            engine::MovedObject {
-                                device: claim_source.device,
-                                inode: claim_source.inode,
-                                size: 0,
-                            },
-                            (),
-                        )
-                    })
-                    .map_err(|e| match e {
-                        engine::MoveFailure::SourceMissing => engine::MoveFailure::SourceMissing,
-                        engine::MoveFailure::AlreadyExists => engine::MoveFailure::AlreadyExists,
-                        engine::MoveFailure::NotCommitted { phase, source } => {
-                            engine::MoveFailure::NotCommitted { phase, source }
-                        }
-                        engine::MoveFailure::OutcomeUnknown { phase, source } => {
-                            engine::MoveFailure::OutcomeUnknown { phase, source }
-                        }
-                    })
+                    );
+                    // Record both source and destination directories for durability.
+                    if let Some(d) = _dirty.as_deref_mut() {
+                        let _ = d.record(shard_fd.as_fd());
+                        let _ = d.record(leased_dir_fd.as_fd());
+                    }
+                    result
                 } else {
                     engine::move_witnessed_noreplace_with(
                         shard_fd.as_fd(),
@@ -3118,11 +2964,6 @@ impl Queue {
     /// window between lease delivery and terminal publication. SteadQ/1 has no
     /// public unverified acknowledgment path.
     pub fn ack(&mut self, lease: &LeaseInfo) -> AckOutcome {
-        self.ack_inner_with_dirty(lease, None)
-    }
-
-    #[allow(dead_code)]
-    fn ack_inner(&mut self, lease: &LeaseInfo) -> AckOutcome {
         self.ack_inner_with_dirty(lease, None)
     }
 
@@ -3890,8 +3731,17 @@ impl Queue {
         };
         if matches!(outcome, LeasedMoveOutcome::Committed) {
             if let Some(d) = dirty {
-                let _ = d.record(source.directory_fd.as_fd());
-                let _ = d.record(destination_directory_fd);
+                match d
+                    .record(source.directory_fd.as_fd())
+                    .and_then(|()| d.record(destination_directory_fd))
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        return LeasedMoveOutcome::OutcomeUnknown(
+                            TransitionPhase::DestinationDirectoryDurable,
+                        )
+                    }
+                }
             }
         }
         outcome
@@ -5825,6 +5675,290 @@ mod tests {
             o => panic!("lease failed: {o:?}"),
         };
         assert_eq!(lease.attempt, 1);
+    }
+
+    #[test]
+    fn batch_enqueue_commit_lease_ack_roundtrip() {
+        // Regression test for Bug #1: Batch::lease was broken because the deferred
+        // move path constructed MovedObject { size: 0 }, causing the post-rename
+        // size check to always fail and poison the queue.
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut q = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Enqueue a job in a batch and commit
+        let mut batch = q.batch();
+        let outcome = batch.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: vec![0xABu8; 64],
+            ..Default::default()
+        });
+        let ticket = match outcome {
+            BatchEnqueueOutcome::Pending(t) => t,
+            other => panic!("enqueue should be pending: {other:?}"),
+        };
+        let commit = batch.commit().expect("commit should succeed");
+        assert_eq!(commit.committed_enqueues.len(), 1);
+        assert_eq!(commit.committed_enqueues[0].job_id, ticket.job_id);
+
+        // Lease via batch — this was completely broken before the fix
+        let mut batch2 = q.batch();
+        let lease_outcome = batch2.lease(0, 30_000_000_000);
+        let lease = match lease_outcome {
+            BatchLeaseOutcome::Pending(info) => info,
+            BatchLeaseOutcome::Empty => panic!("should have a job to lease"),
+            BatchLeaseOutcome::NotCommitted(e) => panic!("batch lease failed: {e:?}"),
+        };
+        assert_eq!(lease.attempt, 1);
+
+        // Ack via batch
+        let ack_outcome = batch2.ack(&lease);
+        assert!(matches!(ack_outcome, BatchAckOutcome::Pending));
+
+        let commit2 = batch2.commit().expect("lease+ack commit should succeed");
+        assert_eq!(commit2.committed_leases, 1);
+        assert_eq!(commit2.committed_acks, 1);
+        assert!(commit2.outcome_unknown_leases.is_empty());
+        assert!(commit2.outcome_unknown_acks.is_empty());
+    }
+
+    #[test]
+    fn batch_lease_ack_multiple_jobs() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut q = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Enqueue 4 jobs in a batch
+        let mut batch = q.batch();
+        for _ in 0..4 {
+            batch.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: vec![0xABu8; 64],
+                ..Default::default()
+            });
+        }
+        batch.commit().expect("enqueue commit");
+
+        // Lease and ack all 4 via batch
+        let mut batch2 = q.batch();
+        let mut leased = Vec::new();
+        for _ in 0..4 {
+            match batch2.lease(0, 30_000_000_000) {
+                BatchLeaseOutcome::Pending(info) => leased.push(info),
+                BatchLeaseOutcome::Empty => break,
+                other => panic!("batch lease failed: {other:?}"),
+            }
+        }
+        assert_eq!(leased.len(), 4, "should lease all 4 jobs");
+        for lease in &leased {
+            match batch2.ack(lease) {
+                BatchAckOutcome::Pending => {}
+                other => panic!("batch ack failed: {other:?}"),
+            }
+        }
+        let outcome = batch2.commit().expect("lease+ack commit");
+        assert_eq!(outcome.committed_leases, 4);
+        assert_eq!(outcome.committed_acks, 4);
+    }
+
+    #[test]
+    fn dirtyset_record_deduplicates_and_sync_all_fsyncs() {
+        // Tests DirtySet::record deduplicates by (dev, inode) and
+        // sync_all actually calls fsync_dir_fd.
+        use crate::queue::engine::DirtySet;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ready/0000")).unwrap();
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        let ready_fd = fs::open_directory(root.as_fd(), "ready").unwrap();
+        let shard_fd = fs::open_directory(ready_fd.as_fd(), "0000").unwrap();
+
+        let mut dirty = DirtySet::new();
+        assert!(dirty.is_empty());
+        assert_eq!(dirty.len(), 0);
+
+        // Record the same directory twice — should deduplicate
+        dirty.record(shard_fd.as_fd()).unwrap();
+        dirty.record(shard_fd.as_fd()).unwrap();
+        assert_eq!(dirty.len(), 1);
+
+        // Record a different directory
+        dirty.record(ready_fd.as_fd()).unwrap();
+        assert_eq!(dirty.len(), 2);
+
+        // sync_all must actually fsync (not no-op)
+        assert!(dirty.sync_all().is_ok());
+
+        // clear works
+        dirty.clear();
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn dirtyset_extend_merges_without_overwriting() {
+        use crate::queue::engine::DirtySet;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        let a_fd = fs::open_directory(root.as_fd(), "a").unwrap();
+        let b_fd = fs::open_directory(root.as_fd(), "b").unwrap();
+
+        let mut d1 = DirtySet::new();
+        d1.record(a_fd.as_fd()).unwrap();
+        assert_eq!(d1.len(), 1);
+
+        let mut d2 = DirtySet::new();
+        d2.record(a_fd.as_fd()).unwrap();
+        d2.record(b_fd.as_fd()).unwrap();
+
+        d1.extend(d2);
+        // a was already in d1, so only b is added
+        assert_eq!(d1.len(), 2);
+        assert!(d1.sync_all().is_ok());
+    }
+
+    #[test]
+    fn dirtyset_sync_all_propagates_fsync_error() {
+        // Kills DirtySet::sync_all -> Ok(()) mutant: if sync_all is a no-op,
+        // it won't call fsync_dir_fd and won't return the injected error.
+        use crate::queue::engine::DirtySet;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ready/0000")).unwrap();
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        let ready_fd = fs::open_directory(root.as_fd(), "ready").unwrap();
+        let shard_fd = fs::open_directory(ready_fd.as_fd(), "0000").unwrap();
+
+        let mut dirty = DirtySet::new();
+        dirty.record(shard_fd.as_fd()).unwrap();
+        assert!(!dirty.is_empty());
+
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+        let result = dirty.sync_all();
+        fs::fault::reset();
+
+        assert!(
+            result.is_err(),
+            "sync_all must propagate fsync_dir_fd error"
+        );
+    }
+
+    #[test]
+    fn deferred_sync_via_queue_sync_actually_fsyncs() {
+        // Kills DirtySet::is_empty -> true mutant: if is_empty always returns true,
+        // Queue::sync() will skip the actual fsync and not trigger the injected error.
+        let (_tmp, mut queue) = {
+            let tmp = TempDir::new().unwrap();
+            Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+            let queue = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    deferred_dir_sync: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (tmp, queue)
+        };
+
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"deferred".to_vec(),
+            ..Default::default()
+        });
+
+        // Inject fault on fsync_dir_fd — sync() must hit it
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+        let result = queue.sync();
+        fs::fault::reset();
+
+        assert!(result.is_err(), "sync() must call fsync_dir_fd when dirty");
+    }
+
+    #[test]
+    fn batch_enqueue_deferred_publish_classifies_link_errors() {
+        // Exercises publish_tmpfile_noreplace_deferred error paths through batch enqueue.
+        for errno in [libc::EEXIST, libc::ENOSPC, libc::EIO] {
+            let (_tmp, mut queue) = create_test_queue();
+            if !tmpfile_supported(&queue) {
+                return;
+            }
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            fs::fault::inject("linkat_proc_self_fd", u64::MAX);
+            fs::fault::inject_errno("linkat_empty_path", 1, errno);
+
+            let mut batch = queue.batch();
+            let outcome = batch.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"deferred publish failure".to_vec(),
+                ..Default::default()
+            });
+            fs::fault::reset();
+
+            // Batch enqueue should report NotCommitted (not Pending) on failure
+            match outcome {
+                BatchEnqueueOutcome::NotCommitted(_, _) => {}
+                other => panic!("expected NotCommitted for errno {errno}, got {other:?}"),
+            }
+            assert!(!queue.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn batch_lease_deferred_move_classifies_rename_errors() {
+        // Exercises move_noreplace_deferred error paths through batch lease.
+        // Each variant re-enqueues a fresh job since a failed lease consumes it.
+        for (errno, expect_label) in [
+            (libc::EIO, "not_committed"),
+            (libc::EEXIST, "not_committed"),
+            (libc::ENOENT, "empty_or_not_committed"),
+        ] {
+            let (_tmp, mut queue) = create_test_queue();
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: b"batch lease fault".to_vec(),
+                ..Default::default()
+            });
+
+            fs::fault::reset();
+            fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+
+            let mut batch = queue.batch();
+            let outcome = batch.lease(0, 30_000_000_000);
+            fs::fault::reset();
+
+            match (&outcome, expect_label) {
+                (BatchLeaseOutcome::NotCommitted(_), "not_committed") => {}
+                (BatchLeaseOutcome::Empty, "empty_or_not_committed") => {}
+                (BatchLeaseOutcome::NotCommitted(_), "empty_or_not_committed") => {}
+                other => panic!("unexpected for errno {errno}: {other:?}"),
+            }
+        }
     }
 
     #[test]
