@@ -531,26 +531,19 @@ enum PresenceFailure {
     Io,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaimSourceIdentity {
-    Match,
-    Mismatch,
-}
-
-fn classify_claim_source_identity(
-    stat: &libc::stat,
-    witness: &ClaimSourceWitness,
-) -> ClaimSourceIdentity {
-    if resolved_identity_matches(
-        stat.st_mode,
-        stat.st_dev,
-        stat.st_ino,
-        witness.device,
-        witness.inode,
-    ) {
-        ClaimSourceIdentity::Match
-    } else {
-        ClaimSourceIdentity::Mismatch
+fn observe_witness_path(
+    directory_fd: BorrowedFd<'_>,
+    name: &str,
+    device: u64,
+    inode: u64,
+) -> Result<WitnessPathObservation, Error> {
+    match fs::fstatat(directory_fd, name) {
+        Ok(stat) if stat_matches_witness(&stat, device, inode) => Ok(WitnessPathObservation::Match),
+        Ok(_) => Ok(WitnessPathObservation::Mismatch),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            Ok(WitnessPathObservation::Gone)
+        }
+        Err(error) => Err(Error::IoFailure(error.to_string())),
     }
 }
 
@@ -2793,7 +2786,8 @@ impl Queue {
                     &parsed.common.job_id,
                     parsed.common.maximum_attempts,
                 ) {
-                    Ok(source) => source,
+                    Ok(Some(source)) => source,
+                    Ok(None) => continue,
                     Err(Error::IoFailure(_)) => {
                         scan_had_error = true;
                         continue;
@@ -2811,18 +2805,21 @@ impl Queue {
                     Err(error) => return LeaseOutcome::NotCommitted(error),
                 };
 
-                match fs::fstatat(shard_fd.as_fd(), entry) {
-                    Ok(stat) => match classify_claim_source_identity(&stat, &claim_source) {
-                        ClaimSourceIdentity::Match => {}
-                        ClaimSourceIdentity::Mismatch => {
-                            return LeaseOutcome::NotCommitted(Error::QueueCorrupt(
-                                "ready source identity changed before claim".into(),
-                            ));
-                        }
-                    },
-                    Err(error) => {
+                match observe_witness_path(
+                    shard_fd.as_fd(),
+                    entry,
+                    claim_source.device,
+                    claim_source.inode,
+                ) {
+                    Ok(WitnessPathObservation::Match) => {}
+                    Ok(WitnessPathObservation::Gone) => continue,
+                    Ok(WitnessPathObservation::Mismatch) => {
+                        return LeaseOutcome::NotCommitted(Error::QueueCorrupt(
+                            "ready source identity changed before claim".into(),
+                        ));
+                    }
+                    Err(_) => {
                         scan_had_error = true;
-                        let _ = error;
                         continue;
                     }
                 }
@@ -3795,16 +3792,12 @@ impl Queue {
     fn observe_leased_source_path(
         source: &LeasedSourceWitness,
     ) -> Result<WitnessPathObservation, Error> {
-        match fs::fstatat(source.directory_fd.as_fd(), &source.name) {
-            Ok(stat) if stat_matches_witness(&stat, source.device, source.inode) => {
-                Ok(WitnessPathObservation::Match)
-            }
-            Ok(_) => Ok(WitnessPathObservation::Mismatch),
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                Ok(WitnessPathObservation::Gone)
-            }
-            Err(error) => Err(Error::IoFailure(error.to_string())),
-        }
+        observe_witness_path(
+            source.directory_fd.as_fd(),
+            &source.name,
+            source.device,
+            source.inode,
+        )
     }
 
     fn execute_leased_move(
@@ -3992,9 +3985,12 @@ impl Queue {
         name: &str,
         expected_job_id: &[u8; 16],
         expected_maximum_attempts: u32,
-    ) -> Result<ClaimSourceWitness, Error> {
-        let file = fs::openat(directory_fd, name, resolver_file_open_flags(), 0)
-            .map_err(|error| Error::IoFailure(error.to_string()))?;
+    ) -> Result<Option<ClaimSourceWitness>, Error> {
+        let file = match fs::openat(directory_fd, name, resolver_file_open_flags(), 0) {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(error) => return Err(Error::IoFailure(error.to_string())),
+        };
         let stat = fs::fstat(file.as_fd()).map_err(|error| Error::IoFailure(error.to_string()))?;
         if !is_singly_linked_regular(stat.st_mode, stat.st_nlink) {
             return Err(Error::QueueCorrupt(
@@ -4006,12 +4002,12 @@ impl Queue {
             expected_job_id,
             expected_maximum_attempts,
         )?;
-        Ok(ClaimSourceWitness {
+        Ok(Some(ClaimSourceWitness {
             file_fd: file,
             device: stat.st_dev as u64,
             inode: stat.st_ino as u64,
             evidence,
-        })
+        }))
     }
 
     fn read_claim_ticket_evidence(
@@ -6798,8 +6794,9 @@ mod tests {
         let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
         let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
 
-        let witness =
-            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3).unwrap();
+        let witness = Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3)
+            .unwrap()
+            .unwrap();
         assert_eq!(witness.evidence.envelope_digest, enqueue.envelope_digest);
         assert_eq!(witness.evidence.payload_length, 15);
 
@@ -6816,7 +6813,39 @@ mod tests {
     }
 
     #[test]
-    fn claim_source_witness_detects_path_replacement() {
+    fn missing_claim_source_before_open_is_a_scan_miss() {
+        let (tmp, mut queue) = create_test_queue();
+        let enqueue = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".to_string(),
+            payload: b"missing before open".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("expected committed enqueue, got {outcome:?}"),
+        };
+        let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
+        let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("openat", 1, libc::EIO);
+        assert!(matches!(
+            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3),
+            Err(Error::IoFailure(_))
+        ));
+        fs::fault::reset();
+
+        std::fs::remove_file(tmp.path().join(&enqueue.expected_relative_path)).unwrap();
+
+        assert!(
+            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claim_source_witness_classifies_disappearance_and_replacement() {
         let (tmp, mut queue) = create_test_queue();
         let enqueue = match queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
@@ -6829,23 +6858,31 @@ mod tests {
         };
         let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
         let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
-        let witness =
-            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3).unwrap();
+        let witness = Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3)
+            .unwrap()
+            .unwrap();
         let source = tmp.path().join(&enqueue.expected_relative_path);
         let displaced = tmp.path().join("tmp/displaced-ready.sqj");
         std::fs::rename(&source, &displaced).unwrap();
-        std::fs::copy(&displaced, &source).unwrap();
-        let replacement = fs::fstatat(directory_fd.as_fd(), name).unwrap();
 
         assert_eq!(
-            classify_claim_source_identity(&replacement, &witness),
-            ClaimSourceIdentity::Mismatch
+            observe_witness_path(directory_fd.as_fd(), name, witness.device, witness.inode,)
+                .unwrap(),
+            WitnessPathObservation::Gone
+        );
+
+        std::fs::copy(&displaced, &source).unwrap();
+        assert_eq!(
+            observe_witness_path(directory_fd.as_fd(), name, witness.device, witness.inode,)
+                .unwrap(),
+            WitnessPathObservation::Mismatch
         );
         let original = fs::fstat(witness.file_fd.as_fd()).unwrap();
-        assert_eq!(
-            classify_claim_source_identity(&original, &witness),
-            ClaimSourceIdentity::Match
-        );
+        assert!(stat_matches_witness(
+            &original,
+            witness.device,
+            witness.inode
+        ));
     }
 
     #[test]
@@ -7002,8 +7039,9 @@ mod tests {
         };
         let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
         let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
-        let witness =
-            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3).unwrap();
+        let witness = Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3)
+            .unwrap()
+            .unwrap();
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(tmp.path().join(enqueue.expected_relative_path))
@@ -7470,6 +7508,11 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use std::thread;
+        use std::time::{Duration, Instant};
+
+        const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+        const RETRY_BACKOFF: Duration = Duration::from_micros(50);
+        const LEASE_WAIT_NS: u64 = 10_000_000;
 
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -7496,6 +7539,7 @@ mod tests {
                 )
                 .unwrap();
                 let mut queue = queue;
+                let deadline = Instant::now() + TEST_TIMEOUT;
                 for _ in 0..jobs_per_producer {
                     let payload =
                         format!("payload-{}", steadq_fs_linux::random_128bit().unwrap()[0]);
@@ -7505,14 +7549,15 @@ mod tests {
                         payload: payload.into_bytes(),
                         ..Default::default()
                     };
-                    let mut attempts = 0;
                     loop {
-                        attempts += 1;
-                        assert!(attempts <= 1_000, "enqueue remained contended");
                         match queue.enqueue(input.clone()) {
                             EnqueueOutcome::Committed(_) => break,
                             EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy) => {
-                                std::thread::yield_now();
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "enqueue remained contended until the test deadline"
+                                );
+                                thread::sleep(RETRY_BACKOFF);
                             }
                             outcome => panic!("concurrent enqueue failed: {outcome:?}"),
                         }
@@ -7541,25 +7586,22 @@ mod tests {
                 )
                 .unwrap();
                 let mut queue = queue;
-                let mut attempts = 0;
+                let deadline = Instant::now() + TEST_TIMEOUT;
                 loop {
-                    attempts += 1;
-                    if attempts > total_jobs * 32 + 1_000 {
+                    if Instant::now() >= deadline {
                         panic!(
-                            "concurrent test hung: attempts {attempts} exceeded bound, leased {} acked {}",
+                            "concurrent test exceeded its deadline: leased {} acked {}",
                             lc.load(Ordering::SeqCst),
                             ac.load(Ordering::SeqCst)
                         );
                     }
-                    match queue.lease(0, 30_000_000_000) {
+                    match queue.lease(LEASE_WAIT_NS, 30_000_000_000) {
                         LeaseOutcome::Leased(lease) => {
                             lc.fetch_add(1, Ordering::SeqCst);
-                            let mut ack_attempts = 0;
                             loop {
-                                ack_attempts += 1;
                                 assert!(
-                                    ack_attempts <= 1_000,
-                                    "ack remained contended after {ack_attempts} attempts; leased {} acked {}",
+                                    Instant::now() < deadline,
+                                    "ack remained contended until the test deadline; leased {} acked {}",
                                     lc.load(Ordering::SeqCst),
                                     ac.load(Ordering::SeqCst)
                                 );
@@ -7569,7 +7611,7 @@ mod tests {
                                         break;
                                     }
                                     AckOutcome::NotCommitted(Error::MaintenanceBusy) => {
-                                        std::thread::yield_now();
+                                        thread::sleep(RETRY_BACKOFF);
                                     }
                                     outcome => panic!("concurrent ack failed: {outcome:?}"),
                                 }
@@ -7579,9 +7621,9 @@ mod tests {
                             if ac.load(Ordering::SeqCst) == total_jobs {
                                 break;
                             }
-                            std::thread::yield_now();
                         }
-                        _ => {}
+                        LeaseOutcome::NotCommitted(Error::MaintenanceBusy) => {}
+                        outcome => panic!("concurrent lease failed: {outcome:?}"),
                     }
                 }
             });
