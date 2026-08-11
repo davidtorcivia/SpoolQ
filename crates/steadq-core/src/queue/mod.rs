@@ -6826,6 +6826,15 @@ mod tests {
         };
         let (directory, name) = enqueue.expected_relative_path.rsplit_once('/').unwrap();
         let directory_fd = open_relative(queue.root_fd().as_fd(), directory).unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("openat", 1, libc::EIO);
+        assert!(matches!(
+            Queue::open_claim_source(directory_fd.as_fd(), name, &enqueue.job_id, 3),
+            Err(Error::IoFailure(_))
+        ));
+        fs::fault::reset();
+
         std::fs::remove_file(tmp.path().join(&enqueue.expected_relative_path)).unwrap();
 
         assert!(
