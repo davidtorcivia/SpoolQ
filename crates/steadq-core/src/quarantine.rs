@@ -1817,6 +1817,42 @@ mod tests {
     }
 
     #[test]
+    fn fsck_shard_extraction_requires_each_exact_path_shape() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let queue = open_test_queue(tmp.path());
+
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("ready", &["ready", "0001", "job.sqj"], Some("0001")),
+            ("ready", &["ready", "0001"], None),
+            ("ready", &["ready", "0001", "job.sqj", "extra"], None),
+            (
+                "leased",
+                &["leased", "boot", "bucket", "0002", "job.sqj"],
+                Some("0002"),
+            ),
+            ("leased", &["leased", "boot", "bucket", "0002"], None),
+            (
+                "delayed",
+                &["delayed", "bucket", "0003", "job.sqj"],
+                Some("0003"),
+            ),
+            ("delayed", &["delayed", "bucket", "0003"], None),
+            ("dead", &["dead", "bucket", "0004", "job.sqj"], Some("0004")),
+            (
+                "receipts",
+                &["receipts", "bucket", "0005", "job.rct"],
+                Some("0005"),
+            ),
+            ("unknown", &["unknown", "bucket", "0006", "job"], None),
+        ];
+
+        for (state, parts, expected) in cases {
+            assert_eq!(queue.fsck_extract_shard_hex(state, parts), *expected);
+        }
+    }
+
+    #[test]
     fn fsck_finds_valid_job() {
         let tmp = TempDir::new().unwrap();
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
