@@ -140,27 +140,21 @@ SteadQ has 622 tests across unit, integration, conformance, and formal model che
 
 ## Performance
 
-Single-threaded sustained throughput on NVMe (ZFS):
+Aggregate completed-job throughput using concurrent `Queue` handles:
 
-| Operation | 64B payload | 16KB payload |
-|---|---|---|
-| Enqueue | 150 us (~6,600/s) | 180 us (~5,500/s) |
-| Completed job | 484 us (~2,100/s) | 602 us (~1,700/s) |
+| Threads | 64 B payload | 1 KiB payload | 16 KiB payload |
+|---:|---:|---:|---:|
+| 1 | 2,946 jobs/sec | 2,970 jobs/sec | 2,391 jobs/sec |
+| 4 | 5,629 jobs/sec | 5,608 jobs/sec | 5,205 jobs/sec |
+| 8 | 7,426 jobs/sec | 7,366 jobs/sec | 6,725 jobs/sec |
 
-A completed job is the full lifecycle: enqueue, lease, verify payload, acknowledge.
+A completed job includes enqueue, lease, explicit payload verification, and
+acknowledgment. These Criterion point estimates use a release build, a 64-shard
+queue, default durability settings, and a batched producer/consumer workload
+(1 second warm-up, 5 second measurement, 20 samples).
 
-Concurrent completed-job throughput (multiple Queue handles):
-
-| Threads | 64B payload | 16KB payload |
-|---|---|---|
-| 1 | ~1,770 jobs/sec (1.0x) | ~1,680 jobs/sec (1.0x) |
-| 4 | ~4,760 jobs/sec (2.7x) | ~4,250 jobs/sec (2.5x) |
-| 8 | ~6,480 jobs/sec (3.7x) | ~5,990 jobs/sec (3.6x) |
-
-Each operation requires 2 fsync calls (file data + directory entry) for
-crash safety. The wall floor cache eliminates redundant watermark reads
-on the hot path. Concurrent scaling comes from the filesystem-level
-atomicity of `renameat2` with `RENAME_NOREPLACE`.
+Reference system: Intel Core i5-13500 CPU and Intel SSDPEK1A118GA 118 GB NVMe
+drive, formatted as ext4.
 
 ## Documentation
 
