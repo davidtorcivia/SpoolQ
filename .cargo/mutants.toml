@@ -53,13 +53,6 @@ exclude_re = [
     # Fsck directory scanner total_objects counter is exercised
     # by existing fsck_finds_valid_* tests outside diff scope.
     "fsck_state_dir",
-    # Deferred variants are near-copies of well-tested non-deferred functions.
-    # The rename/link/stat error classification logic is identical - only the
-    # final fsync_dir_fd calls are deferred. Non-deferred versions have full
-    # fault-injection coverage. Expiry: when deferred and non-deferred paths
-    # are unified to share code.
-    "move_noreplace_deferred",
-    "publish_tmpfile_noreplace_deferred",
     # Pre-existing: prepare_enqueue payload boundary > vs >= mutant.
     # No test enqueues a payload of exactly max_payload_length.
     "Queue::prepare_enqueue",

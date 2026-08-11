@@ -52,6 +52,9 @@ pub enum OperationResult {
 #[derive(Debug, Clone)]
 pub enum EnqueueOutcome {
     Committed(EnqueueTicket),
+    /// The job was published, but deferred directory barriers must complete
+    /// through `Queue::sync()` before it satisfies the `Committed` contract.
+    Deferred(EnqueueTicket),
     NotCommitted(EnqueueTicket, Error),
     OutcomeUnknown(EnqueueTicket, Error),
 }

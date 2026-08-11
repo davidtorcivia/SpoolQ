@@ -48,6 +48,15 @@ match queue.lease(0, 30_000_000_000) {
 }
 ```
 
+`lease(max_wait_ns, lease_duration_ns)` scans once when `max_wait_ns` is zero. A
+positive wait retries empty scans and transient watermark-lock contention with
+bounded backoff until the monotonic deadline.
+
+Deferred directory sync is opt-in through `OpenOptions::deferred_dir_sync`.
+Enqueue returns `EnqueueOutcome::Deferred(ticket)`, not `Committed`; a successful
+`queue.sync()` then establishes durability for pending tickets. Strict mode
+remains the default.
+
 ### Streaming Enqueue
 
 For payloads that should not be buffered in memory:

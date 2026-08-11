@@ -242,6 +242,13 @@ pub extern "C" fn steadq_enqueue(
                 }
                 STEADQ_OK
             }
+            EnqueueOutcome::Deferred(ticket) => {
+                if !job_id_out.is_null() {
+                    unsafe { (*job_id_out).bytes = ticket.job_id };
+                }
+                set_last_error("enqueue directory durability is deferred");
+                STEADQ_INDETERMINATE
+            }
             EnqueueOutcome::NotCommitted(_, e) => {
                 let code = error_to_code(&e);
                 set_last_error(&leak_error(e));
