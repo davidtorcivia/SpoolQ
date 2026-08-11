@@ -5,7 +5,7 @@ use steadq_core::{
 };
 use tempfile::TempDir;
 
-const MAX_CONTENTION_RETRIES: usize = 10_000;
+const MAX_CONTENTION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn benchmark_tempdir() -> TempDir {
     match std::env::var_os("STEADQ_BENCH_ROOT") {
@@ -15,7 +15,8 @@ fn benchmark_tempdir() -> TempDir {
 }
 
 fn enqueue_one(queue: &mut Queue, payload: &[u8]) {
-    for _ in 0..MAX_CONTENTION_RETRIES {
+    let started = std::time::Instant::now();
+    loop {
         match queue.enqueue(EnqueueInput {
             maximum_attempts: 3,
             content_type: "x".to_string(),
@@ -24,36 +25,45 @@ fn enqueue_one(queue: &mut Queue, payload: &[u8]) {
         }) {
             EnqueueOutcome::Committed(_) => return,
             EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy) => {
-                std::thread::yield_now();
+                pause_for_contention(started, "enqueue");
             }
             outcome => panic!("enqueue failed: {outcome:?}"),
         }
     }
-    panic!("enqueue remained contended after {MAX_CONTENTION_RETRIES} attempts");
 }
 
 fn lease_one(queue: &mut Queue) -> LeaseInfo {
-    for _ in 0..MAX_CONTENTION_RETRIES {
+    let started = std::time::Instant::now();
+    loop {
         match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(lease) => return lease,
             LeaseOutcome::Empty | LeaseOutcome::NotCommitted(Error::MaintenanceBusy) => {
-                std::thread::yield_now();
+                pause_for_contention(started, "lease");
             }
             outcome => panic!("lease failed: {outcome:?}"),
         }
     }
-    panic!("lease remained contended after {MAX_CONTENTION_RETRIES} attempts");
 }
 
 fn ack_one(queue: &mut Queue, lease: &LeaseInfo) {
-    for _ in 0..MAX_CONTENTION_RETRIES {
+    let started = std::time::Instant::now();
+    loop {
         match queue.ack(lease) {
             AckOutcome::Acked => return,
-            AckOutcome::NotCommitted(Error::MaintenanceBusy) => std::thread::yield_now(),
+            AckOutcome::NotCommitted(Error::MaintenanceBusy) => {
+                pause_for_contention(started, "ack")
+            }
             outcome => panic!("ack failed: {outcome:?}"),
         }
     }
-    panic!("ack remained contended after {MAX_CONTENTION_RETRIES} attempts");
+}
+
+fn pause_for_contention(started: std::time::Instant, operation: &str) {
+    assert!(
+        started.elapsed() < MAX_CONTENTION_WAIT,
+        "{operation} remained contended for {MAX_CONTENTION_WAIT:?}"
+    );
+    std::thread::yield_now();
 }
 
 fn bench_enqueue(c: &mut Criterion) {
