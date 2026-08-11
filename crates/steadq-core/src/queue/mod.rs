@@ -729,7 +729,18 @@ fn watermark_path_matches_opened(
     opened: &libc::stat,
     current: &libc::stat,
 ) -> Result<bool, WatermarkReadError> {
-    if current.st_mode & libc::S_IFMT != libc::S_IFREG || current.st_nlink != 1 {
+    if current.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(WatermarkReadError::Corrupt(
+            "watermark is not a regular file".into(),
+        ));
+    }
+    // A concurrent replacing rename can unlink the inode after pathname
+    // resolution but before fstatat copies its attributes. Like an opened old
+    // inode, that is a stale snapshot to retry rather than on-disk corruption.
+    if current.st_nlink == 0 {
+        return Ok(false);
+    }
+    if current.st_nlink != 1 {
         return Err(WatermarkReadError::Corrupt(
             "watermark is not a singly-linked regular file".into(),
         ));
@@ -9224,7 +9235,7 @@ mod tests {
     }
 
     #[test]
-    fn watermark_path_authentication_rejects_each_invalid_property() {
+    fn watermark_path_authentication_classifies_replacement_and_invalid_properties() {
         let (_tmp, queue) = create_test_queue();
         let control = fs::open_directory(queue.root_fd(), "control").unwrap();
         let opened =
@@ -9237,6 +9248,10 @@ mod tests {
             watermark_path_matches_opened(&valid, &non_regular),
             Err(WatermarkReadError::Corrupt(_))
         ));
+
+        let mut unlinked = valid;
+        unlinked.st_nlink = 0;
+        assert!(!watermark_path_matches_opened(&valid, &unlinked).unwrap());
 
         let mut multiply_linked = valid;
         multiply_linked.st_nlink = 2;
