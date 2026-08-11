@@ -1,6 +1,60 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use steadq_core::{CreateOptions, EnqueueInput, EnqueueOutcome, LeaseOutcome, OpenOptions, Queue};
+use steadq_core::{
+    AckOutcome, CreateOptions, EnqueueInput, EnqueueOutcome, Error, LeaseInfo, LeaseOutcome,
+    OpenOptions, Queue,
+};
 use tempfile::TempDir;
+
+const MAX_CONTENTION_RETRIES: usize = 10_000;
+
+fn benchmark_tempdir() -> TempDir {
+    match std::env::var_os("STEADQ_BENCH_ROOT") {
+        Some(root) => TempDir::new_in(root).unwrap(),
+        None => TempDir::new().unwrap(),
+    }
+}
+
+fn enqueue_one(queue: &mut Queue, payload: &[u8]) {
+    for _ in 0..MAX_CONTENTION_RETRIES {
+        match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: payload.to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(_) => return,
+            EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy) => {
+                std::thread::yield_now();
+            }
+            outcome => panic!("enqueue failed: {outcome:?}"),
+        }
+    }
+    panic!("enqueue remained contended after {MAX_CONTENTION_RETRIES} attempts");
+}
+
+fn lease_one(queue: &mut Queue) -> LeaseInfo {
+    for _ in 0..MAX_CONTENTION_RETRIES {
+        match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => return lease,
+            LeaseOutcome::Empty | LeaseOutcome::NotCommitted(Error::MaintenanceBusy) => {
+                std::thread::yield_now();
+            }
+            outcome => panic!("lease failed: {outcome:?}"),
+        }
+    }
+    panic!("lease remained contended after {MAX_CONTENTION_RETRIES} attempts");
+}
+
+fn ack_one(queue: &mut Queue, lease: &LeaseInfo) {
+    for _ in 0..MAX_CONTENTION_RETRIES {
+        match queue.ack(lease) {
+            AckOutcome::Acked => return,
+            AckOutcome::NotCommitted(Error::MaintenanceBusy) => std::thread::yield_now(),
+            outcome => panic!("ack failed: {outcome:?}"),
+        }
+    }
+    panic!("ack remained contended after {MAX_CONTENTION_RETRIES} attempts");
+}
 
 fn bench_enqueue(c: &mut Criterion) {
     let mut group = c.benchmark_group("enqueue");
@@ -12,7 +66,7 @@ fn bench_enqueue(c: &mut Criterion) {
             |b, &size| {
                 b.iter_batched(
                     || {
-                        let tmp = TempDir::new().unwrap();
+                        let tmp = benchmark_tempdir();
                         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                         let q = Queue::open(
                             tmp.path(),
@@ -52,7 +106,7 @@ fn bench_lease_empty(c: &mut Criterion) {
             |b, &sc| {
                 b.iter_batched(
                     || {
-                        let tmp = TempDir::new().unwrap();
+                        let tmp = benchmark_tempdir();
                         Queue::init(
                             tmp.path(),
                             &CreateOptions {
@@ -90,7 +144,7 @@ fn bench_lease_hit(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n_jobs), n_jobs, |b, &n| {
             b.iter_batched(
                 || {
-                    let tmp = TempDir::new().unwrap();
+                    let tmp = benchmark_tempdir();
                     Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                     let mut q = Queue::open(
                         tmp.path(),
@@ -125,7 +179,7 @@ fn bench_ack(c: &mut Criterion) {
     c.bench_function("ack", |b| {
         b.iter_batched(
             || {
-                let tmp = TempDir::new().unwrap();
+                let tmp = benchmark_tempdir();
                 Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                 let mut q = Queue::open(
                     tmp.path(),
@@ -165,7 +219,7 @@ fn bench_sustained_enqueue(c: &mut Criterion) {
             BenchmarkId::from_parameter(payload_size),
             payload_size,
             |b, &size| {
-                let tmp = TempDir::new().unwrap();
+                let tmp = benchmark_tempdir();
                 Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                 let mut q = Queue::open(
                     tmp.path(),
@@ -194,7 +248,7 @@ fn bench_sustained_enqueue(c: &mut Criterion) {
 
 fn bench_sustained_ack(c: &mut Criterion) {
     c.bench_function("sustained_ack", |b| {
-        let tmp = TempDir::new().unwrap();
+        let tmp = benchmark_tempdir();
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
         let mut q = Queue::open(
             tmp.path(),
@@ -229,7 +283,7 @@ fn bench_sustained_completed(c: &mut Criterion) {
             BenchmarkId::from_parameter(payload_size),
             payload_size,
             |b, &size| {
-                let tmp = TempDir::new().unwrap();
+                let tmp = benchmark_tempdir();
                 Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                 let mut q = Queue::open(
                     tmp.path(),
@@ -241,21 +295,10 @@ fn bench_sustained_completed(c: &mut Criterion) {
                 .unwrap();
                 let payload = vec![0xABu8; size];
                 b.iter(|| {
-                    // Enqueue
-                    q.enqueue(EnqueueInput {
-                        maximum_attempts: 3,
-                        content_type: "x".to_string(),
-                        payload: payload.clone(),
-                        ..Default::default()
-                    });
-                    // Lease
-                    let lease = match q.lease(0, 30_000_000_000) {
-                        LeaseOutcome::Leased(l) => l,
-                        _ => panic!("lease failed in completed benchmark"),
-                    };
-                    // Verify + Ack (full payload verification)
+                    enqueue_one(&mut q, &payload);
+                    let lease = lease_one(&mut q);
                     q.verify_lease_payload(&lease).unwrap();
-                    q.ack(&lease);
+                    ack_one(&mut q, &lease);
                 });
             },
         );
@@ -264,28 +307,31 @@ fn bench_sustained_completed(c: &mut Criterion) {
 }
 
 fn bench_concurrent_completed(c: &mut Criterion) {
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     let mut group = c.benchmark_group("concurrent_completed");
-    for &payload_size in &[64usize, 16384] {
+    for &payload_size in &[64usize, 1024, 16384] {
         for &n_threads in &[1u32, 4, 8] {
-            group.throughput(criterion::Throughput::Elements(1));
+            group.throughput(criterion::Throughput::Elements(u64::from(n_threads)));
             let label = format!("{payload_size}B_{n_threads}t");
             group.bench_with_input(
                 BenchmarkId::from_parameter(label),
                 &(payload_size, n_threads),
                 |b, &(size, n)| {
+                    let tmp = benchmark_tempdir();
+                    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                    let path = tmp.path().to_path_buf();
                     b.iter_custom(|iters| {
-                        let tmp = TempDir::new().unwrap();
-                        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
-                        let path = tmp.path().to_path_buf();
+                        let publish_barrier = Arc::new(Barrier::new(n as usize));
                         let start = std::time::Instant::now();
 
                         let handles: Vec<_> = (0..n)
                             .map(|_| {
                                 let p = path.clone();
+                                let publish_barrier = Arc::clone(&publish_barrier);
                                 thread::spawn(move || {
-                                    let queue = Queue::open(
+                                    let mut queue = Queue::open(
                                         &p,
                                         &OpenOptions {
                                             allow_unsupported_fs: true,
@@ -293,31 +339,23 @@ fn bench_concurrent_completed(c: &mut Criterion) {
                                         },
                                     )
                                     .unwrap();
-                                    let mut queue = queue;
                                     let payload = vec![0xABu8; size];
                                     for _ in 0..iters {
-                                        queue.enqueue(EnqueueInput {
-                                            maximum_attempts: 3,
-                                            content_type: "x".to_string(),
-                                            payload: payload.clone(),
-                                            ..Default::default()
-                                        });
-                                        if let LeaseOutcome::Leased(lease) =
-                                            queue.lease(0, 30_000_000_000)
-                                        {
-                                            let _ = queue.verify_lease_payload(&lease);
-                                            let _ = queue.ack(&lease);
-                                        }
+                                        enqueue_one(&mut queue, &payload);
                                     }
+                                    publish_barrier.wait();
+                                    for _ in 0..iters {
+                                        let lease = lease_one(&mut queue);
+                                        queue.verify_lease_payload(&lease).unwrap();
+                                        ack_one(&mut queue, &lease);
+                                    }
+                                    iters
                                 })
                             })
                             .collect();
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                        let elapsed = start.elapsed();
-                        drop(tmp);
-                        elapsed
+                        let completed: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                        assert_eq!(completed, u64::from(n) * iters);
+                        start.elapsed()
                     });
                 },
             );
@@ -334,7 +372,7 @@ fn bench_deferred_completed(c: &mut Criterion) {
             BenchmarkId::from_parameter(payload_size),
             &payload_size,
             |b, &size| {
-                let tmp = TempDir::new().unwrap();
+                let tmp = benchmark_tempdir();
                 Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                 let mut q = Queue::open(
                     tmp.path(),
@@ -375,7 +413,7 @@ fn bench_batch_deferred(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             &batch_size,
             |b, &n| {
-                let tmp = TempDir::new().unwrap();
+                let tmp = benchmark_tempdir();
                 Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                 let mut q = Queue::open(
                     tmp.path(),
@@ -432,7 +470,7 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
             n_threads,
             |b, &n| {
                 b.iter_custom(|iters| {
-                    let tmp = TempDir::new().unwrap();
+                    let tmp = benchmark_tempdir();
                     Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                     let path = tmp.path().to_path_buf();
                     let total = Arc::new(AtomicUsize::new(0));
