@@ -48,12 +48,23 @@ impl DirtySet {
 
     /// Record a directory that needs fsync. Deduplicates by device and inode.
     pub fn record(&mut self, fd: BorrowedFd) -> io::Result<()> {
+        self.record_with(fd, |fd| {
+            fd.try_clone_to_owned()
+                .map_err(|error| io::Error::other(error.to_string()))
+        })
+    }
+
+    pub(super) fn record_with(
+        &mut self,
+        fd: BorrowedFd,
+        clone_fd: impl FnOnce(BorrowedFd<'_>) -> io::Result<OwnedFd>,
+    ) -> io::Result<()> {
         let stat = fs::fstat(fd)?;
         let key = (stat.st_dev as u64, stat.st_ino as u64);
-        let owned = fd
-            .try_clone_to_owned()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        self.dirs.entry(key).or_insert(owned);
+        let std::collections::hash_map::Entry::Vacant(entry) = self.dirs.entry(key) else {
+            return Ok(());
+        };
+        entry.insert(clone_fd(fd)?);
         Ok(())
     }
 
@@ -62,9 +73,9 @@ impl DirtySet {
     pub fn sync_all(&self) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
         for fd in self.dirs.values() {
-            if let Err(e) = fs::fsync_dir_fd(fd.as_fd()) {
+            if let Err(error) = fs::fsync_dir_fd(fd.as_fd()) {
                 if first_err.is_none() {
-                    first_err = Some(e);
+                    first_err = Some(error);
                 }
             }
         }
@@ -178,7 +189,7 @@ pub(super) enum TmpfilePublishPhase {
 
 #[derive(Debug)]
 pub(super) enum TmpfilePublishOutcome {
-    Published,
+    Published(fs::PublicationMode),
     Unsupported,
 }
 
@@ -583,10 +594,106 @@ fn authenticate_published_identity(
     }
 }
 
-pub(super) fn publish_tmpfile_noreplace(
+enum LinkStrategyAttempt {
+    Published(fs::PublicationMode),
+    TryNext,
+    Unsupported,
+}
+
+fn try_direct_tmpfile_link(
     tmpfile_fd: BorrowedFd<'_>,
     destination_directory_fd: BorrowedFd<'_>,
     destination_name: &str,
+) -> Result<LinkStrategyAttempt, TmpfilePublishFailure> {
+    match fs::linkat_empty_path(tmpfile_fd, destination_directory_fd, destination_name) {
+        Ok(()) => Ok(LinkStrategyAttempt::Published(
+            fs::PublicationMode::DirectAtEmptyPath,
+        )),
+        Err(error) if is_already_exists_io_kind(error.kind()) => {
+            Err(TmpfilePublishFailure::AlreadyExists)
+        }
+        // Both publication forms use linkat(2), so ENOSYS rules out the proc path too.
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+            Ok(LinkStrategyAttempt::Unsupported)
+        }
+        Err(error) if is_direct_link_unsupported(&error) => Ok(LinkStrategyAttempt::TryNext),
+        Err(source) => Err(TmpfilePublishFailure::NotCommitted {
+            phase: TmpfilePublishPhase::Link,
+            source,
+        }),
+    }
+}
+
+fn try_proc_tmpfile_link(
+    tmpfile_fd: BorrowedFd<'_>,
+    destination_directory_fd: BorrowedFd<'_>,
+    destination_name: &str,
+) -> Result<LinkStrategyAttempt, TmpfilePublishFailure> {
+    match fs::linkat_proc_self_fd(tmpfile_fd, destination_directory_fd, destination_name) {
+        Ok(()) => Ok(LinkStrategyAttempt::Published(
+            fs::PublicationMode::ProcSelfFd,
+        )),
+        Err(error) if is_already_exists_io_kind(error.kind()) => {
+            Err(TmpfilePublishFailure::AlreadyExists)
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            let destination = fs::fstat(destination_directory_fd).map_err(|source| {
+                TmpfilePublishFailure::NotCommitted {
+                    phase: TmpfilePublishPhase::Link,
+                    source,
+                }
+            })?;
+            if destination.st_nlink == 0 {
+                return Err(TmpfilePublishFailure::NotCommitted {
+                    phase: TmpfilePublishPhase::Link,
+                    source: error,
+                });
+            }
+            Ok(LinkStrategyAttempt::TryNext)
+        }
+        Err(error) if is_proc_link_unsupported(&error) => Ok(LinkStrategyAttempt::TryNext),
+        Err(source) => Err(TmpfilePublishFailure::NotCommitted {
+            phase: TmpfilePublishPhase::Link,
+            source,
+        }),
+    }
+}
+
+fn link_tmpfile_noreplace(
+    tmpfile_fd: BorrowedFd<'_>,
+    destination_directory_fd: BorrowedFd<'_>,
+    destination_name: &str,
+    preferred: Option<fs::PublicationMode>,
+) -> Result<Option<fs::PublicationMode>, TmpfilePublishFailure> {
+    let proc_first = matches!(preferred, Some(fs::PublicationMode::ProcSelfFd));
+    let first = if proc_first {
+        try_proc_tmpfile_link(tmpfile_fd, destination_directory_fd, destination_name)?
+    } else {
+        try_direct_tmpfile_link(tmpfile_fd, destination_directory_fd, destination_name)?
+    };
+    match first {
+        LinkStrategyAttempt::Published(mode) => return Ok(Some(mode)),
+        LinkStrategyAttempt::Unsupported => return Ok(None),
+        LinkStrategyAttempt::TryNext => {}
+    }
+
+    let second = if proc_first {
+        try_direct_tmpfile_link(tmpfile_fd, destination_directory_fd, destination_name)?
+    } else {
+        try_proc_tmpfile_link(tmpfile_fd, destination_directory_fd, destination_name)?
+    };
+    match second {
+        LinkStrategyAttempt::Published(mode) => Ok(Some(mode)),
+        LinkStrategyAttempt::TryNext | LinkStrategyAttempt::Unsupported => Ok(None),
+    }
+}
+
+fn publish_tmpfile_noreplace_impl(
+    tmpfile_fd: BorrowedFd<'_>,
+    destination_directory_fd: BorrowedFd<'_>,
+    destination_name: &str,
+    preferred: Option<fs::PublicationMode>,
+    sync_destination: bool,
 ) -> Result<TmpfilePublishOutcome, TmpfilePublishFailure> {
     let source_stat =
         fs::fstat(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
@@ -605,53 +712,15 @@ pub(super) fn publish_tmpfile_noreplace(
         source,
     })?;
 
-    match fs::linkat_empty_path(tmpfile_fd, destination_directory_fd, destination_name) {
-        Ok(()) => {}
-        Err(error) if is_already_exists_io_kind(error.kind()) => {
-            return Err(TmpfilePublishFailure::AlreadyExists);
-        }
-        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
-            return Ok(TmpfilePublishOutcome::Unsupported);
-        }
-        Err(error) if is_direct_link_unsupported(&error) => {
-            match fs::linkat_proc_self_fd(tmpfile_fd, destination_directory_fd, destination_name) {
-                Ok(()) => {}
-                Err(error) if is_already_exists_io_kind(error.kind()) => {
-                    return Err(TmpfilePublishFailure::AlreadyExists);
-                }
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                    let destination = fs::fstat(destination_directory_fd).map_err(|source| {
-                        TmpfilePublishFailure::NotCommitted {
-                            phase: TmpfilePublishPhase::Link,
-                            source,
-                        }
-                    })?;
-                    if destination.st_nlink == 0 {
-                        return Err(TmpfilePublishFailure::NotCommitted {
-                            phase: TmpfilePublishPhase::Link,
-                            source: error,
-                        });
-                    }
-                    return Ok(TmpfilePublishOutcome::Unsupported);
-                }
-                Err(error) if is_proc_link_unsupported(&error) => {
-                    return Ok(TmpfilePublishOutcome::Unsupported);
-                }
-                Err(source) => {
-                    return Err(TmpfilePublishFailure::NotCommitted {
-                        phase: TmpfilePublishPhase::Link,
-                        source,
-                    });
-                }
-            }
-        }
-        Err(source) => {
-            return Err(TmpfilePublishFailure::NotCommitted {
-                phase: TmpfilePublishPhase::Link,
-                source,
-            });
-        }
-    }
+    let Some(mode) = link_tmpfile_noreplace(
+        tmpfile_fd,
+        destination_directory_fd,
+        destination_name,
+        preferred,
+    )?
+    else {
+        return Ok(TmpfilePublishOutcome::Unsupported);
+    };
 
     let destination =
         fs::fstatat(destination_directory_fd, destination_name).map_err(|source| {
@@ -667,13 +736,45 @@ pub(super) fn publish_tmpfile_noreplace(
         }
     })?;
 
-    fs::fsync_dir_fd(destination_directory_fd).map_err(|source| {
-        TmpfilePublishFailure::OutcomeUnknown {
-            phase: TmpfilePublishPhase::DestinationFsync,
-            source,
-        }
-    })?;
-    Ok(TmpfilePublishOutcome::Published)
+    if sync_destination {
+        fs::fsync_dir_fd(destination_directory_fd).map_err(|source| {
+            TmpfilePublishFailure::OutcomeUnknown {
+                phase: TmpfilePublishPhase::DestinationFsync,
+                source,
+            }
+        })?;
+    }
+    Ok(TmpfilePublishOutcome::Published(mode))
+}
+
+#[cfg(test)]
+pub(super) fn publish_tmpfile_noreplace(
+    tmpfile_fd: BorrowedFd<'_>,
+    destination_directory_fd: BorrowedFd<'_>,
+    destination_name: &str,
+) -> Result<TmpfilePublishOutcome, TmpfilePublishFailure> {
+    publish_tmpfile_noreplace_impl(
+        tmpfile_fd,
+        destination_directory_fd,
+        destination_name,
+        None,
+        true,
+    )
+}
+
+pub(super) fn publish_tmpfile_noreplace_with_mode(
+    tmpfile_fd: BorrowedFd<'_>,
+    destination_directory_fd: BorrowedFd<'_>,
+    destination_name: &str,
+    preferred: Option<fs::PublicationMode>,
+) -> Result<TmpfilePublishOutcome, TmpfilePublishFailure> {
+    publish_tmpfile_noreplace_impl(
+        tmpfile_fd,
+        destination_directory_fd,
+        destination_name,
+        preferred,
+        true,
+    )
 }
 
 fn same_directory(source: BorrowedFd<'_>, destination: BorrowedFd<'_>) -> bool {
@@ -891,87 +992,19 @@ fn move_noreplace_deferred<T, E>(
     Ok(output)
 }
 
-pub(super) fn publish_tmpfile_noreplace_deferred(
+pub(super) fn publish_tmpfile_noreplace_deferred_with_mode(
     tmpfile_fd: BorrowedFd<'_>,
     destination_directory_fd: BorrowedFd<'_>,
     destination_name: &str,
+    preferred: Option<fs::PublicationMode>,
 ) -> Result<TmpfilePublishOutcome, TmpfilePublishFailure> {
-    let source_stat =
-        fs::fstat(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
-            phase: TmpfilePublishPhase::SourceIdentity,
-            source,
-        })?;
-    let source_identity = unnamed_file_identity(&source_stat).map_err(|source| {
-        TmpfilePublishFailure::NotCommitted {
-            phase: TmpfilePublishPhase::SourceIdentity,
-            source,
-        }
-    })?;
-    fs::fsync(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
-        phase: TmpfilePublishPhase::FileFsync,
-        source,
-    })?;
-    match fs::linkat_empty_path(tmpfile_fd, destination_directory_fd, destination_name) {
-        Ok(()) => {}
-        Err(error) if is_already_exists_io_kind(error.kind()) => {
-            return Err(TmpfilePublishFailure::AlreadyExists);
-        }
-        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
-            return Ok(TmpfilePublishOutcome::Unsupported);
-        }
-        Err(error) if is_direct_link_unsupported(&error) => {
-            match fs::linkat_proc_self_fd(tmpfile_fd, destination_directory_fd, destination_name) {
-                Ok(()) => {}
-                Err(error) if is_already_exists_io_kind(error.kind()) => {
-                    return Err(TmpfilePublishFailure::AlreadyExists);
-                }
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                    let destination = fs::fstat(destination_directory_fd).map_err(|source| {
-                        TmpfilePublishFailure::NotCommitted {
-                            phase: TmpfilePublishPhase::Link,
-                            source,
-                        }
-                    })?;
-                    if destination.st_nlink == 0 {
-                        return Err(TmpfilePublishFailure::NotCommitted {
-                            phase: TmpfilePublishPhase::Link,
-                            source: error,
-                        });
-                    }
-                    return Ok(TmpfilePublishOutcome::Unsupported);
-                }
-                Err(error) if is_proc_link_unsupported(&error) => {
-                    return Ok(TmpfilePublishOutcome::Unsupported);
-                }
-                Err(source) => {
-                    return Err(TmpfilePublishFailure::NotCommitted {
-                        phase: TmpfilePublishPhase::Link,
-                        source,
-                    });
-                }
-            }
-        }
-        Err(source) => {
-            return Err(TmpfilePublishFailure::NotCommitted {
-                phase: TmpfilePublishPhase::Link,
-                source,
-            });
-        }
-    }
-    let destination =
-        fs::fstatat(destination_directory_fd, destination_name).map_err(|source| {
-            TmpfilePublishFailure::OutcomeUnknown {
-                phase: TmpfilePublishPhase::DestinationIdentity,
-                source,
-            }
-        })?;
-    authenticate_published_identity(source_identity, &destination).map_err(|source| {
-        TmpfilePublishFailure::OutcomeUnknown {
-            phase: TmpfilePublishPhase::DestinationIdentity,
-            source,
-        }
-    })?;
-    Ok(TmpfilePublishOutcome::Published)
+    publish_tmpfile_noreplace_impl(
+        tmpfile_fd,
+        destination_directory_fd,
+        destination_name,
+        preferred,
+        false,
+    )
 }
 
 /// Convert a MoveFailure into the public Error / poison decision.
@@ -1100,7 +1133,7 @@ mod tests {
             let proc_calls = fs::fault::call_count("linkat_proc_self_fd");
             fs::fault::reset();
 
-            assert!(matches!(outcome, TmpfilePublishOutcome::Published));
+            assert!(matches!(outcome, TmpfilePublishOutcome::Published(_)));
             let destination = fs::fstatat(directory.as_fd(), "published.raw").unwrap();
             assert_eq!(destination.st_dev, source.st_dev);
             assert_eq!(destination.st_ino, source.st_ino);
@@ -1109,6 +1142,52 @@ mod tests {
                 assert_eq!(proc_calls, 1);
             }
         }
+    }
+
+    #[test]
+    fn tmpfile_publication_reuses_a_successful_proc_strategy() {
+        fs::fault::reset();
+        let root = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let Some(first_tmpfile) = open_unnamed_file(directory.as_fd()) else {
+            return;
+        };
+        fs::fault::inject_errno("linkat_empty_path", 1, libc::ENOENT);
+        fs::fault::inject("linkat_proc_self_fd", u64::MAX);
+
+        let first = publish_tmpfile_noreplace_with_mode(
+            first_tmpfile.as_fd(),
+            directory.as_fd(),
+            "first.raw",
+            None,
+        )
+        .unwrap();
+        let TmpfilePublishOutcome::Published(mode) = first else {
+            panic!("proc publication unexpectedly unsupported");
+        };
+        assert_eq!(mode, fs::PublicationMode::ProcSelfFd);
+
+        let Some(second_tmpfile) = open_unnamed_file(directory.as_fd()) else {
+            fs::fault::reset();
+            return;
+        };
+        let second = publish_tmpfile_noreplace_with_mode(
+            second_tmpfile.as_fd(),
+            directory.as_fd(),
+            "second.raw",
+            Some(mode),
+        )
+        .unwrap();
+        let direct_calls = fs::fault::call_count("linkat_empty_path");
+        let proc_calls = fs::fault::call_count("linkat_proc_self_fd");
+        fs::fault::reset();
+
+        assert!(matches!(
+            second,
+            TmpfilePublishOutcome::Published(fs::PublicationMode::ProcSelfFd)
+        ));
+        assert_eq!(direct_calls, 1, "the learned proc path skips direct link");
+        assert_eq!(proc_calls, 2);
     }
 
     #[test]
