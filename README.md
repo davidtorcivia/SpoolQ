@@ -144,14 +144,14 @@ Aggregate completed-job throughput using concurrent `Queue` handles:
 
 | Threads | 64 B payload | 1 KiB payload | 16 KiB payload |
 |---:|---:|---:|---:|
-| 1 | 2,946 jobs/sec | 2,970 jobs/sec | 2,391 jobs/sec |
-| 4 | 5,629 jobs/sec | 5,608 jobs/sec | 5,205 jobs/sec |
-| 8 | 7,426 jobs/sec | 7,366 jobs/sec | 6,725 jobs/sec |
+| 1 | 2,900 jobs/sec | 3,082 jobs/sec | 2,585 jobs/sec |
+| 4 | 5,651 jobs/sec | 5,426 jobs/sec | 5,294 jobs/sec |
+| 8 | 7,508 jobs/sec | 7,474 jobs/sec | 6,792 jobs/sec |
 
 A completed job includes enqueue, lease, explicit payload verification, and
 acknowledgment. These Criterion point estimates use a release build, a 64-shard
 queue, default durability settings, and a batched producer/consumer workload
-(1 second warm-up, 5 second measurement, 20 samples).
+(2 second warm-up, 10 second measurement, 30 samples).
 
 Reference system: Intel Core i5-13500 CPU and Intel SSDPEK1A118GA 118 GB NVMe
 drive, formatted as ext4.
