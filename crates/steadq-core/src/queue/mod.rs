@@ -672,6 +672,14 @@ pub enum WatermarkReadError {
     Io(String),
 }
 
+#[derive(Debug)]
+enum WatermarkSnapshot {
+    Current(steadq_format::WatermarkRecord),
+    Replaced,
+}
+
+const WATERMARK_READ_ATTEMPTS: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WallFloor {
     unix_ns: u64,
@@ -715,6 +723,23 @@ fn watermark_open_flags() -> i32 {
     libc::O_NOFOLLOW
         .checked_add(libc::O_CLOEXEC)
         .expect("watermark open flags must not overlap")
+}
+
+fn watermark_path_matches_opened(
+    opened: &libc::stat,
+    current: &libc::stat,
+) -> Result<bool, WatermarkReadError> {
+    if current.st_mode & libc::S_IFMT != libc::S_IFREG || current.st_nlink != 1 {
+        return Err(WatermarkReadError::Corrupt(
+            "watermark is not a singly-linked regular file".into(),
+        ));
+    }
+    Ok(identity_matches(
+        current.st_dev,
+        current.st_ino,
+        opened.st_dev,
+        opened.st_ino,
+    ))
 }
 
 fn preferred_publication_mode(filesystem_type: i64) -> Option<fs::PublicationMode> {
@@ -1334,22 +1359,48 @@ impl Queue {
     fn read_wall_watermark(&self) -> Result<steadq_format::WatermarkRecord, WatermarkReadError> {
         let control_fd = fs::open_directory(self.root_fd.as_fd(), "control")
             .map_err(|e| WatermarkReadError::Io(e.to_string()))?;
-        let data = match fs::openat(
-            control_fd.as_fd(),
-            "wall-watermark",
-            watermark_open_flags(),
-            0,
-        ) {
-            Ok(fd) => fd,
-            Err(e) => {
-                if watermark_open_is_not_found(&e) {
-                    return Err(WatermarkReadError::NotFound);
+
+        for _ in 0..WATERMARK_READ_ATTEMPTS {
+            let data = match fs::openat(
+                control_fd.as_fd(),
+                "wall-watermark",
+                watermark_open_flags(),
+                0,
+            ) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    if watermark_open_is_not_found(&e) {
+                        return Err(WatermarkReadError::NotFound);
+                    }
+                    return Err(WatermarkReadError::Io(e.to_string()));
                 }
-                return Err(WatermarkReadError::Io(e.to_string()));
+            };
+
+            match Self::read_opened_wall_watermark(control_fd.as_fd(), data.as_fd())? {
+                WatermarkSnapshot::Current(watermark) => return Ok(watermark),
+                WatermarkSnapshot::Replaced => continue,
             }
-        };
-        let stat = fs::fstat(data.as_fd()).map_err(|e| WatermarkReadError::Io(e.to_string()))?;
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+        }
+
+        Err(WatermarkReadError::Io(format!(
+            "wall watermark changed during {WATERMARK_READ_ATTEMPTS} consecutive reads"
+        )))
+    }
+
+    fn read_opened_wall_watermark(
+        control_fd: BorrowedFd<'_>,
+        data_fd: BorrowedFd<'_>,
+    ) -> Result<WatermarkSnapshot, WatermarkReadError> {
+        let stat = fs::fstat(data_fd).map_err(|e| WatermarkReadError::Io(e.to_string()))?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(WatermarkReadError::Corrupt(
+                "watermark is not a regular file".into(),
+            ));
+        }
+        if stat.st_nlink == 0 {
+            return Ok(WatermarkSnapshot::Replaced);
+        }
+        if stat.st_nlink != 1 {
             return Err(WatermarkReadError::Corrupt(
                 "watermark is not a singly-linked regular file".into(),
             ));
@@ -1369,15 +1420,28 @@ impl Queue {
             )));
         }
         let mut buf = [0u8; steadq_format::WATERMARK_SIZE];
-        if let Err(error) = fs::pread_exact(data.as_fd(), &mut buf, 0) {
+        if let Err(error) = fs::pread_exact(data_fd, &mut buf, 0) {
             return if error.kind() == io::ErrorKind::UnexpectedEof {
                 Err(WatermarkReadError::Truncated(error.to_string()))
             } else {
                 Err(WatermarkReadError::Io(error.to_string()))
             };
         }
-        steadq_format::WatermarkRecord::decode(&buf)
-            .map_err(|e| WatermarkReadError::Corrupt(e.to_string()))
+        let watermark = steadq_format::WatermarkRecord::decode(&buf)
+            .map_err(|e| WatermarkReadError::Corrupt(e.to_string()))?;
+
+        let current = fs::fstatat(control_fd, "wall-watermark").map_err(|error| {
+            if watermark_open_is_not_found(&error) {
+                WatermarkReadError::NotFound
+            } else {
+                WatermarkReadError::Io(error.to_string())
+            }
+        })?;
+        if !watermark_path_matches_opened(&stat, &current)? {
+            return Ok(WatermarkSnapshot::Replaced);
+        }
+
+        Ok(WatermarkSnapshot::Current(watermark))
     }
 
     /// Requires the exclusive wall-watermark lock to remain held until return.
@@ -5461,6 +5525,17 @@ mod tests {
         .unwrap();
     }
 
+    fn replace_wall_watermark(tmp: &TempDir, highest_observed_bucket: u64, sequence: u64) {
+        let control = tmp.path().join("control");
+        let replacement = control.join(".watermark-test-replacement");
+        let watermark = steadq_format::WatermarkRecord {
+            highest_observed_bucket,
+            sequence,
+        };
+        std::fs::write(&replacement, watermark.encode()).unwrap();
+        std::fs::rename(replacement, control.join("wall-watermark")).unwrap();
+    }
+
     fn find_file_with_suffix(root: &Path, suffix: &str) -> Option<PathBuf> {
         for entry in std::fs::read_dir(root).ok()? {
             let path = entry.ok()?.path();
@@ -6686,7 +6761,14 @@ mod tests {
             }
             fs::fault::reset();
             fs::fault::set_clock_realtime_ns(1_000_000_000);
-            fs::fault::inject_errno(fault, 1, libc::EIO);
+            let fault_call = if fault == "fstatat" {
+                // The first call authenticates the wall-watermark pathname;
+                // the second verifies the published destination identity.
+                2
+            } else {
+                1
+            };
+            fs::fault::inject_errno(fault, fault_call, libc::EIO);
 
             let outcome = queue.enqueue(EnqueueInput {
                 maximum_attempts: 3,
@@ -9116,6 +9198,55 @@ mod tests {
     }
 
     #[test]
+    fn watermark_read_retries_an_atomic_replacement() {
+        let (tmp, queue) = create_test_queue();
+        let original = queue.read_wall_watermark().unwrap();
+        let control = fs::open_directory(queue.root_fd(), "control").unwrap();
+        let opened =
+            fs::openat(control.as_fd(), "wall-watermark", watermark_open_flags(), 0).unwrap();
+        let opened_before = fs::fstat(opened.as_fd()).unwrap();
+        assert_eq!(opened_before.st_nlink, 1);
+
+        let replacement_bucket = original.highest_observed_bucket.checked_add(1).unwrap();
+        let replacement_sequence = original.sequence.checked_add(1).unwrap();
+        replace_wall_watermark(&tmp, replacement_bucket, replacement_sequence);
+
+        let current = fs::fstatat(control.as_fd(), "wall-watermark").unwrap();
+        assert!(!watermark_path_matches_opened(&opened_before, &current).unwrap());
+        assert!(matches!(
+            Queue::read_opened_wall_watermark(control.as_fd(), opened.as_fd()).unwrap(),
+            WatermarkSnapshot::Replaced
+        ));
+
+        let observed = queue.read_wall_watermark().unwrap();
+        assert_eq!(observed.highest_observed_bucket, replacement_bucket);
+        assert_eq!(observed.sequence, replacement_sequence);
+    }
+
+    #[test]
+    fn watermark_path_authentication_rejects_each_invalid_property() {
+        let (_tmp, queue) = create_test_queue();
+        let control = fs::open_directory(queue.root_fd(), "control").unwrap();
+        let opened =
+            fs::openat(control.as_fd(), "wall-watermark", watermark_open_flags(), 0).unwrap();
+        let valid = fs::fstat(opened.as_fd()).unwrap();
+
+        let mut non_regular = valid;
+        non_regular.st_mode = (non_regular.st_mode & !libc::S_IFMT) | libc::S_IFDIR;
+        assert!(matches!(
+            watermark_path_matches_opened(&valid, &non_regular),
+            Err(WatermarkReadError::Corrupt(_))
+        ));
+
+        let mut multiply_linked = valid;
+        multiply_linked.st_nlink = 2;
+        assert!(matches!(
+            watermark_path_matches_opened(&valid, &multiply_linked),
+            Err(WatermarkReadError::Corrupt(_))
+        ));
+    }
+
+    #[test]
     fn cached_wall_floor_observes_another_handles_durable_advance_after_rollback() {
         let (tmp, mut handle_a) = create_test_queue();
         let mut handle_b = Queue::open(
@@ -9534,6 +9665,7 @@ mod tests {
             "openat",
             "fstat",
             "pread",
+            "fstatat",
             "clock_realtime_ns",
         ] {
             let (_tmp, queue) = create_test_queue();
