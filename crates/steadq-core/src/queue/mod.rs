@@ -1257,20 +1257,29 @@ impl Queue {
         )
     }
     /// Compute the effective wall floor: max(CLOCK_REALTIME, stored watermark bucket * width)
-    /// Wall floor for mutating operations. P0-01: Returns Err and poisons
-    /// on failure so callers abort before computing destination paths.
+    /// Wall floor for mutating operations. P0-01: Returns Err and poisons on
+    /// non-transient failure so callers abort before computing destination paths.
     pub(crate) fn wall_floor_for_mutation(&mut self) -> Result<WallFloor, Error> {
+        self.wall_floor_for_mutation_with_attempts(WATERMARK_READ_ATTEMPTS)
+    }
+
+    fn wall_floor_for_mutation_with_attempts(
+        &mut self,
+        watermark_read_attempts: usize,
+    ) -> Result<WallFloor, Error> {
         // A process-local cache cannot establish the shared durable floor: another
         // handle may advance the watermark while realtime rolls back into this
         // handle's cached bucket. Authenticate shared state before using the cache.
         if let Some(cached) = self.cached_wall_floor {
-            let authenticated = match self.authenticated_wall_floor() {
-                Ok(floor) => floor,
-                Err(error) => {
-                    self.poison();
-                    return Err(error);
-                }
-            };
+            let authenticated =
+                match self.authenticated_wall_floor_with_attempts(watermark_read_attempts) {
+                    Ok(floor) => floor,
+                    Err(Error::MaintenanceBusy) => return Err(Error::MaintenanceBusy),
+                    Err(error) => {
+                        self.poison();
+                        return Err(error);
+                    }
+                };
             let observed_bucket = steadq_math::bucket_number(
                 authenticated.unix_ns(),
                 self.format.delayed_bucket_width_ns(),
@@ -1309,8 +1318,16 @@ impl Queue {
     }
 
     pub(crate) fn authenticated_wall_floor(&self) -> Result<WallFloor, Error> {
-        let watermark = match self.read_wall_watermark() {
-            Ok(watermark) => watermark,
+        self.authenticated_wall_floor_with_attempts(WATERMARK_READ_ATTEMPTS)
+    }
+
+    fn authenticated_wall_floor_with_attempts(
+        &self,
+        watermark_read_attempts: usize,
+    ) -> Result<WallFloor, Error> {
+        let watermark = match self.try_read_wall_watermark(watermark_read_attempts) {
+            Ok(Some(watermark)) => watermark,
+            Ok(None) => return Err(Error::MaintenanceBusy),
             Err(WatermarkReadError::NotFound) => {
                 return Err(Error::QueueCorrupt("wall watermark missing".into()));
             }
@@ -1379,10 +1396,24 @@ impl Queue {
     /// Returns Ok on success, Err(NotFound) when no watermark has been written yet,
     /// Err(Corrupt/Truncated) on digest or size mismatch, Err(Io) on I/O failure.
     fn read_wall_watermark(&self) -> Result<steadq_format::WatermarkRecord, WatermarkReadError> {
+        match self.try_read_wall_watermark(WATERMARK_READ_ATTEMPTS)? {
+            Some(watermark) => Ok(watermark),
+            None => Err(WatermarkReadError::Io(format!(
+                "wall watermark changed during {WATERMARK_READ_ATTEMPTS} consecutive reads"
+            ))),
+        }
+    }
+
+    /// Optimistically authenticate the shared watermark without taking its lock.
+    /// `Ok(None)` is transient replacement contention, not an I/O failure.
+    fn try_read_wall_watermark(
+        &self,
+        attempts: usize,
+    ) -> Result<Option<steadq_format::WatermarkRecord>, WatermarkReadError> {
         let control_fd = fs::open_directory(self.root_fd.as_fd(), "control")
             .map_err(|e| WatermarkReadError::Io(e.to_string()))?;
 
-        for _ in 0..WATERMARK_READ_ATTEMPTS {
+        for _ in 0..attempts {
             let data = match fs::openat(
                 control_fd.as_fd(),
                 "wall-watermark",
@@ -1399,14 +1430,12 @@ impl Queue {
             };
 
             match Self::read_opened_wall_watermark(control_fd.as_fd(), data.as_fd())? {
-                WatermarkSnapshot::Current(watermark) => return Ok(watermark),
+                WatermarkSnapshot::Current(watermark) => return Ok(Some(watermark)),
                 WatermarkSnapshot::Replaced => continue,
             }
         }
 
-        Err(WatermarkReadError::Io(format!(
-            "wall watermark changed during {WATERMARK_READ_ATTEMPTS} consecutive reads"
-        )))
+        Ok(None)
     }
 
     fn read_opened_wall_watermark(
@@ -9364,6 +9393,40 @@ mod tests {
         let observed = queue.read_wall_watermark().unwrap();
         assert_eq!(observed.highest_observed_bucket, replacement_bucket);
         assert_eq!(observed.sequence, replacement_sequence);
+    }
+
+    #[test]
+    fn watermark_read_exhaustion_is_transient_contention() {
+        let (_tmp, queue) = create_test_queue();
+
+        assert!(queue.try_read_wall_watermark(0).unwrap().is_none());
+        assert_eq!(
+            queue.authenticated_wall_floor_with_attempts(0),
+            Err(Error::MaintenanceBusy)
+        );
+        assert!(
+            queue.read_wall_watermark().is_ok(),
+            "the ordinary authenticated read must remain usable"
+        );
+    }
+
+    #[test]
+    fn cached_wall_floor_contention_does_not_poison_the_handle() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.wall_floor_for_mutation().unwrap();
+
+        assert_eq!(
+            queue.wall_floor_for_mutation_with_attempts(0),
+            Err(Error::MaintenanceBusy)
+        );
+        assert!(
+            !queue.poisoned,
+            "transient replacement contention poisoned the queue"
+        );
+        assert!(
+            queue.wall_floor_for_mutation().is_ok(),
+            "the queue must remain usable after transient contention"
+        );
     }
 
     #[test]
