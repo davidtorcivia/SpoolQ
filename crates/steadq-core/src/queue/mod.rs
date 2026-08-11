@@ -82,6 +82,17 @@ pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
     Ok(())
 }
 
+const MIN_LEASE_DURATION_NS: u64 = 1_000_000_000;
+const MAX_LEASE_DURATION_NS: u64 = 604_800_000_000_000;
+
+fn lease_duration_is_valid(duration_ns: u64) -> bool {
+    (MIN_LEASE_DURATION_NS..=MAX_LEASE_DURATION_NS).contains(&duration_ns)
+}
+
+fn payload_length_is_valid(payload_length: u64, maximum: u64) -> bool {
+    payload_length <= maximum
+}
+
 /// Operational options for opening a queue.
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -2670,9 +2681,7 @@ impl Queue {
         }
 
         // Validate lease duration: 1s to 7d
-        let min_dur = 1_000_000_000u64;
-        let max_dur = 7 * 24 * 60 * 60 * 1_000_000_000u64;
-        if lease_duration_ns < min_dur || lease_duration_ns > max_dur {
+        if !lease_duration_is_valid(lease_duration_ns) {
             return LeaseOutcome::NotCommitted(Error::InvalidInput(
                 "lease duration must be 1s to 7d".into(),
             ));
@@ -2848,11 +2857,14 @@ impl Queue {
 
                 let leased_dir_fd = match open_relative(self.root_fd.as_fd(), &leased_dir) {
                     Ok(fd) => fd,
-                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
-                    Err(_) => {
-                        scan_had_error = true;
-                        continue;
-                    }
+                    Err(error) => match classify_lease_directory_open_failure(&error) {
+                        LeaseDirectoryOpenFailure::Gone => continue,
+                        LeaseDirectoryOpenFailure::InvalidDirectory
+                        | LeaseDirectoryOpenFailure::Io => {
+                            scan_had_error = true;
+                            continue;
+                        }
+                    },
                 };
 
                 let claim_source = match Self::open_claim_source(
@@ -2996,7 +3008,7 @@ impl Queue {
                         // Verify envelope digest, exact size, and payload limit.
                         {
                             let ext_len_h = header.extension_header_length as usize;
-                            if ext_len_h > 65536 {
+                            if verified::is_extension_too_large(ext_len_h) {
                                 self.poison();
                                 return LeaseOutcome::OutcomeUnknown(
                                     claim_ticket
@@ -3031,7 +3043,10 @@ impl Queue {
                                 );
                             }
                             // Verify payload limit
-                            if header.payload_length > self.format.max_payload_length() {
+                            if !payload_length_is_valid(
+                                header.payload_length,
+                                self.format.max_payload_length(),
+                            ) {
                                 self.poison();
                                 return LeaseOutcome::OutcomeUnknown(
                                     claim_ticket
@@ -3050,14 +3065,9 @@ impl Queue {
 
                         // B2: Extension read/decode failure after claim is a post-linearization
                         // corruption. Do not return an ordinary lease with empty content_type.
-                        let content_type = if header.extension_header_length > 0 {
-                            if header.extension_header_length > 65536 {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
+                        let content_type = if verified::is_extension_present(
+                            header.extension_header_length as usize,
+                        ) {
                             let mut ext_buf = vec![0u8; header.extension_header_length as usize];
                             match fs::pread_exact(leased_file.as_fd(), &mut ext_buf, 128) {
                                 Ok(()) => {
@@ -3543,9 +3553,7 @@ impl Queue {
             return RenewOutcome::NotCommitted(e);
         }
 
-        let min_dur = 1_000_000_000u64;
-        let max_dur = 7 * 24 * 60 * 60 * 1_000_000_000u64;
-        if lease_duration_ns < min_dur || lease_duration_ns > max_dur {
+        if !lease_duration_is_valid(lease_duration_ns) {
             return RenewOutcome::NotCommitted(Error::InvalidInput(
                 "lease duration must be 1s to 7d".into(),
             ));
@@ -4282,7 +4290,10 @@ impl Queue {
         if offset >= payload_len {
             return Ok(0);
         }
-        let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
+        let remaining = payload_len
+            .checked_sub(offset)
+            .expect("offset below payload length was checked");
+        let to_read = (buf.len() as u64).min(remaining) as usize;
         let abs_offset = payload_start + offset;
         let n = fs::pread(source.file_fd.as_fd(), &mut buf[..to_read], abs_offset)
             .map_err(|e| Error::IoFailure(e.to_string()))?;
@@ -4335,7 +4346,10 @@ impl Queue {
         let mut buf = vec![0u8; cap];
         let mut offset = 0u64;
         while offset < payload_len {
-            let to_read = (buf.len() as u64).min(payload_len - offset) as usize;
+            let remaining = payload_len
+                .checked_sub(offset)
+                .expect("offset below payload length was checked");
+            let to_read = (buf.len() as u64).min(remaining) as usize;
             let n = fs::pread(
                 source.file_fd.as_fd(),
                 &mut buf[..to_read],
@@ -4346,7 +4360,9 @@ impl Queue {
                 return Err(Error::QueueCorrupt("unexpected EOF during stream".into()));
             }
             f(&buf[..n])?;
-            offset += n as u64;
+            offset = offset
+                .checked_add(n as u64)
+                .expect("stream offset cannot exceed the verified payload length");
         }
         Ok(())
     }
@@ -4739,7 +4755,7 @@ impl Queue {
         let header = verified.header();
 
         // R4-H06: Check queue-configured payload limit
-        if header.payload_length > self.format.max_payload_length() {
+        if !payload_length_is_valid(header.payload_length, self.format.max_payload_length()) {
             return Err(Error::QueueCorrupt(format!(
                 "payload length {} exceeds queue limit {}",
                 header.payload_length,
@@ -5474,9 +5490,6 @@ impl PublishError {
             Some(libc::ENOSPC) | Some(libc::EDQUOT) => {
                 PublishError::NotCommitted(Error::ResourceExhausted)
             }
-            Some(libc::EIO) | Some(libc::ESTALE) => {
-                PublishError::NotCommitted(Error::IoFailure(e.to_string()))
-            }
             _ => PublishError::NotCommitted(Error::IoFailure(e.to_string())),
         }
     }
@@ -5721,6 +5734,122 @@ mod tests {
             let error = io::Error::from_raw_os_error(errno);
             assert_eq!(resolver_error_is_not_found(&error), expected);
         }
+    }
+
+    #[test]
+    fn create_option_validation_rejects_every_invalid_field() {
+        let invalid = [
+            CreateOptions {
+                shard_count: 0,
+                ..Default::default()
+            },
+            CreateOptions {
+                shard_count: 3,
+                ..Default::default()
+            },
+            CreateOptions {
+                shard_count: 8192,
+                ..Default::default()
+            },
+            CreateOptions {
+                lease_bucket_width_ns: 0,
+                ..Default::default()
+            },
+            CreateOptions {
+                delayed_bucket_width_ns: 0,
+                ..Default::default()
+            },
+            CreateOptions {
+                terminal_bucket_width_ns: 0,
+                ..Default::default()
+            },
+            CreateOptions {
+                terminal_bucket_width_ns: 59_000_000_000,
+                delayed_bucket_width_ns: 1_000_000_000,
+                ..Default::default()
+            },
+            CreateOptions {
+                terminal_bucket_width_ns: 86_401_000_000_000,
+                delayed_bucket_width_ns: 1_000_000_000,
+                ..Default::default()
+            },
+            CreateOptions {
+                delayed_bucket_width_ns: 7_000_000_000,
+                ..Default::default()
+            },
+            CreateOptions {
+                max_payload_length: MAX_PAYLOAD_LENGTH + 1,
+                ..Default::default()
+            },
+        ];
+
+        assert!(validate_create_options(&CreateOptions::default()).is_ok());
+        assert!(validate_create_options(&CreateOptions {
+            shard_count: 4096,
+            ..Default::default()
+        })
+        .is_ok());
+        for options in invalid {
+            assert!(matches!(
+                validate_create_options(&options),
+                Err(Error::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn lease_duration_validation_includes_exact_boundaries() {
+        for (duration_ns, expected) in [
+            (0, false),
+            (MIN_LEASE_DURATION_NS - 1, false),
+            (MIN_LEASE_DURATION_NS, true),
+            (MAX_LEASE_DURATION_NS, true),
+            (MAX_LEASE_DURATION_NS + 1, false),
+            (u64::MAX, false),
+        ] {
+            assert_eq!(lease_duration_is_valid(duration_ns), expected);
+        }
+    }
+
+    #[test]
+    fn payload_length_validation_includes_the_exact_limit() {
+        for (payload_length, maximum, expected) in [
+            (0, 0, true),
+            (0, 1, true),
+            (1, 1, true),
+            (2, 1, false),
+            (u64::MAX, u64::MAX, true),
+        ] {
+            assert_eq!(payload_length_is_valid(payload_length, maximum), expected);
+        }
+    }
+
+    #[test]
+    fn queue_id_accessor_returns_the_format_identity() {
+        let (_tmp, queue) = create_test_queue();
+        assert_eq!(queue.queue_id(), queue.format().queue_id());
+        assert_ne!(queue.queue_id(), &[1; 16]);
+        assert_eq!(queue.boot_id(), queue.boot_id);
+        assert_ne!(queue.boot_id(), "xyzzy");
+    }
+
+    #[test]
+    fn receipt_retention_probe_bound_accepts_only_the_exact_limit() {
+        let tmp = TempDir::new().unwrap();
+        let format = Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let width = format.terminal_bucket_width_ns();
+        let maximum = width.checked_mul(4094).unwrap();
+        let options = |receipt_retention_ns| OpenOptions {
+            allow_unsupported_fs: true,
+            receipt_retention_ns,
+            ..Default::default()
+        };
+
+        Queue::open(tmp.path(), &options(maximum)).unwrap();
+        assert!(matches!(
+            Queue::open(tmp.path(), &options(maximum + 1)),
+            Err(Error::InvalidInput(_))
+        ));
     }
 
     #[test]
@@ -7526,6 +7655,9 @@ mod tests {
         let policy = steadq_math::RetryPolicy::new(1000, 300_000, false, None).unwrap();
         let result = queue.retry_with_policy(&lease, &policy);
         assert!(matches!(result, TransitionOutcome::Committed));
+        let snapshots = queue.inspect(&lease.job_id);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, "delayed");
     }
     #[test]
     fn inspect_finds_ready_job() {
