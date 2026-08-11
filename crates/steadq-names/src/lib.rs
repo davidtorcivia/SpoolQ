@@ -1,11 +1,22 @@
 // SteadQ/1 canonical filename parsing, formatting, name tags, and shard math.
 
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 // ---------- Hex helpers ----------
 
 pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    push_hex(&mut encoded, bytes);
+    encoded
+}
+
+fn push_hex(encoded: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
 }
 
 fn from_hex_digit_lower(b: u8) -> Option<u8> {
@@ -77,16 +88,8 @@ fn hex_decode_bytes(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn hex_job_id(id: &[u8; 16]) -> String {
-    hex_encode(id)
-}
-
 fn hex_u64(v: u64) -> String {
     format!("{v:016x}")
-}
-
-fn hex_u32(v: u32) -> String {
-    format!("{v:08x}")
 }
 
 fn hex_u16(v: u16) -> String {
@@ -123,10 +126,16 @@ impl State {
 /// Compute the 64-bit name integrity tag.
 /// tag = first 8 bytes of SHA256("SteadQ-1-name\0" || queue_id || ascii_context)
 pub fn compute_name_tag(queue_id: &[u8; 16], canonical_context: &str) -> [u8; 8] {
+    compute_name_tag_parts(queue_id, &[canonical_context])
+}
+
+fn compute_name_tag_parts(queue_id: &[u8; 16], context_parts: &[&str]) -> [u8; 8] {
     let mut hasher = Sha256::new();
     hasher.update(b"SteadQ-1-name\0");
     hasher.update(queue_id);
-    hasher.update(canonical_context.as_bytes());
+    for part in context_parts {
+        hasher.update(part.as_bytes());
+    }
     let result = hasher.finalize();
     let mut out = [0u8; 8];
     out.copy_from_slice(&result[..8]);
@@ -234,23 +243,22 @@ pub fn boot_id_bytes(s: &str) -> Option<[u8; 16]> {
             return None;
         }
     }
-    // Verify lowercase hex at all other positions
-    for (i, &b) in bytes.iter().enumerate() {
-        if matches!(i, 8 | 13 | 18 | 23) {
+    let mut decoded = [0u8; 16];
+    let mut nibble_index = 0usize;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
             continue;
         }
-        if !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b) {
-            return None;
+        let nibble = from_hex_digit_lower(byte)?;
+        let output = &mut decoded[nibble_index / 2];
+        if nibble_index.is_multiple_of(2) {
+            *output = nibble << 4;
+        } else {
+            *output |= nibble;
         }
+        nibble_index += 1;
     }
-    // Collect hex digits
-    let hex_str: String = bytes
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !matches!(i, 8 | 13 | 18 | 23))
-        .map(|(_, &b)| b as char)
-        .collect();
-    hex_decode_16(&hex_str)
+    Some(decoded)
 }
 
 // ---------- Canonical filenames ----------
@@ -265,13 +273,15 @@ pub struct CommonFields {
 
 impl CommonFields {
     fn base_name(&self) -> String {
-        format!(
-            "{}.g{}.a{}.m{}",
-            hex_job_id(&self.job_id),
-            hex_u64(self.generation),
-            hex_u32(self.attempt),
-            hex_u32(self.maximum_attempts),
+        let mut name = String::with_capacity(70);
+        push_hex(&mut name, &self.job_id);
+        write!(
+            name,
+            ".g{:016x}.a{:08x}.m{:08x}",
+            self.generation, self.attempt, self.maximum_attempts
         )
+        .expect("writing to a String cannot fail");
+        name
     }
 }
 
@@ -288,20 +298,23 @@ impl ReadyName {
 
     /// Authenticate the name tag against the queue ID.
     pub fn authenticate_tag(&self, queue_id: &[u8; 16], shard_hex: &str) -> bool {
-        let ctx = self.canonical_context(shard_hex);
-        compute_name_tag(queue_id, &ctx) == self.tag
+        let base = self.common.base_name();
+        compute_name_tag_parts(queue_id, &["ready/-/-/", shard_hex, "/", &base]) == self.tag
     }
 }
 
 impl LeasedName {
     fn leased_base(&self) -> String {
-        format!(
-            "{}.b{}.w{}.t{}",
-            self.common.base_name(),
-            hex_u64(self.boottime_deadline_ns),
-            hex_u64(self.wall_deadline_ns),
-            hex_encode(&self.token),
+        let mut base = self.common.base_name();
+        base.reserve(70);
+        write!(
+            base,
+            ".b{:016x}.w{:016x}.t",
+            self.boottime_deadline_ns, self.wall_deadline_ns
         )
+        .expect("writing to a String cannot fail");
+        push_hex(&mut base, &self.token);
+        base
     }
 
     /// Reconstruct the exact canonical context used by the writer.
@@ -317,18 +330,19 @@ impl LeasedName {
         bucket: &str,
         shard_hex: &str,
     ) -> bool {
-        let ctx = self.canonical_context(boot_id, bucket, shard_hex);
-        compute_name_tag(queue_id, &ctx) == self.tag
+        let base = self.leased_base();
+        compute_name_tag_parts(
+            queue_id,
+            &["leased/", boot_id, "/", bucket, "/", shard_hex, "/", &base],
+        ) == self.tag
     }
 }
 
 impl DelayedName {
     fn delayed_base(&self) -> String {
-        format!(
-            "{}.d{}",
-            self.common.base_name(),
-            hex_u64(self.not_before_ns),
-        )
+        let mut base = self.common.base_name();
+        write!(base, ".d{:016x}", self.not_before_ns).expect("writing to a String cannot fail");
+        base
     }
 
     /// Reconstruct the exact canonical context used by the writer.
@@ -338,14 +352,19 @@ impl DelayedName {
 
     /// Authenticate the name tag against the queue ID.
     pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
-        let ctx = self.canonical_context(bucket, shard_hex);
-        compute_name_tag(queue_id, &ctx) == self.tag
+        let base = self.delayed_base();
+        compute_name_tag_parts(
+            queue_id,
+            &["delayed/-/", bucket, "/", shard_hex, "/", &base],
+        ) == self.tag
     }
 }
 
 impl DeadName {
     fn dead_base(&self) -> String {
-        format!("{}.x{}", self.common.base_name(), hex_u16(self.reason),)
+        let mut base = self.common.base_name();
+        write!(base, ".x{:04x}", self.reason).expect("writing to a String cannot fail");
+        base
     }
 
     /// Reconstruct the exact canonical context used by the writer.
@@ -355,14 +374,28 @@ impl DeadName {
 
     /// Authenticate the name tag against the queue ID.
     pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
-        let ctx = self.canonical_context(bucket, shard_hex);
-        compute_name_tag(queue_id, &ctx) == self.tag
+        let base = self.dead_base();
+        compute_name_tag_parts(
+            queue_id,
+            &[
+                State::Dead.dir_name(),
+                "/-/",
+                bucket,
+                "/",
+                shard_hex,
+                "/",
+                &base,
+            ],
+        ) == self.tag
     }
 }
 
 impl ReceiptName {
     fn receipt_base(&self) -> String {
-        format!("{}.t{}", self.common.base_name(), hex_encode(&self.token),)
+        let mut base = self.common.base_name();
+        base.push_str(".t");
+        push_hex(&mut base, &self.token);
+        base
     }
 
     /// Reconstruct the exact canonical context used by the writer.
@@ -372,44 +405,47 @@ impl ReceiptName {
 
     /// Authenticate the name tag against the queue ID.
     pub fn authenticate_tag(&self, queue_id: &[u8; 16], bucket: &str, shard_hex: &str) -> bool {
-        let ctx = self.canonical_context(bucket, shard_hex);
-        compute_name_tag(queue_id, &ctx) == self.tag
+        let base = self.receipt_base();
+        compute_name_tag_parts(
+            queue_id,
+            &[
+                State::Receipt.dir_name(),
+                "/-/",
+                bucket,
+                "/",
+                shard_hex,
+                "/",
+                &base,
+            ],
+        ) == self.tag
     }
 }
 
 // Ready: <job-id>.g<gen>.a<att>.m<max>.k<tag>.sqj
 pub fn ready_filename(fields: &CommonFields, tag: &[u8; 8]) -> String {
-    format!("{}.k{}.sqj", fields.base_name(), name_tag_hex(tag))
+    tagged_filename(fields.base_name(), tag, ".sqj")
 }
 
 // Delayed: <job-id>.g<gen>.a<att>.m<max>.d<ns>.k<tag>.sqj
 pub fn delayed_filename(fields: &CommonFields, not_before_ns: u64, tag: &[u8; 8]) -> String {
-    format!(
-        "{}.d{}.k{}.sqj",
-        fields.base_name(),
-        hex_u64(not_before_ns),
-        name_tag_hex(tag)
-    )
+    let mut base = fields.base_name();
+    write!(base, ".d{not_before_ns:016x}").expect("writing to a String cannot fail");
+    tagged_filename(base, tag, ".sqj")
 }
 
 // Dead: <job-id>.g<gen>.a<att>.m<max>.x<reason>.k<tag>.sqj
 pub fn dead_filename(fields: &CommonFields, reason: u16, tag: &[u8; 8]) -> String {
-    format!(
-        "{}.x{}.k{}.sqj",
-        fields.base_name(),
-        hex_u16(reason),
-        name_tag_hex(tag)
-    )
+    let mut base = fields.base_name();
+    write!(base, ".x{reason:04x}").expect("writing to a String cannot fail");
+    tagged_filename(base, tag, ".sqj")
 }
 
 // Receipt: <job-id>.g<gen>.a<att>.m<max>.t<token>.k<tag>.rct
 pub fn receipt_filename(fields: &CommonFields, token: &[u8; 16], tag: &[u8; 8]) -> String {
-    format!(
-        "{}.t{}.k{}.rct",
-        fields.base_name(),
-        hex_encode(token),
-        name_tag_hex(tag)
-    )
+    let mut base = fields.base_name();
+    base.push_str(".t");
+    push_hex(&mut base, token);
+    tagged_filename(base, tag, ".rct")
 }
 
 // Leased: <job-id>.g<gen>.a<att>.m<max>.b<boottime_dl>.w<wall_dl>.t<token>.k<tag>.sqj
@@ -420,14 +456,24 @@ pub fn leased_filename(
     token: &[u8; 16],
     tag: &[u8; 8],
 ) -> String {
-    format!(
-        "{}.b{}.w{}.t{}.k{}.sqj",
-        fields.base_name(),
-        hex_u64(boottime_deadline_ns),
-        hex_u64(wall_deadline_ns),
-        hex_encode(token),
-        name_tag_hex(tag)
+    let mut base = fields.base_name();
+    write!(
+        base,
+        ".b{boottime_deadline_ns:016x}.w{wall_deadline_ns:016x}.t"
     )
+    .expect("writing to a String cannot fail");
+    push_hex(&mut base, token);
+    tagged_filename(base, tag, ".sqj")
+}
+
+fn tagged_filename(mut base: String, tag: &[u8; 8], extension: &str) -> String {
+    // Both canonical tagged extensions are four bytes; reserve their fixed
+    // suffix in one step without making correctness depend on capacity math.
+    base.reserve(22);
+    base.push_str(".k");
+    push_hex(&mut base, tag);
+    base.push_str(extension);
+    base
 }
 
 // Temp: <created-boottime-ns-hex>.<random-128-bit-hex>.tmp
@@ -451,9 +497,8 @@ pub fn quarantine_filename(quarantine_id: &[u8; 16], reason: u16) -> String {
 
 pub fn make_ready_name(queue_id: &[u8; 16], shard_hex: &str, common: &CommonFields) -> String {
     let base = common.base_name();
-    let ctx = ready_context(shard_hex, &base);
-    let tag = compute_name_tag(queue_id, &ctx);
-    ready_filename(common, &tag)
+    let tag = compute_name_tag_parts(queue_id, &["ready/-/-/", shard_hex, "/", &base]);
+    tagged_filename(base, &tag, ".sqj")
 }
 
 pub fn make_delayed_name(
@@ -463,10 +508,13 @@ pub fn make_delayed_name(
     common: &CommonFields,
     not_before_ns: u64,
 ) -> String {
-    let base = format!("{}.d{}", common.base_name(), hex_u64(not_before_ns));
-    let ctx = delayed_context(bucket_hex, shard_hex, &base);
-    let tag = compute_name_tag(queue_id, &ctx);
-    delayed_filename(common, not_before_ns, &tag)
+    let mut base = common.base_name();
+    write!(base, ".d{not_before_ns:016x}").expect("writing to a String cannot fail");
+    let tag = compute_name_tag_parts(
+        queue_id,
+        &["delayed/-/", bucket_hex, "/", shard_hex, "/", &base],
+    );
+    tagged_filename(base, &tag, ".sqj")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -480,16 +528,20 @@ pub fn make_leased_name(
     wall_deadline_ns: u64,
     token: &[u8; 16],
 ) -> String {
-    let base = format!(
-        "{}.b{}.w{}.t{}",
-        common.base_name(),
-        hex_u64(boottime_deadline_ns),
-        hex_u64(wall_deadline_ns),
-        hex_encode(token),
+    let mut base = common.base_name();
+    write!(
+        base,
+        ".b{boottime_deadline_ns:016x}.w{wall_deadline_ns:016x}.t"
+    )
+    .expect("writing to a String cannot fail");
+    push_hex(&mut base, token);
+    let tag = compute_name_tag_parts(
+        queue_id,
+        &[
+            "leased/", boot_id, "/", bucket_hex, "/", shard_hex, "/", &base,
+        ],
     );
-    let ctx = leased_context(boot_id, bucket_hex, shard_hex, &base);
-    let tag = compute_name_tag(queue_id, &ctx);
-    leased_filename(common, boottime_deadline_ns, wall_deadline_ns, token, &tag)
+    tagged_filename(base, &tag, ".sqj")
 }
 
 pub fn make_receipt_name(
@@ -499,10 +551,22 @@ pub fn make_receipt_name(
     common: &CommonFields,
     token: &[u8; 16],
 ) -> String {
-    let base = format!("{}.t{}", common.base_name(), hex_encode(token));
-    let ctx = terminal_context(State::Receipt, bucket_hex, shard_hex, &base);
-    let tag = compute_name_tag(queue_id, &ctx);
-    receipt_filename(common, token, &tag)
+    let mut base = common.base_name();
+    base.push_str(".t");
+    push_hex(&mut base, token);
+    let tag = compute_name_tag_parts(
+        queue_id,
+        &[
+            State::Receipt.dir_name(),
+            "/-/",
+            bucket_hex,
+            "/",
+            shard_hex,
+            "/",
+            &base,
+        ],
+    );
+    tagged_filename(base, &tag, ".rct")
 }
 
 pub fn make_dead_name(
@@ -512,10 +576,21 @@ pub fn make_dead_name(
     common: &CommonFields,
     reason: u16,
 ) -> String {
-    let base = format!("{}.x{}", common.base_name(), hex_u16(reason));
-    let ctx = terminal_context(State::Dead, bucket_hex, shard_hex, &base);
-    let tag = compute_name_tag(queue_id, &ctx);
-    dead_filename(common, reason, &tag)
+    let mut base = common.base_name();
+    write!(base, ".x{reason:04x}").expect("writing to a String cannot fail");
+    let tag = compute_name_tag_parts(
+        queue_id,
+        &[
+            State::Dead.dir_name(),
+            "/-/",
+            bucket_hex,
+            "/",
+            shard_hex,
+            "/",
+            &base,
+        ],
+    );
+    tagged_filename(base, &tag, ".sqj")
 }
 
 // ---------- Canonical context for name tag ----------
