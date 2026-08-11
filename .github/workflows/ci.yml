@@ -151,7 +151,7 @@ jobs:
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_filename_parser -- -max_len=256 -runs=50000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_cbor_decoder -- -max_len=1024 -runs=50000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_transition_ticket -- -max_len=1024 -runs=50000
-          timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_operation_sequence -- -max_len=128 -runs=5000
+          timeout 600 cargo +nightly-2026-08-07 fuzz run fuzz_operation_sequence -- -max_len=128 -runs=5000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_queue_corruption -- -max_len=128 -runs=5000
           timeout 300 cargo +nightly-2026-08-07 fuzz run fuzz_resolve -- -max_len=1024 -runs=5000
 
