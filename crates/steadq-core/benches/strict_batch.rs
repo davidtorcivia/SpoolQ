@@ -3,6 +3,13 @@ use std::time::Instant;
 use steadq_core::{CreateOptions, EnqueueInput, OpenOptions, Queue};
 use tempfile::TempDir;
 
+fn benchmark_tempdir() -> TempDir {
+    match std::env::var_os("STEADQ_BENCH_ROOT") {
+        Some(root) => TempDir::new_in(root).unwrap(),
+        None => TempDir::new().unwrap(),
+    }
+}
+
 fn bench_strict_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("strict_batch_completed");
 
@@ -16,11 +23,7 @@ fn bench_strict_batch(c: &mut Criterion) {
                     &(payload_size, batch_size, n_workers),
                     |b, &(payload_size, batch_size, n_workers)| {
                         b.iter_custom(|iters| {
-                            // Benchmark only on SanDisk SSD (nvme-mirror), never on OS boot drive.
-                            // Uses ZFS dataset nvme-mirror/DEV/steadq which is on the SanDisk pool;
-                            // init now allows ZFS (0x2fc12fc1) for secondary, ext4 loop image can be
-                            // hosted here for primary when available.
-                            let tmp = TempDir::new_in("/nvme-mirror/DEV/steadq").unwrap();
+                            let tmp = benchmark_tempdir();
                             Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                             let payload = vec![0xABu8; payload_size];
                             let mut total_jobs = 0u64;

@@ -12,6 +12,7 @@ use std::ptr::NonNull;
 
 const MAX_COMPONENT_BYTES: usize = 255;
 const MAX_RELATIVE_PATH_BYTES: usize = 4095;
+const INLINE_C_PATH_BYTES: usize = MAX_COMPONENT_BYTES + 1;
 
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -246,12 +247,11 @@ pub fn open_tmpfile(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     // Use libc::O_TMPFILE which correctly includes O_DIRECTORY on all arches.
     // Fall back to the defined constant if libc does not expose it.
     let o_tmpfile = libc::O_TMPFILE;
-    let dot = CString::new(".").unwrap();
-    // SAFETY: `dot` is NUL-terminated and `dir_fd` remains live for the call.
+    // SAFETY: the C string is NUL-terminated and `dir_fd` remains live for the call.
     let fd = unsafe {
         libc::openat(
             dir_fd.as_raw_fd(),
-            dot.as_ptr(),
+            c".".as_ptr(),
             o_tmpfile | libc::O_RDWR | libc::O_CLOEXEC,
             0o600,
         )
@@ -263,20 +263,72 @@ pub fn open_tmpfile(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Convert a name string to CString, returning InvalidInput on embedded NUL.
-fn cstr_from_name(name: &str) -> io::Result<CString> {
-    CString::new(name).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path component contains NUL byte",
-        )
-    })
+/// A NUL-terminated syscall path. Canonical SteadQ names stay inline; unusually
+/// long paths retain the previous heap-backed behavior.
+#[allow(clippy::large_enum_variant)] // Boxing the common case would restore the allocation avoided here.
+enum CPath {
+    Inline([u8; INLINE_C_PATH_BYTES]),
+    Heap(CString),
 }
 
-/// Convert a byte slice (OsStr on Linux) to CString, returning InvalidInput on embedded NUL.
-fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CString> {
-    CString::new(bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
+impl CPath {
+    fn from_bytes(bytes: &[u8], nul_error: &'static str) -> io::Result<Self> {
+        if bytes.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, nul_error));
+        }
+        if bytes.len() < INLINE_C_PATH_BYTES {
+            let mut inline = [0; INLINE_C_PATH_BYTES];
+            inline[..bytes.len()].copy_from_slice(bytes);
+            Ok(Self::Inline(inline))
+        } else {
+            // The explicit NUL check above makes construction infallible.
+            Ok(Self::Heap(
+                CString::new(bytes).expect("NUL already rejected"),
+            ))
+        }
+    }
+
+    fn as_ptr(&self) -> *const libc::c_char {
+        match self {
+            Self::Inline(bytes) => bytes.as_ptr().cast(),
+            Self::Heap(path) => path.as_ptr(),
+        }
+    }
+}
+
+/// Convert a name string to a NUL-terminated syscall path.
+fn cstr_from_name(name: &str) -> io::Result<CPath> {
+    CPath::from_bytes(name.as_bytes(), "path component contains NUL byte")
+}
+
+/// Convert a byte slice (OsStr on Linux) to a NUL-terminated syscall path.
+fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CPath> {
+    CPath::from_bytes(bytes, "path contains NUL byte")
+}
+
+fn proc_self_fd_path(fd: BorrowedFd<'_>) -> [u8; 32] {
+    proc_self_fd_path_raw(fd.as_raw_fd() as u32)
+}
+
+fn proc_self_fd_path_raw(value: u32) -> [u8; 32] {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let mut path = [0; 32];
+    path[..PREFIX.len()].copy_from_slice(PREFIX);
+
+    let mut divisor = 1_u32;
+    while value / divisor >= 10 {
+        divisor *= 10;
+    }
+    let mut offset = PREFIX.len();
+    loop {
+        path[offset] = b'0' + ((value / divisor) % 10) as u8;
+        offset += 1;
+        if divisor == 1 {
+            break;
+        }
+        divisor /= 10;
+    }
+    path
 }
 
 /// Open a directory for reading.
@@ -451,13 +503,12 @@ pub fn linkat_empty_path(
     fault_check!("linkat_empty_path");
     const AT_EMPTY_PATH: i32 = 0x1000;
     let c_dest = cstr_from_name(dest_name)?;
-    let empty = CString::new("").unwrap();
     // SAFETY: both names are NUL-terminated and both descriptor borrows remain live.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
             fd.as_raw_fd(),
-            empty.as_ptr(),
+            c"".as_ptr(),
             dest_dir_fd.as_raw_fd(),
             c_dest.as_ptr(),
             AT_EMPTY_PATH,
@@ -477,15 +528,14 @@ pub fn linkat_proc_self_fd(
 ) -> io::Result<()> {
     fault_check!("linkat_proc_self_fd");
     const AT_SYMLINK_FOLLOW: i32 = 0x400;
-    #[allow(clippy::manual_c_str_literals)]
-    let proc_path = format!("/proc/self/fd/{}\0", fd.as_raw_fd());
+    let proc_path = proc_self_fd_path(fd);
     let c_dest = cstr_from_name(dest_name)?;
     // SAFETY: both paths are NUL-terminated and both descriptor borrows remain live.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_linkat,
             libc::AT_FDCWD,
-            proc_path.as_ptr() as *const _,
+            proc_path.as_ptr().cast::<libc::c_char>(),
             dest_dir_fd.as_raw_fd(),
             c_dest.as_ptr(),
             AT_SYMLINK_FOLLOW,
@@ -1427,7 +1477,7 @@ pub fn should_propagate_on_fallback(err: &io::Error) -> bool {
 }
 
 /// Probe unnamed-file publication modes. Returns which mode is available.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationMode {
     DirectAtEmptyPath,
     ProcSelfFd,
@@ -1775,6 +1825,47 @@ mod tests {
         // C-06: embedded NUL must return error, not panic
         let result = cstr_from_name("hello\0world");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn syscall_paths_keep_canonical_names_inline_and_long_paths_valid() {
+        let inline = cstr_from_name("ready-name.sqj").unwrap();
+        assert!(matches!(inline, CPath::Inline(_)));
+        // SAFETY: CPath guarantees a trailing NUL for the lifetime of `inline`.
+        let inline_bytes = unsafe { std::ffi::CStr::from_ptr(inline.as_ptr()) }.to_bytes();
+        assert_eq!(inline_bytes, b"ready-name.sqj");
+
+        let boundary_name = "b".repeat(MAX_COMPONENT_BYTES);
+        let boundary = cstr_from_name(&boundary_name).unwrap();
+        assert!(matches!(boundary, CPath::Inline(_)));
+        // SAFETY: CPath guarantees a trailing NUL for the lifetime of `boundary`.
+        let boundary_bytes = unsafe { std::ffi::CStr::from_ptr(boundary.as_ptr()) }.to_bytes();
+        assert_eq!(boundary_bytes, boundary_name.as_bytes());
+
+        let long_name = "x".repeat(INLINE_C_PATH_BYTES);
+        let heap = cstr_from_name(&long_name).unwrap();
+        assert!(matches!(heap, CPath::Heap(_)));
+        // SAFETY: CPath guarantees a trailing NUL for the lifetime of `heap`.
+        let heap_bytes = unsafe { std::ffi::CStr::from_ptr(heap.as_ptr()) }.to_bytes();
+        assert_eq!(heap_bytes, long_name.as_bytes());
+    }
+
+    #[test]
+    fn proc_self_fd_path_encodes_the_live_descriptor_without_allocation() {
+        let directory = test_dir("proc_self_fd_path");
+        let fd: OwnedFd = std::fs::File::open(directory.path()).unwrap().into();
+        let path = proc_self_fd_path(fd.as_fd());
+        // SAFETY: proc_self_fd_path leaves zero-filled bytes after the digits.
+        let actual = unsafe { std::ffi::CStr::from_ptr(path.as_ptr().cast()) };
+        assert_eq!(
+            actual.to_bytes(),
+            format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes()
+        );
+
+        let multiple_digits = proc_self_fd_path_raw(1234);
+        // SAFETY: proc_self_fd_path_raw leaves zero-filled bytes after the digits.
+        let actual = unsafe { std::ffi::CStr::from_ptr(multiple_digits.as_ptr().cast()) };
+        assert_eq!(actual.to_bytes(), b"/proc/self/fd/1234");
     }
 
     #[test]

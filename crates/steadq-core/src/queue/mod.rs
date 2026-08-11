@@ -251,6 +251,7 @@ pub struct Queue {
     pub(crate) boot_id_bytes: [u8; 16],
     pub(crate) poisoned: bool,
     pub(crate) scan_round: u64,
+    pub(crate) ready_shard_hint: Option<u32>,
     pub(crate) worker_nonce: [u8; 16],
     pub(crate) options: OpenOptions,
     #[allow(dead_code)]
@@ -259,6 +260,7 @@ pub struct Queue {
     pub(crate) cached_wall_floor: Option<WallFloor>,
     pub(crate) known_dirs: std::cell::RefCell<std::collections::HashSet<String>>,
     pub(crate) cached_dest_fd: Option<(String, std::os::fd::OwnedFd)>,
+    pub(crate) publication_mode: Option<fs::PublicationMode>,
     pub(crate) deferred_dir_sync: bool,
     pub(crate) dirty: std::cell::RefCell<engine::DirtySet>,
 }
@@ -300,6 +302,7 @@ struct PreparedEnqueue {
     payload: Vec<u8>,
     dest_dir: String,
     filename: String,
+    ready_shard_hint: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -715,6 +718,37 @@ fn watermark_open_flags() -> i32 {
         .expect("watermark open flags must not overlap")
 }
 
+fn preferred_publication_mode(filesystem_type: i64) -> Option<fs::PublicationMode> {
+    // OpenZFS can stall O_TMPFILE link publication behind transaction-group
+    // work; its ordinary named-temp rename path avoids that slow path while
+    // retaining the same no-overwrite and durability checks.
+    (filesystem_type == fs::ZFS_SUPER_MAGIC).then_some(fs::PublicationMode::NamedFallback)
+}
+
+fn classify_filesystem_type(
+    observation: io::Result<i64>,
+    allow_unsupported: bool,
+) -> Result<Option<i64>, Error> {
+    match observation {
+        Ok(filesystem_type)
+            if allow_unsupported
+                || matches!(
+                    filesystem_type,
+                    fs::EXT4_SUPER_MAGIC
+                        | fs::XFS_SUPER_MAGIC
+                        | fs::BTRFS_SUPER_MAGIC
+                        | fs::F2FS_SUPER_MAGIC
+                        | fs::ZFS_SUPER_MAGIC
+                ) =>
+        {
+            Ok(Some(filesystem_type))
+        }
+        Ok(_) => Err(Error::UnsupportedFilesystem),
+        Err(_) if allow_unsupported => Ok(None),
+        Err(error) => Err(Error::IoFailure(error.to_string())),
+    }
+}
+
 /// Pure helper for watermark advance decision. Returns true when observed
 /// bucket is strictly greater than stored bucket. Extracted so <= vs > mutants
 /// are killable.
@@ -1054,27 +1088,12 @@ impl Queue {
             ));
         }
 
-        // Check filesystem type
-        if !opts.allow_unsupported_fs {
-            let magic = fs::statfs(root).map_err(|e| Error::IoFailure(e.to_string()))?;
-            let ft = magic.f_type as i64;
-            match ft {
-                fs::EXT4_SUPER_MAGIC
-                | fs::XFS_SUPER_MAGIC
-                | fs::BTRFS_SUPER_MAGIC
-                | fs::F2FS_SUPER_MAGIC
-                | fs::ZFS_SUPER_MAGIC => {}
-                fs::TMPFS_MAGIC => {
-                    return Err(Error::UnsupportedFilesystem);
-                }
-                fs::NFS_SUPER_MAGIC | fs::FUSE_SUPER_MAGIC | fs::OVERLAYFS_SUPER_MAGIC => {
-                    return Err(Error::UnsupportedFilesystem);
-                }
-                _ => {
-                    return Err(Error::UnsupportedFilesystem);
-                }
-            }
-        }
+        // Check filesystem type. Keep the observation even when validation is
+        // relaxed because publication performance differs materially by backend.
+        let filesystem_type = classify_filesystem_type(
+            fs::statfs(root).map(|stat| stat.f_type),
+            opts.allow_unsupported_fs,
+        )?;
 
         // B-11: Require all state directories to exist and be on the same device.
         for state_dir in &[
@@ -1126,6 +1145,7 @@ impl Queue {
         }
         let recovery_cursor =
             crate::recovery::load_recovery_cursor(root_fd.as_fd(), format_rec.queue_id())?;
+        let publication_mode = filesystem_type.and_then(preferred_publication_mode);
         Ok(Queue {
             root_fd,
             root_path: root.to_path_buf(),
@@ -1134,6 +1154,7 @@ impl Queue {
             boot_id_bytes: boot_id_bin,
             poisoned: false,
             scan_round: 0,
+            ready_shard_hint: None,
             worker_nonce,
             options: opts.clone(),
             maint_lock_fd: Some(maint_fd),
@@ -1141,6 +1162,7 @@ impl Queue {
             cached_wall_floor: None,
             known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
             cached_dest_fd: None,
+            publication_mode,
             deferred_dir_sync: opts.deferred_dir_sync,
             dirty: std::cell::RefCell::new(engine::DirtySet::new()),
         })
@@ -1612,6 +1634,14 @@ impl Queue {
             expected_initial_state: initial_state,
             expected_relative_path: expected_path.clone(),
         };
+        let ready_shard_hint = match initial_state {
+            InitialState::Ready => Some(compute_shard(
+                self.format.queue_id(),
+                &job_id,
+                self.format.shard_count(),
+            )),
+            InitialState::Delayed => None,
+        };
         Ok(PreparedEnqueue {
             ticket,
             header,
@@ -1619,6 +1649,7 @@ impl Queue {
             payload: job.payload,
             dest_dir: dest_dir_relative,
             filename,
+            ready_shard_hint,
         })
     }
 
@@ -1651,7 +1682,12 @@ impl Queue {
             )
         };
         match result {
-            Ok(()) => EnqueueOutcome::Committed(prepared.ticket),
+            Ok(()) => {
+                if let Some(shard) = prepared.ready_shard_hint {
+                    self.ready_shard_hint = Some(shard);
+                }
+                EnqueueOutcome::Committed(prepared.ticket)
+            }
             Err(PublishError::NotCommitted(e)) => EnqueueOutcome::NotCommitted(prepared.ticket, e),
             Err(PublishError::OutcomeUnknown(e)) => {
                 self.poison();
@@ -1764,6 +1800,18 @@ impl Queue {
             .open_or_cache_dir(dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
+        if self.publication_mode == Some(fs::PublicationMode::NamedFallback) {
+            return self.named_fallback_with_dirty(
+                dest_dir_relative,
+                dest_fd.as_fd(),
+                dest_name,
+                header,
+                ext_bytes,
+                payload,
+                dirty,
+            );
+        }
+
         match fs::open_tmpfile(dest_fd.as_fd()) {
             Ok(tmp_fd) => {
                 let header_bytes = header
@@ -1772,16 +1820,23 @@ impl Queue {
                 fs::writev_all(tmp_fd.as_fd(), &[&header_bytes, ext_bytes, payload])
                     .map_err(PublishError::classify_write)?;
                 let publish_outcome = if dirty.is_some() {
-                    engine::publish_tmpfile_noreplace_deferred(
+                    engine::publish_tmpfile_noreplace_deferred_with_mode(
                         tmp_fd.as_fd(),
                         dest_fd.as_fd(),
                         dest_name,
+                        self.publication_mode,
                     )
                 } else {
-                    engine::publish_tmpfile_noreplace(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name)
+                    engine::publish_tmpfile_noreplace_with_mode(
+                        tmp_fd.as_fd(),
+                        dest_fd.as_fd(),
+                        dest_name,
+                        self.publication_mode,
+                    )
                 };
                 match publish_outcome {
-                    Ok(engine::TmpfilePublishOutcome::Published) => {
+                    Ok(engine::TmpfilePublishOutcome::Published(mode)) => {
+                        self.publication_mode = Some(mode);
                         if let Some(d) = dirty {
                             d.record(dest_fd.as_fd()).map_err(|e| {
                                 PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
@@ -1789,8 +1844,9 @@ impl Queue {
                         }
                         Ok(())
                     }
-                    Ok(engine::TmpfilePublishOutcome::Unsupported) => self
-                        .named_fallback_with_dirty(
+                    Ok(engine::TmpfilePublishOutcome::Unsupported) => {
+                        self.publication_mode = Some(fs::PublicationMode::NamedFallback);
+                        self.named_fallback_with_dirty(
                             dest_dir_relative,
                             dest_fd.as_fd(),
                             dest_name,
@@ -1798,12 +1854,14 @@ impl Queue {
                             ext_bytes,
                             payload,
                             dirty,
-                        ),
+                        )
+                    }
                     Err(failure) => Err(PublishError::classify_tmpfile(failure)),
                 }
             }
             Err(e) => {
                 if engine::is_tmpfile_open_unsupported(&e) {
+                    self.publication_mode = Some(fs::PublicationMode::NamedFallback);
                     self.named_fallback_with_dirty(
                         dest_dir_relative,
                         dest_fd.as_fd(),
@@ -1886,6 +1944,9 @@ impl Queue {
             ) {
                 Ok(_) => {
                     temp_guard.armed = false;
+                    d.record(tmp_dir_fd.as_fd()).map_err(|e| {
+                        PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
+                    })?;
                     d.record(dest_fd).map_err(|e| {
                         PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
                     })?;
@@ -1952,12 +2013,9 @@ impl Queue {
         relative: &str,
         mut dirty: Option<&mut engine::DirtySet>,
     ) -> io::Result<()> {
-        if self.known_dirs.borrow().contains(relative) && dirty.is_none() {
+        if self.known_dirs.borrow().contains(relative) {
             return Ok(());
         }
-        // When using dirty tracking, we still need to check known_dirs but
-        // must not skip recording for new dirs that are already known.
-        // For simplicity, always walk the path when dirty is Some.
         let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
         let mut current = None::<OwnedFd>;
 
@@ -2177,6 +2235,19 @@ impl Queue {
         let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
+        if self.publication_mode == Some(fs::PublicationMode::NamedFallback) {
+            return self.named_fallback_streaming_init(
+                dest_dir_relative,
+                dest_fd.as_fd(),
+                dest_name,
+                job_id,
+                maximum_attempts,
+                created_at,
+                ext_bytes,
+                reader,
+            );
+        }
+
         match fs::open_tmpfile(dest_fd.as_fd()) {
             Ok(tmp_fd) => {
                 let (payload_len, payload_digest) =
@@ -2213,12 +2284,18 @@ impl Queue {
                     .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
                 fs::pwrite_all(tmp_fd.as_fd(), &header_bytes, 0)
                     .map_err(PublishError::classify_write)?;
-                fs::fsync(tmp_fd.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
-                match engine::publish_tmpfile_noreplace(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name)
-                {
-                    Ok(engine::TmpfilePublishOutcome::Published) => {}
+                match engine::publish_tmpfile_noreplace_with_mode(
+                    tmp_fd.as_fd(),
+                    dest_fd.as_fd(),
+                    dest_name,
+                    self.publication_mode,
+                ) {
+                    Ok(engine::TmpfilePublishOutcome::Published(mode)) => {
+                        self.publication_mode = Some(mode);
+                    }
                     Ok(engine::TmpfilePublishOutcome::Unsupported) => {
+                        self.publication_mode = Some(fs::PublicationMode::NamedFallback);
                         // O_TMPFILE not supported: need named fallback.
                         // Read back from the tmpfile and use the standard path.
                         return self.named_fallback_streaming(
@@ -2239,6 +2316,7 @@ impl Queue {
             }
             Err(e) => {
                 if engine::is_tmpfile_open_unsupported(&e) {
+                    self.publication_mode = Some(fs::PublicationMode::NamedFallback);
                     // O_TMPFILE not supported: stream to a named temp file instead.
                     self.named_fallback_streaming_init(
                         dest_dir_relative,
@@ -2290,7 +2368,6 @@ impl Queue {
 
     /// Named fallback for streaming when O_TMPFILE is unsupported.
     /// Reads back from the O_TMPFILE fd and writes to a named temp file.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn named_fallback_streaming(
         &mut self,
@@ -2365,7 +2442,6 @@ impl Queue {
     }
 
     /// Named fallback for streaming when O_TMPFILE open fails entirely.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn named_fallback_streaming_init(
         &mut self,
@@ -2485,13 +2561,14 @@ impl Queue {
         // C-15: Use and advance the per-worker scan round
         let scan_round = self.scan_round;
         self.scan_round = self.scan_round.wrapping_add(1);
-        let (start, stride) = steadq_names::shard_scan_params(
+        let (scheduled_start, stride) = steadq_names::shard_scan_params(
             self.format.queue_id(),
             &self.boot_id_bytes,
             &self.worker_nonce,
             scan_round,
             self.format.shard_count(),
         );
+        let start = self.ready_shard_hint.take().unwrap_or(scheduled_start);
 
         for i in 0..self.format.shard_count() {
             let shard = steadq_names::shard_at(start, stride, i, self.format.shard_count());
@@ -5633,6 +5710,46 @@ mod tests {
     }
 
     #[test]
+    fn zfs_prefers_named_publication_without_changing_other_backends() {
+        assert_eq!(
+            preferred_publication_mode(fs::ZFS_SUPER_MAGIC),
+            Some(fs::PublicationMode::NamedFallback)
+        );
+        for filesystem in [
+            fs::EXT4_SUPER_MAGIC,
+            fs::XFS_SUPER_MAGIC,
+            fs::BTRFS_SUPER_MAGIC,
+            fs::F2FS_SUPER_MAGIC,
+        ] {
+            assert_eq!(preferred_publication_mode(filesystem), None);
+        }
+    }
+
+    #[test]
+    fn filesystem_classification_preserves_strict_and_relaxed_behavior() {
+        assert_eq!(
+            classify_filesystem_type(Ok(fs::EXT4_SUPER_MAGIC), false).unwrap(),
+            Some(fs::EXT4_SUPER_MAGIC)
+        );
+        assert!(matches!(
+            classify_filesystem_type(Ok(fs::TMPFS_MAGIC), false),
+            Err(Error::UnsupportedFilesystem)
+        ));
+        assert_eq!(
+            classify_filesystem_type(Ok(fs::TMPFS_MAGIC), true).unwrap(),
+            Some(fs::TMPFS_MAGIC)
+        );
+
+        let strict_error =
+            classify_filesystem_type(Err(io::Error::from_raw_os_error(libc::EIO)), false);
+        assert!(matches!(strict_error, Err(Error::IoFailure(_))));
+        assert_eq!(
+            classify_filesystem_type(Err(io::Error::from_raw_os_error(libc::EIO)), true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn sync_flushes_deferred_directory_changes() {
         let (tmp, mut queue) = {
             let tmp = TempDir::new().unwrap();
@@ -5795,7 +5912,11 @@ mod tests {
 
         // Record the same directory twice — should deduplicate
         dirty.record(shard_fd.as_fd()).unwrap();
-        dirty.record(shard_fd.as_fd()).unwrap();
+        dirty
+            .record_with(shard_fd.as_fd(), |_| {
+                Err(io::Error::other("duplicate descriptor was cloned"))
+            })
+            .unwrap();
         assert_eq!(dirty.len(), 1);
 
         // Record a different directory
@@ -5808,6 +5929,27 @@ mod tests {
         // clear works
         dirty.clear();
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn dirty_ensure_skips_known_directory_without_recording_parent() {
+        let (_tmp, queue) = create_test_queue();
+        let mut initial_dirty = engine::DirtySet::new();
+        queue
+            .ensure_dir_with_dirty("ready/0000", Some(&mut initial_dirty))
+            .unwrap();
+        initial_dirty.sync_all().unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("mkdirat", 1, libc::EIO);
+        let mut next_dirty = engine::DirtySet::new();
+        let result = queue.ensure_dir_with_dirty("ready/0000", Some(&mut next_dirty));
+        let mkdir_calls = fs::fault::call_count("mkdirat");
+        fs::fault::reset();
+
+        assert!(result.is_ok());
+        assert_eq!(mkdir_calls, 0);
+        assert!(next_dirty.is_empty());
     }
 
     #[test]
@@ -6004,6 +6146,64 @@ mod tests {
             .unwrap();
         assert_eq!(read, payload.len());
         assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn preferred_named_publication_bypasses_tmpfile_linking() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+        fs::fault::reset();
+        fs::fault::inject("open_tmpfile", u64::MAX);
+
+        let enqueue = queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".into(),
+            payload: b"named preference".to_vec(),
+            ..Default::default()
+        });
+        let tmpfile_calls = fs::fault::call_count("open_tmpfile");
+        let rename_calls = fs::fault::call_count("renameat2_noreplace");
+        fs::fault::reset();
+
+        assert!(matches!(enqueue, EnqueueOutcome::Committed(_)));
+        assert_eq!(tmpfile_calls, 0);
+        assert_eq!(rename_calls, 1);
+    }
+
+    #[test]
+    fn deferred_named_publication_records_source_and_destination_directories() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+        let boot_id = queue.boot_id.clone();
+        let mut batch = queue.batch();
+        let outcome = batch.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "text/plain".into(),
+            payload: b"deferred named publication".to_vec(),
+            ..Default::default()
+        });
+        let BatchEnqueueOutcome::Pending(ticket) = outcome else {
+            panic!("named batch enqueue failed: {outcome:?}");
+        };
+        let destination_path = ticket.expected_relative_path.rsplit_once('/').unwrap().0;
+        let shard = destination_path.rsplit('/').next().unwrap();
+        let source_path = format!("tmp/{boot_id}/{shard}");
+        let source_fd = open_relative(batch.queue.root_fd.as_fd(), &source_path).unwrap();
+        let destination_fd = open_relative(batch.queue.root_fd.as_fd(), destination_path).unwrap();
+        let source_identity = fs::fstat(source_fd.as_fd()).unwrap();
+        let destination_identity = fs::fstat(destination_fd.as_fd()).unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject("fsync_dir_fd", u64::MAX);
+        batch.commit().expect("named batch commit");
+        let synced = fs::fault::fd_identities("fsync_dir_fd");
+        fs::fault::reset();
+
+        assert!(synced.contains(&(source_identity.st_dev as u64, source_identity.st_ino as u64)));
+        assert!(synced.contains(&(
+            destination_identity.st_dev as u64,
+            destination_identity.st_ino as u64
+        )));
     }
 
     #[test]
@@ -7196,6 +7396,8 @@ mod tests {
         let payload = vec![0x42u8; 100_000];
 
         let cursor = std::io::Cursor::new(payload.clone());
+        fs::fault::reset();
+        fs::fault::inject("fsync", u64::MAX);
         let outcome = queue.enqueue_streaming(
             3,
             "x".to_string(),
@@ -7205,10 +7407,18 @@ mod tests {
             None,
             cursor,
         );
+        let file_fsync_calls = fs::fault::call_count("fsync");
+        let directory_fsync_calls = fs::fault::call_count("fsync_dir_fd");
+        fs::fault::reset();
         let _ticket = match outcome {
             EnqueueOutcome::Committed(t) => t,
             o => panic!("streaming enqueue failed: {o:?}"),
         };
+        assert_eq!(
+            file_fsync_calls.checked_sub(directory_fsync_calls),
+            Some(1),
+            "streaming publication syncs its data file once"
+        );
 
         let lease = match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(l) => l,
@@ -7233,6 +7443,41 @@ mod tests {
             offset += n as u64;
         }
         assert_eq!(read_data, payload);
+    }
+
+    #[test]
+    fn preferred_named_streaming_publication_bypasses_tmpfiles() {
+        let (_tmp, mut queue) = create_test_queue();
+        queue.publication_mode = Some(fs::PublicationMode::NamedFallback);
+        let payload = vec![0x5Au8; 8193];
+
+        fs::fault::reset();
+        fs::fault::inject("open_tmpfile", u64::MAX);
+        let outcome = queue.enqueue_streaming(
+            3,
+            "application/octet-stream".to_string(),
+            Default::default(),
+            None,
+            None,
+            None,
+            std::io::Cursor::new(payload),
+        );
+        let tmpfile_calls = fs::fault::call_count("open_tmpfile");
+        let rename_calls = fs::fault::call_count("renameat2_noreplace");
+        fs::fault::reset();
+
+        assert_eq!(tmpfile_calls, 0);
+        assert_eq!(rename_calls, 1);
+        let ticket = match outcome {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("named streaming enqueue failed: {outcome:?}"),
+        };
+        let lease = match queue.lease(0, 30_000_000_000) {
+            LeaseOutcome::Leased(lease) => lease,
+            outcome => panic!("lease failed: {outcome:?}"),
+        };
+        assert_eq!(lease.job_id, ticket.job_id);
+        queue.verify_lease_payload(&lease).unwrap();
     }
 
     #[test]
@@ -7547,6 +7792,82 @@ mod tests {
         assert_eq!(queue.scan_round, 1);
         let _ = queue.lease(0, 30_000_000_000);
         assert_eq!(queue.scan_round, 2);
+    }
+
+    #[test]
+    fn enqueue_hint_scans_the_known_ready_shard_first() {
+        let (_tmp, mut queue) = create_test_queue();
+        let ticket = match queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"hinted".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(ticket) => ticket,
+            outcome => panic!("enqueue failed: {outcome:?}"),
+        };
+        let hinted_shard = compute_shard(
+            queue.format.queue_id(),
+            &ticket.job_id,
+            queue.format.shard_count(),
+        );
+        assert_eq!(queue.ready_shard_hint, Some(hinted_shard));
+
+        queue.scan_round = (0..4096)
+            .find(|round| {
+                let (start, _) = steadq_names::shard_scan_params(
+                    queue.format.queue_id(),
+                    &queue.boot_id_bytes,
+                    &queue.worker_nonce,
+                    *round,
+                    queue.format.shard_count(),
+                );
+                start != hinted_shard
+            })
+            .unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno("open_directory", 1, libc::EIO);
+        let outcome = queue.lease(0, 30_000_000_000);
+        fs::fault::reset();
+
+        assert!(matches!(
+            outcome,
+            LeaseOutcome::NotCommitted(Error::IoFailure(_))
+        ));
+        assert_eq!(queue.ready_shard_hint, None);
+        assert!(matches!(
+            queue.lease(0, 30_000_000_000),
+            LeaseOutcome::Leased(_)
+        ));
+    }
+
+    #[test]
+    fn delayed_enqueue_preserves_ready_shard_hint() {
+        let (_tmp, mut queue) = create_test_queue();
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: b"ready".to_vec(),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        let ready_hint = queue.ready_shard_hint;
+        let not_before = queue.wall_floor_for_mutation().unwrap().unix_ns() + 60_000_000_000;
+        assert!(matches!(
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: b"delayed".to_vec(),
+                initial_not_before: Some(not_before),
+                ..Default::default()
+            }),
+            EnqueueOutcome::Committed(_)
+        ));
+        assert!(ready_hint.is_some());
+        assert_eq!(queue.ready_shard_hint, ready_hint);
     }
 
     // ===== R4-H22/H23: ack re-hashes payload internally =====
