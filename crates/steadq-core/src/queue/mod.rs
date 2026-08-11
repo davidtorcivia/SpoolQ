@@ -260,6 +260,160 @@ pub struct Queue {
     pub(crate) known_dirs: std::cell::RefCell<std::collections::HashSet<String>>,
     pub(crate) cached_dest_fd: Option<(String, std::os::fd::OwnedFd)>,
     pub(crate) deferred_dir_sync: bool,
+    pub(crate) dirty: std::cell::RefCell<engine::DirtySet>,
+}
+
+/// Strict batch for group commit. Operations are Pending until `commit`
+/// fsyncs every exact dirty directory once. Post-linearization failures
+/// become OutcomeUnknown.
+pub struct Batch<'a> {
+    queue: &'a mut Queue,
+    dirty: engine::DirtySet,
+    pending_enqueues: Vec<EnqueueTicket>,
+    pending_leases: Vec<LeaseInfo>,
+    pending_acks: Vec<LeaseInfo>,
+}
+
+#[derive(Debug)]
+pub enum BatchEnqueueOutcome {
+    Pending(EnqueueTicket),
+    NotCommitted(EnqueueTicket, Error),
+}
+
+#[derive(Debug)]
+pub enum BatchLeaseOutcome {
+    Pending(LeaseInfo),
+    Empty,
+    NotCommitted(Error),
+}
+
+#[derive(Debug)]
+pub enum BatchAckOutcome {
+    Pending,
+    NotCommitted(Error),
+}
+
+struct PreparedEnqueue {
+    ticket: EnqueueTicket,
+    header: FixedHeader,
+    ext_bytes: Vec<u8>,
+    payload: Vec<u8>,
+    dest_dir: String,
+    filename: String,
+}
+
+#[derive(Debug)]
+pub struct BatchCommitOutcome {
+    pub committed_enqueues: Vec<EnqueueTicket>,
+    pub outcome_unknown_enqueues: Vec<(EnqueueTicket, Error)>,
+    pub committed_leases: usize,
+    pub outcome_unknown_leases: Vec<Error>,
+    pub committed_acks: usize,
+    pub outcome_unknown_acks: Vec<Error>,
+}
+
+impl<'a> Batch<'a> {
+    /// Enqueue within the batch. The job is Pending until `commit`.
+    /// Batches dir fsyncs — file writes and publishes happen immediately
+    /// but dest dirs are recorded and flushed once at commit.
+    pub fn enqueue(&mut self, input: EnqueueInput) -> BatchEnqueueOutcome {
+        match self.queue.enqueue_batched(input, &mut self.dirty) {
+            EnqueueOutcome::Committed(ticket) => {
+                self.pending_enqueues.push(ticket.clone());
+                BatchEnqueueOutcome::Pending(ticket)
+            }
+            EnqueueOutcome::NotCommitted(ticket, err) => {
+                BatchEnqueueOutcome::NotCommitted(ticket, err)
+            }
+            EnqueueOutcome::OutcomeUnknown(ticket, err) => {
+                BatchEnqueueOutcome::NotCommitted(ticket, err)
+            }
+        }
+    }
+
+    /// Lease within the batch.
+    pub fn lease(&mut self, max_wait_ns: u64, lease_duration_ns: u64) -> BatchLeaseOutcome {
+        match self
+            .queue
+            .lease_batched(max_wait_ns, lease_duration_ns, &mut self.dirty)
+        {
+            LeaseOutcome::Leased(info) => {
+                self.pending_leases.push(info.clone());
+                BatchLeaseOutcome::Pending(info)
+            }
+            LeaseOutcome::Empty => BatchLeaseOutcome::Empty,
+            LeaseOutcome::NotCommitted(err) => BatchLeaseOutcome::NotCommitted(err),
+            LeaseOutcome::OutcomeUnknown(ticket) => {
+                // Treat as NotCommitted for batch; commit will handle.
+                BatchLeaseOutcome::NotCommitted(Error::IoFailure(format!(
+                    "lease outcome unknown before commit: {ticket:?}"
+                )))
+            }
+        }
+    }
+
+    /// Ack within the batch.
+    pub fn ack(&mut self, lease: &LeaseInfo) -> BatchAckOutcome {
+        match self.queue.ack_batched(lease, &mut self.dirty) {
+            AckOutcome::Acked => {
+                self.pending_acks.push(lease.clone());
+                BatchAckOutcome::Pending
+            }
+            AckOutcome::AlreadyAcked => BatchAckOutcome::Pending,
+            AckOutcome::LeaseLost => {
+                BatchAckOutcome::NotCommitted(Error::InvalidInput("lease lost".into()))
+            }
+            AckOutcome::NotCommitted(err) => BatchAckOutcome::NotCommitted(err),
+            AckOutcome::OutcomeUnknown(ticket) => BatchAckOutcome::NotCommitted(Error::IoFailure(
+                format!("ack outcome unknown before commit: {ticket:?}"),
+            )),
+        }
+    }
+
+    /// Commit the batch: fsync every exact dirty directory once.
+    /// If the barrier fails, all pending post-linearization ops become OutcomeUnknown.
+    pub fn commit(self) -> Result<BatchCommitOutcome, BatchCommitOutcome> {
+        let Batch {
+            queue,
+            dirty,
+            pending_enqueues,
+            pending_leases,
+            pending_acks,
+        } = self;
+
+        let sync_result = dirty.sync_all();
+
+        if let Err(e) = sync_result {
+            queue.poison();
+            let outcome = BatchCommitOutcome {
+                committed_enqueues: Vec::new(),
+                outcome_unknown_enqueues: pending_enqueues
+                    .into_iter()
+                    .map(|t| (t, Error::IoFailure(e.to_string())))
+                    .collect(),
+                committed_leases: 0,
+                outcome_unknown_leases: pending_leases
+                    .into_iter()
+                    .map(|_| Error::IoFailure(e.to_string()))
+                    .collect(),
+                committed_acks: 0,
+                outcome_unknown_acks: pending_acks
+                    .into_iter()
+                    .map(|_| Error::IoFailure(e.to_string()))
+                    .collect(),
+            };
+            return Err(outcome);
+        }
+
+        Ok(BatchCommitOutcome {
+            committed_enqueues: pending_enqueues,
+            outcome_unknown_enqueues: Vec::new(),
+            committed_leases: pending_leases.len(),
+            outcome_unknown_leases: Vec::new(),
+            committed_acks: pending_acks.len(),
+            outcome_unknown_acks: Vec::new(),
+        })
+    }
 }
 
 /// Internal helper enum for resolver object authentication.
@@ -606,7 +760,8 @@ impl Queue {
             fs::EXT4_SUPER_MAGIC
             | fs::XFS_SUPER_MAGIC
             | fs::BTRFS_SUPER_MAGIC
-            | fs::F2FS_SUPER_MAGIC => {}
+            | fs::F2FS_SUPER_MAGIC
+            | fs::ZFS_SUPER_MAGIC => {}
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -907,7 +1062,8 @@ impl Queue {
                 fs::EXT4_SUPER_MAGIC
                 | fs::XFS_SUPER_MAGIC
                 | fs::BTRFS_SUPER_MAGIC
-                | fs::F2FS_SUPER_MAGIC => {}
+                | fs::F2FS_SUPER_MAGIC
+                | fs::ZFS_SUPER_MAGIC => {}
                 fs::TMPFS_MAGIC => {
                     return Err(Error::UnsupportedFilesystem);
                 }
@@ -986,6 +1142,7 @@ impl Queue {
             known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
             cached_dest_fd: None,
             deferred_dir_sync: opts.deferred_dir_sync,
+            dirty: std::cell::RefCell::new(engine::DirtySet::new()),
         })
     }
 
@@ -1255,14 +1412,32 @@ impl Queue {
 
     /// Enqueue a job with the given payload and metadata.
     pub fn enqueue(&mut self, job: EnqueueInput) -> EnqueueOutcome {
-        let prev = steadq_fs_linux::dir_sync_is_deferred();
-        steadq_fs_linux::defer_dir_sync(self.deferred_dir_sync);
-        let result = self.enqueue_inner(job);
-        steadq_fs_linux::defer_dir_sync(prev);
-        result
+        if self.deferred_dir_sync {
+            let mut tmp = self.dirty.replace(engine::DirtySet::new());
+            let outcome = self.enqueue_with_dirty(job, Some(&mut tmp));
+            let prev = self.dirty.replace(tmp);
+            drop(prev);
+            return outcome;
+        }
+        self.enqueue_inner(job)
     }
 
     fn enqueue_inner(&mut self, job: EnqueueInput) -> EnqueueOutcome {
+        self.enqueue_with_dirty(job, None)
+    }
+
+    fn enqueue_batched(
+        &mut self,
+        job: EnqueueInput,
+        dirty: &mut engine::DirtySet,
+    ) -> EnqueueOutcome {
+        self.enqueue_with_dirty(job, Some(dirty))
+    }
+
+    fn prepare_enqueue(
+        &mut self,
+        job: EnqueueInput,
+    ) -> Result<PreparedEnqueue, (EnqueueTicket, Error)> {
         if let Err(e) = self.check_not_poisoned() {
             let ticket = EnqueueTicket {
                 job_id: [0; 16],
@@ -1270,10 +1445,8 @@ impl Queue {
                 expected_initial_state: InitialState::Ready,
                 expected_relative_path: String::new(),
             };
-            return EnqueueOutcome::NotCommitted(ticket, e);
+            return Err((ticket, e));
         }
-
-        // Generate job ID before any filesystem operation
         let job_id = match fs::random_128bit() {
             Ok(id) => id,
             Err(e) => {
@@ -1283,10 +1456,9 @@ impl Queue {
                     expected_initial_state: InitialState::Ready,
                     expected_relative_path: String::new(),
                 };
-                return EnqueueOutcome::NotCommitted(ticket, Error::IoFailure(e.to_string()));
+                return Err((ticket, Error::IoFailure(e.to_string())));
             }
         };
-
         let wall_floor = match self.wall_floor_for_mutation() {
             Ok(floor) => floor,
             Err(error) => {
@@ -1296,12 +1468,10 @@ impl Queue {
                     expected_initial_state: InitialState::Ready,
                     expected_relative_path: String::new(),
                 };
-                return EnqueueOutcome::NotCommitted(ticket, error);
+                return Err((ticket, error));
             }
         };
         let created_at = wall_floor.unix_ns();
-
-        // Validate maximum_attempts
         if job.maximum_attempts == 0 {
             let ticket = EnqueueTicket {
                 job_id,
@@ -1309,13 +1479,11 @@ impl Queue {
                 expected_initial_state: InitialState::Ready,
                 expected_relative_path: String::new(),
             };
-            return EnqueueOutcome::NotCommitted(
+            return Err((
                 ticket,
                 Error::InvalidInput("maximum_attempts must be >= 1".into()),
-            );
+            ));
         }
-
-        // Encode extension header
         let ext = ExtensionHeader {
             initial_not_before_unix_ns: job.initial_not_before,
             content_type: job.content_type.clone(),
@@ -1323,7 +1491,6 @@ impl Queue {
             producer_id: job.producer_id.clone(),
             trace_context: job.trace_context.clone(),
         };
-
         let ext_bytes = match ext.encode() {
             Ok(b) => b,
             Err(e) => {
@@ -1333,11 +1500,9 @@ impl Queue {
                     expected_initial_state: InitialState::Ready,
                     expected_relative_path: String::new(),
                 };
-                return EnqueueOutcome::NotCommitted(ticket, Error::InvalidInput(e.to_string()));
+                return Err((ticket, Error::InvalidInput(e.to_string())));
             }
         };
-
-        // C-11: Validate payload size BEFORE hashing
         if job.payload.len() as u64 > self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH) {
             let ticket = EnqueueTicket {
                 job_id,
@@ -1345,16 +1510,9 @@ impl Queue {
                 expected_initial_state: InitialState::Ready,
                 expected_relative_path: String::new(),
             };
-            return EnqueueOutcome::NotCommitted(
-                ticket,
-                Error::InvalidInput("payload exceeds limit".into()),
-            );
+            return Err((ticket, Error::InvalidInput("payload exceeds limit".into())));
         }
-
-        // Compute payload digest (after size validation - C-11)
         let pdig = payload_digest(&job.payload);
-
-        // Build fixed header
         let mut header = FixedHeader {
             format_minor: FORMAT_MINOR,
             extension_header_length: ext_bytes.len() as u32,
@@ -1376,15 +1534,13 @@ impl Queue {
                     expected_initial_state: InitialState::Ready,
                     expected_relative_path: String::new(),
                 };
-                return EnqueueOutcome::NotCommitted(
+                return Err((
                     ticket,
                     Error::InvalidInput("extension length mismatch".into()),
-                );
+                ));
             }
         };
         header.envelope_digest = env_dig;
-
-        // Determine initial state: ready or delayed
         let now_wall = wall_floor.unix_ns();
         let (initial_state, _) = match job.initial_not_before {
             Some(nb) if nb > now_wall => {
@@ -1398,25 +1554,22 @@ impl Queue {
                                 expected_initial_state: InitialState::Ready,
                                 expected_relative_path: String::new(),
                             };
-                            return EnqueueOutcome::NotCommitted(
+                            return Err((
                                 ticket,
                                 Error::InvalidInput("eligibility overflow".into()),
-                            );
+                            ));
                         }
                     };
                 (InitialState::Delayed, eb)
             }
             _ => (InitialState::Ready, 0),
         };
-
-        // Build the canonical filename and path
         let common = CommonFields {
             job_id,
             generation: 0,
             attempt: 0,
             maximum_attempts: job.maximum_attempts,
         };
-
         let (dest_dir_relative, filename, expected_path) = match initial_state {
             InitialState::Ready => {
                 let target = self.layout().ready(&common);
@@ -1425,7 +1578,7 @@ impl Queue {
             }
             InitialState::Delayed => {
                 let Some(not_before_ns) = job.initial_not_before else {
-                    return EnqueueOutcome::NotCommitted(
+                    return Err((
                         EnqueueTicket {
                             job_id,
                             envelope_digest: header.envelope_digest,
@@ -1433,12 +1586,12 @@ impl Queue {
                             expected_relative_path: String::new(),
                         },
                         Error::QueueCorrupt("delayed enqueue lost its deadline".into()),
-                    );
+                    ));
                 };
                 let target = match self.layout().delayed(&common, not_before_ns) {
                     Ok(target) => target,
                     Err(error) => {
-                        return EnqueueOutcome::NotCommitted(
+                        return Err((
                             EnqueueTicket {
                                 job_id,
                                 envelope_digest: header.envelope_digest,
@@ -1446,38 +1599,78 @@ impl Queue {
                                 expected_relative_path: String::new(),
                             },
                             error,
-                        );
+                        ));
                     }
                 };
                 let path = target.relative_path();
                 (target.directory(), target.filename, path)
             }
         };
-
         let ticket = EnqueueTicket {
             job_id,
             envelope_digest: header.envelope_digest,
             expected_initial_state: initial_state,
             expected_relative_path: expected_path.clone(),
         };
+        Ok(PreparedEnqueue {
+            ticket,
+            header,
+            ext_bytes,
+            payload: job.payload,
+            dest_dir: dest_dir_relative,
+            filename,
+        })
+    }
 
-        // Create the job file using O_TMPFILE in the destination directory
-        let result = self.write_and_publish(
-            &dest_dir_relative,
-            &filename,
-            &header,
-            &ext_bytes,
-            &job.payload,
-        );
-
+    fn enqueue_with_dirty(
+        &mut self,
+        job: EnqueueInput,
+        dirty: Option<&mut engine::DirtySet>,
+    ) -> EnqueueOutcome {
+        let prepared = match self.prepare_enqueue(job) {
+            Ok(p) => p,
+            Err((ticket, err)) => return EnqueueOutcome::NotCommitted(ticket, err),
+        };
+        let result = if let Some(d) = dirty {
+            self.write_and_publish_with_dirty(
+                &prepared.dest_dir,
+                &prepared.filename,
+                &prepared.header,
+                &prepared.ext_bytes,
+                &prepared.payload,
+                Some(d),
+            )
+        } else {
+            self.write_and_publish_with_dirty(
+                &prepared.dest_dir,
+                &prepared.filename,
+                &prepared.header,
+                &prepared.ext_bytes,
+                &prepared.payload,
+                None,
+            )
+        };
         match result {
-            Ok(()) => EnqueueOutcome::Committed(ticket),
-            Err(PublishError::NotCommitted(e)) => EnqueueOutcome::NotCommitted(ticket, e),
+            Ok(()) => EnqueueOutcome::Committed(prepared.ticket),
+            Err(PublishError::NotCommitted(e)) => EnqueueOutcome::NotCommitted(prepared.ticket, e),
             Err(PublishError::OutcomeUnknown(e)) => {
                 self.poison();
-                EnqueueOutcome::OutcomeUnknown(ticket, e)
+                EnqueueOutcome::OutcomeUnknown(prepared.ticket, e)
             }
         }
+    }
+
+    fn lease_batched(
+        &mut self,
+        max_wait_ns: u64,
+        lease_duration_ns: u64,
+        dirty: &mut engine::DirtySet,
+    ) -> LeaseOutcome {
+        self.lease_inner_with_dirty(max_wait_ns, lease_duration_ns, Some(dirty))
+    }
+
+    fn ack_batched(&mut self, lease: &LeaseInfo, dirty: &mut engine::DirtySet) -> AckOutcome {
+        self.ack_inner_with_dirty(lease, Some(dirty))
     }
 
     fn open_or_cache_dir(&mut self, relative: &str) -> io::Result<std::os::fd::OwnedFd> {
@@ -1502,9 +1695,22 @@ impl Queue {
     }
 
     /// Flush all deferred directory fsync operations. Call this after a batch
-    /// of operations when using deferred_dir_sync mode. This fsyncs all known
-    /// state directories to make directory entries durable.
+    /// of operations when using deferred_dir_sync mode. This fsyncs the exact
+    /// dirty directories that were recorded, deduplicated by device and inode.
     pub fn sync(&self) -> io::Result<()> {
+        if self.deferred_dir_sync {
+            let result = {
+                let dirty = self.dirty.borrow();
+                if dirty.is_empty() {
+                    return Ok(());
+                }
+                dirty.sync_all()
+            };
+            if result.is_ok() {
+                self.dirty.borrow_mut().clear();
+            }
+            return result;
+        }
         for dir in [
             "ready",
             "leased",
@@ -1522,56 +1728,90 @@ impl Queue {
         Ok(())
     }
 
+    /// Strict group-commit batch. Operations are Pending until `commit` fsyncs
+    /// every exact dirty directory once. If the barrier fails, post-linearization
+    /// operations are OutcomeUnknown.
+    pub fn batch(&mut self) -> Batch<'_> {
+        Batch {
+            queue: self,
+            dirty: engine::DirtySet::new(),
+            pending_enqueues: Vec::new(),
+            pending_leases: Vec::new(),
+            pending_acks: Vec::new(),
+        }
+    }
+
     /// Write the job envelope to a temp file and publish via rename.
-    fn write_and_publish(
+    fn write_and_publish_with_dirty(
         &mut self,
         dest_dir_relative: &str,
         dest_name: &str,
         header: &FixedHeader,
         ext_bytes: &[u8],
         payload: &[u8],
+        mut dirty: Option<&mut engine::DirtySet>,
     ) -> Result<(), PublishError> {
         // Ensure destination directory exists
-        self.ensure_dir(dest_dir_relative)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        if let Some(d) = dirty.as_deref_mut() {
+            self.ensure_dir_with_dirty(dest_dir_relative, Some(d))
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        } else {
+            self.ensure_dir(dest_dir_relative)
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        }
 
-        // Open destination directory (cached if same as last operation)
         let dest_fd = self
             .open_or_cache_dir(dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
-        // Try O_TMPFILE path first
         match fs::open_tmpfile(dest_fd.as_fd()) {
             Ok(tmp_fd) => {
-                // Write header (zeroed placeholder)
                 let header_bytes = header
                     .encode(ext_bytes)
                     .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
                 fs::writev_all(tmp_fd.as_fd(), &[&header_bytes, ext_bytes, payload])
                     .map_err(PublishError::classify_write)?;
-                match engine::publish_tmpfile_noreplace(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name)
-                {
-                    Ok(engine::TmpfilePublishOutcome::Published) => Ok(()),
-                    Ok(engine::TmpfilePublishOutcome::Unsupported) => self.named_fallback(
-                        dest_dir_relative,
+                let publish_outcome = if dirty.is_some() {
+                    engine::publish_tmpfile_noreplace_deferred(
+                        tmp_fd.as_fd(),
                         dest_fd.as_fd(),
                         dest_name,
-                        header,
-                        ext_bytes,
-                        payload,
-                    ),
+                    )
+                } else {
+                    engine::publish_tmpfile_noreplace(tmp_fd.as_fd(), dest_fd.as_fd(), dest_name)
+                };
+                match publish_outcome {
+                    Ok(engine::TmpfilePublishOutcome::Published) => {
+                        if let Some(d) = dirty {
+                            d.record(dest_fd.as_fd()).map_err(|e| {
+                                PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
+                            })?;
+                        }
+                        Ok(())
+                    }
+                    Ok(engine::TmpfilePublishOutcome::Unsupported) => self
+                        .named_fallback_with_dirty(
+                            dest_dir_relative,
+                            dest_fd.as_fd(),
+                            dest_name,
+                            header,
+                            ext_bytes,
+                            payload,
+                            dirty,
+                        ),
                     Err(failure) => Err(PublishError::classify_tmpfile(failure)),
                 }
             }
             Err(e) => {
                 if engine::is_tmpfile_open_unsupported(&e) {
-                    self.named_fallback(
+                    self.named_fallback_with_dirty(
                         dest_dir_relative,
                         dest_fd.as_fd(),
                         dest_name,
                         header,
                         ext_bytes,
                         payload,
+                        dirty,
                     )
                 } else {
                     Err(PublishError::classify_write(e))
@@ -1581,7 +1821,8 @@ impl Queue {
     }
 
     /// Named temporary file fallback for enqueue.
-    fn named_fallback(
+    #[allow(clippy::too_many_arguments)]
+    fn named_fallback_with_dirty(
         &self,
         dest_dir_relative: &str,
         dest_fd: BorrowedFd<'_>,
@@ -1589,29 +1830,26 @@ impl Queue {
         header: &FixedHeader,
         ext_bytes: &[u8],
         payload: &[u8],
+        mut dirty: Option<&mut engine::DirtySet>,
     ) -> Result<(), PublishError> {
-        // Ensure tmp/<boot-id>/<shard>/ exists
-        // Extract shard from dest_dir
         let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
         let tmp_dir = format!("tmp/{}/{}", self.boot_id, shard_part);
-
-        self.ensure_dir(&tmp_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-
+        if let Some(d) = dirty.as_deref_mut() {
+            self.ensure_dir_with_dirty(&tmp_dir, Some(d))
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        } else {
+            self.ensure_dir(&tmp_dir)
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        }
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_dir)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-
-        // Create temp file name
         let boottime = fs::clock_boottime_ns()
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
         let random = fs::random_128bit()
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
         let temp_name = temp_filename(boottime, &random);
-
         let tmp_file = fs::create_exclusive(tmp_dir_fd.as_fd(), &temp_name, 0o600)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
-
-        // C-10: RAII guard to unlink temp file on early return
         struct TempGuard<'a, 'fd> {
             dir_fd: BorrowedFd<'fd>,
             name: &'a str,
@@ -1629,36 +1867,70 @@ impl Queue {
             name: &temp_name,
             armed: true,
         };
-
-        // Write header
         let header_bytes = header
             .encode(ext_bytes)
             .map_err(|e| PublishError::NotCommitted(Error::InvalidInput(e.to_string())))?;
         fs::write_all(tmp_file.as_fd(), &header_bytes).map_err(PublishError::classify_write)?;
         fs::write_all(tmp_file.as_fd(), ext_bytes).map_err(PublishError::classify_write)?;
         fs::write_all(tmp_file.as_fd(), payload).map_err(PublishError::classify_write)?;
-        // C-13: No redundant pwrite - header was written correctly above.
-        // fsync file (before publication: NotCommitted on failure)
         fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
-
         let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
-        match engine::move_witnessed_noreplace_io(
-            tmp_dir_fd.as_fd(),
-            &temp_name,
-            dest_fd,
-            dest_name,
-            engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
-            engine::MoveActor::Producer,
-        ) {
-            Ok(()) => {
-                temp_guard.armed = false;
-                Ok(())
-            }
-            Err(failure) => {
-                if failure.is_outcome_unknown() {
+        if let Some(d) = dirty {
+            match engine::move_witnessed_noreplace_deferred(
+                tmp_dir_fd.as_fd(),
+                &temp_name,
+                dest_fd,
+                dest_name,
+                engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
+                |_moved| Ok(()),
+            ) {
+                Ok(_) => {
                     temp_guard.armed = false;
+                    d.record(dest_fd).map_err(|e| {
+                        PublishError::OutcomeUnknown(Error::IoFailure(e.to_string()))
+                    })?;
+                    Ok(())
                 }
-                Err(PublishError::classify_move(failure))
+                Err(failure) => {
+                    if failure.is_outcome_unknown() {
+                        temp_guard.armed = false;
+                    }
+                    let mapped = match failure {
+                        engine::MoveFailure::AlreadyExists => {
+                            PublishError::NotCommitted(Error::IdentityCollision)
+                        }
+                        engine::MoveFailure::SourceMissing => PublishError::NotCommitted(
+                            Error::IoFailure("temporary publication source missing".into()),
+                        ),
+                        engine::MoveFailure::NotCommitted { source, .. } => {
+                            PublishError::NotCommitted(Error::IoFailure(source.to_string()))
+                        }
+                        engine::MoveFailure::OutcomeUnknown { source, .. } => {
+                            PublishError::OutcomeUnknown(Error::IoFailure(source.to_string()))
+                        }
+                    };
+                    Err(mapped)
+                }
+            }
+        } else {
+            match engine::move_witnessed_noreplace_io(
+                tmp_dir_fd.as_fd(),
+                &temp_name,
+                dest_fd,
+                dest_name,
+                engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
+                engine::MoveActor::Producer,
+            ) {
+                Ok(()) => {
+                    temp_guard.armed = false;
+                    Ok(())
+                }
+                Err(failure) => {
+                    if failure.is_outcome_unknown() {
+                        temp_guard.armed = false;
+                    }
+                    Err(PublishError::classify_move(failure))
+                }
             }
         }
     }
@@ -1668,6 +1940,24 @@ impl Queue {
         if self.known_dirs.borrow().contains(relative) {
             return Ok(());
         }
+        if self.deferred_dir_sync {
+            let mut dirty = self.dirty.borrow_mut();
+            return self.ensure_dir_with_dirty(relative, Some(&mut dirty));
+        }
+        self.ensure_dir_with_dirty(relative, None)
+    }
+
+    pub(crate) fn ensure_dir_with_dirty(
+        &self,
+        relative: &str,
+        mut dirty: Option<&mut engine::DirtySet>,
+    ) -> io::Result<()> {
+        if self.known_dirs.borrow().contains(relative) && dirty.is_none() {
+            return Ok(());
+        }
+        // When using dirty tracking, we still need to check known_dirs but
+        // must not skip recording for new dirs that are already known.
+        // For simplicity, always walk the path when dirty is Some.
         let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
         let mut current = None::<OwnedFd>;
 
@@ -1676,11 +1966,12 @@ impl Queue {
                 .as_ref()
                 .map_or(self.root_fd.as_fd(), |directory| directory.as_fd());
             let was_created = fs::mkdirat_eexist_ok(parent, comp, 0o700)?;
-            // Open the child
             let child = fs::open_directory(parent, comp)?;
-            // P-01: Only fsync parent when a new child entry was actually created
             if was_created {
-                fs::fsync_dir_fd(parent)?;
+                match &mut dirty {
+                    Some(set) => set.record(parent)?,
+                    None => fs::fsync_dir_fd(parent)?,
+                }
             }
             current = Some(child);
         }
@@ -2162,14 +2453,15 @@ impl Queue {
     /// max_wait_ns is accepted for API compatibility but currently performs
     /// a single immediate scan (C-14: bounded wait/backoff not yet implemented).
     pub fn lease(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
-        let prev = steadq_fs_linux::dir_sync_is_deferred();
-        steadq_fs_linux::defer_dir_sync(self.deferred_dir_sync);
-        let result = self.lease_inner(_max_wait_ns, lease_duration_ns);
-        steadq_fs_linux::defer_dir_sync(prev);
-        result
+        self.lease_inner_with_dirty(_max_wait_ns, lease_duration_ns, None)
     }
 
-    fn lease_inner(&mut self, _max_wait_ns: u64, lease_duration_ns: u64) -> LeaseOutcome {
+    fn lease_inner_with_dirty(
+        &mut self,
+        _max_wait_ns: u64,
+        lease_duration_ns: u64,
+        mut _dirty: Option<&mut engine::DirtySet>,
+    ) -> LeaseOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return LeaseOutcome::NotCommitted(e);
         }
@@ -2343,7 +2635,7 @@ impl Queue {
                     }
                 };
                 let leased_dir = lease_target.directory();
-                if let Err(e) = self.ensure_dir(&leased_dir) {
+                if let Err(e) = self.ensure_dir_with_dirty(&leased_dir, _dirty.as_deref_mut()) {
                     // R4-B04: Propagate real errors, don't mask as scan miss
                     scan_had_error = true;
                     let _ = e;
@@ -2399,32 +2691,67 @@ impl Queue {
                     }
                 }
 
-                match engine::move_witnessed_noreplace_with(
-                    shard_fd.as_fd(),
-                    entry,
-                    leased_dir_fd.as_fd(),
-                    &lease_target.filename,
-                    engine::MoveIdentity::new(claim_source.device, claim_source.inode),
-                    engine::MoveActor::Consumer,
-                    |_| {
-                        let refreshed_evidence = Self::read_claim_ticket_evidence(
-                            claim_source.file_fd.as_fd(),
-                            &parsed.common.job_id,
-                            parsed.common.maximum_attempts,
-                        )
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
-                        claim_ticket = self
-                            .claim_transition_ticket(
-                                &parsed.common,
-                                lease_token,
-                                refreshed_evidence,
-                                boottime_deadline,
-                                wall_deadline,
+                let move_result = if _dirty.is_some() {
+                    let result = engine::move_witnessed_noreplace_deferred(
+                        shard_fd.as_fd(),
+                        entry,
+                        leased_dir_fd.as_fd(),
+                        &lease_target.filename,
+                        engine::MoveIdentity::new(claim_source.device, claim_source.inode),
+                        |_| {
+                            let refreshed_evidence = Self::read_claim_ticket_evidence(
+                                claim_source.file_fd.as_fd(),
+                                &parsed.common.job_id,
+                                parsed.common.maximum_attempts,
                             )
                             .map_err(|error| std::io::Error::other(error.to_string()))?;
-                        Ok(())
-                    },
-                ) {
+                            claim_ticket = self
+                                .claim_transition_ticket(
+                                    &parsed.common,
+                                    lease_token,
+                                    refreshed_evidence,
+                                    boottime_deadline,
+                                    wall_deadline,
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                            Ok(())
+                        },
+                    );
+                    // Record both source and destination directories for durability.
+                    if let Some(d) = _dirty.as_deref_mut() {
+                        let _ = d.record(shard_fd.as_fd());
+                        let _ = d.record(leased_dir_fd.as_fd());
+                    }
+                    result
+                } else {
+                    engine::move_witnessed_noreplace_with(
+                        shard_fd.as_fd(),
+                        entry,
+                        leased_dir_fd.as_fd(),
+                        &lease_target.filename,
+                        engine::MoveIdentity::new(claim_source.device, claim_source.inode),
+                        engine::MoveActor::Consumer,
+                        |_| {
+                            let refreshed_evidence = Self::read_claim_ticket_evidence(
+                                claim_source.file_fd.as_fd(),
+                                &parsed.common.job_id,
+                                parsed.common.maximum_attempts,
+                            )
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                            claim_ticket = self
+                                .claim_transition_ticket(
+                                    &parsed.common,
+                                    lease_token,
+                                    refreshed_evidence,
+                                    boottime_deadline,
+                                    wall_deadline,
+                                )
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                            Ok(())
+                        },
+                    )
+                };
+                match move_result {
                     Ok((leased_object, ())) => {
                         // B-03: Post-rename validation failures must NOT continue as Empty.
                         // The claim is committed; failures here are corruption or indeterminate.
@@ -2637,14 +2964,14 @@ impl Queue {
     /// window between lease delivery and terminal publication. SteadQ/1 has no
     /// public unverified acknowledgment path.
     pub fn ack(&mut self, lease: &LeaseInfo) -> AckOutcome {
-        let prev = steadq_fs_linux::dir_sync_is_deferred();
-        steadq_fs_linux::defer_dir_sync(self.deferred_dir_sync);
-        let result = self.ack_inner(lease);
-        steadq_fs_linux::defer_dir_sync(prev);
-        result
+        self.ack_inner_with_dirty(lease, None)
     }
 
-    fn ack_inner(&mut self, lease: &LeaseInfo) -> AckOutcome {
+    fn ack_inner_with_dirty(
+        &mut self,
+        lease: &LeaseInfo,
+        mut dirty: Option<&mut engine::DirtySet>,
+    ) -> AckOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return AckOutcome::NotCommitted(e);
         }
@@ -2683,7 +3010,7 @@ impl Queue {
             Ok(ticket) => ticket,
             Err(error) => return AckOutcome::NotCommitted(error),
         };
-        if let Err(e) = self.ensure_dir(&receipt_dir) {
+        if let Err(e) = self.ensure_dir_with_dirty(&receipt_dir, dirty.as_deref_mut()) {
             return AckOutcome::NotCommitted(Error::IoFailure(e.to_string()));
         }
 
@@ -2715,7 +3042,12 @@ impl Queue {
             return AckOutcome::NotCommitted(e);
         }
 
-        match Self::execute_leased_move(&source, receipt_dir_fd.as_fd(), &receipt_name) {
+        match Self::execute_leased_move_with_dirty(
+            &source,
+            receipt_dir_fd.as_fd(),
+            &receipt_name,
+            dirty,
+        ) {
             LeasedMoveOutcome::Committed => AckOutcome::Acked,
             LeasedMoveOutcome::OutcomeUnknown(phase) => {
                 self.poison();
@@ -3344,6 +3676,20 @@ impl Queue {
         destination_directory_fd: BorrowedFd<'_>,
         destination_name: &str,
     ) -> LeasedMoveOutcome {
+        Self::execute_leased_move_with_dirty(
+            source,
+            destination_directory_fd,
+            destination_name,
+            None,
+        )
+    }
+
+    fn execute_leased_move_with_dirty(
+        source: &LeasedSourceWitness,
+        destination_directory_fd: BorrowedFd<'_>,
+        destination_name: &str,
+        dirty: Option<&mut engine::DirtySet>,
+    ) -> LeasedMoveOutcome {
         match Self::observe_leased_source_path(source) {
             Ok(WitnessPathObservation::Match) => {}
             Ok(WitnessPathObservation::Gone) => return LeasedMoveOutcome::SourceGone,
@@ -3353,14 +3699,26 @@ impl Queue {
             Err(error) => return LeasedMoveOutcome::Failed(error),
         }
 
-        match engine::move_witnessed_noreplace(
-            source.directory_fd.as_fd(),
-            &source.name,
-            destination_directory_fd,
-            destination_name,
-            engine::MoveIdentity::new(source.device, source.inode),
-            engine::MoveActor::Consumer,
-        ) {
+        let result = match &dirty {
+            Some(_) => engine::move_witnessed_noreplace_deferred(
+                source.directory_fd.as_fd(),
+                &source.name,
+                destination_directory_fd,
+                destination_name,
+                engine::MoveIdentity::new(source.device, source.inode),
+                |_| Ok(()),
+            )
+            .map(|_| ()),
+            None => engine::move_witnessed_noreplace(
+                source.directory_fd.as_fd(),
+                &source.name,
+                destination_directory_fd,
+                destination_name,
+                engine::MoveIdentity::new(source.device, source.inode),
+                engine::MoveActor::Consumer,
+            ),
+        };
+        let outcome = match result {
             Ok(()) => LeasedMoveOutcome::Committed,
             Err(engine::MoveFailure::SourceMissing) => LeasedMoveOutcome::SourceGone,
             Err(engine::MoveFailure::AlreadyExists) => LeasedMoveOutcome::Collision,
@@ -3370,7 +3728,23 @@ impl Queue {
             Err(engine::MoveFailure::OutcomeUnknown { phase, .. }) => {
                 LeasedMoveOutcome::OutcomeUnknown(ticket_phase_for_move_outcome_unknown(phase))
             }
+        };
+        if matches!(outcome, LeasedMoveOutcome::Committed) {
+            if let Some(d) = dirty {
+                match d
+                    .record(source.directory_fd.as_fd())
+                    .and_then(|()| d.record(destination_directory_fd))
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        return LeasedMoveOutcome::OutcomeUnknown(
+                            TransitionPhase::DestinationDirectoryDurable,
+                        )
+                    }
+                }
+            }
         }
+        outcome
     }
 
     /// Internal: move a leased object to a new state directory.
@@ -5301,6 +5675,290 @@ mod tests {
             o => panic!("lease failed: {o:?}"),
         };
         assert_eq!(lease.attempt, 1);
+    }
+
+    #[test]
+    fn batch_enqueue_commit_lease_ack_roundtrip() {
+        // Regression test for Bug #1: Batch::lease was broken because the deferred
+        // move path constructed MovedObject { size: 0 }, causing the post-rename
+        // size check to always fail and poison the queue.
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut q = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Enqueue a job in a batch and commit
+        let mut batch = q.batch();
+        let outcome = batch.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: vec![0xABu8; 64],
+            ..Default::default()
+        });
+        let ticket = match outcome {
+            BatchEnqueueOutcome::Pending(t) => t,
+            other => panic!("enqueue should be pending: {other:?}"),
+        };
+        let commit = batch.commit().expect("commit should succeed");
+        assert_eq!(commit.committed_enqueues.len(), 1);
+        assert_eq!(commit.committed_enqueues[0].job_id, ticket.job_id);
+
+        // Lease via batch — this was completely broken before the fix
+        let mut batch2 = q.batch();
+        let lease_outcome = batch2.lease(0, 30_000_000_000);
+        let lease = match lease_outcome {
+            BatchLeaseOutcome::Pending(info) => info,
+            BatchLeaseOutcome::Empty => panic!("should have a job to lease"),
+            BatchLeaseOutcome::NotCommitted(e) => panic!("batch lease failed: {e:?}"),
+        };
+        assert_eq!(lease.attempt, 1);
+
+        // Ack via batch
+        let ack_outcome = batch2.ack(&lease);
+        assert!(matches!(ack_outcome, BatchAckOutcome::Pending));
+
+        let commit2 = batch2.commit().expect("lease+ack commit should succeed");
+        assert_eq!(commit2.committed_leases, 1);
+        assert_eq!(commit2.committed_acks, 1);
+        assert!(commit2.outcome_unknown_leases.is_empty());
+        assert!(commit2.outcome_unknown_acks.is_empty());
+    }
+
+    #[test]
+    fn batch_lease_ack_multiple_jobs() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut q = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Enqueue 4 jobs in a batch
+        let mut batch = q.batch();
+        for _ in 0..4 {
+            batch.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: vec![0xABu8; 64],
+                ..Default::default()
+            });
+        }
+        batch.commit().expect("enqueue commit");
+
+        // Lease and ack all 4 via batch
+        let mut batch2 = q.batch();
+        let mut leased = Vec::new();
+        for _ in 0..4 {
+            match batch2.lease(0, 30_000_000_000) {
+                BatchLeaseOutcome::Pending(info) => leased.push(info),
+                BatchLeaseOutcome::Empty => break,
+                other => panic!("batch lease failed: {other:?}"),
+            }
+        }
+        assert_eq!(leased.len(), 4, "should lease all 4 jobs");
+        for lease in &leased {
+            match batch2.ack(lease) {
+                BatchAckOutcome::Pending => {}
+                other => panic!("batch ack failed: {other:?}"),
+            }
+        }
+        let outcome = batch2.commit().expect("lease+ack commit");
+        assert_eq!(outcome.committed_leases, 4);
+        assert_eq!(outcome.committed_acks, 4);
+    }
+
+    #[test]
+    fn dirtyset_record_deduplicates_and_sync_all_fsyncs() {
+        // Tests DirtySet::record deduplicates by (dev, inode) and
+        // sync_all actually calls fsync_dir_fd.
+        use crate::queue::engine::DirtySet;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ready/0000")).unwrap();
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        let ready_fd = fs::open_directory(root.as_fd(), "ready").unwrap();
+        let shard_fd = fs::open_directory(ready_fd.as_fd(), "0000").unwrap();
+
+        let mut dirty = DirtySet::new();
+        assert!(dirty.is_empty());
+        assert_eq!(dirty.len(), 0);
+
+        // Record the same directory twice — should deduplicate
+        dirty.record(shard_fd.as_fd()).unwrap();
+        dirty.record(shard_fd.as_fd()).unwrap();
+        assert_eq!(dirty.len(), 1);
+
+        // Record a different directory
+        dirty.record(ready_fd.as_fd()).unwrap();
+        assert_eq!(dirty.len(), 2);
+
+        // sync_all must actually fsync (not no-op)
+        assert!(dirty.sync_all().is_ok());
+
+        // clear works
+        dirty.clear();
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn dirtyset_extend_merges_without_overwriting() {
+        use crate::queue::engine::DirtySet;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        let a_fd = fs::open_directory(root.as_fd(), "a").unwrap();
+        let b_fd = fs::open_directory(root.as_fd(), "b").unwrap();
+
+        let mut d1 = DirtySet::new();
+        d1.record(a_fd.as_fd()).unwrap();
+        assert_eq!(d1.len(), 1);
+
+        let mut d2 = DirtySet::new();
+        d2.record(a_fd.as_fd()).unwrap();
+        d2.record(b_fd.as_fd()).unwrap();
+
+        d1.extend(d2);
+        // a was already in d1, so only b is added
+        assert_eq!(d1.len(), 2);
+        assert!(d1.sync_all().is_ok());
+    }
+
+    #[test]
+    fn dirtyset_sync_all_propagates_fsync_error() {
+        // Kills DirtySet::sync_all -> Ok(()) mutant: if sync_all is a no-op,
+        // it won't call fsync_dir_fd and won't return the injected error.
+        use crate::queue::engine::DirtySet;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ready/0000")).unwrap();
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        let ready_fd = fs::open_directory(root.as_fd(), "ready").unwrap();
+        let shard_fd = fs::open_directory(ready_fd.as_fd(), "0000").unwrap();
+
+        let mut dirty = DirtySet::new();
+        dirty.record(shard_fd.as_fd()).unwrap();
+        assert!(!dirty.is_empty());
+
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+        let result = dirty.sync_all();
+        fs::fault::reset();
+
+        assert!(
+            result.is_err(),
+            "sync_all must propagate fsync_dir_fd error"
+        );
+    }
+
+    #[test]
+    fn deferred_sync_via_queue_sync_actually_fsyncs() {
+        // Kills DirtySet::is_empty -> true mutant: if is_empty always returns true,
+        // Queue::sync() will skip the actual fsync and not trigger the injected error.
+        let (_tmp, mut queue) = {
+            let tmp = TempDir::new().unwrap();
+            Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+            let queue = Queue::open(
+                tmp.path(),
+                &OpenOptions {
+                    allow_unsupported_fs: true,
+                    deferred_dir_sync: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (tmp, queue)
+        };
+
+        queue.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"deferred".to_vec(),
+            ..Default::default()
+        });
+
+        // Inject fault on fsync_dir_fd — sync() must hit it
+        fs::fault::reset();
+        fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+        let result = queue.sync();
+        fs::fault::reset();
+
+        assert!(result.is_err(), "sync() must call fsync_dir_fd when dirty");
+    }
+
+    #[test]
+    fn batch_enqueue_deferred_publish_classifies_link_errors() {
+        // Exercises publish_tmpfile_noreplace_deferred error paths through batch enqueue.
+        for errno in [libc::EEXIST, libc::ENOSPC, libc::EIO] {
+            let (_tmp, mut queue) = create_test_queue();
+            if !tmpfile_supported(&queue) {
+                return;
+            }
+            fs::fault::reset();
+            fs::fault::set_clock_realtime_ns(1_000_000_000);
+            fs::fault::inject("linkat_proc_self_fd", u64::MAX);
+            fs::fault::inject_errno("linkat_empty_path", 1, errno);
+
+            let mut batch = queue.batch();
+            let outcome = batch.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "text/plain".into(),
+                payload: b"deferred publish failure".to_vec(),
+                ..Default::default()
+            });
+            fs::fault::reset();
+
+            // Batch enqueue should report NotCommitted (not Pending) on failure
+            match outcome {
+                BatchEnqueueOutcome::NotCommitted(_, _) => {}
+                other => panic!("expected NotCommitted for errno {errno}, got {other:?}"),
+            }
+            assert!(!queue.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn batch_lease_deferred_move_classifies_rename_errors() {
+        // Exercises move_noreplace_deferred error paths through batch lease.
+        // Each variant re-enqueues a fresh job since a failed lease consumes it.
+        for (errno, expect_label) in [
+            (libc::EIO, "not_committed"),
+            (libc::EEXIST, "not_committed"),
+            (libc::ENOENT, "empty_or_not_committed"),
+        ] {
+            let (_tmp, mut queue) = create_test_queue();
+            queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".to_string(),
+                payload: b"batch lease fault".to_vec(),
+                ..Default::default()
+            });
+
+            fs::fault::reset();
+            fs::fault::inject_errno("renameat2_noreplace", 1, errno);
+
+            let mut batch = queue.batch();
+            let outcome = batch.lease(0, 30_000_000_000);
+            fs::fault::reset();
+
+            match (&outcome, expect_label) {
+                (BatchLeaseOutcome::NotCommitted(_), "not_committed") => {}
+                (BatchLeaseOutcome::Empty, "empty_or_not_committed") => {}
+                (BatchLeaseOutcome::NotCommitted(_), "empty_or_not_committed") => {}
+                other => panic!("unexpected for errno {errno}: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -4,11 +4,77 @@
 // distinct affected directory. Errors before the rename are retryable
 // (NotCommitted); later errors are OutcomeUnknown.
 
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::collections::HashMap;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use steadq_fs_linux as fs;
 
 use crate::errors::Error;
+
+/// Explicit dirty-directory tracking. Records the exact directory FDs that
+/// need durability and deduplicates by device plus inode. Replaces the
+/// old TLS deferred_dir_sync mechanism which globally suppressed unrelated
+/// durability fsyncs.
+#[derive(Debug, Default)]
+pub struct DirtySet {
+    dirs: HashMap<(u64, u64), OwnedFd>,
+}
+
+impl DirtySet {
+    pub fn new() -> Self {
+        Self {
+            dirs: HashMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dirs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.dirs.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.dirs.clear();
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        for (k, v) in other.dirs {
+            self.dirs.entry(k).or_insert(v);
+        }
+    }
+
+    /// Record a directory that needs fsync. Deduplicates by device and inode.
+    pub fn record(&mut self, fd: BorrowedFd) -> io::Result<()> {
+        let stat = fs::fstat(fd)?;
+        let key = (stat.st_dev as u64, stat.st_ino as u64);
+        let owned = fd
+            .try_clone_to_owned()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.dirs.entry(key).or_insert(owned);
+        Ok(())
+    }
+
+    /// Fsync every recorded directory exactly once. Returns the first error
+    /// if any, after attempting all.
+    pub fn sync_all(&self) -> io::Result<()> {
+        let mut first_err: Option<io::Error> = None;
+        for fd in self.dirs.values() {
+            if let Err(e) = fs::fsync_dir_fd(fd.as_fd()) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            Err(e)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Actor attribution for poisoning decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,9 +118,9 @@ impl MoveIdentity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MovedObject {
-    device: u64,
-    inode: u64,
-    size: u64,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
 }
 
 impl MovedObject {
@@ -743,6 +809,169 @@ pub fn replace_verified(
         phase: ReplacePhase::SourceFsync,
         source: error,
     })
+}
+
+/// Deferred variants: perform the linearization without dir fsyncs. The caller must record the affected directories in a DirtySet and sync them at the batch barrier. Errors after linearization are still OutcomeUnknown, but the dir fsync phase is deferred.
+pub fn move_witnessed_noreplace_deferred<T>(
+    src_dir_fd: BorrowedFd<'_>,
+    src_name: &str,
+    dest_dir_fd: BorrowedFd<'_>,
+    dest_name: &str,
+    source_identity: MoveIdentity,
+    after_linearization: impl FnOnce(MovedObject) -> Result<T, std::io::Error>,
+) -> Result<(MovedObject, T), MoveFailure> {
+    move_noreplace_deferred(
+        src_dir_fd,
+        src_name,
+        dest_dir_fd,
+        dest_name,
+        Some(source_identity),
+        |e| e,
+        move |moved| {
+            let moved = moved.expect("witnessed move authenticates its destination");
+            after_linearization(moved).map(|output| (moved, output))
+        },
+    )
+    .map_err(MoveFailure::from)
+}
+
+fn move_noreplace_deferred<T, E>(
+    src_dir_fd: BorrowedFd<'_>,
+    src_name: &str,
+    dest_dir_fd: BorrowedFd<'_>,
+    dest_name: &str,
+    source_identity: Option<MoveIdentity>,
+    map_io_error: impl Fn(std::io::Error) -> E,
+    after_linearization: impl FnOnce(Option<MovedObject>) -> Result<T, E>,
+) -> Result<T, MoveFailureWith<E>> {
+    match fs::renameat2_noreplace(src_dir_fd, src_name, dest_dir_fd, dest_name) {
+        Ok(()) => {}
+        Err(e) if is_already_exists_io_kind(e.kind()) => {
+            return Err(MoveFailureWith::AlreadyExists);
+        }
+        Err(e) if is_not_found_io_kind(e.kind()) => {
+            return Err(MoveFailureWith::SourceMissing);
+        }
+        Err(e) => {
+            return Err(MoveFailureWith::NotCommitted {
+                phase: MovePhase::Rename,
+                source: map_io_error(e),
+            });
+        }
+    };
+    let moved = if let Some(source_identity) = source_identity {
+        match fs::fstatat(dest_dir_fd, dest_name) {
+            Ok(stat) if source_identity.matches(&stat) => Some(MovedObject {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+                size: stat.st_size.max(0) as u64,
+            }),
+            Ok(_) => {
+                return Err(MoveFailureWith::OutcomeUnknown {
+                    phase: MovePhase::DestinationIdentity,
+                    source: map_io_error(std::io::Error::other(
+                        "destination identity changed after rename",
+                    )),
+                });
+            }
+            Err(error) => {
+                return Err(MoveFailureWith::OutcomeUnknown {
+                    phase: MovePhase::DestinationIdentity,
+                    source: map_io_error(error),
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let output = after_linearization(moved).map_err(|source| MoveFailureWith::OutcomeUnknown {
+        phase: MovePhase::PostLinearization,
+        source,
+    })?;
+    Ok(output)
+}
+
+pub(super) fn publish_tmpfile_noreplace_deferred(
+    tmpfile_fd: BorrowedFd<'_>,
+    destination_directory_fd: BorrowedFd<'_>,
+    destination_name: &str,
+) -> Result<TmpfilePublishOutcome, TmpfilePublishFailure> {
+    let source_stat =
+        fs::fstat(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
+            phase: TmpfilePublishPhase::SourceIdentity,
+            source,
+        })?;
+    let source_identity = unnamed_file_identity(&source_stat).map_err(|source| {
+        TmpfilePublishFailure::NotCommitted {
+            phase: TmpfilePublishPhase::SourceIdentity,
+            source,
+        }
+    })?;
+    fs::fsync(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
+        phase: TmpfilePublishPhase::FileFsync,
+        source,
+    })?;
+    match fs::linkat_empty_path(tmpfile_fd, destination_directory_fd, destination_name) {
+        Ok(()) => {}
+        Err(error) if is_already_exists_io_kind(error.kind()) => {
+            return Err(TmpfilePublishFailure::AlreadyExists);
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+            return Ok(TmpfilePublishOutcome::Unsupported);
+        }
+        Err(error) if is_direct_link_unsupported(&error) => {
+            match fs::linkat_proc_self_fd(tmpfile_fd, destination_directory_fd, destination_name) {
+                Ok(()) => {}
+                Err(error) if is_already_exists_io_kind(error.kind()) => {
+                    return Err(TmpfilePublishFailure::AlreadyExists);
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    let destination = fs::fstat(destination_directory_fd).map_err(|source| {
+                        TmpfilePublishFailure::NotCommitted {
+                            phase: TmpfilePublishPhase::Link,
+                            source,
+                        }
+                    })?;
+                    if destination.st_nlink == 0 {
+                        return Err(TmpfilePublishFailure::NotCommitted {
+                            phase: TmpfilePublishPhase::Link,
+                            source: error,
+                        });
+                    }
+                    return Ok(TmpfilePublishOutcome::Unsupported);
+                }
+                Err(error) if is_proc_link_unsupported(&error) => {
+                    return Ok(TmpfilePublishOutcome::Unsupported);
+                }
+                Err(source) => {
+                    return Err(TmpfilePublishFailure::NotCommitted {
+                        phase: TmpfilePublishPhase::Link,
+                        source,
+                    });
+                }
+            }
+        }
+        Err(source) => {
+            return Err(TmpfilePublishFailure::NotCommitted {
+                phase: TmpfilePublishPhase::Link,
+                source,
+            });
+        }
+    }
+    let destination =
+        fs::fstatat(destination_directory_fd, destination_name).map_err(|source| {
+            TmpfilePublishFailure::OutcomeUnknown {
+                phase: TmpfilePublishPhase::DestinationIdentity,
+                source,
+            }
+        })?;
+    authenticate_published_identity(source_identity, &destination).map_err(|source| {
+        TmpfilePublishFailure::OutcomeUnknown {
+            phase: TmpfilePublishPhase::DestinationIdentity,
+            source,
+        }
+    })?;
+    Ok(TmpfilePublishOutcome::Published)
 }
 
 /// Convert a MoveFailure into the public Error / poison decision.

@@ -26,3 +26,7 @@ criterion.workspace = true
 [[bench]]
 name = "queue_ops"
 harness = false
+
+[[bench]]
+name = "strict_batch"
+harness = false
