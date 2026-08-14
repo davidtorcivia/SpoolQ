@@ -6062,6 +6062,14 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let tmp = TempDir::new().unwrap();
+        // See fsck_preserves_non_ascii_name_bytes: skip on filesystems that
+        // reject non-UTF-8 names outright.
+        match std::fs::write(tmp.path().join(OsStr::from_bytes(b"probe-\x80")), b"") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => return,
+            Err(e) => panic!("probe write failed: {e}"),
+        }
+        std::fs::remove_file(tmp.path().join(OsStr::from_bytes(b"probe-\x80"))).unwrap();
         std::fs::write(tmp.path().join(OsStr::from_bytes(b"bad-\x80")), b"x").unwrap();
         let dir = std::fs::File::open(tmp.path()).unwrap();
         let mut stats = RecoveryScanStats::default();
