@@ -9,6 +9,6 @@ fn invalid_command_exits_unsuccessfully() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "xtask: usage: cargo xtask <check|check-generated|generate>\n"
+        "xtask: usage: cargo xtask <check|check-generated|generate|crashlab ...>\n"
     );
 }

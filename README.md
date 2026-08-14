@@ -126,7 +126,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 ## Architecture
 
 | Crate | Responsibility |
-|---|---|
+| --- | --- |
 | steadq-format | Binary encoding: FORMAT record, job header, receipt, watermark, CBOR extension |
 | steadq-names | Canonical filename parsing, integrity tags, shard computation |
 | steadq-math | Bucket arithmetic, retry jitter, checked conversions |
@@ -138,7 +138,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 
 ## Testing
 
-SteadQ has 622 tests across unit, integration, conformance, and formal model checking:
+SteadQ has 676 tests across unit, integration, conformance, and formal model checking:
 
 - Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
 - Fault injection tests inject I/O errors at every syscall boundary and verify error classification
@@ -146,13 +146,14 @@ SteadQ has 622 tests across unit, integration, conformance, and formal model che
 - TLA+ model checking verifies invariants for lease tokens, capability tokens, namespace durability, scheduling, and receipt evidence across six model configurations
 - Mutation testing (cargo-mutants) runs on every pull request, scoped to the changed lines
 - Fuzz testing covers format parsing, filename parsing, CBOR decoding, and arithmetic
+- Crash lab replays every persistence-barrier crash state on real filesystem images and verifies the queue contract after each state ([docs/crash-lab.md](docs/crash-lab.md))
 
 ## Performance
 
 Aggregate completed-job throughput using concurrent `Queue` handles:
 
 | Threads | 64 B payload | 1 KiB payload | 16 KiB payload |
-|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: |
 | 1 | 2,900 jobs/sec | 3,082 jobs/sec | 2,585 jobs/sec |
 | 4 | 5,651 jobs/sec | 5,426 jobs/sec | 5,294 jobs/sec |
 | 8 | 7,508 jobs/sec | 7,474 jobs/sec | 6,792 jobs/sec |
@@ -175,6 +176,7 @@ drive, formatted as ext4.
 - [`docs/release-checklist.md`](docs/release-checklist.md) - Requirements for a stable release
 - [`docs/formal-evidence-scope.md`](docs/formal-evidence-scope.md) - What the formal models prove and their limitations
 - [`docs/filesystem-profiles.md`](docs/filesystem-profiles.md) - Filesystem certification requirements
+- [`docs/crash-lab.md`](docs/crash-lab.md) - Storage crash testing tooling
 
 ## Requirements
 

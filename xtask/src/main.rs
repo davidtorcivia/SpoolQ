@@ -1,3 +1,4 @@
+mod crashlab;
 mod model;
 mod protocol;
 
@@ -24,11 +25,19 @@ fn run_command(command: Option<&str>) -> Result<(), String> {
 }
 
 fn dispatch_command(command: Option<&str>, root: &Path) -> Result<(), String> {
+    let mut args = std::env::args().skip(2);
     match command {
         Some("check") => check_all(root),
         Some("check-generated") => check_generated(root),
         Some("generate") => generate(root),
-        _ => Err("usage: cargo xtask <check|check-generated|generate>".into()),
+        Some("crashlab") => {
+            let sub = args.next().ok_or_else(|| {
+                "usage: cargo xtask crashlab <doctor|tier0|tier1|teardown|help>".to_string()
+            })?;
+            let rest: Vec<String> = args.collect();
+            crashlab::dispatch(root, &sub, &rest)
+        }
+        _ => Err("usage: cargo xtask <check|check-generated|generate|crashlab ...>".into()),
     }
 }
 

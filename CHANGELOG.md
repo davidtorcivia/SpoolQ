@@ -22,13 +22,15 @@
 
 ### Testing
 
-- 622 tests: unit, fault injection, differential, and formal model checking
+- 676 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request
+- Tests that require non-UTF-8 directory names or link publication skip on filesystems that reject those inputs (ZFS utf8only, strict ext4 encoding)
 
 ### Infrastructure
 
 - Closed protocol IR with versioned schema and typed domains
 - Reproducible toolchain pinning (Rust 1.97.1, x86_64-unknown-linux-gnu)
 - Compatibility policy for independent versioning of disk format, Rust API, C ABI, and ticket schema
+- Crash lab (`cargo xtask crashlab`): SIGKILL lane and dm-log-writes replay lane with device-safety guards, run registry, and per-state manifests (docs/crash-lab.md)
