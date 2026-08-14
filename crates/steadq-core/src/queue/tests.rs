@@ -1,4 +1,5 @@
 // Unit tests for the queue module.
+use super::resolve::*;
 use super::*;
 use crate::FsckOptions;
 use std::os::unix::fs::{FileExt, MetadataExt};
