@@ -293,6 +293,11 @@ fn execute_run(
         // would leave later writes in place and test an almost-final state
         // instead of the cut point.
         copy_sparse(&pristine, backing)?;
+        // A stale attachment from a failed cleanup would make attach fail
+        // with EBUSY; detach first so each state starts clean.
+        let _ = std::process::Command::new("losetup")
+            .args(["-d", &loop_b])
+            .output();
         attach_loop_explicit(&loop_b, backing)?;
         guards::verify_block_target(&loop_b, backing, root)?;
         run_cmd(
@@ -324,7 +329,7 @@ fn execute_run(
                     ])
                     .status()
                     .map_err(|e| format!("spawn checker: {e}"))?;
-                let _ = run_cmd("umount", &[&mount_dir.to_string_lossy()], &[]);
+                umount_retry(mount_dir)?;
                 status.success()
             }
             Err(e) => {
@@ -486,10 +491,42 @@ fn attach_loop_explicit(dev: &str, backing: &Path) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// Detach a loop device, retrying: the kernel releases the loop reference
+/// asynchronously after umount, so an immediate detach can fail with EBUSY.
 fn detach_loop(dev: &str) {
-    let _ = std::process::Command::new("losetup")
-        .args(["-d", dev])
-        .output();
+    for attempt in 0..20 {
+        let ok = std::process::Command::new("losetup")
+            .args(["-d", dev])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if attempt == 19 {
+            eprintln!("crashlab: warning: could not detach {dev} after retries");
+        }
+    }
+}
+
+/// Unmount, retrying briefly: a just-exited checker's file handles can take
+/// a moment to release. Returns Err when the mount is still busy so callers
+/// fail the state loudly instead of corrupting the next one.
+fn umount_retry(mount_dir: &Path) -> Result<(), String> {
+    let target = mount_dir.to_string_lossy();
+    for _attempt in 0..20 {
+        let ok = std::process::Command::new("umount")
+            .arg(&*target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(format!("umount {target} still busy after retries"))
 }
 
 fn sectors_of(dev: &str) -> Result<String, String> {
