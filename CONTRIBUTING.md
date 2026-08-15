@@ -2,7 +2,7 @@
 
 SteadQ changes are reviewed as protocol changes, even when the patch looks local.
 
-Before modifying a transition, read `spec/contract.md`, `spec/state-machine.json`, `docs/traceability.md`, and the relevant entry in `docs/complexity-ledger.md`.
+Before modifying a transition, read `spec/contract.md`, `spec/state-machine.json`, and `docs/formal-evidence-scope.md`, and be able to name where the transition's residual complexity is reviewed.
 
 Every change must state:
 

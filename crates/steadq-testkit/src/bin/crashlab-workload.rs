@@ -5,7 +5,7 @@
 // The runner (cargo xtask crashlab tier0) SIGKILLs this process after
 // observing a target number of lines, so the surviving prefix is the cut.
 //
-// Usage: crashlab-workload --queue DIR --oplog FILE --seed N --ops N
+// Usage: crashlab-workload --queue DIR --oplog FILE [--on-disk-oplog FILE] [--seed N] [--ops N]
 
 use std::io::Write as _;
 use steadq_testkit::driver::ProductionDriver;
@@ -13,6 +13,7 @@ use steadq_testkit::driver::ProductionDriver;
 struct Args {
     queue: String,
     oplog: String,
+    on_disk_oplog: Option<String>,
     seed: u64,
     ops: u64,
 }
@@ -21,6 +22,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         queue: String::new(),
         oplog: String::new(),
+        on_disk_oplog: None,
         seed: 1,
         ops: 24,
     };
@@ -32,6 +34,7 @@ fn parse_args() -> Result<Args, String> {
         match flag.as_str() {
             "--queue" => args.queue = value,
             "--oplog" => args.oplog = value,
+            "--on-disk-oplog" => args.on_disk_oplog = Some(value),
             "--seed" => args.seed = value.parse().map_err(|_| "bad --seed")?,
             "--ops" => args.ops = value.parse().map_err(|_| "bad --ops")?,
             _ => return Err(format!("unknown flag {flag}")),

@@ -69,8 +69,13 @@ fn unhex(s: &str) -> Option<[u8; 16]> {
 }
 
 fn read_oplog(path: &Path) -> Result<Vec<OpLine>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read oplog {}: {e}", path.display()))?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        // A crash state before the oplog file was created has zero
+        // completed operations and therefore zero expectations.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read oplog {}: {e}", path.display())),
+    };
     // Tolerate a truncated trailing line: drop anything after the last newline.
     let text = match text.rfind('\n') {
         Some(i) => &text[..=i],
@@ -122,6 +127,26 @@ fn main() {
 }
 
 fn run_check(args: &Args) -> Result<serde_json::Value, String> {
+    // A crash state before the queue was initialized checks nothing: no
+    // queue exists, no operations were durably completed.
+    if !Path::new(&args.queue).is_dir() {
+        return Ok(json!({ "pass": true, "queue_absent": true }));
+    }
+    // FORMAT publication is fsync-then-rename and precedes every queue
+    // write, so a missing FORMAT means initialization was interrupted
+    // before any operation could complete durably. A durable operation
+    // without FORMAT would be a causality violation.
+    if !Path::new(&args.queue).join("FORMAT").is_file() {
+        let ops = read_oplog(Path::new(&args.oplog))?;
+        return if ops.is_empty() {
+            Ok(json!({ "pass": true, "interrupted_init": true }))
+        } else {
+            Ok(json!({
+                "pass": false,
+                "format_missing_with_durable_ops": ops.len(),
+            }))
+        };
+    }
     let ops = read_oplog(Path::new(&args.oplog))?;
 
     let committed: Vec<[u8; 16]> = ops
@@ -205,22 +230,21 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         }
     }
 
-    // G3: probe deliveries. Anything leasable must be a committed job; an
-    // acknowledged job must never be delivered; corrupt payloads must be
-    // quarantined, not delivered.
+    // G3: probe deliveries. An acknowledged job must never be delivered;
+    // corrupt payloads must be quarantined, not delivered. A job that exists
+    // on disk but has no durable oplog line is NOT a phantom: publication
+    // fsyncs before its oplog line is written, so the durable prefix is a
+    // lower bound on completed work and on-disk presence proves the enqueue.
     let acked_hex: Vec<String> = acked.iter().map(|j| hex(j)).collect();
     let mut delivered = Vec::new();
     let mut phantom = Vec::new();
     let mut quarantined_corrupt = 0u32;
-    let committed_hex: Vec<String> = committed.iter().map(|j| hex(j)).collect();
     for _ in 0..8 {
         match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(info) => {
                 let jh = hex(&info.job_id);
                 if acked_hex.contains(&jh) {
                     phantom.push(format!("acked-delivered:{jh}"));
-                } else if !committed_hex.contains(&jh) {
-                    phantom.push(format!("phantom:{jh}"));
                 } else {
                     delivered.push(jh);
                 }

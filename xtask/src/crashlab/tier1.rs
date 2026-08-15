@@ -108,6 +108,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     if !a.keep_images && result.is_ok() {
         let _ = std::fs::remove_file(&backing);
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(a.store.join(format!("{id}.pristine.img")));
     }
     result
 }
@@ -162,6 +163,11 @@ fn execute_run(
         .unwrap_or_default();
 
     // 4. dm log-writes target over the fresh fs.
+    // Snapshot the pristine post-mkfs state: replay-log applies log entries
+    // onto the backing image, so each crash state must start from the exact
+    // pre-log image, not the final workload state.
+    let pristine = a.store.join(format!("{id}.pristine.img"));
+    copy_sparse(backing, &pristine)?;
     let sectors = sectors_of(&loop_b)?;
     let dm_name = format!("crashlab-{id}");
     run.dm_names = vec![dm_name.clone()];
@@ -186,12 +192,17 @@ fn execute_run(
     )
     .unwrap_or_default();
     let queue_dir = mount_dir.join("queue");
+    // The on-disk oplog lives next to the queue on the tested device: its
+    // surviving prefix after a replay marks the durably completed ops.
+    let disk_oplog = mount_dir.join("oplog.ndjson");
     let workload_status = std::process::Command::new(workload)
         .args([
             "--queue",
             queue_dir.to_str().ok_or("queue path not utf-8")?,
             "--oplog",
             oplog.to_str().ok_or("oplog path not utf-8")?,
+            "--on-disk-oplog",
+            disk_oplog.to_str().ok_or("oplog path not utf-8")?,
             "--seed",
             &a.seed.to_string(),
             "--ops",
@@ -248,7 +259,9 @@ fn execute_run(
     }
     barriers.sort_unstable();
     barriers.dedup();
-    let nr_entries: u64 = run_cmd(&replay_log, &["--log", &loop_m, "--number-entries"], &[])?
+    // The getopt table spells this option "num-entries"; the usage text
+    // misleadingly prints "--number-entries".
+    let nr_entries: u64 = run_cmd(&replay_log, &["--log", &loop_m, "--num-entries"], &[])?
         .trim()
         .parse()
         .unwrap_or(0);
@@ -276,6 +289,15 @@ fn execute_run(
         if a.max_marks > 0 && i >= a.max_marks {
             break;
         }
+        // Restore the pristine image: replaying onto the final-state image
+        // would leave later writes in place and test an almost-final state
+        // instead of the cut point.
+        copy_sparse(&pristine, backing)?;
+        // A stale attachment from a failed cleanup would make attach fail
+        // with EBUSY; detach first so each state starts clean.
+        let _ = std::process::Command::new("losetup")
+            .args(["-d", &loop_b])
+            .output();
         attach_loop_explicit(&loop_b, backing)?;
         guards::verify_block_target(&loop_b, backing, root)?;
         run_cmd(
@@ -301,13 +323,13 @@ fn execute_run(
                         "--queue",
                         queue_dir.to_str().ok_or("queue path not utf-8")?,
                         "--oplog",
-                        oplog.to_str().ok_or("oplog path not utf-8")?,
+                        disk_oplog.to_str().ok_or("oplog path not utf-8")?,
                         "--out",
                         verdict_path.to_str().ok_or("verdict path not utf-8")?,
                     ])
                     .status()
                     .map_err(|e| format!("spawn checker: {e}"))?;
-                let _ = run_cmd("umount", &[&mount_dir.to_string_lossy()], &[]);
+                umount_retry(mount_dir)?;
                 status.success()
             }
             Err(e) => {
@@ -372,17 +394,64 @@ fn execute_run(
 
 fn teardown_run_resources(run: &RegistryRun) {
     if let Some(mount) = &run.mount {
-        let _ = std::process::Command::new("umount").arg(mount).status();
+        let _ = std::process::Command::new("umount").arg(mount).output();
     }
     for dm in &run.dm_names {
         let _ = std::process::Command::new("dmsetup")
             .args(["remove", dm])
-            .status();
+            .output();
     }
     for loop_dev in &run.loops {
         let _ = std::process::Command::new("losetup")
             .args(["-d", loop_dev])
-            .status();
+            .output();
+    }
+    // Loops re-attached after run.loops was cleared (log enumeration and
+    // per-state replay re-attach by explicit device name) are not in the
+    // registry list. Detach whatever is still attached to this run's own
+    // images; losetup -j only reports loops backed by those files.
+    for image in [run.backing.as_deref(), run.marker.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        detach_loops_for(Path::new(image));
+    }
+}
+
+fn detach_loops_for(image: &Path) {
+    let Ok(out) = std::process::Command::new("losetup")
+        .arg("-j")
+        .arg(image)
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some(dev) = line.split(':').next() else {
+            continue;
+        };
+        if dev.trim_start_matches("/dev/").starts_with("loop") {
+            let _ = std::process::Command::new("losetup")
+                .args(["-d", dev])
+                .output();
+        }
+    }
+}
+
+/// Copy a crash-lab image, skipping unwritten extents: the post-mkfs image
+/// is mostly holes, so a sparse copy restores in time proportional to the
+/// mkfs footprint rather than the image size.
+fn copy_sparse(src: &Path, dst: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("cp")
+        .args(["--sparse=always", "--reflink=auto"])
+        .arg(src)
+        .arg(dst)
+        .status()
+        .map_err(|e| format!("cp {src:?} -> {dst:?}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cp {src:?} -> {dst:?} failed: {status}"))
     }
 }
 
@@ -422,10 +491,42 @@ fn attach_loop_explicit(dev: &str, backing: &Path) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// Detach a loop device, retrying: the kernel releases the loop reference
+/// asynchronously after umount, so an immediate detach can fail with EBUSY.
 fn detach_loop(dev: &str) {
-    let _ = std::process::Command::new("losetup")
-        .args(["-d", dev])
-        .status();
+    for attempt in 0..20 {
+        let ok = std::process::Command::new("losetup")
+            .args(["-d", dev])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if attempt == 19 {
+            eprintln!("crashlab: warning: could not detach {dev} after retries");
+        }
+    }
+}
+
+/// Unmount, retrying briefly: a just-exited checker's file handles can take
+/// a moment to release. Returns Err when the mount is still busy so callers
+/// fail the state loudly instead of corrupting the next one.
+fn umount_retry(mount_dir: &Path) -> Result<(), String> {
+    let target = mount_dir.to_string_lossy();
+    for _attempt in 0..20 {
+        let ok = std::process::Command::new("umount")
+            .arg(&*target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(format!("umount {target} still busy after retries"))
 }
 
 fn sectors_of(dev: &str) -> Result<String, String> {
