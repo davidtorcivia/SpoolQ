@@ -17,6 +17,7 @@ SteadQ runs on local Linux filesystems that provide the following guarantees:
 | XFS | `0x58465342` | Reference filesystem. Journal-based durability. |
 | btrfs | `0x9123683E` | Copy-on-write B-tree durability. |
 | f2fs | `0xF00D` | Flash-optimized for SSDs and eMMC. Log-structured durability. |
+| ZFS | `0x2FC12FC1` | Pooled copy-on-write. Publication uses the named-temp rename path (O_TMPFILE linking stalls on OpenZFS). Crash recovery is pool import. |
 
 ## Rejected filesystems
 
@@ -29,6 +30,8 @@ SteadQ runs on local Linux filesystems that provide the following guarantees:
 
 ## Crash testing
 
-No filesystem has been independently crash-tested with real power-cut
-hardware. Until that testing is complete, durability claims are based on
+Block-level crash replay (dm-log-writes) is run per profile by the crash
+lab ([crash-lab.md](crash-lab.md)); manifests record the exact kernel,
+tool, and mount configuration of each run. No filesystem has been tested
+with real power-cut hardware. Durability claims additionally rest on
 POSIX and Linux kernel documentation guarantees for each filesystem.

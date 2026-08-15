@@ -196,6 +196,19 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         .filter(|f| matches!(f.severity, steadq_core::FindingSeverity::Error))
         .count();
     let fsck_warnings = report.findings.len() - fsck_errors;
+    let fsck_findings: Vec<serde_json::Value> = report
+        .findings
+        .iter()
+        .take(20)
+        .map(|f| {
+            json!({
+                "severity": format!("{:?}", f.severity),
+                "type": f.finding_type,
+                "path": f.relative_path,
+                "details": f.details,
+            })
+        })
+        .collect();
 
     // G1: committed jobs must still exist somewhere.
     let mut missing = Vec::new();
@@ -258,6 +271,19 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
     }
 
     let stats = last;
+    let recovery_errors: Vec<String> = stats
+        .errors
+        .iter()
+        .take(20)
+        .map(|e| format!("{e:?}"))
+        .collect();
+    let oplog_tail: Vec<String> = ops
+        .iter()
+        .rev()
+        .take(5)
+        .rev()
+        .map(|l| format!("{}:{}", l.op, l.result))
+        .collect();
     let gates_pass = missing.is_empty()
         && acked_bad.is_empty()
         && phantom.is_empty()
@@ -267,19 +293,25 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
     Ok(json!({
         "pass": gates_pass,
         "ops": ops.len(),
+        "oplog_tail": oplog_tail,
         "committed": committed.len(),
         "acked": acked.len(),
         "gates": {
             "committed_not_lost": { "checked": committed.len(), "missing": missing },
             "acked_terminal": { "checked": acked.len(), "violations": acked_bad },
             "no_phantom_or_acked_delivery": { "violations": phantom, "delivered_probe": delivered.len() },
-            "recovery_clean": { "passes": passes, "errors": total_errors },
+            "recovery_clean": {
+                "passes": passes,
+                "errors": total_errors,
+                "error_detail": recovery_errors,
+            },
             "fsck_clean": {
                 "errors": fsck_errors,
                 "warnings": fsck_warnings,
                 "total_objects": report.total_objects,
                 "structurally_verified": report.structurally_verified,
                 "payloads_deep_verified": report.payloads_deep_verified,
+                "findings": fsck_findings,
             },
             "quarantined_corrupt_payloads": quarantined_corrupt,
         },
