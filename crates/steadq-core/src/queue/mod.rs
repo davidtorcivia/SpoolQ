@@ -277,7 +277,9 @@ impl Queue {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "filesystem type not supported for queue (requires ext4, xfs, btrfs, or f2fs)",
+                    format!(
+                        "filesystem type not supported for queue (observed magic {ft:#x}; requires ext4, xfs, btrfs, or f2fs)"
+                    ),
                 ));
             }
         }

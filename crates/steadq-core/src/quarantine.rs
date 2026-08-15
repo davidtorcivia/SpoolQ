@@ -639,12 +639,17 @@ impl Queue {
         }
 
         let mut header_buf = [0u8; 128];
-        if fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0).is_err() {
+        if let Err(read_error) = fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0) {
+            let file_size = fs::fstat(file_fd.as_fd())
+                .map(|st| st.st_size.to_string())
+                .unwrap_or_else(|e| format!("fstat error {e}"));
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
                 finding_type: "header_read_failed".into(),
                 severity: FindingSeverity::Error,
-                details: "cannot read 128-byte header".into(),
+                details: format!(
+                    "cannot read 128-byte header: size={file_size}, error={read_error}"
+                ),
             });
             if opts.mode == FsckMode::Repair {
                 self.quarantine_object_or_record(

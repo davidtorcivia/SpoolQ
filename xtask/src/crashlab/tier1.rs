@@ -154,6 +154,7 @@ fn execute_run(
         "xfs" => &["-f"],
         "btrfs" => &["-f"],
         "f2fs" => &["-f"],
+        "zfs" => &[],
         _ => unreachable!(),
     };
     if !is_zfs {
