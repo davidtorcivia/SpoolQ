@@ -1824,6 +1824,32 @@ fn enqueue_delayed() {
 }
 
 #[test]
+fn enqueue_not_before_at_or_before_now_starts_ready() {
+    let (_tmp, mut queue) = create_test_queue();
+    let now = 10_000_000_000_000;
+    fs::fault::reset();
+    fs::fault::set_clock_realtime_ns(now);
+    for (label, nb) in [("past", now - 1), ("exact-now", now)] {
+        let outcome = queue.enqueue(EnqueueInput {
+            maximum_attempts: 1,
+            content_type: "x".to_string(),
+            initial_not_before: Some(nb),
+            payload: vec![0x42; 10],
+            ..Default::default()
+        });
+        match outcome {
+            EnqueueOutcome::Committed(ticket) => assert!(
+                ticket.expected_relative_path.starts_with("ready/"),
+                "{label}: not_before at or before the wall floor must start ready, got {}",
+                ticket.expected_relative_path
+            ),
+            other => panic!("{label}: expected committed, got {other:?}"),
+        }
+    }
+    fs::fault::reset();
+}
+
+#[test]
 fn enqueue_zero_attempts_rejected() {
     let (_tmp, mut queue) = create_test_queue();
     let input = EnqueueInput {
