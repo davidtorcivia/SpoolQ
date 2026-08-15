@@ -386,6 +386,36 @@ fn teardown_run_resources(run: &RegistryRun) {
             .args(["-d", loop_dev])
             .output();
     }
+    // Loops re-attached after run.loops was cleared (log enumeration and
+    // per-state replay re-attach by explicit device name) are not in the
+    // registry list. Detach whatever is still attached to this run's own
+    // images; losetup -j only reports loops backed by those files.
+    for image in [run.backing.as_deref(), run.marker.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        detach_loops_for(Path::new(image));
+    }
+}
+
+fn detach_loops_for(image: &Path) {
+    let Ok(out) = std::process::Command::new("losetup")
+        .arg("-j")
+        .arg(image)
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some(dev) = line.split(':').next() else {
+            continue;
+        };
+        if dev.trim_start_matches("/dev/").starts_with("loop") {
+            let _ = std::process::Command::new("losetup")
+                .args(["-d", dev])
+                .output();
+        }
+    }
 }
 
 fn allocate_image(path: &Path, size_mb: u64) -> Result<(), String> {
