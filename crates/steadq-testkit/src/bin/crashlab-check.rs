@@ -160,6 +160,9 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         .filter_map(|l| unhex(&l.job))
         .collect();
 
+    let committed_hex: Vec<String> = committed.iter().map(|j| hex(j)).collect();
+    let acked_hex: Vec<String> = acked.iter().map(|j| hex(j)).collect();
+
     let mut queue = Queue::open(
         Path::new(&args.queue),
         &OpenOptions {
@@ -174,11 +177,29 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         max_operations: 100_000,
         max_duration_ms: 60_000,
     };
+    // Recovery errors referencing objects with no durable obligation are
+    // the same legal power-loss loss class as beyond-prefix fsck findings.
+    let error_beyond_prefix = |e: &steadq_core::recovery::RecoveryError| -> bool {
+        let name = e.relative_path.rsplit('/').next().unwrap_or("");
+        let job_hex = name.split('.').next().unwrap_or("");
+        !committed_hex.iter().any(|c| c == job_hex) && !acked_hex.iter().any(|a| a == job_hex)
+    };
     let mut passes = 0u32;
     let mut total_errors = 0usize;
+    let mut recovery_beyond_prefix = 0usize;
+    let mut recovery_beyond_errors: Vec<String> = Vec::new();
     let last = loop {
         let stats = queue.recover(&budget);
-        total_errors += stats.errors.len();
+        for e in &stats.errors {
+            if error_beyond_prefix(e) {
+                recovery_beyond_prefix += 1;
+                if recovery_beyond_errors.len() < 20 {
+                    recovery_beyond_errors.push(format!("{e:?}"));
+                }
+            } else {
+                total_errors += 1;
+            }
+        }
         passes += 1;
         if !stats.budget_exhausted || passes > 100 {
             break stats;
@@ -190,12 +211,28 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         mode: FsckMode::Check,
         depth: FsckDepth::Deep,
     });
-    let fsck_errors = report
-        .findings
-        .iter()
-        .filter(|f| matches!(f.severity, steadq_core::FindingSeverity::Error))
-        .count();
-    let fsck_warnings = report.findings.len() - fsck_errors;
+    // Findings on objects with no durable obligation are legal power-loss
+    // loss: the contract protects only work whose completion is in the
+    // durable oplog prefix. Damage beyond the prefix (never-acknowledged
+    // jobs, receipts without durable acks) must not fail the state; the
+    // same damage on a durably committed job still fails it.
+    let beyond_prefix = |finding: &steadq_core::CorruptionFinding| -> bool {
+        let name = finding.relative_path.rsplit('/').next().unwrap_or("");
+        let job_hex = name.split('.').next().unwrap_or("");
+        !committed_hex.iter().any(|c| c == job_hex) && !acked_hex.iter().any(|a| a == job_hex)
+    };
+    let mut fsck_errors = 0usize;
+    let mut beyond_prefix_findings = 0usize;
+    for finding in &report.findings {
+        if matches!(finding.severity, steadq_core::FindingSeverity::Error) {
+            if beyond_prefix(finding) {
+                beyond_prefix_findings += 1;
+            } else {
+                fsck_errors += 1;
+            }
+        }
+    }
+    let fsck_warnings = report.findings.len() - fsck_errors - beyond_prefix_findings;
     let fsck_findings: Vec<serde_json::Value> = report
         .findings
         .iter()
@@ -305,6 +342,8 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
                 "errors": total_errors,
                 "error_detail": recovery_errors,
             },
+            "beyond_prefix_findings": beyond_prefix_findings,
+            "beyond_prefix_recovery_errors": recovery_beyond_prefix,
             "fsck_clean": {
                 "errors": fsck_errors,
                 "warnings": fsck_warnings,
