@@ -132,6 +132,21 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
     if !Path::new(&args.queue).is_dir() {
         return Ok(json!({ "pass": true, "queue_absent": true }));
     }
+    // FORMAT publication is fsync-then-rename and precedes every queue
+    // write, so a missing FORMAT means initialization was interrupted
+    // before any operation could complete durably. A durable operation
+    // without FORMAT would be a causality violation.
+    if !Path::new(&args.queue).join("FORMAT").is_file() {
+        let ops = read_oplog(Path::new(&args.oplog))?;
+        return if ops.is_empty() {
+            Ok(json!({ "pass": true, "interrupted_init": true }))
+        } else {
+            Ok(json!({
+                "pass": false,
+                "format_missing_with_durable_ops": ops.len(),
+            }))
+        };
+    }
     let ops = read_oplog(Path::new(&args.oplog))?;
 
     let committed: Vec<[u8; 16]> = ops

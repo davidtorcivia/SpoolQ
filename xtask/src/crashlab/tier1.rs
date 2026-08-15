@@ -167,7 +167,7 @@ fn execute_run(
     // onto the backing image, so each crash state must start from the exact
     // pre-log image, not the final workload state.
     let pristine = a.store.join(format!("{id}.pristine.img"));
-    std::fs::copy(backing, &pristine).map_err(|e| format!("pristine snapshot: {e}"))?;
+    copy_sparse(backing, &pristine)?;
     let sectors = sectors_of(&loop_b)?;
     let dm_name = format!("crashlab-{id}");
     run.dm_names = vec![dm_name.clone()];
@@ -292,7 +292,7 @@ fn execute_run(
         // Restore the pristine image: replaying onto the final-state image
         // would leave later writes in place and test an almost-final state
         // instead of the cut point.
-        std::fs::copy(&pristine, backing).map_err(|e| format!("restore pristine: {e}"))?;
+        copy_sparse(&pristine, backing)?;
         attach_loop_explicit(&loop_b, backing)?;
         guards::verify_block_target(&loop_b, backing, root)?;
         run_cmd(
@@ -430,6 +430,23 @@ fn detach_loops_for(image: &Path) {
                 .args(["-d", dev])
                 .output();
         }
+    }
+}
+
+/// Copy a crash-lab image, skipping unwritten extents: the post-mkfs image
+/// is mostly holes, so a sparse copy restores in time proportional to the
+/// mkfs footprint rather than the image size.
+fn copy_sparse(src: &Path, dst: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("cp")
+        .args(["--sparse=always", "--reflink=auto"])
+        .arg(src)
+        .arg(dst)
+        .status()
+        .map_err(|e| format!("cp {src:?} -> {dst:?}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cp {src:?} -> {dst:?} failed: {status}"))
     }
 }
 
