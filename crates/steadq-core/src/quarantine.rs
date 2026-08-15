@@ -1754,6 +1754,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
         let shard = tmp.path().join("ready/0000");
+        // Filesystems with mandatory UTF-8 names (ZFS utf8only, ext4 strict
+        // encoding) reject non-UTF-8 names with EILSEQ; the property is
+        // untestable there.
+        match std::fs::write(shard.join(OsStr::from_bytes(b"probe-\x80")), b"") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => return,
+            Err(e) => panic!("probe write failed: {e}"),
+        }
+        std::fs::remove_file(shard.join(OsStr::from_bytes(b"probe-\x80"))).unwrap();
         std::fs::write(shard.join(OsStr::from_bytes(b"bad-\x80")), b"a").unwrap();
         std::fs::write(shard.join(OsStr::from_bytes(b"bad-\x81")), b"b").unwrap();
         std::fs::write(shard.join("café"), b"c").unwrap();

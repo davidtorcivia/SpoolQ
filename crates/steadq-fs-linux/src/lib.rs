@@ -2060,6 +2060,17 @@ mod tests {
         let directory = test_dir("raw-directory-names");
         let dir_path = directory.path();
         std::fs::write(dir_path.join("plain"), b"plain").unwrap();
+        // Skip on filesystems with mandatory UTF-8 names (ZFS utf8only,
+        // ext4 strict encoding); they reject the inputs with EILSEQ.
+        match std::fs::write(
+            dir_path.join(std::ffi::OsStr::from_bytes(b"probe-\x80")),
+            b"",
+        ) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => return,
+            Err(e) => panic!("probe write failed: {e}"),
+        }
+        std::fs::remove_file(dir_path.join(std::ffi::OsStr::from_bytes(b"probe-\x80"))).unwrap();
         let first = OsStr::from_bytes(b"bad-\x80");
         let second = OsStr::from_bytes(b"bad-\x81");
         std::fs::write(dir_path.join(first), b"a").unwrap();

@@ -5683,6 +5683,13 @@ mod tests {
         fs::open_tmpfile(ready.as_fd()).is_ok()
     }
 
+    // Link publication tests assert call sequences that hold only when
+    // linkat publication is attempted. Filesystems that force the named
+    // temp rename path (ZFS) must skip them; that path has its own tests.
+    fn link_publication_attempted(queue: &Queue) -> bool {
+        queue.publication_mode != Some(fs::PublicationMode::NamedFallback)
+    }
+
     fn add_hard_link(tmp: &tempfile::TempDir, relative_path: &str, label: &str) {
         std::fs::hard_link(
             tmp.path().join(relative_path),
@@ -6455,7 +6462,7 @@ mod tests {
         // Exercises publish_tmpfile_noreplace_deferred error paths through batch enqueue.
         for errno in [libc::EEXIST, libc::ENOSPC, libc::EIO] {
             let (_tmp, mut queue) = create_test_queue();
-            if !tmpfile_supported(&queue) {
+            if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
                 return;
             }
             fs::fault::reset();
@@ -6517,6 +6524,11 @@ mod tests {
     #[test]
     fn batch_enqueue_preserves_every_injected_postlinearization_failure() {
         for named_fallback in [false, true] {
+            // On filesystems that force the named path, the false variant
+            // would duplicate the true variant under different call numbering.
+            if !named_fallback && !link_publication_attempted(&create_test_queue().1) {
+                continue;
+            }
             for fault in ["fstatat", "fstat"] {
                 let count_calls = || {
                     let (_tmp, mut queue) = create_test_queue();
@@ -6844,7 +6856,7 @@ mod tests {
     fn tmpfile_publication_uses_proc_then_named_fallback() {
         for named_fallback in [false, true] {
             let (_tmp, mut queue) = create_test_queue();
-            if !tmpfile_supported(&queue) {
+            if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
                 return;
             }
             fs::fault::reset();
@@ -6883,7 +6895,7 @@ mod tests {
             (libc::EPERM, "io"),
         ] {
             let (tmp, mut queue) = create_test_queue();
-            if !tmpfile_supported(&queue) {
+            if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
                 return;
             }
             fs::fault::reset();
@@ -6925,7 +6937,7 @@ mod tests {
     fn tmpfile_publication_preserves_postlinearization_failures() {
         for fault in ["fstatat", "fsync_dir_fd"] {
             let (tmp, mut queue) = create_test_queue();
-            if !tmpfile_supported(&queue) {
+            if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
                 return;
             }
             fs::fault::reset();

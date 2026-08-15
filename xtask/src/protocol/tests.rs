@@ -226,11 +226,11 @@ fn rejects_unsupported_target() {
 fn command_dispatch_rejects_unknown_commands() {
     assert_eq!(
         run_command(Some("unknown")).unwrap_err(),
-        "usage: cargo xtask <check|check-generated|generate>"
+        "usage: cargo xtask <check|check-generated|generate|crashlab ...>"
     );
     assert_eq!(
         run_command(None).unwrap_err(),
-        "usage: cargo xtask <check|check-generated|generate>"
+        "usage: cargo xtask <check|check-generated|generate|crashlab ...>"
     );
 }
 
