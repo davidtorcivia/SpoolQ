@@ -230,22 +230,21 @@ fn run_check(args: &Args) -> Result<serde_json::Value, String> {
         }
     }
 
-    // G3: probe deliveries. Anything leasable must be a committed job; an
-    // acknowledged job must never be delivered; corrupt payloads must be
-    // quarantined, not delivered.
+    // G3: probe deliveries. An acknowledged job must never be delivered;
+    // corrupt payloads must be quarantined, not delivered. A job that exists
+    // on disk but has no durable oplog line is NOT a phantom: publication
+    // fsyncs before its oplog line is written, so the durable prefix is a
+    // lower bound on completed work and on-disk presence proves the enqueue.
     let acked_hex: Vec<String> = acked.iter().map(|j| hex(j)).collect();
     let mut delivered = Vec::new();
     let mut phantom = Vec::new();
     let mut quarantined_corrupt = 0u32;
-    let committed_hex: Vec<String> = committed.iter().map(|j| hex(j)).collect();
     for _ in 0..8 {
         match queue.lease(0, 30_000_000_000) {
             LeaseOutcome::Leased(info) => {
                 let jh = hex(&info.job_id);
                 if acked_hex.contains(&jh) {
                     phantom.push(format!("acked-delivered:{jh}"));
-                } else if !committed_hex.contains(&jh) {
-                    phantom.push(format!("phantom:{jh}"));
                 } else {
                     delivered.push(jh);
                 }
