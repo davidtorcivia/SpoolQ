@@ -223,6 +223,7 @@ fn classify_filesystem_type(
                         | fs::XFS_SUPER_MAGIC
                         | fs::BTRFS_SUPER_MAGIC
                         | fs::F2FS_SUPER_MAGIC
+                        | fs::F2FS_STATFS_MAGIC_ALT
                         | fs::ZFS_SUPER_MAGIC
                 ) =>
         {
@@ -273,6 +274,7 @@ impl Queue {
             | fs::XFS_SUPER_MAGIC
             | fs::BTRFS_SUPER_MAGIC
             | fs::F2FS_SUPER_MAGIC
+            | fs::F2FS_STATFS_MAGIC_ALT
             | fs::ZFS_SUPER_MAGIC => {}
             _ => {
                 return Err(io::Error::new(

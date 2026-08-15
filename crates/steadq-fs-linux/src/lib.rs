@@ -1287,6 +1287,9 @@ pub const EXT4_SUPER_MAGIC: i64 = 0xEF53;
 pub const XFS_SUPER_MAGIC: i64 = 0x58465342;
 pub const BTRFS_SUPER_MAGIC: i64 = 0x9123683E;
 pub const F2FS_SUPER_MAGIC: i64 = 0xF00D;
+/// statfs(2) on f2fs as reported by kernel 6.8: the on-disk superblock
+/// magic, not the uapi constant above. Accept both.
+pub const F2FS_STATFS_MAGIC_ALT: i64 = 0xF2F5_2010;
 pub const ZFS_SUPER_MAGIC: i64 = 0x2fc12fc1;
 pub const TMPFS_MAGIC: i64 = 0x01021994;
 pub const NFS_SUPER_MAGIC: i64 = 0x6969;

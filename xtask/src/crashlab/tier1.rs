@@ -543,12 +543,20 @@ fn zfs_state_mount(dev: &str, pool: &str, _mount_dir: &Path) -> Result<(), Strin
     if !listing.contains(pool) {
         return Err(format!("{POOL_ABSENT}: {pool}"));
     }
-    run_cmd(
+    match run_cmd(
         "zpool",
         &["import", "-f", "-o", "cachefile=none", "-d", dev, pool],
         &[],
-    )
-    .map(|_| ())
+    ) {
+        Ok(_) => Ok(()),
+        // Labels are enumerable but no valid uberblock exists: ZFS
+        // durability begins at uberblock commit, so nothing in this pool
+        // was ever durable. Same vacuous class as pool-absent.
+        Err(e) if e.contains("unavailable") || e.contains("corrupted data") => {
+            Err(format!("{POOL_ABSENT}: import: {e}"))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Export the run's pool, retrying while the checker's handles drain.
