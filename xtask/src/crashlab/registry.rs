@@ -60,17 +60,17 @@ pub fn teardown_active(store: &Path) -> Result<usize, String> {
     for run in runs.iter_mut().filter(|r| r.status == "active") {
         eprintln!("tearing down run {}", run.id);
         if let Some(mount) = &run.mount {
-            let _ = std::process::Command::new("umount").arg(mount).status();
+            let _ = std::process::Command::new("umount").arg(mount).output();
         }
         for dm in &run.dm_names {
             let _ = std::process::Command::new("dmsetup")
                 .args(["remove", dm])
-                .status();
+                .output();
         }
         for loop_dev in &run.loops {
             let _ = std::process::Command::new("losetup")
                 .args(["-d", loop_dev])
-                .status();
+                .output();
         }
         run.status = "torn-down".into();
         run.ended = Some(super::now_iso());
@@ -89,7 +89,7 @@ fn sweep_leftovers() {
     {
         for target in String::from_utf8_lossy(&out.stdout).lines() {
             if target.contains("/mnt/crashlab-") {
-                let _ = std::process::Command::new("umount").arg(target).status();
+                let _ = std::process::Command::new("umount").arg(target).output();
             }
         }
     }
@@ -99,7 +99,7 @@ fn sweep_leftovers() {
                 if name.starts_with("crashlab-") {
                     let _ = std::process::Command::new("dmsetup")
                         .args(["remove", name])
-                        .status();
+                        .output();
                 }
             }
         }

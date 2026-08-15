@@ -248,7 +248,9 @@ fn execute_run(
     }
     barriers.sort_unstable();
     barriers.dedup();
-    let nr_entries: u64 = run_cmd(&replay_log, &["--log", &loop_m, "--number-entries"], &[])?
+    // The getopt table spells this option "num-entries"; the usage text
+    // misleadingly prints "--number-entries".
+    let nr_entries: u64 = run_cmd(&replay_log, &["--log", &loop_m, "--num-entries"], &[])?
         .trim()
         .parse()
         .unwrap_or(0);
@@ -372,17 +374,17 @@ fn execute_run(
 
 fn teardown_run_resources(run: &RegistryRun) {
     if let Some(mount) = &run.mount {
-        let _ = std::process::Command::new("umount").arg(mount).status();
+        let _ = std::process::Command::new("umount").arg(mount).output();
     }
     for dm in &run.dm_names {
         let _ = std::process::Command::new("dmsetup")
             .args(["remove", dm])
-            .status();
+            .output();
     }
     for loop_dev in &run.loops {
         let _ = std::process::Command::new("losetup")
             .args(["-d", loop_dev])
-            .status();
+            .output();
     }
 }
 
@@ -425,7 +427,7 @@ fn attach_loop_explicit(dev: &str, backing: &Path) -> Result<(), String> {
 fn detach_loop(dev: &str) {
     let _ = std::process::Command::new("losetup")
         .args(["-d", dev])
-        .status();
+        .output();
 }
 
 fn sectors_of(dev: &str) -> Result<String, String> {
