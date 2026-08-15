@@ -294,10 +294,9 @@ fn execute_run(
         // instead of the cut point.
         copy_sparse(&pristine, backing)?;
         // A stale attachment from a failed cleanup would make attach fail
-        // with EBUSY; detach first so each state starts clean.
-        let _ = std::process::Command::new("losetup")
-            .args(["-d", &loop_b])
-            .output();
+        // with EBUSY; detach first so each state starts clean. The attach
+        // itself retries because freeing the device trails the detach.
+        detach_loop(&loop_b);
         attach_loop_explicit(&loop_b, backing)?;
         guards::verify_block_target(&loop_b, backing, root)?;
         run_cmd(
@@ -482,13 +481,28 @@ fn attach_loop(backing: &Path) -> Result<String, String> {
     }
 }
 
+/// Attach a loop device, retrying: after a successful detach the kernel can
+/// still take a moment to free the device, so an immediate attach can fail
+/// with EBUSY.
 fn attach_loop_explicit(dev: &str, backing: &Path) -> Result<(), String> {
-    run_cmd(
-        "losetup",
-        &["--direct-io=on", dev, &backing.display().to_string()],
-        &[],
-    )
-    .map(|_| ())
+    let mut last_err = String::new();
+    for _attempt in 0..20 {
+        match run_cmd(
+            "losetup",
+            &["--direct-io=on", dev, &backing.display().to_string()],
+            &[],
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    Err(format!(
+        "attach {dev} to {} failed after retries: {last_err}",
+        backing.display()
+    ))
 }
 
 /// Detach a loop device, retrying: the kernel releases the loop reference
