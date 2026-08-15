@@ -269,13 +269,15 @@ fn execute_run(
         detach_loop(&loop_m);
         return Err("no persistence barriers (flush/fua) found in log".into());
     }
-    // Crash states to test: the prefix ending right before and right after
-    // each barrier, plus the full log (clean completion sanity state).
-    let mut limits: Vec<u64> = Vec::new();
-    for b in &barriers {
-        limits.push((*b).max(1)); // before the barrier
-        limits.push((*b + 1).min(nr_entries.max(1))); // after the barrier
-    }
+    // Crash-equivalent states: the prefix including all data writes up to
+    // each persistence barrier, plus the full log as the clean-completion
+    // sanity state. Flush and FUA log entries carry no data, so the prefix
+    // ending before a barrier is byte-identical to the previous state; only
+    // the after-barrier prefixes are distinct.
+    let mut limits: Vec<u64> = barriers
+        .iter()
+        .map(|b| (*b + 1).min(nr_entries.max(1)))
+        .collect();
     if nr_entries > 0 {
         limits.push(nr_entries);
     }
@@ -293,19 +295,19 @@ fn execute_run(
         // would leave later writes in place and test an almost-final state
         // instead of the cut point.
         copy_sparse(&pristine, backing)?;
-        // A stale attachment from a failed cleanup would make attach fail
-        // with EBUSY; detach first so each state starts clean. The attach
-        // itself retries because freeing the device trails the detach.
-        detach_loop(&loop_b);
-        attach_loop_explicit(&loop_b, backing)?;
-        guards::verify_block_target(&loop_b, backing, root)?;
+        // A fresh loop device per state: reusing a specific device races
+        // the kernel's asynchronous release after umount (losetup -d
+        // returns EBUSY until it completes). losetup --find picks any free
+        // device; attachments that outlive a state are swept by teardown.
+        let loop_state = attach_loop(backing)?;
+        guards::verify_block_target(&loop_state, backing, root)?;
         run_cmd(
             &replay_log,
             &[
                 "--log",
                 &loop_m,
                 "--replay",
-                &loop_b,
+                &loop_state,
                 "--limit",
                 &limit.to_string(),
             ],
@@ -313,7 +315,7 @@ fn execute_run(
         )
         .map_err(|e| format!("replay limit {limit}: {e}"))?;
 
-        let mount_result = run_cmd("mount", &[&loop_b, &mount_dir.to_string_lossy()], &[]);
+        let mount_result = run_cmd("mount", &[&loop_state, &mount_dir.to_string_lossy()], &[]);
         let verdict_path = a.store.join(format!("{id}.e{limit}.verdict.json"));
         let pass = match mount_result {
             Ok(_) => {
@@ -342,7 +344,8 @@ fn execute_run(
         if !pass {
             failures.push(*limit);
         }
-        detach_loop(&loop_b);
+        umount_if_mounted(mount_dir);
+        detach_loop_quiet(&loop_state);
         if !failures.is_empty() {
             // Keep everything for debugging the first failure.
             detach_loop(&loop_m);
@@ -522,6 +525,31 @@ fn detach_loop(dev: &str) {
             eprintln!("crashlab: warning: could not detach {dev} after retries");
         }
     }
+}
+
+/// Detach a per-state loop device, briefly and silently: the kernel's
+/// asynchronous release can make this fail EBUSY, which is expected and
+/// harmless because teardown detaches every loop backed by the run's images.
+fn detach_loop_quiet(dev: &str) {
+    for _ in 0..5 {
+        let ok = std::process::Command::new("losetup")
+            .args(["-d", dev])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Unmount without failing the caller: used on paths where the state's
+/// verdict has already been decided and a leftover mount is cleaned by
+/// teardown.
+fn umount_if_mounted(mount_dir: &Path) {
+    let target = mount_dir.to_string_lossy();
+    let _ = std::process::Command::new("umount").arg(&*target).output();
 }
 
 /// Unmount, retrying briefly: a just-exited checker's file handles can take
