@@ -70,3 +70,24 @@ Each tier 1 run writes a manifest recording the kernel, mkfs and mount
 options, seed, entry and barrier counts, and one verdict per checked crash
 state. The first failing state stops the run and preserves the images for
 reproduction.
+
+## Results
+
+Block-replay coverage per profile for a 40-operation workload, seed 1, on
+kernel 6.8.0-137-generic (loop-backed images, dm-log-writes replay at every
+persistence barrier):
+
+| Filesystem | mkfs | States checked | Result |
+|---|---|---:|---|
+| ext4 | mke2fs 1.47.0 | 198 | all passed |
+| XFS | mkfs.xfs 6.6.0 | 161 | all passed |
+| btrfs | btrfs-progs 6.6.3 | 157 | all passed |
+| f2fs | mkfs.f2fs 1.16.0 | 144 | all passed |
+| ZFS | zfs 2.2.2 (pool creation and force-import recovery) | 101 | all passed |
+
+Tier 0 (SIGKILL): 84 runs across five seeds, all passed.
+
+Scope: one workload shape and seed per profile, one kernel, no hardware
+power-cut testing, no second-crash-after-resolution lane. State verdicts
+gate on durable obligations only: damage to objects whose completion is
+not in the durable operation prefix is recorded, not failed.
