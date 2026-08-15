@@ -2918,6 +2918,43 @@ fn enqueue_rejects_oversize_payload() {
     assert!(matches!(result, EnqueueOutcome::NotCommitted(_, _)));
 }
 
+#[test]
+fn enqueue_accepts_payload_at_exact_limit() {
+    let tmp = TempDir::new().unwrap();
+    let opts = CreateOptions {
+        max_payload_length: 1024,
+        ..Default::default()
+    };
+    Queue::init(tmp.path(), &opts).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let exact = vec![0u8; 1024]; // exactly max_payload_length
+    let result = queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: exact,
+        ..Default::default()
+    });
+    assert!(
+        matches!(result, EnqueueOutcome::Committed(_)),
+        "payload at the exact limit must commit: {result:?}"
+    );
+    let over = vec![0u8; 1025];
+    let result = queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: over,
+        ..Default::default()
+    });
+    assert!(matches!(result, EnqueueOutcome::NotCommitted(_, _)));
+}
+
 // ===== C-15: Scan round advances =====
 #[test]
 fn scan_round_advances() {

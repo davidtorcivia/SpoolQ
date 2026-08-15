@@ -1747,6 +1747,38 @@ mod tests {
     }
 
     #[test]
+    fn fsck_counts_objects_across_state_directories() {
+        let tmp = TempDir::new().unwrap();
+        Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+        let mut queue = open_test_queue(tmp.path());
+        for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+            let outcome = queue.enqueue(EnqueueInput {
+                maximum_attempts: 3,
+                content_type: "x".into(),
+                payload: payload.to_vec(),
+                ..Default::default()
+            });
+            assert!(matches!(outcome, crate::EnqueueOutcome::Committed(_)));
+        }
+        // Lease and ack the first job: it becomes a full receipt.
+        let lease = match queue.lease(0, 30_000_000_000) {
+            crate::LeaseOutcome::Leased(info) => info,
+            other => panic!("expected a lease, got {other:?}"),
+        };
+        assert!(matches!(queue.ack(&lease), crate::AckOutcome::Acked));
+        // Lease the second job and hold it: it stays leased.
+        match queue.lease(0, 30_000_000_000) {
+            crate::LeaseOutcome::Leased(_) => {}
+            other => panic!("expected a second lease, got {other:?}"),
+        }
+
+        let queue = open_test_queue(tmp.path());
+        let report = queue.fsck(&FsckOptions::default());
+        // one ready + one leased + one full receipt = 3
+        assert_eq!(report.total_objects, 3);
+    }
+
+    #[test]
     fn fsck_preserves_non_ascii_name_bytes() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
