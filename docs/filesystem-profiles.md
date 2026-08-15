@@ -4,7 +4,7 @@ SteadQ runs on local Linux filesystems that provide the following guarantees:
 
 - **Atomic no-overwrite rename** via `renameat2` with `RENAME_NOREPLACE`
 - **Unnamed temporary files** via `O_TMPFILE`
-- **File publication** via `linkat` with `AT_EMPTY_PATH` or `/proc/self/fd`
+- **File publication** via `linkat` with `AT_EMPTY_PATH` or `/proc/self/fd`, or via a named temporary plus `renameat2` with `RENAME_NOREPLACE` (ZFS)
 - **Path containment** via `openat2` with `RESOLVE_BENEATH`
 - **File data durability** via `fsync`
 - **Directory entry durability** via `fsync` on the directory file descriptor
@@ -12,7 +12,7 @@ SteadQ runs on local Linux filesystems that provide the following guarantees:
 ## Supported filesystems
 
 | Filesystem | Magic | Notes |
-|---|---|---|
+| --- | --- | --- |
 | ext4 | `0xEF53` | Reference filesystem. Journal-based durability. |
 | XFS | `0x58465342` | Reference filesystem. Journal-based durability. |
 | btrfs | `0x9123683E` | Copy-on-write B-tree durability. |
@@ -22,7 +22,7 @@ SteadQ runs on local Linux filesystems that provide the following guarantees:
 ## Rejected filesystems
 
 | Filesystem | Reason |
-|---|---|
+| --- | --- |
 | tmpfs | No durability guarantee; data lost on reboot. |
 | NFS | Rename atomicity and fsync ordering are not guaranteed across network. |
 | FUSE | Durability depends on the FUSE implementation; cannot be guaranteed. |
