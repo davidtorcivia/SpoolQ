@@ -14,6 +14,8 @@ pub struct RegistryRun {
     pub loops: Vec<String>,
     pub dm_names: Vec<String>,
     pub mount: Option<String>,
+    #[serde(default)]
+    pub pool: Option<String>,
     pub status: String,
     pub started: String,
     pub ended: Option<String>,
@@ -83,6 +85,20 @@ pub fn teardown_active(store: &Path) -> Result<usize, String> {
 }
 
 fn sweep_leftovers() {
+    // Imported crash-lab pools hold their loop devices; export by name
+    // prefix before sweeping mounts and dm tables.
+    if let Ok(out) = std::process::Command::new("zpool")
+        .args(["list", "-Hp", "-o", "name"])
+        .output()
+    {
+        for name in String::from_utf8_lossy(&out.stdout).lines() {
+            if name.starts_with("crashl") {
+                let _ = std::process::Command::new("zpool")
+                    .args(["export", "-f", name])
+                    .output();
+            }
+        }
+    }
     if let Ok(out) = std::process::Command::new("findmnt")
         .args(["-rn", "-o", "TARGET"])
         .output()
@@ -123,6 +139,7 @@ mod tests {
             loops: vec!["/dev/loop7".into()],
             dm_names: vec!["crashlab-r1".into()],
             mount: Some("/mnt/crashlab-r1".into()),
+            pool: None,
             status: "active".into(),
             started: "t0".into(),
             ended: None,

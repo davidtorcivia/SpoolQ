@@ -31,12 +31,18 @@ Each crash state must satisfy:
 ```sh
 cargo xtask crashlab doctor                 # tool and device preflight
 cargo xtask crashlab tier0 --runs 24        # SIGKILL lane
-sudo cargo xtask crashlab tier1 --fs ext4   # block replay lane
+sudo cargo xtask crashlab tier1 --fs ext4   # also xfs, btrfs, f2fs, zfs
 cargo xtask crashlab teardown               # release resources after an interrupted run
 ```
 
 Tier 1 requires `replay-log` from xfstests (`src/log-writes/`), `mkfs.<fs>`,
-`losetup`, `dmsetup`, and the `dm-log-writes` kernel module.
+`losetup`, `dmsetup`, and the `dm-log-writes` kernel module. The ZFS
+profile additionally requires `zpool`/`zfs` and creates its pool on the
+log device, so pool creation is itself crash-tested; crash states are
+recovered by force-importing the run's pool from exactly the run's loop
+device (never a bare `zpool import`, which scans every host device), and
+states that predate pool creation are vacuous passes. Pools use
+`cachefile=none` so runs never touch the host pool cache.
 
 ## Device safety
 
@@ -55,6 +61,8 @@ Guards, enforced on every operation:
 - Devices that are the source (or parent) of a mounted filesystem are refused.
 - Device-mapper tables and mount points are namespaced per run and recorded
   in a registry; `teardown` releases a crashed run's resources.
+- ZFS pools are created and imported scoped to the run's own loop device
+  and pool name only; the host pool cache is never written.
 
 ## Output
 

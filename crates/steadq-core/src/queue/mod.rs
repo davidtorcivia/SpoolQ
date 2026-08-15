@@ -223,6 +223,7 @@ fn classify_filesystem_type(
                         | fs::XFS_SUPER_MAGIC
                         | fs::BTRFS_SUPER_MAGIC
                         | fs::F2FS_SUPER_MAGIC
+                        | fs::F2FS_STATFS_MAGIC_ALT
                         | fs::ZFS_SUPER_MAGIC
                 ) =>
         {
@@ -273,11 +274,14 @@ impl Queue {
             | fs::XFS_SUPER_MAGIC
             | fs::BTRFS_SUPER_MAGIC
             | fs::F2FS_SUPER_MAGIC
+            | fs::F2FS_STATFS_MAGIC_ALT
             | fs::ZFS_SUPER_MAGIC => {}
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "filesystem type not supported for queue (requires ext4, xfs, btrfs, or f2fs)",
+                    format!(
+                        "filesystem type not supported for queue (observed magic {ft:#x}; requires ext4, xfs, btrfs, or f2fs)"
+                    ),
                 ));
             }
         }

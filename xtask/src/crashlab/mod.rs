@@ -166,6 +166,8 @@ fn doctor(root: &Path) -> Result<(), String> {
         "mkfs.xfs",
         "mkfs.btrfs",
         "mkfs.f2fs",
+        "zpool",
+        "zfs",
     ] {
         let note = match which(tool) {
             Some(_) => String::new(),

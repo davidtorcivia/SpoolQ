@@ -182,7 +182,7 @@ drive, formatted as ext4.
 
 - Linux x86_64 (glibc)
 - Rust 1.97.1
-- ext4, XFS, btrfs, or f2fs filesystem
+- ext4, XFS, btrfs, f2fs, or ZFS filesystem
 
 ## License
 

@@ -54,8 +54,8 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         }
     }
     match a.fs.as_str() {
-        "ext4" | "xfs" | "btrfs" | "f2fs" => {}
-        _ => return Err("tier1 requires --fs ext4|xfs|btrfs|f2fs".into()),
+        "ext4" | "xfs" | "btrfs" | "f2fs" | "zfs" => {}
+        _ => return Err("tier1 requires --fs ext4|xfs|btrfs|f2fs|zfs".into()),
     }
 
     // Root check with a clear message (guards still protect without it).
@@ -88,6 +88,8 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         loops: Vec::new(),
         dm_names: Vec::new(),
         mount: Some(mount_dir.display().to_string()),
+        // Same construction as execute_run's pool_name.
+        pool: (a.fs == "zfs").then(|| format!("crashl{}", std::process::id())),
         status: "active".into(),
         started: now_iso(),
         ended: None,
@@ -141,26 +143,49 @@ fn execute_run(
     guards::verify_block_target(&loop_b, backing, root)?;
     guards::verify_block_target(&loop_m, marker, root)?;
 
-    // 3. Filesystem with recorded options.
+    // 3. Filesystem with recorded options. ZFS has no pre-creation step:
+    // the pool is created on the dm target in step 5 so the write log
+    // records pool creation, and the pristine snapshot in step 4 is the
+    // zeroed image.
+    let is_zfs = a.fs == "zfs";
+    let pool_name = format!("crashl{}", std::process::id());
     let mkfs_opts: &[&str] = match a.fs.as_str() {
         "ext4" => &["-b", "4096", "-F"],
         "xfs" => &["-f"],
         "btrfs" => &["-f"],
         "f2fs" => &["-f"],
+        "zfs" => &[],
         _ => unreachable!(),
     };
-    run_cmd(&format!("mkfs.{}", a.fs), mkfs_opts, &[&loop_b]).map_err(|e| format!("mkfs: {e}"))?;
-    let mkfs_version = std::process::Command::new(format!("mkfs.{}", a.fs))
-        .arg("-V")
-        .output()
-        .map(|o| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            )
-        })
-        .unwrap_or_default();
+    if !is_zfs {
+        run_cmd(&format!("mkfs.{}", a.fs), mkfs_opts, &[&loop_b])
+            .map_err(|e| format!("mkfs: {e}"))?;
+    }
+    let mkfs_version = if is_zfs {
+        std::process::Command::new("zfs")
+            .arg("version")
+            .output()
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        std::process::Command::new(format!("mkfs.{}", a.fs))
+            .arg("-V")
+            .output()
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default()
+    };
 
     // 4. dm log-writes target over the fresh fs.
     // Snapshot the pristine post-mkfs state: replay-log applies log entries
@@ -176,21 +201,48 @@ fn execute_run(
     run_cmd("dmsetup", &["create", &dm_name, "--table", &table], &[])?;
     let dm_node = format!("/dev/mapper/{dm_name}");
 
-    // 5. Mount, run the workload, quiesce.
+    // 5. Bring up the filesystem, run the workload, quiesce.
     std::fs::create_dir_all(mount_dir).map_err(|e| format!("mkdir mount: {e}"))?;
-    run_cmd("mount", &[&dm_node, &mount_dir.to_string_lossy()], &[])?;
-    let mount_info = run_cmd(
-        "findmnt",
-        &[
-            "-rn",
-            "-T",
-            &mount_dir.to_string_lossy(),
-            "-o",
-            "FSTYPE,OPTIONS",
-        ],
-        &[],
-    )
-    .unwrap_or_default();
+    let mount_dir_str = mount_dir.to_string_lossy().into_owned();
+    if is_zfs {
+        // cachefile=none keeps the run's pool out of the host cache; the
+        // crash states below import with the same flag. Creation happens on
+        // the dm target so the log records it.
+        run_cmd(
+            "zpool",
+            &[
+                "create",
+                "-f",
+                "-o",
+                "ashift=12",
+                "-o",
+                "cachefile=none",
+                "-m",
+                &mount_dir_str,
+                &pool_name,
+                &dm_node,
+            ],
+            &[],
+        )
+        .map_err(|e| format!("zpool create: {e}"))?;
+    } else {
+        run_cmd("mount", &[&dm_node, &mount_dir_str], &[])?;
+    }
+    let mount_info = if is_zfs {
+        run_cmd(
+            "zpool",
+            &["list", "-H", "-o", "name,health", &pool_name],
+            &[],
+        )
+        .unwrap_or_default()
+    } else {
+        run_cmd(
+            "findmnt",
+            &["-rn", "-T", &mount_dir_str, "-o", "FSTYPE,OPTIONS"],
+            &[],
+        )
+        .unwrap_or_default()
+    };
     let queue_dir = mount_dir.join("queue");
     // The on-disk oplog lives next to the queue on the tested device: its
     // surviving prefix after a replay marks the durably completed ops.
@@ -213,7 +265,11 @@ fn execute_run(
     if !workload_status.success() {
         return Err(format!("workload failed: {workload_status}"));
     }
-    run_cmd("umount", &[&mount_dir.to_string_lossy()], &[])?;
+    if is_zfs {
+        zpool_export_retry(&pool_name)?;
+    } else {
+        run_cmd("umount", &[&mount_dir_str], &[])?;
+    }
     run_cmd("dmsetup", &["remove", &dm_name], &[])?;
     detach_loop(&loop_b);
     detach_loop(&loop_m);
@@ -315,10 +371,14 @@ fn execute_run(
         )
         .map_err(|e| format!("replay limit {limit}: {e}"))?;
 
-        let mount_result = run_cmd("mount", &[&loop_state, &mount_dir.to_string_lossy()], &[]);
+        let mount_result = if is_zfs {
+            zfs_state_mount(&loop_state, &pool_name, mount_dir)
+        } else {
+            run_cmd("mount", &[&loop_state, &mount_dir.to_string_lossy()], &[]).map(|_| ())
+        };
         let verdict_path = a.store.join(format!("{id}.e{limit}.verdict.json"));
         let pass = match mount_result {
-            Ok(_) => {
+            Ok(()) => {
                 let status = std::process::Command::new(check)
                     .args([
                         "--queue",
@@ -330,8 +390,17 @@ fn execute_run(
                     ])
                     .status()
                     .map_err(|e| format!("spawn checker: {e}"))?;
-                umount_retry(mount_dir)?;
+                if is_zfs {
+                    zpool_export_retry(&pool_name)?;
+                } else {
+                    umount_retry(mount_dir)?;
+                }
                 status.success()
+            }
+            // A crash state before pool creation: nothing durable exists.
+            Err(e) if is_zfs && e.contains(POOL_ABSENT) => {
+                write_json(&verdict_path, &json!({"pass": true, "pool_absent": true}))?;
+                true
             }
             Err(e) => {
                 // A crash state that cannot even mount is a catastrophic
@@ -395,6 +464,11 @@ fn execute_run(
 }
 
 fn teardown_run_resources(run: &RegistryRun) {
+    if let Some(pool) = &run.pool {
+        let _ = std::process::Command::new("zpool")
+            .args(["export", "-f", pool])
+            .output();
+    }
     if let Some(mount) = &run.mount {
         let _ = std::process::Command::new("umount").arg(mount).output();
     }
@@ -455,6 +529,50 @@ fn copy_sparse(src: &Path, dst: &Path) -> Result<(), String> {
     } else {
         Err(format!("cp {src:?} -> {dst:?} failed: {status}"))
     }
+}
+
+const POOL_ABSENT: &str = "crashlab-pool-absent";
+
+/// Import the run's pool from exactly one device. Never issues a bare
+/// `zpool import` (it scans every host device, including real pools);
+/// the run's own loop device is the only device searched and only the
+/// run's pool name is imported. Returns Err(POOL_ABSENT) when the replay
+/// predates pool creation.
+fn zfs_state_mount(dev: &str, pool: &str, _mount_dir: &Path) -> Result<(), String> {
+    let listing = run_cmd("zpool", &["import", "-d", dev], &[])?;
+    if !listing.contains(pool) {
+        return Err(format!("{POOL_ABSENT}: {pool}"));
+    }
+    match run_cmd(
+        "zpool",
+        &["import", "-f", "-o", "cachefile=none", "-d", dev, pool],
+        &[],
+    ) {
+        Ok(_) => Ok(()),
+        // Labels are enumerable but no valid uberblock exists: ZFS
+        // durability begins at uberblock commit, so nothing in this pool
+        // was ever durable. Same vacuous class as pool-absent.
+        Err(e) if e.contains("unavailable") || e.contains("corrupted data") => {
+            Err(format!("{POOL_ABSENT}: import: {e}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Export the run's pool, retrying while the checker's handles drain.
+fn zpool_export_retry(pool: &str) -> Result<(), String> {
+    for _ in 0..20 {
+        let ok = std::process::Command::new("zpool")
+            .args(["export", "-f", pool])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(format!("zpool export {pool} still busy after retries"))
 }
 
 fn allocate_image(path: &Path, size_mb: u64) -> Result<(), String> {
@@ -616,7 +734,13 @@ fn preflight(fs: &str) -> Result<(), String> {
                 .into(),
         );
     }
-    if which(&format!("mkfs.{fs}")).is_none() {
+    if fs == "zfs" {
+        for tool in ["zpool", "zfs"] {
+            if which(tool).is_none() {
+                return Err(format!("missing tool: {tool}"));
+            }
+        }
+    } else if which(&format!("mkfs.{fs}")).is_none() {
         return Err(format!("missing mkfs.{fs}"));
     }
     Ok(())

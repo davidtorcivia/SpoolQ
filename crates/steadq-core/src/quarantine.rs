@@ -638,13 +638,43 @@ impl Queue {
             return;
         }
 
+        // Publication fsyncs file data before linking the name, so a
+        // zero-length named object is residue of an interrupted publication:
+        // it can never represent a committed job. Quarantine in Repair mode.
+        if fs::fstat(file_fd.as_fd())
+            .map(|st| st.st_size == 0)
+            .unwrap_or(false)
+        {
+            report.findings.push(CorruptionFinding {
+                relative_path: full_path.to_string(),
+                finding_type: "zero_length_publication_residue".into(),
+                severity: FindingSeverity::Warning,
+                details: "name published without durable content".into(),
+            });
+            if opts.mode == FsckMode::Repair {
+                self.quarantine_object_or_record(
+                    shard_fd,
+                    filename,
+                    full_path,
+                    crate::QuarantineReason::EnvelopeCorrupt,
+                    report,
+                );
+            }
+            return;
+        }
+
         let mut header_buf = [0u8; 128];
-        if fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0).is_err() {
+        if let Err(read_error) = fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0) {
+            let file_size = fs::fstat(file_fd.as_fd())
+                .map(|st| st.st_size.to_string())
+                .unwrap_or_else(|e| format!("fstat error {e}"));
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
                 finding_type: "header_read_failed".into(),
                 severity: FindingSeverity::Error,
-                details: "cannot read 128-byte header".into(),
+                details: format!(
+                    "cannot read 128-byte header: size={file_size}, error={read_error}"
+                ),
             });
             if opts.mode == FsckMode::Repair {
                 self.quarantine_object_or_record(
