@@ -1825,11 +1825,18 @@ fn enqueue_delayed() {
 
 #[test]
 fn enqueue_not_before_at_or_before_now_starts_ready() {
-    let (_tmp, mut queue) = create_test_queue();
-    let now = 10_000_000_000_000;
-    fs::fault::reset();
-    fs::fault::set_clock_realtime_ns(now);
-    for (label, nb) in [("past", now - 1), ("exact-now", now)] {
+    // The effective wall floor is max(clock, watermark bucket start), and
+    // init seeds the watermark from the real clock. Pin the clock to a
+    // bucket-aligned time in the future so the floor equals the pinned
+    // clock exactly, then test not_before one nanosecond below and exactly
+    // at that floor. Each case uses a fresh queue.
+    let width = 10_000_000_000u64; // default delayed_bucket_width_ns
+    let now = 2_000_000_000_000_000_000u64; // bucket-aligned, far past init's seed
+    assert_eq!(now % width, 0);
+    for (label, nb) in [("below-floor", now - 1), ("exact-floor", now)] {
+        let (_tmp, mut queue) = create_test_queue();
+        fs::fault::reset();
+        fs::fault::set_clock_realtime_ns(now);
         let outcome = queue.enqueue(EnqueueInput {
             maximum_attempts: 1,
             content_type: "x".to_string(),
@@ -1837,16 +1844,16 @@ fn enqueue_not_before_at_or_before_now_starts_ready() {
             payload: vec![0x42; 10],
             ..Default::default()
         });
+        fs::fault::reset();
         match outcome {
             EnqueueOutcome::Committed(ticket) => assert!(
                 ticket.expected_relative_path.starts_with("ready/"),
-                "{label}: not_before at or before the wall floor must start ready, got {}",
+                "{label}: not_before at or below the wall floor must start ready, got {}",
                 ticket.expected_relative_path
             ),
             other => panic!("{label}: expected committed, got {other:?}"),
         }
     }
-    fs::fault::reset();
 }
 
 #[test]
