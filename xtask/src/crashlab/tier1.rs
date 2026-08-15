@@ -108,6 +108,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     if !a.keep_images && result.is_ok() {
         let _ = std::fs::remove_file(&backing);
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(a.store.join(format!("{id}.pristine.img")));
     }
     result
 }
@@ -162,6 +163,11 @@ fn execute_run(
         .unwrap_or_default();
 
     // 4. dm log-writes target over the fresh fs.
+    // Snapshot the pristine post-mkfs state: replay-log applies log entries
+    // onto the backing image, so each crash state must start from the exact
+    // pre-log image, not the final workload state.
+    let pristine = a.store.join(format!("{id}.pristine.img"));
+    std::fs::copy(backing, &pristine).map_err(|e| format!("pristine snapshot: {e}"))?;
     let sectors = sectors_of(&loop_b)?;
     let dm_name = format!("crashlab-{id}");
     run.dm_names = vec![dm_name.clone()];
@@ -186,12 +192,17 @@ fn execute_run(
     )
     .unwrap_or_default();
     let queue_dir = mount_dir.join("queue");
+    // The on-disk oplog lives next to the queue on the tested device: its
+    // surviving prefix after a replay marks the durably completed ops.
+    let disk_oplog = mount_dir.join("oplog.ndjson");
     let workload_status = std::process::Command::new(workload)
         .args([
             "--queue",
             queue_dir.to_str().ok_or("queue path not utf-8")?,
             "--oplog",
             oplog.to_str().ok_or("oplog path not utf-8")?,
+            "--on-disk-oplog",
+            disk_oplog.to_str().ok_or("oplog path not utf-8")?,
             "--seed",
             &a.seed.to_string(),
             "--ops",
@@ -278,6 +289,10 @@ fn execute_run(
         if a.max_marks > 0 && i >= a.max_marks {
             break;
         }
+        // Restore the pristine image: replaying onto the final-state image
+        // would leave later writes in place and test an almost-final state
+        // instead of the cut point.
+        std::fs::copy(&pristine, backing).map_err(|e| format!("restore pristine: {e}"))?;
         attach_loop_explicit(&loop_b, backing)?;
         guards::verify_block_target(&loop_b, backing, root)?;
         run_cmd(
@@ -303,7 +318,7 @@ fn execute_run(
                         "--queue",
                         queue_dir.to_str().ok_or("queue path not utf-8")?,
                         "--oplog",
-                        oplog.to_str().ok_or("oplog path not utf-8")?,
+                        disk_oplog.to_str().ok_or("oplog path not utf-8")?,
                         "--out",
                         verdict_path.to_str().ok_or("verdict path not utf-8")?,
                     ])

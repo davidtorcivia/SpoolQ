@@ -69,8 +69,13 @@ fn unhex(s: &str) -> Option<[u8; 16]> {
 }
 
 fn read_oplog(path: &Path) -> Result<Vec<OpLine>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read oplog {}: {e}", path.display()))?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        // A crash state before the oplog file was created has zero
+        // completed operations and therefore zero expectations.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read oplog {}: {e}", path.display())),
+    };
     // Tolerate a truncated trailing line: drop anything after the last newline.
     let text = match text.rfind('\n') {
         Some(i) => &text[..=i],
@@ -122,6 +127,11 @@ fn main() {
 }
 
 fn run_check(args: &Args) -> Result<serde_json::Value, String> {
+    // A crash state before the queue was initialized checks nothing: no
+    // queue exists, no operations were durably completed.
+    if !Path::new(&args.queue).is_dir() {
+        return Ok(json!({ "pass": true, "queue_absent": true }));
+    }
     let ops = read_oplog(Path::new(&args.oplog))?;
 
     let committed: Vec<[u8; 16]> = ops
