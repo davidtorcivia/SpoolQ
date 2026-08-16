@@ -2640,7 +2640,12 @@ fn streaming_enqueue_reports_deferred_until_queue_sync() {
         std::io::Cursor::new(b"streamed deferred"),
     );
     assert!(matches!(outcome, EnqueueOutcome::Deferred(_)));
+    assert!(
+        !queue.dirty.borrow().is_empty(),
+        "streaming deferred publish must record dirty directories"
+    );
     queue.sync().unwrap();
+    assert!(queue.dirty.borrow().is_empty());
 }
 
 #[test]

@@ -8,22 +8,48 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 /// Stable exit codes per spec section 11.5
-#[allow(dead_code)]
 const EXIT_SUCCESS: u8 = 0;
-#[allow(dead_code)]
 const EXIT_ORDINARY: u8 = 1;
-#[allow(dead_code)]
 const EXIT_INDETERMINATE: u8 = 2;
-#[allow(dead_code)]
 const EXIT_CORRUPTION: u8 = 3;
-#[allow(dead_code)]
 const EXIT_RESOURCE_EXHAUSTED: u8 = 4;
-#[allow(dead_code)]
 const EXIT_PERMISSION: u8 = 5;
 const EXIT_IO_FAILURE: u8 = 6;
-#[allow(dead_code)]
 const EXIT_UNSUPPORTED: u8 = 64;
-use steadq_core::{CreateOptions, EnqueueInput, EnqueueOutcome, LeaseOutcome, OpenOptions, Queue};
+use steadq_core::{
+    CreateOptions, EnqueueInput, EnqueueOutcome, Error, LeaseOutcome, OpenOptions, Queue,
+};
+
+fn exit(code: u8) -> ExitCode {
+    ExitCode::from(code)
+}
+
+fn exit_core(error: &Error) -> ExitCode {
+    exit(match error {
+        Error::QueueCorrupt(_) | Error::PayloadCorrupt | Error::QueuePoisoned(_) => EXIT_CORRUPTION,
+        Error::UnsupportedFilesystem | Error::UnsupportedFormat => EXIT_UNSUPPORTED,
+        Error::PermissionDenied => EXIT_PERMISSION,
+        Error::ResourceExhausted | Error::StateExhausted => EXIT_RESOURCE_EXHAUSTED,
+        Error::IoFailure(_) | Error::InvalidClock => EXIT_IO_FAILURE,
+        Error::InvalidInput(_)
+        | Error::InvalidTicket(_)
+        | Error::NotCommitted(_)
+        | Error::MaintenanceBusy
+        | Error::IdentityCollision => EXIT_ORDINARY,
+    })
+}
+
+fn exit_io(error: &std::io::Error) -> ExitCode {
+    exit(match error.kind() {
+        std::io::ErrorKind::Unsupported => EXIT_UNSUPPORTED,
+        std::io::ErrorKind::PermissionDenied => EXIT_PERMISSION,
+        std::io::ErrorKind::AlreadyExists
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::WouldBlock => EXIT_ORDINARY,
+        _ => EXIT_IO_FAILURE,
+    })
+}
 
 fn escape_os_bytes(value: &std::ffi::OsStr) -> String {
     value
@@ -225,11 +251,11 @@ fn main() -> ExitCode {
                     eprintln!("initialized queue at {}", path.display());
                     eprintln!("queue_id: {}", steadq_names::hex_encode(format.queue_id()));
                     eprintln!("shards: {}", format.shard_count());
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 Err(e) => {
                     eprintln!("init failed: {e}");
-                    ExitCode::FAILURE
+                    exit_io(&e)
                 }
             }
         }
@@ -251,7 +277,7 @@ fn main() -> ExitCode {
                         Ok(_) => buf,
                         Err(e) => {
                             eprintln!("stdin read failed: {e}");
-                            return ExitCode::FAILURE;
+                            return exit_io(&e);
                         }
                     }
                 }
@@ -259,7 +285,7 @@ fn main() -> ExitCode {
                     Ok(data) => data,
                     Err(e) => {
                         eprintln!("file read failed: {e}");
-                        return ExitCode::FAILURE;
+                        return exit_io(&e);
                     }
                 },
             };
@@ -268,7 +294,7 @@ fn main() -> ExitCode {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_core(&e);
                 }
             };
             let mut queue = queue;
@@ -286,26 +312,26 @@ fn main() -> ExitCode {
                 EnqueueOutcome::Committed(ticket) => {
                     println!("job_id: {}", steadq_names::hex_encode(&ticket.job_id));
                     println!("path: {}", ticket.expected_relative_path);
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 EnqueueOutcome::Deferred(ticket) => {
                     eprintln!("durability deferred; operation is not committed");
                     eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id));
                     eprintln!("path: {}", ticket.expected_relative_path);
-                    ExitCode::from(2)
+                    exit(EXIT_INDETERMINATE)
                 }
                 EnqueueOutcome::NotCommitted(ticket, err) => {
                     eprintln!("not committed: {err}");
                     if ticket.job_id != [0; 16] {
                         eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id));
                     }
-                    ExitCode::FAILURE
+                    exit_core(&err)
                 }
                 EnqueueOutcome::OutcomeUnknown(ticket, err) => {
                     eprintln!("outcome unknown: {err}");
                     eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id));
                     eprintln!("path: {}", ticket.expected_relative_path);
-                    ExitCode::from(2)
+                    exit(EXIT_INDETERMINATE)
                 }
             }
         }
@@ -320,7 +346,7 @@ fn main() -> ExitCode {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_core(&e);
                 }
             };
             let mut queue = queue;
@@ -329,7 +355,7 @@ fn main() -> ExitCode {
                 Some(ns) => ns,
                 None => {
                     eprintln!("invalid duration: overflow");
-                    return ExitCode::FAILURE;
+                    return exit(EXIT_ORDINARY);
                 }
             };
             match queue.lease(0, duration_ns) {
@@ -339,21 +365,21 @@ fn main() -> ExitCode {
                             save_handle_to_file(&path, queue.format().queue_id(), hf, &lease)
                         {
                             eprintln!("failed to write handle file: {e}");
-                            return ExitCode::from(EXIT_IO_FAILURE);
+                            return exit(EXIT_IO_FAILURE);
                         }
                     }
                     println!("job_id: {}", steadq_names::hex_encode(&lease.job_id));
                     println!("generation: {}", lease.generation);
                     println!("attempt: {}/{}", lease.attempt, lease.maximum_attempts);
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 LeaseOutcome::Empty => {
                     eprintln!("no jobs available");
-                    ExitCode::FAILURE
+                    exit(EXIT_ORDINARY)
                 }
                 LeaseOutcome::NotCommitted(e) => {
                     eprintln!("lease failed: {e}");
-                    ExitCode::FAILURE
+                    exit_core(&e)
                 }
                 LeaseOutcome::OutcomeUnknown(ticket) => {
                     eprintln!("outcome unknown");
@@ -365,7 +391,7 @@ fn main() -> ExitCode {
                             Err(e) => eprintln!("warning: failed to write ticket: {e}"),
                         }
                     }
-                    ExitCode::from(2)
+                    exit(EXIT_INDETERMINATE)
                 }
             }
         }
@@ -398,11 +424,11 @@ fn main() -> ExitCode {
                             println!("{state}: {count}");
                         }
                     }
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    ExitCode::FAILURE
+                    exit_core(&e)
                 }
             }
         }
@@ -513,9 +539,9 @@ fn main() -> ExitCode {
             // R2-H22: Exit failure if any check failed.
             let all_ok = results.iter().all(|(_, _, ok)| *ok);
             if all_ok {
-                ExitCode::SUCCESS
+                exit(EXIT_SUCCESS)
             } else {
-                ExitCode::from(EXIT_IO_FAILURE)
+                exit(EXIT_IO_FAILURE)
             }
         }
 
@@ -524,14 +550,14 @@ fn main() -> ExitCode {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    return ExitCode::from(EXIT_IO_FAILURE);
+                    return exit_core(&e);
                 }
             };
             let lease = match load_handle(&handle_file, queue.format().queue_id()) {
                 Ok(q) => q,
                 Err(e) => {
-                    eprintln!("open failed: {e}");
-                    return ExitCode::FAILURE;
+                    eprintln!("handle load failed: {e}");
+                    return exit_io(&e);
                 }
             };
             // R2-H19: CLI uses strict ack path: verify payload first.
@@ -540,23 +566,23 @@ fn main() -> ExitCode {
             match queue.ack(&lease) {
                 steadq_core::AckOutcome::Acked => {
                     eprintln!("acked");
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 steadq_core::AckOutcome::AlreadyAcked => {
                     eprintln!("already acked (idempotent success)");
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 steadq_core::AckOutcome::LeaseLost => {
                     eprintln!("lease lost");
-                    ExitCode::FAILURE
+                    exit(EXIT_ORDINARY)
                 }
                 steadq_core::AckOutcome::NotCommitted(e) => {
                     eprintln!("not committed: {e}");
-                    ExitCode::FAILURE
+                    exit_core(&e)
                 }
                 steadq_core::AckOutcome::OutcomeUnknown(_) => {
                     eprintln!("outcome unknown");
-                    ExitCode::from(2)
+                    exit(EXIT_INDETERMINATE)
                 }
             }
         }
@@ -570,14 +596,14 @@ fn main() -> ExitCode {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_core(&e);
                 }
             };
             let lease = match load_handle(&handle_file, queue.format().queue_id()) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("handle load failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_io(&e);
                 }
             };
             // R2-H20: Use Queue::retry_after() which uses the rollback-safe
@@ -592,19 +618,19 @@ fn main() -> ExitCode {
             match outcome {
                 steadq_core::TransitionOutcome::Committed => {
                     eprintln!("retried");
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 steadq_core::TransitionOutcome::LeaseLost => {
                     eprintln!("lease lost");
-                    ExitCode::FAILURE
+                    exit(EXIT_ORDINARY)
                 }
                 steadq_core::TransitionOutcome::NotCommitted(e) => {
                     eprintln!("not committed: {e}");
-                    ExitCode::FAILURE
+                    exit_core(&e)
                 }
                 steadq_core::TransitionOutcome::OutcomeUnknown(_) => {
                     eprintln!("outcome unknown");
-                    ExitCode::from(2)
+                    exit(EXIT_INDETERMINATE)
                 }
             }
         }
@@ -618,14 +644,14 @@ fn main() -> ExitCode {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_core(&e);
                 }
             };
             let lease = match load_handle(&handle_file, queue.format().queue_id()) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("handle load failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_io(&e);
                 }
             };
             let reason = steadq_core::DeadReason::from_u16(reason)
@@ -633,19 +659,19 @@ fn main() -> ExitCode {
             match queue.bury(&lease, reason) {
                 steadq_core::TransitionOutcome::Committed => {
                     eprintln!("buried");
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 steadq_core::TransitionOutcome::LeaseLost => {
                     eprintln!("lease lost");
-                    ExitCode::FAILURE
+                    exit(EXIT_ORDINARY)
                 }
                 steadq_core::TransitionOutcome::NotCommitted(e) => {
                     eprintln!("not committed: {e}");
-                    ExitCode::FAILURE
+                    exit_core(&e)
                 }
                 steadq_core::TransitionOutcome::OutcomeUnknown(_) => {
                     eprintln!("outcome unknown");
-                    ExitCode::from(2)
+                    exit(EXIT_INDETERMINATE)
                 }
             }
         }
@@ -655,7 +681,7 @@ fn main() -> ExitCode {
                 Some(b) => b,
                 None => {
                     eprintln!("invalid job_id: expected 32 lowercase hex chars");
-                    return ExitCode::FAILURE;
+                    return exit(EXIT_ORDINARY);
                 }
             };
             match Queue::open(&path, &OpenOptions::default()) {
@@ -663,7 +689,7 @@ fn main() -> ExitCode {
                     let snapshots = queue.inspect(&job_id_bytes);
                     if snapshots.is_empty() {
                         eprintln!("not found");
-                        return ExitCode::FAILURE;
+                        return exit(EXIT_ORDINARY);
                     }
                     for s in &snapshots {
                         println!(
@@ -671,11 +697,11 @@ fn main() -> ExitCode {
                             s.state, s.generation, s.attempt, s.maximum_attempts, s.relative_path
                         );
                     }
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    ExitCode::FAILURE
+                    exit_core(&e)
                 }
             }
         }
@@ -685,7 +711,7 @@ fn main() -> ExitCode {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("read failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_io(&e);
                 }
             };
             if data.len() >= 128 && &data[0..8] == b"SDQJOB1\0" {
@@ -703,13 +729,13 @@ fn main() -> ExitCode {
                                 expected_size,
                                 data.len()
                             );
-                            return ExitCode::from(3);
+                            return exit(EXIT_CORRUPTION);
                         }
                         // C-58: Verify envelope digest
                         let ext_bytes = &data[128..128 + header.extension_header_length as usize];
                         if !steadq_format::verify_envelope_digest(&header, ext_bytes) {
                             eprintln!("CORRUPT: envelope digest mismatch");
-                            return ExitCode::from(3);
+                            return exit(EXIT_CORRUPTION);
                         }
                         eprintln!("envelope_digest: verified");
                         if deep {
@@ -717,16 +743,16 @@ fn main() -> ExitCode {
                             let computed = steadq_format::payload_digest(payload);
                             if computed != header.payload_digest {
                                 eprintln!("CORRUPT: payload digest mismatch");
-                                return ExitCode::from(3);
+                                return exit(EXIT_CORRUPTION);
                             }
                             eprintln!("payload_digest: verified");
                         }
                         eprintln!("valid");
-                        ExitCode::SUCCESS
+                        exit(EXIT_SUCCESS)
                     }
                     Err(e) => {
                         eprintln!("CORRUPT: {e}");
-                        ExitCode::from(3)
+                        exit(EXIT_CORRUPTION)
                     }
                 }
             } else if data.len() == 160 && &data[0..8] == b"SDQFMT1\0" {
@@ -735,16 +761,16 @@ fn main() -> ExitCode {
                         eprintln!("queue_id: {}", steadq_names::hex_encode(fmt.queue_id()));
                         eprintln!("shard_count: {}", fmt.shard_count());
                         eprintln!("valid");
-                        ExitCode::SUCCESS
+                        exit(EXIT_SUCCESS)
                     }
                     Err(e) => {
                         eprintln!("CORRUPT: {e}");
-                        ExitCode::from(3)
+                        exit(EXIT_CORRUPTION)
                     }
                 }
             } else {
                 eprintln!("unknown format");
-                ExitCode::FAILURE
+                exit(EXIT_ORDINARY)
             }
         }
 
@@ -753,7 +779,7 @@ fn main() -> ExitCode {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("read failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_io(&e);
                 }
             };
             if data.len() >= 128 && &data[0..8] == b"SDQJOB1\0" {
@@ -772,11 +798,11 @@ fn main() -> ExitCode {
                             "envelope_digest: {}",
                             steadq_names::hex_encode(&h.envelope_digest)
                         );
-                        ExitCode::SUCCESS
+                        exit(EXIT_SUCCESS)
                     }
                     Err(e) => {
                         eprintln!("parse error: {e}");
-                        ExitCode::FAILURE
+                        exit(EXIT_ORDINARY)
                     }
                 }
             } else if data.len() == 160 && &data[0..8] == b"SDQFMT1\0" {
@@ -789,16 +815,16 @@ fn main() -> ExitCode {
                         println!("delayed_bucket_width_ns: {}", f.delayed_bucket_width_ns());
                         println!("terminal_bucket_width_ns: {}", f.terminal_bucket_width_ns());
                         println!("max_payload_length: {}", f.max_payload_length());
-                        ExitCode::SUCCESS
+                        exit(EXIT_SUCCESS)
                     }
                     Err(e) => {
                         eprintln!("parse error: {e}");
-                        ExitCode::FAILURE
+                        exit(EXIT_ORDINARY)
                     }
                 }
             } else {
                 eprintln!("unrecognized format");
-                ExitCode::FAILURE
+                exit(EXIT_ORDINARY)
             }
         }
 
@@ -816,7 +842,7 @@ fn main() -> ExitCode {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    return ExitCode::FAILURE;
+                    return exit_core(&e);
                 }
             };
             loop {
@@ -841,12 +867,12 @@ fn main() -> ExitCode {
                     if stats.errors.is_empty() {
                         break;
                     } else {
-                        return ExitCode::from(EXIT_IO_FAILURE);
+                        return exit(EXIT_IO_FAILURE);
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
-            ExitCode::SUCCESS
+            exit(EXIT_SUCCESS)
         }
         Commands::Resolve {
             path,
@@ -857,14 +883,14 @@ fn main() -> ExitCode {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("read result file failed: {e}");
-                    return ExitCode::from(EXIT_ORDINARY);
+                    return exit(EXIT_ORDINARY);
                 }
             };
             let ticket = match steadq_core::TransitionTicket::from_json(&data) {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     eprintln!("invalid transition ticket: {error}");
-                    return ExitCode::from(EXIT_ORDINARY);
+                    return exit(EXIT_ORDINARY);
                 }
             };
 
@@ -872,14 +898,14 @@ fn main() -> ExitCode {
                 Ok(q) => q,
                 Err(e) => {
                     eprintln!("open failed: {e}");
-                    return ExitCode::from(EXIT_IO_FAILURE);
+                    return exit(EXIT_IO_FAILURE);
                 }
             };
             let (source_path, dest_path) = match queue.transition_ticket_paths(&ticket) {
                 Ok(paths) => paths,
                 Err(error) => {
                     eprintln!("invalid transition ticket: {error}");
-                    return ExitCode::from(EXIT_ORDINARY);
+                    return exit(EXIT_ORDINARY);
                 }
             };
 
@@ -888,28 +914,28 @@ fn main() -> ExitCode {
                 steadq_core::ResolutionOutcome::DestinationObserved
                 | steadq_core::ResolutionOutcome::DestinationStabilized => {
                     eprintln!("destination observed: {dest_path}");
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 steadq_core::ResolutionOutcome::SourceObserved
                 | steadq_core::ResolutionOutcome::SourceStabilized => {
                     eprintln!("source observed: {source_path}");
-                    ExitCode::SUCCESS
+                    exit(EXIT_SUCCESS)
                 }
                 steadq_core::ResolutionOutcome::BothObserved => {
                     eprintln!("both source and destination observed (corruption)");
-                    ExitCode::from(EXIT_CORRUPTION)
+                    exit(EXIT_CORRUPTION)
                 }
                 steadq_core::ResolutionOutcome::NeitherObserved => {
                     eprintln!("neither source nor destination observed");
-                    ExitCode::from(EXIT_ORDINARY)
+                    exit(EXIT_ORDINARY)
                 }
                 steadq_core::ResolutionOutcome::ConflictingObject => {
                     eprintln!("conflicting object at expected path");
-                    ExitCode::from(EXIT_CORRUPTION)
+                    exit(EXIT_CORRUPTION)
                 }
                 steadq_core::ResolutionOutcome::ResolutionFailed(e) => {
                     eprintln!("resolution failed: {e}");
-                    ExitCode::from(EXIT_IO_FAILURE)
+                    exit(EXIT_IO_FAILURE)
                 }
             }
         }
@@ -1016,7 +1042,7 @@ fn main() -> ExitCode {
             eprintln!("enqueued: {} ({:.0}/s)", eq, eq as f64 / elapsed);
             eprintln!("leased: {} ({:.0}/s)", lq, lq as f64 / elapsed);
             eprintln!("acked: {} ({:.0}/s)", aq, aq as f64 / elapsed);
-            ExitCode::from(EXIT_SUCCESS)
+            exit(EXIT_SUCCESS)
         }
 
         Commands::Admin { command } => match command {
@@ -1025,9 +1051,9 @@ fn main() -> ExitCode {
                 let entries = match std::fs::read_dir(&qroot) {
                     Ok(e) => e,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return ExitCode::from(EXIT_SUCCESS);
+                        return exit(EXIT_SUCCESS);
                     }
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 for bucket in entries.flatten() {
                     let shards = match std::fs::read_dir(bucket.path()) {
@@ -1048,16 +1074,16 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                ExitCode::from(EXIT_SUCCESS)
+                exit(EXIT_SUCCESS)
             }
             AdminCommands::DeadInspect { path, job_id } => {
                 let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
                     Some(b) => b,
-                    None => return ExitCode::from(EXIT_ORDINARY),
+                    None => return exit(EXIT_ORDINARY),
                 };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 for s in queue
                     .inspect(&job_id_bytes)
@@ -1069,7 +1095,7 @@ fn main() -> ExitCode {
                         s.generation, s.attempt, s.maximum_attempts, s.relative_path
                     );
                 }
-                ExitCode::from(EXIT_SUCCESS)
+                exit(EXIT_SUCCESS)
             }
             AdminCommands::DeadExport {
                 path,
@@ -1078,53 +1104,53 @@ fn main() -> ExitCode {
             } => {
                 let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
                     Some(b) => b,
-                    None => return ExitCode::from(EXIT_ORDINARY),
+                    None => return exit(EXIT_ORDINARY),
                 };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 match queue.export_dead(&job_id_bytes, &output) {
                     Ok(n) => {
                         eprintln!("exported {n} bytes");
-                        ExitCode::from(EXIT_SUCCESS)
+                        exit(EXIT_SUCCESS)
                     }
                     Err(steadq_core::Error::QueueCorrupt(_)) => {
                         eprintln!("not found");
-                        ExitCode::from(EXIT_ORDINARY)
+                        exit(EXIT_ORDINARY)
                     }
-                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => exit(EXIT_IO_FAILURE),
                 }
             }
             AdminCommands::DeadRemove { path, job_id } => {
                 let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
                     Some(b) => b,
-                    None => return ExitCode::from(EXIT_ORDINARY),
+                    None => return exit(EXIT_ORDINARY),
                 };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 match queue.remove_dead(&job_id_bytes) {
                     Ok(true) => {
                         eprintln!("removed");
-                        ExitCode::from(EXIT_SUCCESS)
+                        exit(EXIT_SUCCESS)
                     }
                     Ok(false) => {
                         eprintln!("not found");
-                        ExitCode::from(EXIT_ORDINARY)
+                        exit(EXIT_ORDINARY)
                     }
                     Err(steadq_core::Error::QueueCorrupt(_)) => {
                         eprintln!("not found");
-                        ExitCode::from(EXIT_ORDINARY)
+                        exit(EXIT_ORDINARY)
                     }
-                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => exit(EXIT_IO_FAILURE),
                 }
             }
             AdminCommands::QuarantineList { path } => {
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 for entry in queue.list_quarantine() {
                     println!(
@@ -1134,7 +1160,7 @@ fn main() -> ExitCode {
                         entry.relative_path
                     );
                 }
-                ExitCode::from(EXIT_SUCCESS)
+                exit(EXIT_SUCCESS)
             }
             AdminCommands::QuarantineInspect {
                 path,
@@ -1144,12 +1170,12 @@ fn main() -> ExitCode {
                     Some(b) => b,
                     None => {
                         eprintln!("invalid quarantine_id");
-                        return ExitCode::from(EXIT_ORDINARY);
+                        return exit(EXIT_ORDINARY);
                     }
                 };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 match queue.find_quarantine(&qid) {
                     Some(entry) => {
@@ -1162,11 +1188,11 @@ fn main() -> ExitCode {
                             entry.reason,
                             entry.relative_path
                         );
-                        ExitCode::from(EXIT_SUCCESS)
+                        exit(EXIT_SUCCESS)
                     }
                     None => {
                         eprintln!("not found");
-                        ExitCode::from(EXIT_ORDINARY)
+                        exit(EXIT_ORDINARY)
                     }
                 }
             }
@@ -1179,23 +1205,23 @@ fn main() -> ExitCode {
                     Some(b) => b,
                     None => {
                         eprintln!("invalid quarantine_id");
-                        return ExitCode::from(EXIT_ORDINARY);
+                        return exit(EXIT_ORDINARY);
                     }
                 };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 match queue.export_quarantine(&qid, &output) {
                     Ok(n) => {
                         eprintln!("exported {n} bytes");
-                        ExitCode::from(EXIT_SUCCESS)
+                        exit(EXIT_SUCCESS)
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         eprintln!("not found");
-                        ExitCode::from(EXIT_ORDINARY)
+                        exit(EXIT_ORDINARY)
                     }
-                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => exit(EXIT_IO_FAILURE),
                 }
             }
             AdminCommands::QuarantineRemove {
@@ -1206,36 +1232,36 @@ fn main() -> ExitCode {
                     Some(b) => b,
                     None => {
                         eprintln!("invalid quarantine_id");
-                        return ExitCode::from(EXIT_ORDINARY);
+                        return exit(EXIT_ORDINARY);
                     }
                 };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 match queue.remove_quarantine(&qid) {
                     Ok(true) => {
                         eprintln!("removed");
-                        ExitCode::from(EXIT_SUCCESS)
+                        exit(EXIT_SUCCESS)
                     }
                     Ok(false) => {
                         eprintln!("not found");
-                        ExitCode::from(EXIT_ORDINARY)
+                        exit(EXIT_ORDINARY)
                     }
-                    Err(_) => ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => exit(EXIT_IO_FAILURE),
                 }
             }
             AdminCommands::CompactReceipts { path } => {
                 let mut queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
-                    Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
+                    Err(_) => return exit(EXIT_IO_FAILURE),
                 };
                 let stats = queue.recover(&steadq_core::WorkBudget::default());
                 eprintln!(
                     "compacted: {} expired: {}",
                     stats.receipts_compacted, stats.receipts_expired
                 );
-                ExitCode::from(EXIT_SUCCESS)
+                exit(EXIT_SUCCESS)
             }
         },
     }
@@ -1438,6 +1464,40 @@ fn load_handle(
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn exit_codes_follow_spec_table() {
+        assert_eq!(
+            exit_core(&Error::InvalidInput("x".into())),
+            exit(EXIT_ORDINARY)
+        );
+        assert_eq!(
+            exit_core(&Error::QueueCorrupt("x".into())),
+            exit(EXIT_CORRUPTION)
+        );
+        assert_eq!(
+            exit_core(&Error::UnsupportedFilesystem),
+            exit(EXIT_UNSUPPORTED)
+        );
+        assert_eq!(exit_core(&Error::PermissionDenied), exit(EXIT_PERMISSION));
+        assert_eq!(
+            exit_core(&Error::ResourceExhausted),
+            exit(EXIT_RESOURCE_EXHAUSTED)
+        );
+        assert_eq!(
+            exit_core(&Error::IoFailure("x".into())),
+            exit(EXIT_IO_FAILURE)
+        );
+        assert_eq!(
+            exit_io(&std::io::Error::new(std::io::ErrorKind::Unsupported, "fs")),
+            exit(EXIT_UNSUPPORTED)
+        );
+        assert_eq!(
+            exit_io(&std::io::Error::new(std::io::ErrorKind::InvalidData, "bad")),
+            exit(EXIT_ORDINARY)
+        );
+        assert_eq!(exit_io(&std::io::Error::other("io")), exit(EXIT_IO_FAILURE));
+    }
 
     #[test]
     fn os_byte_escaping_preserves_distinct_names() {
