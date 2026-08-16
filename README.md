@@ -146,7 +146,7 @@ SteadQ has 691 tests across unit, integration, conformance, and formal model che
 - TLA+ model checking verifies invariants for lease tokens, capability tokens, namespace durability, scheduling, and receipt evidence across six model configurations
 - Mutation testing (cargo-mutants) runs on every pull request, scoped to the changed lines
 - Fuzz testing covers format parsing, filename parsing, CBOR decoding, and arithmetic
-- Crash lab replays persistence-barrier crash states on real filesystem images: 761 states across ext4, XFS, btrfs, f2fs, and ZFS, all passing ([docs/crash-lab.md](docs/crash-lab.md))
+- Crash lab replays persistence-barrier crash states on real filesystem images: 761 states on kernel 6.8.0-137 and 793 states on kernel 7.0.0-28, all five profiles passing on both hosts ([docs/crash-lab.md](docs/crash-lab.md))
 
 ## Performance
 
