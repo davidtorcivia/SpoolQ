@@ -10,6 +10,8 @@
 
 ### Fixes
 
+- Receipt compaction and retention record open and lock I/O instead of treating those failures as a busy skip
+- Deleted unused public name helpers `name_tag_hex`, `filename_without_tag_and_ext`, and `verify_ready_tag`
 - Production identity changes (generation and attempt) come from the protocol IR via `next_common_fields`
 - Streaming enqueue records deferred dirty directories and skips dest-dir fsync until `sync()`, matching buffered enqueue
 - CLI maps every command through the spec 11.5 exit table (`exit_core` / `exit_io`) instead of collapsing most failures to 1
@@ -47,7 +49,7 @@
 
 ### Testing
 
-- 689 tests: unit, fault injection, differential, and formal model checking
+- 691 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request
