@@ -31,7 +31,7 @@ echo "hello world" | ./target/release/steadq put /tmp/myqueue - --content-type t
 ```rust
 use steadq_core::{Queue, EnqueueInput};
 
-let mut queue = Queue::open("/tmp/myqueue", &Default::default())?;
+let mut queue = Queue::open(std::path::Path::new("/tmp/myqueue"), &Default::default())?;
 queue.enqueue(EnqueueInput {
     maximum_attempts: 3,
     content_type: "text/plain".into(),
@@ -105,7 +105,7 @@ steadq_close(q);
 
 ## How It Works
 
-A queue lives in a directory on a local Linux filesystem (ext4, XFS, btrfs, or f2fs). The layout is:
+A queue lives in a directory on a local Linux filesystem (ext4, XFS, btrfs, f2fs, or ZFS). The layout is:
 
     queue/
       FORMAT                  Queue identity and configuration
@@ -138,7 +138,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 
 ## Testing
 
-SteadQ has 676 tests across unit, integration, conformance, and formal model checking:
+SteadQ has 687 tests across unit, integration, conformance, and formal model checking:
 
 - Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
 - Fault injection tests inject I/O errors at every syscall boundary and verify error classification

@@ -369,15 +369,29 @@ impl Queue {
                         // Parse the leased filename to get deadline and attempt info
                         let parsed = match steadq_names::parse_leased(entry) {
                             Ok(p) => p,
-                            // C-34: Malformed entries should be quarantined, not skipped
                             Err(_) => {
-                                stats.errors.push(RecoveryError {
-                                    operation: "reap_parse".into(),
-                                    relative_path: format!(
-                                        "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
-                                    ),
-                                    error: "malformed leased filename".into(),
-                                });
+                                let relative_path = format!(
+                                    "leased/{boot_dir_name}/{bucket_name}/{shard_name}/{entry}"
+                                );
+                                Self::record_error(
+                                    stats,
+                                    "reap_parse",
+                                    &relative_path,
+                                    "malformed leased filename",
+                                );
+                                if !self.quarantine_recovery_object(
+                                    RecoveryQuarantineCandidate {
+                                        source_directory_fd: shard_fd.as_fd(),
+                                        filename: entry,
+                                        relative_path: &relative_path,
+                                        reason: crate::QuarantineReason::FilenameParseFailed,
+                                    },
+                                    stats,
+                                    budget,
+                                ) {
+                                    self.recovery_cursor.reap_leases = previous_entry_cursor;
+                                    return;
+                                }
                                 continue;
                             }
                         };

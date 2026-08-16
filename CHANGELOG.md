@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixes
+
+- CLI lease handles persist payload length, digest, and content type so `ack`/`retry`/`bury` work after `lease --handle-file`
+- `steadq doctor` accepts ZFS and the alternate f2fs statfs magic, and honors the global `--json` flag
+- Streaming enqueue fails closed when `getrandom` fails instead of publishing job id `0`
+- Admin dead export/remove reject invalid job IDs instead of operating on the all-zero id
+- CBOR metadata encodes `i64::MIN` without overflowing
+- C `steadq_init` maps unsupported filesystem and permission errors to the matching result codes
+- C resolve reports `BothObserved` as corruption, matching the CLI
+- Batch/deferred lease records dirty directories only after a successful claim rename, and a record failure is OutcomeUnknown
+- Streaming enqueue keeps the published envelope digest on OutcomeUnknown
+- Lease scan stops after a failed exhausted-attempt dead-letter move instead of claiming on a poisoned handle
+- Claim of a corrupt payload that cannot be quarantined is OutcomeUnknown, not NotCommitted
+- `renew` returns NotCommitted instead of panicking when lease-bucket arithmetic is exhausted
+- Recovery quarantines malformed leased filenames instead of skipping them
+
 ### Core
 
 - Full queue lifecycle: init, open, enqueue, lease, ack, retry, bury, renew, recover, inspect
@@ -22,7 +38,7 @@
 
 ### Testing
 
-- 676 tests: unit, fault injection, differential, and formal model checking
+- 687 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request
