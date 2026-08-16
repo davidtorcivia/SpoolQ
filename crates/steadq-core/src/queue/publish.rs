@@ -873,13 +873,6 @@ impl Queue {
                                     error: Error::IoFailure(e.to_string()),
                                 }
                             })?;
-                        } else {
-                            fs::fsync_dir_fd(dest_fd.as_fd()).map_err(|e| {
-                                PublishError::OutcomeUnknownPublished {
-                                    envelope_digest: env_dig,
-                                    error: Error::IoFailure(e.to_string()),
-                                }
-                            })?;
                         }
                     }
                     Ok(engine::TmpfilePublishOutcome::Unsupported) => {

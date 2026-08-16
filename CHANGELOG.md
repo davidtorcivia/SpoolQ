@@ -4,7 +4,7 @@
 
 ### Structure
 
-- README test count matches `cargo test --workspace --all-features -- --list` (691)
+- README test count matches `cargo test --workspace --all-features -- --list` (693)
 - Removed leftover `dead_code`/`unused_imports` allows on live items and the unused power-loss `is_durable` helper
 - Split `queue/mod.rs` into publish, lease, consumer, and inspect modules; init and open stay in the parent
 - Split recovery phases into reap, promote, and retain
@@ -12,6 +12,7 @@
 
 ### Fixes
 
+- Streaming tmpfile enqueue no longer fsyncs the destination directory after `publish_tmpfile_noreplace_with_mode`, which already synced it
 - Receipt compaction and retention record open and lock I/O instead of treating those failures as a busy skip
 - Deleted unused public name helpers `name_tag_hex`, `filename_without_tag_and_ext`, and `verify_ready_tag`
 - Production identity changes (generation and attempt) come from the protocol IR via `next_common_fields`
@@ -33,7 +34,7 @@
 
 ### Performance
 
-- Measured strict vs deferred completed-job throughput on the README NVMe: 3,065/s strict, 3,520/s deferred batch-50. A completed job issues 8 `fsync`; a deferred batch of 10 still issues 7.7 `fsync` per job.
+- Measured strict vs deferred completed-job throughput on the README NVMe: 3,065/s strict, 3,520/s deferred batch-50. A warm 64-shard completed job issues 8 `fsync` (6 required plus 2 new-shard parent syncs); a deferred batch of 10 still issues 7.7 `fsync` per job.
 
 ### Core
 
@@ -55,7 +56,7 @@
 
 ### Testing
 
-- 691 tests: unit, fault injection, differential, and formal model checking
+- 693 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request

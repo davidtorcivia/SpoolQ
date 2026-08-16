@@ -2541,6 +2541,148 @@ fn enqueue_survives_reopen() {
     assert_eq!(snapshots[0].state, "ready");
 }
 
+fn create_test_queue_shards(shard_count: u32) -> (TempDir, Queue) {
+    let tmp = TempDir::new().unwrap();
+    Queue::init(
+        tmp.path(),
+        &CreateOptions {
+            shard_count,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (tmp, queue)
+}
+
+fn complete_one_job(queue: &mut Queue) {
+    match queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "text/plain".into(),
+        payload: vec![0xAB; 64],
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(_) => {}
+        other => panic!("enqueue: {other:?}"),
+    }
+    let lease = match queue.lease(0, 30_000_000_000) {
+        LeaseOutcome::Leased(lease) => lease,
+        other => panic!("lease: {other:?}"),
+    };
+    queue.verify_lease_payload(&lease).expect("verify");
+    match queue.ack(&lease) {
+        AckOutcome::Acked => {}
+        other => panic!("ack: {other:?}"),
+    }
+}
+
+fn sync_call_counts() -> (u64, u64) {
+    (
+        fs::fault::call_count("fsync"),
+        fs::fault::call_count("fsync_dir_fd"),
+    )
+}
+
+fn sync_call_delta(before: (u64, u64)) -> (u64, u64) {
+    let after = sync_call_counts();
+    (after.0 - before.0, after.1 - before.1)
+}
+
+#[test]
+fn warm_completed_job_fsyncs_required_directories_once() {
+    let (_tmp, mut queue) = create_test_queue_shards(1);
+    complete_one_job(&mut queue);
+
+    fs::fault::reset();
+    fs::fault::inject("fsync", u64::MAX);
+    let start = sync_call_counts();
+    match queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "text/plain".into(),
+        payload: vec![0xAB; 64],
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(_) => {}
+        other => panic!("enqueue: {other:?}"),
+    }
+    let enqueue = sync_call_delta(start);
+    let after_enqueue = sync_call_counts();
+    let named_fallback = matches!(
+        queue.publication_mode,
+        Some(fs::PublicationMode::NamedFallback)
+    );
+    let lease = match queue.lease(0, 30_000_000_000) {
+        LeaseOutcome::Leased(lease) => lease,
+        other => panic!("lease: {other:?}"),
+    };
+    let lease_counts = sync_call_delta(after_enqueue);
+    let after_lease = sync_call_counts();
+    queue.verify_lease_payload(&lease).expect("verify");
+    let verify = sync_call_delta(after_lease);
+    let after_verify = sync_call_counts();
+    match queue.ack(&lease) {
+        AckOutcome::Acked => {}
+        other => panic!("ack: {other:?}"),
+    }
+    let ack = sync_call_delta(after_verify);
+    fs::fault::reset();
+
+    if named_fallback {
+        assert_eq!(enqueue, (3, 2), "named fallback: file + dest + tmp");
+    } else {
+        assert_eq!(enqueue, (2, 1), "tmpfile: file + dest");
+    }
+    assert_eq!(lease_counts, (2, 2), "lease dest + source");
+    assert_eq!(verify, (0, 0), "verify is read-only");
+    assert_eq!(ack, (2, 2), "ack dest + source");
+}
+
+#[test]
+fn streaming_tmpfile_enqueue_fsyncs_destination_once() {
+    let (_tmp, mut queue) = create_test_queue_shards(1);
+    if !tmpfile_supported(&queue) {
+        return;
+    }
+
+    let dest_fd = open_relative(queue.root_fd().as_fd(), "ready/0000").unwrap();
+    let dest_stat = fs::fstat(dest_fd.as_fd()).unwrap();
+    let dest_id = (dest_stat.st_dev as u64, dest_stat.st_ino as u64);
+
+    fs::fault::reset();
+    fs::fault::inject("fsync", u64::MAX);
+    match queue.enqueue_streaming(
+        3,
+        "text/plain".into(),
+        Default::default(),
+        None,
+        None,
+        None,
+        std::io::Cursor::new(vec![0xABu8; 64]),
+    ) {
+        EnqueueOutcome::Committed(_) => {}
+        other => panic!("stream: {other:?}"),
+    }
+    let dest_hits = fs::fault::fd_identities("fsync_dir_fd")
+        .into_iter()
+        .filter(|id| *id == dest_id)
+        .count();
+    fs::fault::reset();
+    if matches!(
+        queue.publication_mode,
+        Some(fs::PublicationMode::NamedFallback)
+    ) {
+        return;
+    }
+    assert_eq!(dest_hits, 1);
+}
+
 #[test]
 fn enqueue_zero_payload() {
     let (_tmp, mut queue) = create_test_queue();
