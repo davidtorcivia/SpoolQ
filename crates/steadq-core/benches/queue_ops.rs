@@ -287,6 +287,9 @@ fn bench_sustained_ack(c: &mut Criterion) {
 
 fn bench_sustained_completed(c: &mut Criterion) {
     let mut group = c.benchmark_group("sustained_completed");
+    group.warm_up_time(std::time::Duration::from_secs(2));
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.sample_size(30);
     for payload_size in [64usize, 1024, 16384].iter() {
         group.throughput(criterion::Throughput::Bytes(*payload_size as u64));
         group.bench_with_input(
@@ -415,6 +418,62 @@ fn bench_deferred_completed(c: &mut Criterion) {
     group.finish();
 }
 
+fn completed_deferred(queue: &mut Queue, payload: &[u8]) {
+    match queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: payload.to_vec(),
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(_) | EnqueueOutcome::Deferred(_) => {}
+        outcome => panic!("enqueue failed: {outcome:?}"),
+    }
+    let lease = match queue.lease(0, 30_000_000_000) {
+        LeaseOutcome::Leased(lease) => lease,
+        outcome => panic!("lease failed: {outcome:?}"),
+    };
+    queue.verify_lease_payload(&lease).unwrap();
+    match queue.ack(&lease) {
+        AckOutcome::Acked => {}
+        outcome => panic!("ack failed: {outcome:?}"),
+    }
+}
+
+fn bench_batch_deferred_completed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_deferred_completed");
+    group.warm_up_time(std::time::Duration::from_secs(2));
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.sample_size(30);
+    for &batch_size in &[1u32, 10, 50] {
+        group.throughput(criterion::Throughput::Elements(u64::from(batch_size)));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            &batch_size,
+            |b, &n| {
+                let tmp = benchmark_tempdir();
+                Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+                let mut q = Queue::open(
+                    tmp.path(),
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        deferred_dir_sync: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let payload = vec![0xABu8; 64];
+                b.iter(|| {
+                    for _ in 0..n {
+                        completed_deferred(&mut q, &payload);
+                    }
+                    q.sync().unwrap();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_batch_deferred(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_deferred");
     for &batch_size in &[1u32, 10, 50] {
@@ -464,6 +523,7 @@ criterion_group!(
     bench_concurrent_completed,
     bench_deferred_completed,
     bench_batch_deferred,
+    bench_batch_deferred_completed,
 );
 criterion_main!(benches);
 

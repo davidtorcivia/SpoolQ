@@ -31,6 +31,10 @@
 - `renew` returns NotCommitted instead of panicking when lease-bucket arithmetic is exhausted
 - Recovery quarantines malformed leased filenames instead of skipping them
 
+### Performance
+
+- Measured strict vs deferred completed-job throughput on the README NVMe: 3,065/s strict, 3,520/s deferred batch-50. A completed job issues 8 `fsync`; a deferred batch of 10 still issues 7.7 `fsync` per job.
+
 ### Core
 
 - Full queue lifecycle: init, open, enqueue, lease, ack, retry, bury, renew, recover, inspect

@@ -166,6 +166,23 @@ queue, default durability settings, and a batched producer/consumer workload
 Reference system: Intel Core i5-13500 CPU and Intel SSDPEK1A118GA 118 GB NVMe
 drive, formatted as ext4.
 
+On that same disk, a single handle completing 64 B jobs (same 2 s / 10 s / 30
+sample Criterion settings):
+
+| Mode | Completed jobs/sec |
+|---|---:|
+| Strict (fsync every directory) | 3,065 |
+| Deferred, `sync()` after every job | 3,278 |
+| Deferred, `sync()` after 10 jobs | 3,527 |
+| Deferred, `sync()` after 50 jobs | 3,520 |
+
+`strace` of one subsequent completed job on a warm queue: 8 `fsync`, 2
+`renameat2`, 1 successful `linkat` (`AT_EMPTY_PATH` then `/proc/self/fd`),
+5 `getrandom`. A deferred batch of 10 issued 77 `fsync` (7.7 per job).
+Deferring directory `fsync` does not remove the per-job file `fsync` or
+most of the directory barriers on this path, so completed-job throughput
+stays on the same side of 4,000/s.
+
 ## Documentation
 
 - [`spec/contract.md`](spec/contract.md) - Assumptions, guarantees, and terminology
