@@ -1,4 +1,5 @@
 // Unit tests for the queue module.
+use super::publish::PublishError;
 use super::resolve::*;
 use super::*;
 use crate::FsckOptions;

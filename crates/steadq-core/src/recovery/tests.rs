@@ -3363,7 +3363,7 @@ fn reap_to_dead_uses_phase_aware_move_executor() {
         )
         .unwrap();
         queue
-            .ensure_dir_pub(&format!(
+            .ensure_dir(&format!(
                 "dead/{}/{}",
                 steadq_names::bucket_hex(terminal_bucket),
                 parts[3]
@@ -3489,7 +3489,7 @@ fn reap_to_dead_records_executor_failure_without_counting_commit() {
         )
         .unwrap();
         queue
-            .ensure_dir_pub(&format!(
+            .ensure_dir(&format!(
                 "dead/{}/{shard}",
                 steadq_names::bucket_hex(terminal_bucket)
             ))
@@ -3657,7 +3657,7 @@ fn reap_to_dead_scanner_handles_collision_and_missing_source() {
             .path()
             .join(dead_destination(&queue, parts[3], &common, wall_floor));
         queue
-            .ensure_dir_pub(
+            .ensure_dir(
                 destination
                     .parent()
                     .unwrap()

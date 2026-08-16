@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Structure
+
+- Split `queue/mod.rs` into publish, lease, consumer, and inspect modules; init and open stay in the parent
+- Split recovery phases into reap, promote, and retain
+- Deleted the `ensure_dir_pub` wrapper and the always-true tag self-comparison in `validate_active_object`
+
 ### Fixes
 
 - Production identity changes (generation and attempt) come from the protocol IR via `next_common_fields`
