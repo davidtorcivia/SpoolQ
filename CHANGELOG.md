@@ -4,6 +4,8 @@
 
 ### Structure
 
+- README test count matches `cargo test --workspace --all-features -- --list` (691)
+- Removed leftover `dead_code`/`unused_imports` allows on live items and the unused power-loss `is_durable` helper
 - Split `queue/mod.rs` into publish, lease, consumer, and inspect modules; init and open stay in the parent
 - Split recovery phases into reap, promote, and retain
 - Deleted the `ensure_dir_pub` wrapper and the always-true tag self-comparison in `validate_active_object`

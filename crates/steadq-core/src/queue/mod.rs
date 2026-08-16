@@ -47,8 +47,8 @@ pub struct Queue {
     pub(crate) ready_shard_hint: Option<u32>,
     pub(crate) worker_nonce: [u8; 16],
     pub(crate) options: OpenOptions,
-    #[allow(dead_code)]
-    pub(crate) maint_lock_fd: Option<OwnedFd>,
+    // Held so the shared OFD lock lives as long as the Queue.
+    _maint_lock_fd: Option<OwnedFd>,
     pub(crate) recovery_cursor: RecoveryCursor,
     pub(crate) cached_wall_floor: Option<WallFloor>,
     pub(crate) known_dirs: std::cell::RefCell<std::collections::HashSet<String>>,
@@ -653,7 +653,7 @@ impl Queue {
             ready_shard_hint: None,
             worker_nonce,
             options: opts.clone(),
-            maint_lock_fd: Some(maint_fd),
+            _maint_lock_fd: Some(maint_fd),
             recovery_cursor,
             cached_wall_floor: None,
             known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),

@@ -20,7 +20,6 @@ thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-#[allow(dead_code)]
 fn clear_last_error() {
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = None;

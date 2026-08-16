@@ -10,7 +10,6 @@
 
 use std::collections::HashSet;
 use std::os::fd::AsFd;
-#[allow(unused_imports)]
 use std::path::Path;
 
 use crate::{
@@ -81,11 +80,6 @@ impl DurabilityTracker {
         let p = normalize(path);
         self.durable_entries.insert(p.clone());
         self.durable_dirs.insert(p);
-    }
-
-    #[allow(dead_code)]
-    pub fn is_durable(&self, path: &str) -> bool {
-        self.durable_entries.contains(&normalize(path))
     }
 }
 

@@ -889,8 +889,6 @@ impl Queue {
         !stats.budget_exhausted
     }
 
-    /// R2-H06: Record a recovery error with full context.
-    #[allow(dead_code)]
     fn record_error(stats: &mut RecoveryStats, op: &str, path: &str, err: &str) {
         stats.errors.push(RecoveryError {
             operation: op.into(),
