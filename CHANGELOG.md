@@ -49,7 +49,7 @@
 
 ### Testing
 
-- 690 tests: unit, fault injection, differential, and formal model checking
+- 691 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request

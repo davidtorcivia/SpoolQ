@@ -4487,6 +4487,22 @@ fn receipt_deletion_records_unlink_phase_without_counting_commit() {
 }
 
 #[test]
+fn missing_receipt_during_compact_is_a_skip_not_an_error() {
+    let (_tmp, mut queue) = create_test_queue();
+    enqueue_and_ack(&mut queue);
+    fs::fault::reset();
+    fs::fault::inject_errno("openat", 1, libc::ENOENT);
+    let stats = compact_receipts_with_budget(&mut queue);
+    fs::fault::reset();
+    assert_eq!(stats.receipts_compacted, 0);
+    assert!(
+        stats.errors.is_empty(),
+        "ENOENT during receipt open must skip, not record: {:?}",
+        stats.errors
+    );
+}
+
+#[test]
 fn receipt_deletion_records_open_and_lock_io() {
     for (fault, expected_operation) in [
         ("openat", "receipt_delete_open"),
