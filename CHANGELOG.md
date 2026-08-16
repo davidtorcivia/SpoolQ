@@ -4,6 +4,9 @@
 
 ### Fixes
 
+- Production identity changes (generation and attempt) come from the protocol IR via `next_common_fields`
+- Streaming enqueue records deferred dirty directories and skips dest-dir fsync until `sync()`, matching buffered enqueue
+- CLI maps every command through the spec 11.5 exit table (`exit_core` / `exit_io`) instead of collapsing most failures to 1
 - CLI lease handles persist payload length, digest, and content type so `ack`/`retry`/`bury` work after `lease --handle-file`
 - `steadq doctor` accepts ZFS and the alternate f2fs statfs magic, and honors the global `--json` flag
 - Streaming enqueue fails closed when `getrandom` fails instead of publishing job id `0`
@@ -38,7 +41,7 @@
 
 ### Testing
 
-- 687 tests: unit, fault injection, differential, and formal model checking
+- 689 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request

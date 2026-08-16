@@ -136,6 +136,42 @@ pub enum TransitionOperation {
     Bury,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityChangeError {
+    Overflow,
+    Indeterminate,
+}
+
+/// Apply the protocol IR generation and attempt rules for `operation`.
+pub(crate) fn next_common_fields(
+    operation: ProtocolOperation,
+    source: &steadq_names::CommonFields,
+) -> Result<steadq_names::CommonFields, IdentityChangeError> {
+    let definition = state_machine::transition(operation);
+    let generation = match definition.generation_change {
+        GenerationChange::Zero => 0,
+        GenerationChange::Increment => source
+            .generation
+            .checked_add(1)
+            .ok_or(IdentityChangeError::Overflow)?,
+        GenerationChange::IncrementOrSame => return Err(IdentityChangeError::Indeterminate),
+    };
+    let attempt = match definition.attempt_change {
+        AttemptChange::Zero => 0,
+        AttemptChange::Increment => source
+            .attempt
+            .checked_add(1)
+            .ok_or(IdentityChangeError::Overflow)?,
+        AttemptChange::Unchanged => source.attempt,
+    };
+    Ok(steadq_names::CommonFields {
+        job_id: source.job_id,
+        generation,
+        attempt,
+        maximum_attempts: source.maximum_attempts,
+    })
+}
+
 impl TransitionOperation {
     fn protocol_operation(self) -> ProtocolOperation {
         match self {
@@ -452,33 +488,16 @@ impl TransitionTicket {
     }
 
     pub(crate) fn destination_common(&self) -> Result<steadq_names::CommonFields, Error> {
-        let definition = state_machine::transition(self.operation.protocol_operation());
-        let generation = match definition.generation_change {
-            GenerationChange::Zero => 0,
-            GenerationChange::Increment => self
-                .source_generation
-                .checked_add(1)
-                .ok_or_else(|| Error::InvalidTicket("source generation cannot increment".into()))?,
-            GenerationChange::IncrementOrSame => {
-                return Err(Error::InvalidTicket(
+        next_common_fields(self.operation.protocol_operation(), &self.source_common()).map_err(
+            |error| match error {
+                IdentityChangeError::Overflow => {
+                    Error::InvalidTicket("source generation or attempt cannot increment".into())
+                }
+                IdentityChangeError::Indeterminate => Error::InvalidTicket(
                     "ticket operation has an indeterminate generation change".into(),
-                ));
-            }
-        };
-        let attempt = match definition.attempt_change {
-            AttemptChange::Zero => 0,
-            AttemptChange::Increment => self
-                .source_attempt
-                .checked_add(1)
-                .ok_or_else(|| Error::InvalidTicket("source attempt cannot increment".into()))?,
-            AttemptChange::Unchanged => self.source_attempt,
-        };
-        Ok(steadq_names::CommonFields {
-            job_id: self.job_id,
-            generation,
-            attempt,
-            maximum_attempts: self.maximum_attempts,
-        })
+                ),
+            },
+        )
     }
 
     pub(crate) fn validate_for_queue(&self, queue_id: &[u8; 16]) -> Result<(), Error> {
@@ -908,6 +927,46 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn next_common_fields_follows_protocol_ir() {
+        let source = steadq_names::CommonFields {
+            job_id: [9; 16],
+            generation: 7,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let cases = [
+            (ProtocolOperation::EnqueueImmediate, 0, 0),
+            (ProtocolOperation::EnqueueDelayed, 0, 0),
+            (ProtocolOperation::Promote, 8, 1),
+            (ProtocolOperation::Claim, 8, 2),
+            (ProtocolOperation::ExhaustedReadyCleanup, 8, 1),
+            (ProtocolOperation::Renew, 8, 1),
+            (ProtocolOperation::Acknowledge, 8, 1),
+            (ProtocolOperation::RetryNow, 8, 1),
+            (ProtocolOperation::RetryLater, 8, 1),
+            (ProtocolOperation::Bury, 8, 1),
+            (ProtocolOperation::ReapExpiredToReady, 8, 1),
+            (ProtocolOperation::ReapExpiredToDead, 8, 1),
+            (ProtocolOperation::Quarantine, 8, 1),
+        ];
+        for (operation, generation, attempt) in cases {
+            let next = next_common_fields(operation, &source).unwrap();
+            assert_eq!(next.job_id, source.job_id);
+            assert_eq!(next.generation, generation, "{operation:?}");
+            assert_eq!(next.attempt, attempt, "{operation:?}");
+            assert_eq!(next.maximum_attempts, source.maximum_attempts);
+        }
+        let maxed = steadq_names::CommonFields {
+            generation: u64::MAX,
+            ..source
+        };
+        assert_eq!(
+            next_common_fields(ProtocolOperation::Claim, &maxed),
+            Err(IdentityChangeError::Overflow)
+        );
     }
 
     #[test]

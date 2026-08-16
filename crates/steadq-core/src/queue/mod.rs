@@ -30,7 +30,7 @@ use steadq_math::{self, bucket_number, ceiling_bucket, eligibility_bucket_and_ns
 use steadq_names::{self, bucket_hex, compute_shard, shard_hex, temp_filename, CommonFields};
 
 use crate::errors::*;
-use crate::state_machine::ObjectKind;
+use crate::state_machine::{ObjectKind, Operation as ProtocolOperation};
 
 pub struct Queue {
     pub(crate) root_fd: OwnedFd,
@@ -191,6 +191,27 @@ fn ticket_phase_for_move_outcome_unknown(phase: engine::MovePhase) -> Transition
 
 fn identity_matches(device: u64, inode: u64, expected_device: u64, expected_inode: u64) -> bool {
     device == expected_device && inode == expected_inode
+}
+
+fn lease_common(lease: &LeaseInfo) -> CommonFields {
+    CommonFields {
+        job_id: lease.job_id,
+        generation: lease.generation,
+        attempt: lease.attempt,
+        maximum_attempts: lease.maximum_attempts,
+    }
+}
+
+fn next_identity(
+    operation: ProtocolOperation,
+    source: &CommonFields,
+) -> Result<CommonFields, Error> {
+    next_common_fields(operation, source).map_err(|error| match error {
+        IdentityChangeError::Overflow => Error::StateExhausted,
+        IdentityChangeError::Indeterminate => {
+            Error::InvalidInput("operation has an indeterminate generation change".into())
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -797,11 +818,21 @@ impl Queue {
             }
             _ => (InitialState::Ready, 0),
         };
-        let common = CommonFields {
+        let origin = CommonFields {
             job_id,
             generation: 0,
             attempt: 0,
             maximum_attempts: job.maximum_attempts,
+        };
+        let enqueue_op = match initial_state {
+            InitialState::Ready => ProtocolOperation::EnqueueImmediate,
+            InitialState::Delayed => ProtocolOperation::EnqueueDelayed,
+        };
+        let common = match next_identity(enqueue_op, &origin) {
+            Ok(common) => common,
+            Err(error) => {
+                return Err((EnqueueTicket::uncommitted(job_id), error));
+            }
         };
         let (dest_dir_relative, filename, expected_path) = match initial_state {
             InitialState::Ready => {
@@ -1319,11 +1350,21 @@ impl Queue {
             _ => (InitialState::Ready, 0),
         };
 
-        let common = CommonFields {
+        let origin = CommonFields {
             job_id,
             generation: 0,
             attempt: 0,
             maximum_attempts,
+        };
+        let enqueue_op = match expected_initial_state {
+            InitialState::Ready => ProtocolOperation::EnqueueImmediate,
+            InitialState::Delayed => ProtocolOperation::EnqueueDelayed,
+        };
+        let common = match next_identity(enqueue_op, &origin) {
+            Ok(common) => common,
+            Err(error) => {
+                return EnqueueOutcome::NotCommitted(EnqueueTicket::uncommitted(job_id), error)
+            }
         };
         let (dest_dir_relative, filename, expected_path) = match expected_initial_state {
             InitialState::Ready => {
@@ -1355,15 +1396,33 @@ impl Queue {
             }
         };
 
-        let result = self.stream_and_publish(
-            &dest_dir_relative,
-            &filename,
-            job_id,
-            maximum_attempts,
-            created_at,
-            &ext_bytes,
-            &mut reader,
-        );
+        let result = if self.deferred_dir_sync {
+            let mut tmp = self.dirty.replace(engine::DirtySet::new());
+            let result = self.stream_and_publish(
+                &dest_dir_relative,
+                &filename,
+                job_id,
+                maximum_attempts,
+                created_at,
+                &ext_bytes,
+                &mut reader,
+                Some(&mut tmp),
+            );
+            let prev = self.dirty.replace(tmp);
+            drop(prev);
+            result
+        } else {
+            self.stream_and_publish(
+                &dest_dir_relative,
+                &filename,
+                job_id,
+                maximum_attempts,
+                created_at,
+                &ext_bytes,
+                &mut reader,
+                None,
+            )
+        };
 
         let env_dig = match &result {
             Ok(d) => *d,
@@ -1432,9 +1491,15 @@ impl Queue {
         created_at: u64,
         ext_bytes: &[u8],
         reader: &mut dyn std::io::Read,
+        mut dirty: Option<&mut engine::DirtySet>,
     ) -> Result<[u8; 32], PublishError> {
-        self.ensure_dir(dest_dir_relative)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        if let Some(d) = dirty.as_deref_mut() {
+            self.ensure_dir_with_dirty(dest_dir_relative, Some(d))
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        } else {
+            self.ensure_dir(dest_dir_relative)
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        }
         let dest_fd = open_relative(self.root_fd.as_fd(), dest_dir_relative)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
 
@@ -1448,6 +1513,7 @@ impl Queue {
                 created_at,
                 ext_bytes,
                 reader,
+                dirty,
             );
         }
 
@@ -1488,19 +1554,42 @@ impl Queue {
                 fs::pwrite_all(tmp_fd.as_fd(), &header_bytes, 0)
                     .map_err(PublishError::classify_write)?;
 
-                match engine::publish_tmpfile_noreplace_with_mode(
-                    tmp_fd.as_fd(),
-                    dest_fd.as_fd(),
-                    dest_name,
-                    self.publication_mode,
-                ) {
+                let publish_outcome = if dirty.is_some() {
+                    engine::publish_tmpfile_noreplace_deferred_with_mode(
+                        tmp_fd.as_fd(),
+                        dest_fd.as_fd(),
+                        dest_name,
+                        self.publication_mode,
+                    )
+                } else {
+                    engine::publish_tmpfile_noreplace_with_mode(
+                        tmp_fd.as_fd(),
+                        dest_fd.as_fd(),
+                        dest_name,
+                        self.publication_mode,
+                    )
+                };
+                match publish_outcome {
                     Ok(engine::TmpfilePublishOutcome::Published(mode)) => {
                         self.publication_mode = Some(mode);
+                        if let Some(d) = dirty {
+                            d.record(dest_fd.as_fd()).map_err(|e| {
+                                PublishError::OutcomeUnknownPublished {
+                                    envelope_digest: env_dig,
+                                    error: Error::IoFailure(e.to_string()),
+                                }
+                            })?;
+                        } else {
+                            fs::fsync_dir_fd(dest_fd.as_fd()).map_err(|e| {
+                                PublishError::OutcomeUnknownPublished {
+                                    envelope_digest: env_dig,
+                                    error: Error::IoFailure(e.to_string()),
+                                }
+                            })?;
+                        }
                     }
                     Ok(engine::TmpfilePublishOutcome::Unsupported) => {
                         self.publication_mode = Some(fs::PublicationMode::NamedFallback);
-                        // O_TMPFILE not supported: need named fallback.
-                        // Read back from the tmpfile and use the standard path.
                         return self.named_fallback_streaming(
                             dest_dir_relative,
                             dest_fd.as_fd(),
@@ -1509,6 +1598,7 @@ impl Queue {
                             ext_bytes,
                             tmp_fd.as_fd(),
                             payload_len,
+                            dirty,
                         );
                     }
                     Err(failure) => {
@@ -1517,18 +1607,11 @@ impl Queue {
                         )
                     }
                 }
-                fs::fsync_dir_fd(dest_fd.as_fd()).map_err(|e| {
-                    PublishError::OutcomeUnknownPublished {
-                        envelope_digest: env_dig,
-                        error: Error::IoFailure(e.to_string()),
-                    }
-                })?;
                 Ok(env_dig)
             }
             Err(e) => {
                 if engine::is_tmpfile_open_unsupported(&e) {
                     self.publication_mode = Some(fs::PublicationMode::NamedFallback);
-                    // O_TMPFILE not supported: stream to a named temp file instead.
                     self.named_fallback_streaming_init(
                         dest_dir_relative,
                         dest_fd.as_fd(),
@@ -1538,6 +1621,7 @@ impl Queue {
                         created_at,
                         ext_bytes,
                         reader,
+                        dirty,
                     )
                 } else {
                     Err(PublishError::classify_write(e))
@@ -1589,14 +1673,20 @@ impl Queue {
         ext_bytes: &[u8],
         tmpfile_fd: BorrowedFd<'_>,
         payload_len: u64,
+        mut dirty: Option<&mut engine::DirtySet>,
     ) -> Result<[u8; 32], PublishError> {
         // The tmpfile already has the full content (placeholder header + ext + payload).
         // We need a named temp file that we can publish via rename.
         let tmp_dir = format!("tmp/{}", self.boot_id);
         let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
         let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
-        self.ensure_dir(&tmp_shard_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        if let Some(d) = dirty.as_deref_mut() {
+            self.ensure_dir_with_dirty(&tmp_shard_dir, Some(d))
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        } else {
+            self.ensure_dir(&tmp_shard_dir)
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        }
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
         let boottime = fs::clock_boottime_ns()
@@ -1633,24 +1723,15 @@ impl Queue {
         fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
         let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
-        match engine::move_witnessed_noreplace_io(
+        self.finish_named_stream_publish(
             tmp_dir_fd.as_fd(),
-            &temp_name,
             dest_fd,
+            &temp_name,
             dest_name,
             engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
-            engine::MoveActor::Producer,
-        ) {
-            Ok(()) => {}
-            Err(failure) => {
-                if failure.is_outcome_unknown() {
-                    let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
-                }
-                return Err(PublishError::classify_move(failure)
-                    .with_published_digest(header.envelope_digest));
-            }
-        }
-        Ok(header.envelope_digest)
+            header.envelope_digest,
+            dirty,
+        )
     }
 
     /// Named fallback for streaming when O_TMPFILE open fails entirely.
@@ -1665,12 +1746,18 @@ impl Queue {
         created_at: u64,
         ext_bytes: &[u8],
         reader: &mut dyn std::io::Read,
+        mut dirty: Option<&mut engine::DirtySet>,
     ) -> Result<[u8; 32], PublishError> {
         let tmp_dir = format!("tmp/{}", self.boot_id);
         let shard_part = dest_dir_relative.rsplit('/').next().unwrap_or("0000");
         let tmp_shard_dir = format!("{tmp_dir}/{shard_part}");
-        self.ensure_dir(&tmp_shard_dir)
-            .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        if let Some(d) = dirty.as_deref_mut() {
+            self.ensure_dir_with_dirty(&tmp_shard_dir, Some(d))
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        } else {
+            self.ensure_dir(&tmp_shard_dir)
+                .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
+        }
         let tmp_dir_fd = open_relative(self.root_fd.as_fd(), &tmp_shard_dir)
             .map_err(|e| PublishError::NotCommitted(Error::IoFailure(e.to_string())))?;
         let boottime = fs::clock_boottime_ns()
@@ -1718,23 +1805,76 @@ impl Queue {
         fs::fsync(tmp_file.as_fd()).map_err(PublishError::classify_pre_pub_fsync)?;
 
         let temp_stat = fs::fstat(tmp_file.as_fd()).map_err(PublishError::classify_write)?;
-        match engine::move_witnessed_noreplace_io(
+        self.finish_named_stream_publish(
             tmp_dir_fd.as_fd(),
-            &temp_name,
             dest_fd,
+            &temp_name,
             dest_name,
             engine::MoveIdentity::new(temp_stat.st_dev, temp_stat.st_ino),
-            engine::MoveActor::Producer,
-        ) {
-            Ok(()) => {}
-            Err(failure) => {
-                if failure.is_outcome_unknown() {
-                    let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
+            env_dig,
+            dirty,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_named_stream_publish(
+        &self,
+        tmp_dir_fd: BorrowedFd<'_>,
+        dest_fd: BorrowedFd<'_>,
+        temp_name: &str,
+        dest_name: &str,
+        identity: engine::MoveIdentity,
+        envelope_digest: [u8; 32],
+        dirty: Option<&mut engine::DirtySet>,
+    ) -> Result<[u8; 32], PublishError> {
+        if let Some(d) = dirty {
+            match engine::move_witnessed_noreplace_deferred(
+                tmp_dir_fd,
+                temp_name,
+                dest_fd,
+                dest_name,
+                identity,
+                |_moved| Ok(()),
+            ) {
+                Ok(_) => {
+                    d.record(tmp_dir_fd)
+                        .map_err(|e| PublishError::OutcomeUnknownPublished {
+                            envelope_digest,
+                            error: Error::IoFailure(e.to_string()),
+                        })?;
+                    d.record(dest_fd)
+                        .map_err(|e| PublishError::OutcomeUnknownPublished {
+                            envelope_digest,
+                            error: Error::IoFailure(e.to_string()),
+                        })?;
+                    Ok(envelope_digest)
                 }
-                return Err(PublishError::classify_move(failure).with_published_digest(env_dig));
+                Err(failure) => {
+                    if failure.is_outcome_unknown() {
+                        let _ = fs::unlinkat(tmp_dir_fd, temp_name);
+                    }
+                    Err(PublishError::from_move_failure(failure)
+                        .with_published_digest(envelope_digest))
+                }
+            }
+        } else {
+            match engine::move_witnessed_noreplace_io(
+                tmp_dir_fd,
+                temp_name,
+                dest_fd,
+                dest_name,
+                identity,
+                engine::MoveActor::Producer,
+            ) {
+                Ok(()) => Ok(envelope_digest),
+                Err(failure) => {
+                    if failure.is_outcome_unknown() {
+                        let _ = fs::unlinkat(tmp_dir_fd, temp_name);
+                    }
+                    Err(PublishError::classify_move(failure).with_published_digest(envelope_digest))
+                }
             }
         }
-        Ok(env_dig)
     }
 
     /// Claim a ready job, returning a lease. Empty scans and transient watermark
@@ -1914,23 +2054,12 @@ impl Queue {
                     None => continue,
                 };
 
-                // Checked generation increment: a source at u64::MAX cannot transition.
-                let new_generation = match parsed.common.generation.checked_add(1) {
-                    Some(g) => g,
-                    None => continue,
+                let leased_common = match next_identity(ProtocolOperation::Claim, &parsed.common) {
+                    Ok(common) => common,
+                    Err(_) => continue,
                 };
-                // Checked attempt increment.
-                let new_attempt = match parsed.common.attempt.checked_add(1) {
-                    Some(a) => a,
-                    None => continue,
-                };
-
-                let leased_common = CommonFields {
-                    job_id: parsed.common.job_id,
-                    generation: new_generation,
-                    attempt: new_attempt,
-                    maximum_attempts: parsed.common.maximum_attempts,
-                };
+                let new_generation = leased_common.generation;
+                let new_attempt = leased_common.attempt;
 
                 let lease_target = match self.layout().leased_for_boot(
                     &leased_common,
@@ -2281,16 +2410,11 @@ impl Queue {
             Ok(floor) => floor,
             Err(e) => return AckOutcome::NotCommitted(e),
         };
-        let new_generation = match lease.generation.checked_add(1) {
-            Some(g) => g,
-            None => return AckOutcome::NotCommitted(Error::StateExhausted),
-        };
-        let receipt_common = CommonFields {
-            job_id: lease.job_id,
-            generation: new_generation,
-            attempt: lease.attempt,
-            maximum_attempts: lease.maximum_attempts,
-        };
+        let receipt_common =
+            match next_identity(ProtocolOperation::Acknowledge, &lease_common(lease)) {
+                Ok(common) => common,
+                Err(error) => return AckOutcome::NotCommitted(error),
+            };
 
         let terminal_bucket =
             match bucket_number(wall_floor.unix_ns(), self.format.terminal_bucket_width_ns()) {
@@ -2522,19 +2646,13 @@ impl Queue {
             };
         }
 
-        let new_gen = match lease.generation.checked_add(1) {
-            Some(g) => g,
-            None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
-        };
-
         let (dest_dir, dest_name, operation, destination) = match delayed_ns {
             Some(nb) => {
-                let common = CommonFields {
-                    job_id: lease.job_id,
-                    generation: new_gen,
-                    attempt: lease.attempt,
-                    maximum_attempts: lease.maximum_attempts,
-                };
+                let common =
+                    match next_identity(ProtocolOperation::RetryLater, &lease_common(lease)) {
+                        Ok(common) => common,
+                        Err(error) => return TransitionOutcome::NotCommitted(error),
+                    };
                 let target = match self.layout().delayed(&common, nb) {
                     Ok(target) => target,
                     Err(error) => return TransitionOutcome::NotCommitted(error),
@@ -2547,11 +2665,10 @@ impl Queue {
                 )
             }
             None => {
-                let common = CommonFields {
-                    job_id: lease.job_id,
-                    generation: new_gen,
-                    attempt: lease.attempt,
-                    maximum_attempts: lease.maximum_attempts,
+                let common = match next_identity(ProtocolOperation::RetryNow, &lease_common(lease))
+                {
+                    Ok(common) => common,
+                    Err(error) => return TransitionOutcome::NotCommitted(error),
                 };
                 let target = self.layout().ready(&common);
                 (
@@ -2592,16 +2709,9 @@ impl Queue {
         reason: DeadReason,
         wall_floor: WallFloor,
     ) -> TransitionOutcome {
-        let new_gen = match lease.generation.checked_add(1) {
-            Some(g) => g,
-            None => return TransitionOutcome::NotCommitted(Error::StateExhausted),
-        };
-
-        let common = CommonFields {
-            job_id: lease.job_id,
-            generation: new_gen,
-            attempt: lease.attempt,
-            maximum_attempts: lease.maximum_attempts,
+        let common = match next_identity(ProtocolOperation::Bury, &lease_common(lease)) {
+            Ok(common) => common,
+            Err(error) => return TransitionOutcome::NotCommitted(error),
         };
 
         let terminal_bucket =
@@ -2661,17 +2771,11 @@ impl Queue {
                 return RenewOutcome::NotCommitted(Error::InvalidInput("deadline overflow".into()))
             }
         };
-        let new_gen = match lease.generation.checked_add(1) {
-            Some(g) => g,
-            None => return RenewOutcome::NotCommitted(Error::StateExhausted),
+        let common = match next_identity(ProtocolOperation::Renew, &lease_common(lease)) {
+            Ok(common) => common,
+            Err(error) => return RenewOutcome::NotCommitted(error),
         };
-
-        let common = CommonFields {
-            job_id: lease.job_id,
-            generation: new_gen,
-            attempt: lease.attempt,
-            maximum_attempts: lease.maximum_attempts,
-        };
+        let new_gen = common.generation;
 
         let target = match self
             .layout()
@@ -3216,16 +3320,7 @@ impl Queue {
             None => return Err(Error::StateExhausted),
         };
 
-        let new_gen = common
-            .generation
-            .checked_add(1)
-            .ok_or(Error::StateExhausted)?;
-        let dead_common = CommonFields {
-            job_id: common.job_id,
-            generation: new_gen,
-            attempt: common.attempt,
-            maximum_attempts: common.maximum_attempts,
-        };
+        let dead_common = next_identity(ProtocolOperation::ExhaustedReadyCleanup, common)?;
 
         let target = self
             .layout()
@@ -3969,17 +4064,11 @@ impl Queue {
     /// and checks them via fstatat, not by listing receipt contents.
     /// P0-04: Authenticate a receipt at a specific path.
     fn receipt_is_authentic(&self, lease: &LeaseInfo, dir: &str, name: &str) -> bool {
-        let new_generation = match lease.generation.checked_add(1) {
-            Some(generation) => generation,
-            None => return false,
+        let Ok(common) = next_identity(ProtocolOperation::Acknowledge, &lease_common(lease)) else {
+            return false;
         };
         let expected = verified::ExpectedReceipt {
-            common: CommonFields {
-                job_id: lease.job_id,
-                generation: new_generation,
-                attempt: lease.attempt,
-                maximum_attempts: lease.maximum_attempts,
-            },
+            common,
             token: lease.token,
             envelope_digest: lease.envelope_digest,
             payload_length: lease.payload_length,
@@ -4032,15 +4121,10 @@ impl Queue {
             self.format.shard_count(),
         );
         let shard_str = shard_hex(shard);
-        let new_generation = match lease.generation.checked_add(1) {
-            Some(generation) => generation,
-            None => return false,
-        };
-        let receipt_common = CommonFields {
-            job_id: lease.job_id,
-            generation: new_generation,
-            attempt: lease.attempt,
-            maximum_attempts: lease.maximum_attempts,
+        let Ok(receipt_common) =
+            next_identity(ProtocolOperation::Acknowledge, &lease_common(lease))
+        else {
+            return false;
         };
         let expected = verified::ExpectedReceipt {
             common: receipt_common.clone(),
@@ -4167,6 +4251,23 @@ impl PublishError {
                 PublishError::OutcomeUnknown(Error::IoFailure(format!(
                     "temporary-file publication failed at {phase:?}: {source}"
                 )))
+            }
+        }
+    }
+
+    fn from_move_failure(failure: engine::MoveFailure) -> Self {
+        match failure {
+            engine::MoveFailure::AlreadyExists => {
+                PublishError::NotCommitted(Error::IdentityCollision)
+            }
+            engine::MoveFailure::SourceMissing => PublishError::NotCommitted(Error::IoFailure(
+                "temporary publication source missing".into(),
+            )),
+            engine::MoveFailure::NotCommitted { source, .. } => {
+                PublishError::NotCommitted(Error::IoFailure(source.to_string()))
+            }
+            engine::MoveFailure::OutcomeUnknown { source, .. } => {
+                PublishError::OutcomeUnknown(Error::IoFailure(source.to_string()))
             }
         }
     }

@@ -573,20 +573,12 @@ impl Queue {
             .leased_shard_dir(boot_dir, leased_bucket, shard_num);
         let dest_dir = self.layout().ready_shard_dir(shard_num);
 
-        let new_gen =
-            common
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| MoveFailure::NotCommitted {
+        let ready_common =
+            crate::next_common_fields(crate::state_machine::Operation::ReapExpiredToReady, common)
+                .map_err(|_| MoveFailure::NotCommitted {
                     phase: MovePhase::PreRename,
-                    source: std::io::Error::other("generation overflow"),
+                    source: std::io::Error::other("generation or attempt overflow"),
                 })?;
-        let ready_common = steadq_names::CommonFields {
-            job_id: common.job_id,
-            generation: new_gen,
-            attempt: common.attempt,
-            maximum_attempts: common.maximum_attempts,
-        };
 
         let ready_target = self.layout().ready(&ready_common);
         let ready_name = ready_target.filename;
@@ -649,20 +641,12 @@ impl Queue {
             source: std::io::Error::other("terminal bucket overflow"),
         })?;
 
-        let new_gen =
-            common
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| MoveFailure::NotCommitted {
-                    phase: MovePhase::PreRename,
-                    source: std::io::Error::other("generation overflow"),
-                })?;
-        let dead_common = steadq_names::CommonFields {
-            job_id: common.job_id,
-            generation: new_gen,
-            attempt: common.attempt,
-            maximum_attempts: common.maximum_attempts,
-        };
+        let dead_common =
+            crate::next_common_fields(crate::state_machine::Operation::ReapExpiredToDead, common)
+                .map_err(|_| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: std::io::Error::other("generation or attempt overflow"),
+            })?;
 
         let dead_target =
             self.layout()
@@ -1033,20 +1017,13 @@ impl Queue {
         delayed_name: &str,
         common: &steadq_names::CommonFields,
     ) -> Result<(), MoveFailure> {
-        let new_gen =
-            common
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| MoveFailure::NotCommitted {
+        let ready_common =
+            crate::next_common_fields(crate::state_machine::Operation::Promote, common).map_err(
+                |_| MoveFailure::NotCommitted {
                     phase: MovePhase::PreRename,
-                    source: std::io::Error::other("generation overflow"),
-                })?;
-        let ready_common = steadq_names::CommonFields {
-            job_id: common.job_id,
-            generation: new_gen,
-            attempt: common.attempt,
-            maximum_attempts: common.maximum_attempts,
-        };
+                    source: std::io::Error::other("generation or attempt overflow"),
+                },
+            )?;
         let ready_name =
             steadq_names::make_ready_name(self.format.queue_id(), shard, &ready_common);
         let src_dir = format!("delayed/{bucket}/{shard}");
