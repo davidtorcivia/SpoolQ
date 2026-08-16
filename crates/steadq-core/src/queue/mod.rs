@@ -34,7 +34,6 @@ use crate::state_machine::ObjectKind;
 
 pub struct Queue {
     pub(crate) root_fd: OwnedFd,
-    #[allow(dead_code)]
     pub(crate) root_path: PathBuf,
     pub(crate) format: FormatRecord,
     pub(crate) boot_id: String,
@@ -216,16 +215,7 @@ fn classify_filesystem_type(
 ) -> Result<Option<i64>, Error> {
     match observation {
         Ok(filesystem_type)
-            if allow_unsupported
-                || matches!(
-                    filesystem_type,
-                    fs::EXT4_SUPER_MAGIC
-                        | fs::XFS_SUPER_MAGIC
-                        | fs::BTRFS_SUPER_MAGIC
-                        | fs::F2FS_SUPER_MAGIC
-                        | fs::F2FS_STATFS_MAGIC_ALT
-                        | fs::ZFS_SUPER_MAGIC
-                ) =>
+            if allow_unsupported || fs::supported_filesystem_name(filesystem_type).is_some() =>
         {
             Ok(Some(filesystem_type))
         }
@@ -269,21 +259,13 @@ impl Queue {
         };
         let magic = fs::statfs(check_path).map_err(|e| io::Error::other(format!("statfs: {e}")))?;
         let ft = magic.f_type as i64;
-        match ft {
-            fs::EXT4_SUPER_MAGIC
-            | fs::XFS_SUPER_MAGIC
-            | fs::BTRFS_SUPER_MAGIC
-            | fs::F2FS_SUPER_MAGIC
-            | fs::F2FS_STATFS_MAGIC_ALT
-            | fs::ZFS_SUPER_MAGIC => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "filesystem type not supported for queue (observed magic {ft:#x}; requires ext4, xfs, btrfs, f2fs, or zfs)"
-                    ),
-                ));
-            }
+        if fs::supported_filesystem_name(ft).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "filesystem type not supported for queue (observed magic {ft:#x}; requires ext4, xfs, btrfs, f2fs, or zfs)"
+                ),
+            ));
         }
 
         // Create root directory if needed
@@ -681,7 +663,6 @@ impl Queue {
         self.poisoned = true;
     }
 
-    #[allow(dead_code)]
     pub(crate) fn layout(&self) -> layout::Layout<'_> {
         layout::Layout::new(
             self.format.queue_id(),
@@ -724,48 +705,27 @@ impl Queue {
         job: EnqueueInput,
     ) -> Result<PreparedEnqueue, (EnqueueTicket, Error)> {
         if let Err(e) = self.check_not_poisoned() {
-            let ticket = EnqueueTicket {
-                job_id: [0; 16],
-                envelope_digest: [0; 32],
-                expected_initial_state: InitialState::Ready,
-                expected_relative_path: String::new(),
-            };
-            return Err((ticket, e));
+            return Err((EnqueueTicket::uncommitted([0; 16]), e));
         }
         let job_id = match fs::random_128bit() {
             Ok(id) => id,
             Err(e) => {
-                let ticket = EnqueueTicket {
-                    job_id: [0; 16],
-                    envelope_digest: [0; 32],
-                    expected_initial_state: InitialState::Ready,
-                    expected_relative_path: String::new(),
-                };
-                return Err((ticket, Error::IoFailure(e.to_string())));
+                return Err((
+                    EnqueueTicket::uncommitted([0; 16]),
+                    Error::IoFailure(e.to_string()),
+                ));
             }
         };
         let wall_floor = match self.wall_floor_for_mutation() {
             Ok(floor) => floor,
             Err(error) => {
-                let ticket = EnqueueTicket {
-                    job_id,
-                    envelope_digest: [0; 32],
-                    expected_initial_state: InitialState::Ready,
-                    expected_relative_path: String::new(),
-                };
-                return Err((ticket, error));
+                return Err((EnqueueTicket::uncommitted(job_id), error));
             }
         };
         let created_at = wall_floor.unix_ns();
         if job.maximum_attempts == 0 {
-            let ticket = EnqueueTicket {
-                job_id,
-                envelope_digest: [0; 32],
-                expected_initial_state: InitialState::Ready,
-                expected_relative_path: String::new(),
-            };
             return Err((
-                ticket,
+                EnqueueTicket::uncommitted(job_id),
                 Error::InvalidInput("maximum_attempts must be >= 1".into()),
             ));
         }
@@ -779,23 +739,17 @@ impl Queue {
         let ext_bytes = match ext.encode() {
             Ok(b) => b,
             Err(e) => {
-                let ticket = EnqueueTicket {
-                    job_id,
-                    envelope_digest: [0; 32],
-                    expected_initial_state: InitialState::Ready,
-                    expected_relative_path: String::new(),
-                };
-                return Err((ticket, Error::InvalidInput(e.to_string())));
+                return Err((
+                    EnqueueTicket::uncommitted(job_id),
+                    Error::InvalidInput(e.to_string()),
+                ));
             }
         };
         if job.payload.len() as u64 > self.format.max_payload_length().min(MAX_PAYLOAD_LENGTH) {
-            let ticket = EnqueueTicket {
-                job_id,
-                envelope_digest: [0; 32],
-                expected_initial_state: InitialState::Ready,
-                expected_relative_path: String::new(),
-            };
-            return Err((ticket, Error::InvalidInput("payload exceeds limit".into())));
+            return Err((
+                EnqueueTicket::uncommitted(job_id),
+                Error::InvalidInput("payload exceeds limit".into()),
+            ));
         }
         let pdig = payload_digest(&job.payload);
         let mut header = FixedHeader {
@@ -813,14 +767,8 @@ impl Queue {
         let env_dig = match envelope_digest(&header, &ext_bytes) {
             Some(d) => d,
             None => {
-                let ticket = EnqueueTicket {
-                    job_id,
-                    envelope_digest: [0; 32],
-                    expected_initial_state: InitialState::Ready,
-                    expected_relative_path: String::new(),
-                };
                 return Err((
-                    ticket,
+                    EnqueueTicket::uncommitted(job_id),
                     Error::InvalidInput("extension length mismatch".into()),
                 ));
             }
@@ -955,6 +903,15 @@ impl Queue {
             Err(PublishError::OutcomeUnknown(e)) => {
                 self.poison();
                 EnqueueOutcome::OutcomeUnknown(prepared.ticket, e)
+            }
+            Err(PublishError::OutcomeUnknownPublished {
+                envelope_digest,
+                error,
+            }) => {
+                self.poison();
+                let mut ticket = prepared.ticket;
+                ticket.envelope_digest = envelope_digest;
+                EnqueueOutcome::OutcomeUnknown(ticket, error)
             }
         }
     }
@@ -1310,25 +1267,12 @@ impl Queue {
         mut reader: impl std::io::Read,
     ) -> EnqueueOutcome {
         if let Err(e) = self.check_not_poisoned() {
-            return EnqueueOutcome::NotCommitted(
-                EnqueueTicket {
-                    job_id: [0; 16],
-                    envelope_digest: [0; 32],
-                    expected_initial_state: InitialState::Ready,
-                    expected_relative_path: String::new(),
-                },
-                e,
-            );
+            return EnqueueOutcome::NotCommitted(EnqueueTicket::uncommitted([0; 16]), e);
         }
 
         if maximum_attempts == 0 {
             return EnqueueOutcome::NotCommitted(
-                EnqueueTicket {
-                    job_id: [0; 16],
-                    envelope_digest: [0; 32],
-                    expected_initial_state: InitialState::Ready,
-                    expected_relative_path: String::new(),
-                },
+                EnqueueTicket::uncommitted([0; 16]),
                 Error::InvalidInput("maximum_attempts must be >= 1".into()),
             );
         }
@@ -1336,19 +1280,19 @@ impl Queue {
         let wall_floor = match self.wall_floor_for_mutation() {
             Ok(floor) => floor,
             Err(error) => {
-                return EnqueueOutcome::NotCommitted(
-                    EnqueueTicket {
-                        job_id: [0; 16],
-                        envelope_digest: [0; 32],
-                        expected_initial_state: InitialState::Ready,
-                        expected_relative_path: String::new(),
-                    },
-                    error,
-                )
+                return EnqueueOutcome::NotCommitted(EnqueueTicket::uncommitted([0; 16]), error)
             }
         };
         let created_at = wall_floor.unix_ns();
-        let job_id = fs::random_128bit().unwrap_or([0; 16]);
+        let job_id = match fs::random_128bit() {
+            Ok(id) => id,
+            Err(e) => {
+                return EnqueueOutcome::NotCommitted(
+                    EnqueueTicket::uncommitted([0; 16]),
+                    Error::IoFailure(e.to_string()),
+                )
+            }
+        };
 
         let ext = ExtensionHeader {
             initial_not_before_unix_ns: initial_not_before,
@@ -1361,12 +1305,7 @@ impl Queue {
             Ok(b) => b,
             Err(e) => {
                 return EnqueueOutcome::NotCommitted(
-                    EnqueueTicket {
-                        job_id,
-                        envelope_digest: [0; 32],
-                        expected_initial_state: InitialState::Ready,
-                        expected_relative_path: String::new(),
-                    },
+                    EnqueueTicket::uncommitted(job_id),
                     Error::InvalidInput(e.to_string()),
                 )
             }
@@ -1398,27 +1337,14 @@ impl Queue {
             InitialState::Delayed => {
                 let Some(not_before_ns) = initial_not_before else {
                     return EnqueueOutcome::NotCommitted(
-                        EnqueueTicket {
-                            job_id,
-                            envelope_digest: [0; 32],
-                            expected_initial_state: InitialState::Ready,
-                            expected_relative_path: String::new(),
-                        },
+                        EnqueueTicket::uncommitted(job_id),
                         Error::QueueCorrupt("delayed enqueue lost its deadline".into()),
                     );
                 };
                 let target = match self.layout().delayed(&common, not_before_ns) {
                     Ok(t) => t,
                     Err(e) => {
-                        return EnqueueOutcome::NotCommitted(
-                            EnqueueTicket {
-                                job_id,
-                                envelope_digest: [0; 32],
-                                expected_initial_state: InitialState::Ready,
-                                expected_relative_path: String::new(),
-                            },
-                            e,
-                        )
+                        return EnqueueOutcome::NotCommitted(EnqueueTicket::uncommitted(job_id), e)
                     }
                 };
                 {
@@ -1462,6 +1388,21 @@ impl Queue {
                         expected_relative_path: expected_path,
                     },
                     e.clone(),
+                );
+            }
+            Err(PublishError::OutcomeUnknownPublished {
+                envelope_digest,
+                error,
+            }) => {
+                self.poison();
+                return EnqueueOutcome::OutcomeUnknown(
+                    EnqueueTicket {
+                        job_id,
+                        envelope_digest: *envelope_digest,
+                        expected_initial_state,
+                        expected_relative_path: expected_path,
+                    },
+                    error.clone(),
                 );
             }
         };
@@ -1570,10 +1511,18 @@ impl Queue {
                             payload_len,
                         );
                     }
-                    Err(failure) => return Err(PublishError::classify_tmpfile(failure)),
+                    Err(failure) => {
+                        return Err(
+                            PublishError::classify_tmpfile(failure).with_published_digest(env_dig)
+                        )
+                    }
                 }
-                fs::fsync_dir_fd(dest_fd.as_fd())
-                    .map_err(|e| PublishError::OutcomeUnknown(Error::IoFailure(e.to_string())))?;
+                fs::fsync_dir_fd(dest_fd.as_fd()).map_err(|e| {
+                    PublishError::OutcomeUnknownPublished {
+                        envelope_digest: env_dig,
+                        error: Error::IoFailure(e.to_string()),
+                    }
+                })?;
                 Ok(env_dig)
             }
             Err(e) => {
@@ -1697,7 +1646,8 @@ impl Queue {
                 if failure.is_outcome_unknown() {
                     let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
                 }
-                return Err(PublishError::classify_move(failure));
+                return Err(PublishError::classify_move(failure)
+                    .with_published_digest(header.envelope_digest));
             }
         }
         Ok(header.envelope_digest)
@@ -1781,7 +1731,7 @@ impl Queue {
                 if failure.is_outcome_unknown() {
                     let _ = fs::unlinkat(tmp_dir_fd.as_fd(), &temp_name);
                 }
-                return Err(PublishError::classify_move(failure));
+                return Err(PublishError::classify_move(failure).with_published_digest(env_dig));
             }
         }
         Ok(env_dig)
@@ -1838,9 +1788,6 @@ impl Queue {
                 "lease duration must be 1s to 7d".into(),
             ));
         }
-
-        // C-16: Clocks are re-captured inside the scan loop before each claim
-        let _boottime_now = fs::clock_boottime_ns().ok();
 
         // C-19: Track scan completeness to distinguish Empty from I/O error
         let mut scan_had_error = false;
@@ -1931,10 +1878,9 @@ impl Queue {
                         operation_wall_floor,
                     ) {
                         Ok(()) => continue,
-                        Err(_) => {
-                            scan_had_error = true;
+                        Err(error) => {
                             self.poison();
-                            continue;
+                            return LeaseOutcome::NotCommitted(error);
                         }
                     }
                 }
@@ -2089,10 +2035,19 @@ impl Queue {
                             Ok(())
                         },
                     );
-                    // Record both source and destination directories for durability.
-                    if let Some(d) = _dirty.as_deref_mut() {
-                        let _ = d.record(shard_fd.as_fd());
-                        let _ = d.record(leased_dir_fd.as_fd());
+                    if result.is_ok() {
+                        if let Some(d) = _dirty.as_deref_mut() {
+                            if d.record(shard_fd.as_fd())
+                                .and_then(|()| d.record(leased_dir_fd.as_fd()))
+                                .is_err()
+                            {
+                                self.poison();
+                                return LeaseOutcome::OutcomeUnknown(
+                                    claim_ticket
+                                        .with_phase(TransitionPhase::DestinationDirectoryDurable),
+                                );
+                            }
+                        }
                     }
                     result
                 } else {
@@ -2158,83 +2113,55 @@ impl Queue {
 
                         // R4-B05: Full structural validation of the claimed object before return.
                         // Verify envelope digest, exact size, and payload limit.
-                        {
-                            let ext_len_h = header.extension_header_length as usize;
-                            if verified::is_extension_too_large(ext_len_h) {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
-                            let mut ext_buf_claim = vec![0u8; ext_len_h];
-                            if fs::pread_exact(leased_file.as_fd(), &mut ext_buf_claim, 128)
-                                .is_err()
-                            {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
-                            if !steadq_format::verify_envelope_digest(&header, &ext_buf_claim) {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
-                            // Verify exact file size
-                            let expected_claim_size =
-                                (128 + ext_len_h + header.payload_length as usize) as u64;
-                            if leased_object.size() != expected_claim_size {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
-                            // Verify payload limit
-                            if !payload_length_is_valid(
-                                header.payload_length,
-                                self.format.max_payload_length(),
-                            ) {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
-                            // Verify header max_attempts matches filename
-                            if header.maximum_attempts != parsed.common.maximum_attempts {
-                                self.poison();
-                                return LeaseOutcome::OutcomeUnknown(
-                                    claim_ticket
-                                        .with_phase(TransitionPhase::SourceDirectoryDurable),
-                                );
-                            }
+                        let ext_len_h = header.extension_header_length as usize;
+                        if verified::is_extension_too_large(ext_len_h) {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
+                        }
+                        let mut ext_buf_claim = vec![0u8; ext_len_h];
+                        if fs::pread_exact(leased_file.as_fd(), &mut ext_buf_claim, 128).is_err() {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
+                        }
+                        if !steadq_format::verify_envelope_digest(&header, &ext_buf_claim) {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
+                        }
+                        let expected_claim_size =
+                            (128 + ext_len_h + header.payload_length as usize) as u64;
+                        if leased_object.size() != expected_claim_size {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
+                        }
+                        if !payload_length_is_valid(
+                            header.payload_length,
+                            self.format.max_payload_length(),
+                        ) {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
+                        }
+                        if header.maximum_attempts != parsed.common.maximum_attempts {
+                            self.poison();
+                            return LeaseOutcome::OutcomeUnknown(
+                                claim_ticket.with_phase(TransitionPhase::SourceDirectoryDurable),
+                            );
                         }
 
-                        // B2: Extension read/decode failure after claim is a post-linearization
+                        // B2: Extension decode failure after claim is a post-linearization
                         // corruption. Do not return an ordinary lease with empty content_type.
-                        let content_type = if verified::is_extension_present(
-                            header.extension_header_length as usize,
-                        ) {
-                            let mut ext_buf = vec![0u8; header.extension_header_length as usize];
-                            match fs::pread_exact(leased_file.as_fd(), &mut ext_buf, 128) {
-                                Ok(()) => {
-                                    match steadq_format::cbor::ExtensionHeader::decode(&ext_buf) {
-                                        Ok(e) => e.content_type,
-                                        Err(_) => {
-                                            self.poison();
-                                            return LeaseOutcome::OutcomeUnknown(
-                                                claim_ticket.with_phase(
-                                                    TransitionPhase::SourceDirectoryDurable,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
+                        let content_type = if verified::is_extension_present(ext_len_h) {
+                            match steadq_format::cbor::ExtensionHeader::decode(&ext_buf_claim) {
+                                Ok(e) => e.content_type,
                                 Err(_) => {
                                     self.poison();
                                     return LeaseOutcome::OutcomeUnknown(
@@ -2253,23 +2180,26 @@ impl Queue {
                         if let Err(e) = self.verify_payload_on_fd(leased_file.as_fd()) {
                             match e {
                                 Error::PayloadCorrupt => {
-                                    if let Err(failure) = self.quarantine_corrupt_lease(
+                                    match self.quarantine_corrupt_lease(
                                         leased_dir_fd.as_fd(),
                                         &lease_target.filename,
                                         leased_file.as_fd(),
                                     ) {
-                                        if failure.is_outcome_unknown() {
+                                        Ok(()) => {
+                                            return LeaseOutcome::NotCommitted(
+                                                Error::PayloadCorrupt,
+                                            );
+                                        }
+                                        Err(failure) => {
                                             self.poison();
                                             return LeaseOutcome::OutcomeUnknown(
-                                                claim_ticket.with_phase(
-                                                    ticket_phase_for_move_outcome_unknown(
-                                                        failure.phase().unwrap(),
-                                                    ),
-                                                ),
+                                                claim_ticket.with_phase(failure.phase().map_or(
+                                                    TransitionPhase::SourceDirectoryDurable,
+                                                    ticket_phase_for_move_outcome_unknown,
+                                                )),
                                             );
                                         }
                                     }
-                                    return LeaseOutcome::NotCommitted(Error::PayloadCorrupt);
                                 }
                                 _ => {
                                     self.poison();
@@ -2743,10 +2673,13 @@ impl Queue {
             maximum_attempts: lease.maximum_attempts,
         };
 
-        let target = self
+        let target = match self
             .layout()
             .leased(&common, new_boottime_dl, new_wall_dl, &lease.token)
-            .unwrap();
+        {
+            Ok(target) => target,
+            Err(error) => return RenewOutcome::NotCommitted(error),
+        };
         let dest_dir = target.directory();
         let fname = target.filename;
 
@@ -4198,9 +4131,23 @@ pub struct EnqueueInput {
 enum PublishError {
     NotCommitted(Error),
     OutcomeUnknown(Error),
+    OutcomeUnknownPublished {
+        envelope_digest: [u8; 32],
+        error: Error,
+    },
 }
 
 impl PublishError {
+    fn with_published_digest(self, envelope_digest: [u8; 32]) -> Self {
+        match self {
+            PublishError::OutcomeUnknown(error) => PublishError::OutcomeUnknownPublished {
+                envelope_digest,
+                error,
+            },
+            other => other,
+        }
+    }
+
     fn classify_tmpfile(failure: engine::TmpfilePublishFailure) -> Self {
         match failure {
             engine::TmpfilePublishFailure::AlreadyExists => {

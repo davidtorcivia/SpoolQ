@@ -81,11 +81,7 @@ enum Commands {
     /// Stats
     Stats { path: PathBuf },
     /// Doctor: check environment
-    Doctor {
-        path: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
+    Doctor { path: PathBuf },
     /// Acknowledge a lease
     Ack {
         path: PathBuf,
@@ -195,6 +191,19 @@ enum AdminCommands {
 
 fn parse_duration_seconds(s: u64) -> Option<u64> {
     s.checked_mul(1_000_000_000)
+}
+
+fn doctor_filesystem(magic: i64) -> (&'static str, bool) {
+    if let Some(name) = steadq_fs_linux::supported_filesystem_name(magic) {
+        return (name, true);
+    }
+    match magic {
+        steadq_fs_linux::TMPFS_MAGIC => ("tmpfs_not_certified", false),
+        steadq_fs_linux::NFS_SUPER_MAGIC => ("nfs_refused", false),
+        steadq_fs_linux::FUSE_SUPER_MAGIC => ("fuse_refused", false),
+        steadq_fs_linux::OVERLAYFS_SUPER_MAGIC => ("overlay_refused", false),
+        _ => ("unknown_refused", false),
+    }
 }
 
 fn main() -> ExitCode {
@@ -329,7 +338,8 @@ fn main() -> ExitCode {
                         if let Err(e) =
                             save_handle_to_file(&path, queue.format().queue_id(), hf, &lease)
                         {
-                            eprintln!("warning: failed to write handle file: {e}");
+                            eprintln!("failed to write handle file: {e}");
+                            return ExitCode::from(EXIT_IO_FAILURE);
                         }
                     }
                     println!("job_id: {}", steadq_names::hex_encode(&lease.job_id));
@@ -397,7 +407,7 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Doctor { path, json } => {
+        Commands::Doctor { path } => {
             let mut results: Vec<(&str, String, bool)> = Vec::new();
 
             // boot_id
@@ -426,26 +436,7 @@ fn main() -> ExitCode {
                 match steadq_fs_linux::statfs(&path) {
                     Ok(stat) => {
                         let ft = stat.f_type;
-                        // R4-H19: Refused filesystems are not OK
-                        let (fs_name, fs_ok) = if ft == steadq_fs_linux::EXT4_SUPER_MAGIC {
-                            ("ext4", true)
-                        } else if ft == steadq_fs_linux::XFS_SUPER_MAGIC {
-                            ("xfs", true)
-                        } else if ft == steadq_fs_linux::BTRFS_SUPER_MAGIC {
-                            ("btrfs", true)
-                        } else if ft == steadq_fs_linux::F2FS_SUPER_MAGIC {
-                            ("f2fs", true)
-                        } else if ft == steadq_fs_linux::TMPFS_MAGIC {
-                            ("tmpfs_not_certified", false)
-                        } else if ft == steadq_fs_linux::NFS_SUPER_MAGIC {
-                            ("nfs_refused", false)
-                        } else if ft == steadq_fs_linux::FUSE_SUPER_MAGIC {
-                            ("fuse_refused", false)
-                        } else if ft == steadq_fs_linux::OVERLAYFS_SUPER_MAGIC {
-                            ("overlay_refused", false)
-                        } else {
-                            ("unknown_refused", false)
-                        };
+                        let (fs_name, fs_ok) = doctor_filesystem(ft);
                         results.push(("filesystem", format!("{fs_name} (magic {ft:#x})"), fs_ok));
                     }
                     Err(e) => results.push(("filesystem", e.to_string(), false)),
@@ -507,7 +498,7 @@ fn main() -> ExitCode {
                 }
             }
 
-            if json {
+            if cli.json {
                 let map: std::collections::BTreeMap<&str, serde_json::Value> = results
                     .iter()
                     .map(|(k, v, ok)| (*k, serde_json::json!({"value": v, "ok": ok})))
@@ -1085,7 +1076,10 @@ fn main() -> ExitCode {
                 job_id,
                 output,
             } => {
-                let job_id_bytes = steadq_names::hex_decode_16(&job_id).unwrap_or([0; 16]);
+                let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
+                    Some(b) => b,
+                    None => return ExitCode::from(EXIT_ORDINARY),
+                };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
                     Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
@@ -1103,7 +1097,10 @@ fn main() -> ExitCode {
                 }
             }
             AdminCommands::DeadRemove { path, job_id } => {
-                let job_id_bytes = steadq_names::hex_decode_16(&job_id).unwrap_or([0; 16]);
+                let job_id_bytes = match steadq_names::hex_decode_16(&job_id) {
+                    Some(b) => b,
+                    None => return ExitCode::from(EXIT_ORDINARY),
+                };
                 let queue = match Queue::open(&path, &OpenOptions::default()) {
                     Ok(q) => q,
                     Err(_) => return ExitCode::from(EXIT_IO_FAILURE),
@@ -1276,6 +1273,9 @@ struct HandleFile {
     expected_inode: u64,
     exact_source_path: String,
     envelope_digest: String,
+    content_type: String,
+    payload_length: u64,
+    payload_digest: String,
 }
 
 fn write_ticket_file(
@@ -1332,6 +1332,9 @@ fn save_handle_to_file(
         expected_inode: lease.expected_inode,
         exact_source_path: lease.exact_source_path.clone(),
         envelope_digest: steadq_names::hex_encode(&lease.envelope_digest),
+        content_type: lease.content_type.clone(),
+        payload_length: lease.payload_length,
+        payload_digest: steadq_names::hex_encode(&lease.payload_digest),
     };
     let json = serde_json::to_string_pretty(&handle)?;
 
@@ -1380,6 +1383,12 @@ fn load_handle(
                 "bad envelope_digest: expected 64 lowercase hex chars",
             )
         })?;
+    let payload_digest = steadq_names::hex_decode_32(&handle.payload_digest).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad payload_digest: expected 64 lowercase hex chars",
+        )
+    })?;
 
     // P1-21: Verify queue binding. Queue id must be present and must match.
     match handle.queue_id.as_ref() {
@@ -1416,9 +1425,9 @@ fn load_handle(
         boot_id: handle.boot_id,
         expires_boottime_ns: handle.expires_boottime_ns,
         expires_wall_ns: handle.expires_wall_ns,
-        content_type: String::new(),
-        payload_length: 0,
-        payload_digest: [0; 32],
+        content_type: handle.content_type,
+        payload_length: handle.payload_length,
+        payload_digest,
         expected_dev: handle.expected_dev,
         expected_inode: handle.expected_inode,
         exact_source_path: handle.exact_source_path,
@@ -1434,5 +1443,65 @@ mod tests {
     fn os_byte_escaping_preserves_distinct_names() {
         assert_eq!(escape_os_bytes(OsStr::from_bytes(b"bad-\x80")), "bad-\\x80");
         assert_eq!(escape_os_bytes(OsStr::from_bytes(b"bad-\x81")), "bad-\\x81");
+    }
+
+    #[test]
+    fn doctor_accepts_supported_filesystems_including_zfs() {
+        assert_eq!(
+            doctor_filesystem(steadq_fs_linux::EXT4_SUPER_MAGIC),
+            ("ext4", true)
+        );
+        assert_eq!(
+            doctor_filesystem(steadq_fs_linux::F2FS_STATFS_MAGIC_ALT),
+            ("f2fs", true)
+        );
+        assert_eq!(
+            doctor_filesystem(steadq_fs_linux::ZFS_SUPER_MAGIC),
+            ("zfs", true)
+        );
+        assert_eq!(
+            doctor_filesystem(steadq_fs_linux::TMPFS_MAGIC),
+            ("tmpfs_not_certified", false)
+        );
+    }
+
+    #[test]
+    fn handle_file_roundtrip_preserves_payload_identity() {
+        let handle_path = std::env::temp_dir().join(format!(
+            "steadq-handle-test-{}.json",
+            steadq_names::hex_encode(&steadq_fs_linux::random_128bit().unwrap())
+        ));
+        let queue_id = [0x11u8; 16];
+        let lease = steadq_core::LeaseInfo {
+            job_id: [0x22; 16],
+            envelope_digest: [0x33; 32],
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+            token: [0x44; 16],
+            boot_id: "boot".into(),
+            expires_boottime_ns: 10,
+            expires_wall_ns: 20,
+            content_type: "text/plain".into(),
+            payload_length: 11,
+            payload_digest: [0x55; 32],
+            expected_dev: 1,
+            expected_inode: 2,
+            exact_source_path: "leased/a/b/c.sqj".into(),
+        };
+        save_handle_to_file(
+            std::path::Path::new("/tmp/q"),
+            &queue_id,
+            &handle_path,
+            &lease,
+        )
+        .unwrap();
+        let loaded = load_handle(&handle_path, &queue_id).unwrap();
+        let _ = std::fs::remove_file(&handle_path);
+        assert_eq!(loaded.payload_length, 11);
+        assert_eq!(loaded.payload_digest, [0x55; 32]);
+        assert_eq!(loaded.content_type, "text/plain");
+        assert_eq!(loaded.envelope_digest, [0x33; 32]);
+        assert_eq!(loaded.job_id, [0x22; 16]);
     }
 }

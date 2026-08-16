@@ -81,6 +81,7 @@ pub mod fault {
         readdir_rotation: usize,
         readdir_reversed: bool,
         realtime_ns: Option<u64>,
+        boottime_ns: Option<u64>,
     }
 
     impl State {
@@ -92,6 +93,7 @@ pub mod fault {
                 readdir_rotation: 0,
                 readdir_reversed: false,
                 realtime_ns: None,
+                boottime_ns: None,
             }
         }
     }
@@ -110,6 +112,7 @@ pub mod fault {
             s.readdir_rotation = 0;
             s.readdir_reversed = false;
             s.realtime_ns = None;
+            s.boottime_ns = None;
         });
     }
 
@@ -120,6 +123,15 @@ pub mod fault {
 
     pub(crate) fn clock_realtime_ns() -> Option<u64> {
         STATE.with(|state| state.borrow().realtime_ns)
+    }
+
+    /// Return a fixed value from subsequent boottime clock reads on this thread.
+    pub fn set_clock_boottime_ns(boottime_ns: u64) {
+        STATE.with(|state| state.borrow_mut().boottime_ns = Some(boottime_ns));
+    }
+
+    pub(crate) fn clock_boottime_ns() -> Option<u64> {
+        STATE.with(|state| state.borrow().boottime_ns)
     }
 
     /// Permute complete directory enumerations on this thread.
@@ -627,6 +639,9 @@ pub fn read_boot_id() -> io::Result<String> {
 /// CLOCK_BOOTTIME in nanoseconds.
 pub fn clock_boottime_ns() -> io::Result<u64> {
     fault_check!("clock_boottime_ns");
+    if let Some(ns) = fault::clock_boottime_ns() {
+        return Ok(ns);
+    }
     // SAFETY: Linux `timespec` contains integer fields and may be zero-initialized.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: `ts` points to writable storage for one `timespec`.
@@ -1296,6 +1311,19 @@ pub const NFS_SUPER_MAGIC: i64 = 0x6969;
 pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const FUSE_SUPER_MAGIC: i64 = 0x65735546;
 
+/// Name of a queue-supported filesystem, if `magic` is one of them.
+/// f2fs reports either `F2FS_SUPER_MAGIC` or `F2FS_STATFS_MAGIC_ALT`.
+pub fn supported_filesystem_name(magic: i64) -> Option<&'static str> {
+    match magic {
+        EXT4_SUPER_MAGIC => Some("ext4"),
+        XFS_SUPER_MAGIC => Some("xfs"),
+        BTRFS_SUPER_MAGIC => Some("btrfs"),
+        F2FS_SUPER_MAGIC | F2FS_STATFS_MAGIC_ALT => Some("f2fs"),
+        ZFS_SUPER_MAGIC => Some("zfs"),
+        _ => None,
+    }
+}
+
 /// Read directory entries without consuming the descriptor or its position.
 pub fn read_dir_entries(dir_fd: BorrowedFd<'_>) -> io::Result<Vec<DirEntryName>> {
     read_dir_entries_impl(reopen_directory(dir_fd)?)
@@ -1869,6 +1897,21 @@ mod tests {
         // SAFETY: proc_self_fd_path_raw leaves zero-filled bytes after the digits.
         let actual = unsafe { std::ffi::CStr::from_ptr(multiple_digits.as_ptr().cast()) };
         assert_eq!(actual.to_bytes(), b"/proc/self/fd/1234");
+    }
+
+    #[test]
+    fn supported_filesystem_name_covers_certified_backends() {
+        assert_eq!(supported_filesystem_name(EXT4_SUPER_MAGIC), Some("ext4"));
+        assert_eq!(supported_filesystem_name(XFS_SUPER_MAGIC), Some("xfs"));
+        assert_eq!(supported_filesystem_name(BTRFS_SUPER_MAGIC), Some("btrfs"));
+        assert_eq!(supported_filesystem_name(F2FS_SUPER_MAGIC), Some("f2fs"));
+        assert_eq!(
+            supported_filesystem_name(F2FS_STATFS_MAGIC_ALT),
+            Some("f2fs")
+        );
+        assert_eq!(supported_filesystem_name(ZFS_SUPER_MAGIC), Some("zfs"));
+        assert_eq!(supported_filesystem_name(TMPFS_MAGIC), None);
+        assert_eq!(supported_filesystem_name(0xdead), None);
     }
 
     #[test]
@@ -2505,6 +2548,21 @@ mod tests {
         let err = fstatat(fd.as_fd(), "f").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
         fault::reset();
+    }
+
+    #[test]
+    fn boottime_override_is_thread_local_and_resettable() {
+        fault::reset();
+        fault::set_clock_boottime_ns(1);
+        assert_eq!(clock_boottime_ns().unwrap(), 1);
+        assert!(
+            std::thread::spawn(|| clock_boottime_ns().unwrap())
+                .join()
+                .unwrap()
+                > 1
+        );
+        fault::reset();
+        assert!(clock_boottime_ns().unwrap() > 1);
     }
 
     #[test]

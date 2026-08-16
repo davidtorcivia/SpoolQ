@@ -105,6 +105,17 @@ pub struct EnqueueTicket {
     pub expected_relative_path: String,
 }
 
+impl EnqueueTicket {
+    pub(crate) fn uncommitted(job_id: [u8; 16]) -> Self {
+        Self {
+            job_id,
+            envelope_digest: [0; 32],
+            expected_initial_state: InitialState::Ready,
+            expected_relative_path: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialState {
     Ready,

@@ -1296,6 +1296,9 @@ fn delayed_shard_open_failure_is_counted_and_does_not_starve_later_shard() {
 #[test]
 fn readdir_permutations_preserve_reap_budget_boundaries() {
     let (tmp, mut queue) = create_test_queue_with_shards(2);
+    // 30s leases must share a bucket; 130s must not. Pin boottime so a
+    // 10s width boundary cannot move between those leases.
+    fs::fault::set_clock_boottime_ns(1_000_000_000_000);
     let first_boot = "00000000-0000-0000-0000-000000000001";
     let second_boot = "00000000-0000-0000-0000-000000000002";
     for (boot, duration, shard, payload) in [
@@ -1313,6 +1316,7 @@ fn readdir_permutations_preserve_reap_budget_boundaries() {
     find_files(&tmp.path().join("leased"), "sqj", &mut leased);
     leased.sort();
     assert_four_level_fixture(&tmp.path().join("leased"), &leased);
+    fs::fault::reset();
     drop(queue);
 
     let options = OpenOptions {
@@ -3217,6 +3221,34 @@ fn recovery_reaps_expired_lease() {
     // Should be able to lease again
     let result = queue.lease(0, 30_000_000_000);
     assert!(matches!(result, LeaseOutcome::Leased(_)));
+}
+
+#[test]
+fn recovery_quarantines_malformed_leased_filename() {
+    let (tmp, mut queue) = create_test_queue();
+    let dir = tmp
+        .path()
+        .join("leased")
+        .join(queue.boot_id())
+        .join("0000000000000000")
+        .join("0000");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("not-a-leased-name.sqj"), b"garbage").unwrap();
+
+    let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    assert!(
+        stats
+            .quarantined
+            .iter()
+            .any(|entry| entry.relative_path.contains("not-a-leased-name")),
+        "errors: {:?}",
+        stats.errors
+    );
+    assert!(queue
+        .list_quarantine()
+        .iter()
+        .any(|entry| entry.reason == crate::QuarantineReason::FilenameParseFailed as u16));
+    assert!(!dir.join("not-a-leased-name.sqj").exists());
 }
 
 #[test]

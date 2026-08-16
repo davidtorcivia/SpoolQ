@@ -483,6 +483,27 @@ fn init_and_open() {
 }
 
 #[test]
+fn publish_error_keeps_digest_after_linearization() {
+    let digest = [0xABu8; 32];
+    match PublishError::OutcomeUnknown(Error::IoFailure("fsync".into()))
+        .with_published_digest(digest)
+    {
+        PublishError::OutcomeUnknownPublished {
+            envelope_digest,
+            error: Error::IoFailure(message),
+        } => {
+            assert_eq!(envelope_digest, digest);
+            assert_eq!(message, "fsync");
+        }
+        _ => panic!("expected published unknown"),
+    }
+    assert!(matches!(
+        PublishError::NotCommitted(Error::IdentityCollision).with_published_digest(digest),
+        PublishError::NotCommitted(Error::IdentityCollision)
+    ));
+}
+
+#[test]
 fn zfs_prefers_named_publication_without_changing_other_backends() {
     assert_eq!(
         preferred_publication_mode(fs::ZFS_SUPER_MAGIC),
@@ -493,6 +514,7 @@ fn zfs_prefers_named_publication_without_changing_other_backends() {
         fs::XFS_SUPER_MAGIC,
         fs::BTRFS_SUPER_MAGIC,
         fs::F2FS_SUPER_MAGIC,
+        fs::F2FS_STATFS_MAGIC_ALT,
     ] {
         assert_eq!(preferred_publication_mode(filesystem), None);
     }
@@ -503,6 +525,14 @@ fn filesystem_classification_preserves_strict_and_relaxed_behavior() {
     assert_eq!(
         classify_filesystem_type(Ok(fs::EXT4_SUPER_MAGIC), false).unwrap(),
         Some(fs::EXT4_SUPER_MAGIC)
+    );
+    assert_eq!(
+        classify_filesystem_type(Ok(fs::ZFS_SUPER_MAGIC), false).unwrap(),
+        Some(fs::ZFS_SUPER_MAGIC)
+    );
+    assert_eq!(
+        classify_filesystem_type(Ok(fs::F2FS_STATFS_MAGIC_ALT), false).unwrap(),
+        Some(fs::F2FS_STATFS_MAGIC_ALT)
     );
     assert!(matches!(
         classify_filesystem_type(Ok(fs::TMPFS_MAGIC), false),

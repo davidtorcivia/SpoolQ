@@ -653,8 +653,6 @@ name = "steadq-capi"
 version = "0.1.0"
 dependencies = [
  "steadq-core",
- "steadq-format",
- "steadq-names",
 ]
 
 [[package]]
@@ -662,7 +660,6 @@ name = "steadq-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "libc",
  "serde",
  "serde_json",
  "steadq-core",

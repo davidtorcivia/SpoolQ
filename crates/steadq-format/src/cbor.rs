@@ -247,7 +247,7 @@ impl ExtensionHeader {
                         if *n >= 0 {
                             encode_header(&mut buf, 0, *n as u64);
                         } else {
-                            encode_header(&mut buf, 1, (-1 - n) as u64);
+                            encode_header(&mut buf, 1, !*n as u64);
                         }
                     }
                     MetadataValue::Text(s) => encode_text_string(&mut buf, s),
@@ -645,6 +645,7 @@ mod tests {
             MetadataValue::Bytes(vec![0xDE, 0xAD]),
         );
         metadata.insert("priority".to_string(), MetadataValue::I64(-1));
+        metadata.insert("min".to_string(), MetadataValue::I64(i64::MIN));
 
         let ext = ExtensionHeader {
             initial_not_before_unix_ns: Some(1_700_000_000_000_000_000),
@@ -656,6 +657,23 @@ mod tests {
         let encoded = ext.encode().unwrap();
         let decoded = ExtensionHeader::decode(&encoded).unwrap();
         assert_eq!(decoded, ext);
+    }
+
+    #[test]
+    fn i64_min_round_trips() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("n".to_string(), MetadataValue::I64(i64::MIN));
+        let ext = ExtensionHeader {
+            content_type: "x".to_string(),
+            metadata,
+            ..Default::default()
+        };
+        let encoded = ext.encode().unwrap();
+        let decoded = ExtensionHeader::decode(&encoded).unwrap();
+        assert_eq!(
+            decoded.metadata.get("n"),
+            Some(&MetadataValue::I64(i64::MIN))
+        );
     }
 
     #[test]

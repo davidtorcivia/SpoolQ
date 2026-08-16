@@ -18,7 +18,6 @@ use steadq_core::{
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
-    static LAST_ERROR_RET: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 #[allow(dead_code)]
@@ -32,6 +31,16 @@ fn set_last_error(msg: &str) {
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = CString::new(msg).ok();
     });
+}
+
+fn classify_init_error(e: std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::Unsupported => Error::UnsupportedFilesystem,
+        std::io::ErrorKind::PermissionDenied => Error::PermissionDenied,
+        std::io::ErrorKind::AlreadyExists => Error::InvalidInput(e.to_string()),
+        std::io::ErrorKind::WouldBlock => Error::MaintenanceBusy,
+        _ => Error::IoFailure(e.to_string()),
+    }
 }
 
 /// R2-H17: Centralized error-to-code mapping.
@@ -126,7 +135,7 @@ pub extern "C" fn steadq_init(path: *const c_char, shard_count: c_uint) -> *mut 
         };
         match Queue::init(std::path::Path::new(path_str), &opts) {
             Ok(_) => {}
-            Err(e) => return Err(Error::IoFailure(e.to_string())),
+            Err(e) => return Err(classify_init_error(e)),
         }
         Queue::open(std::path::Path::new(path_str), &OpenOptions::default())
     });
@@ -567,8 +576,8 @@ pub extern "C" fn steadq_lease_payload_length(lease: *const SteadqLease) -> u64 
     unsafe { (*lease).inner.payload_length }
 }
 
-/// Get the boot_id from a lease handle as a C string.
-/// Returns pointer to thread-local storage. Do not free.
+/// Copy the boot_id from a lease handle into `out`.
+/// Writes a NUL-terminated string. `out_len` is the buffer capacity.
 #[no_mangle]
 pub extern "C" fn steadq_lease_boot_id(
     lease: *const SteadqLease,
@@ -591,8 +600,8 @@ pub extern "C" fn steadq_lease_boot_id(
     STEADQ_OK
 }
 
-/// Get the content type from a lease handle as a C string.
-/// Returns pointer to thread-local storage. Do not free.
+/// Copy the content type from a lease handle into `out`.
+/// Writes a NUL-terminated string. `out_len` is the buffer capacity.
 #[no_mangle]
 pub extern "C" fn steadq_lease_content_type(
     lease: *const SteadqLease,
@@ -614,8 +623,8 @@ pub extern "C" fn steadq_lease_content_type(
     STEADQ_OK
 }
 
-/// Get the source path from a lease handle as a C string.
-/// Returns pointer to thread-local storage. Do not free.
+/// Copy the source path from a lease handle into `out`.
+/// Writes a NUL-terminated string. `out_len` is the buffer capacity.
 #[no_mangle]
 pub extern "C" fn steadq_lease_source_path(
     lease: *const SteadqLease,
@@ -751,7 +760,7 @@ pub extern "C" fn steadq_resolve(
         | ResolutionOutcome::SourceStabilized
         | ResolutionOutcome::DestinationObserved
         | ResolutionOutcome::DestinationStabilized => STEADQ_OK,
-        ResolutionOutcome::BothObserved => STEADQ_INDETERMINATE,
+        ResolutionOutcome::BothObserved => STEADQ_CORRUPTION,
         ResolutionOutcome::NeitherObserved => STEADQ_NOT_COMMITTED,
         ResolutionOutcome::ConflictingObject => STEADQ_CORRUPTION,
         ResolutionOutcome::ResolutionFailed(e) => {
@@ -764,4 +773,32 @@ pub extern "C" fn steadq_resolve(
 /// Format an error for the thread-local last-error store.
 fn leak_error(e: Error) -> String {
     format!("{e}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_error_mapping_preserves_kind() {
+        assert!(matches!(
+            classify_init_error(std::io::Error::new(std::io::ErrorKind::Unsupported, "fs")),
+            Error::UnsupportedFilesystem
+        ));
+        assert!(matches!(
+            classify_init_error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "perm"
+            )),
+            Error::PermissionDenied
+        ));
+        assert!(matches!(
+            classify_init_error(std::io::Error::new(std::io::ErrorKind::WouldBlock, "lock")),
+            Error::MaintenanceBusy
+        ));
+        assert!(matches!(
+            classify_init_error(std::io::Error::other("io")),
+            Error::IoFailure(_)
+        ));
+    }
 }

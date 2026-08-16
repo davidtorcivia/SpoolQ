@@ -13,7 +13,6 @@ name = "steadq"
 path = "src/main.rs"
 
 [dependencies]
-libc = "0.2"
 steadq-core = { path = "../steadq-core" }
 steadq-format = { path = "../steadq-format" }
 steadq-names = { path = "../steadq-names" }

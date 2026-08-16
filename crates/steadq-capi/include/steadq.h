@@ -155,20 +155,20 @@ unsigned int steadq_lease_attempt(const struct SteadqLease *lease);
 uint64_t steadq_lease_payload_length(const struct SteadqLease *lease);
 
 /**
- * Get the boot_id from a lease handle as a C string.
- * Returns pointer to thread-local storage. Do not free.
+ * Copy the boot_id from a lease handle into `out`.
+ * Writes a NUL-terminated string. `out_len` is the buffer capacity.
  */
 int steadq_lease_boot_id(const struct SteadqLease *lease, char *out, size_t out_len);
 
 /**
- * Get the content type from a lease handle as a C string.
- * Returns pointer to thread-local storage. Do not free.
+ * Copy the content type from a lease handle into `out`.
+ * Writes a NUL-terminated string. `out_len` is the buffer capacity.
  */
 int steadq_lease_content_type(const struct SteadqLease *lease, char *out, size_t out_len);
 
 /**
- * Get the source path from a lease handle as a C string.
- * Returns pointer to thread-local storage. Do not free.
+ * Copy the source path from a lease handle into `out`.
+ * Writes a NUL-terminated string. `out_len` is the buffer capacity.
  */
 int steadq_lease_source_path(const struct SteadqLease *lease, char *out, size_t out_len);
 

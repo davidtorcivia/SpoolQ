@@ -13,5 +13,3 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 steadq-core = { path = "../steadq-core" }
-steadq-format = { path = "../steadq-format" }
-steadq-names = { path = "../steadq-names" }
