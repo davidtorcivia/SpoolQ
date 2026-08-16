@@ -17,7 +17,10 @@ fn main() {
             std::fs::create_dir_all(&dir).expect("mkdir");
             Queue::init(&dir, &CreateOptions::default()).expect("init");
         }
-        "run" => one_job(&dir, false),
+        "run" => {
+            let mut queue = Queue::open(&dir, &Default::default()).expect("open");
+            complete(&mut queue);
+        }
         "run-deferred" => {
             let count: u32 = args
                 .next()
@@ -38,21 +41,6 @@ fn main() {
             queue.sync().expect("sync");
         }
         other => panic!("unknown command {other}"),
-    }
-}
-
-fn one_job(dir: &std::path::Path, deferred: bool) {
-    let mut queue = Queue::open(
-        dir,
-        &OpenOptions {
-            deferred_dir_sync: deferred,
-            ..Default::default()
-        },
-    )
-    .expect("open");
-    complete(&mut queue);
-    if deferred {
-        queue.sync().expect("sync");
     }
 }
 
