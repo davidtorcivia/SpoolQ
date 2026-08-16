@@ -73,9 +73,10 @@ reproduction.
 
 ## Results
 
-Block-replay coverage per profile for a 40-operation workload, seed 1, on
-kernel 6.8.0-137-generic (loop-backed images, dm-log-writes replay at every
-persistence barrier):
+Block-replay coverage per profile for a 40-operation workload, seed 1
+(loop-backed images, dm-log-writes replay at every persistence barrier).
+
+First host, kernel 6.8.0-137-generic (761 states):
 
 | Filesystem | mkfs | States checked | Result |
 |---|---|---:|---|
@@ -85,9 +86,29 @@ persistence barrier):
 | f2fs | mkfs.f2fs 1.16.0 | 144 | all passed |
 | ZFS | zfs 2.2.2 (pool creation and force-import recovery) | 101 | all passed |
 
-Tier 0 (SIGKILL): 84 runs across five seeds, all passed.
+Independent host `nyx` (IceWhale ZimaBoard2, Intel N150), kernel
+7.0.0-28-generic (793 states):
 
-Scope: one workload shape and seed per profile, one kernel, no hardware
+| Filesystem | mkfs | States checked | Result |
+|---|---|---:|---|
+| ext4 | mke2fs 1.47.0 | 217 | all passed |
+| XFS | mkfs.xfs 6.6.0 | 144 | all passed |
+| btrfs | btrfs-progs 6.6.3 | 187 | all passed |
+| f2fs | mkfs.f2fs 1.16.0 | 149 | all passed |
+| ZFS | zfs 2.2.2-0ubuntu9.4 userspace, kmod 2.4.1-1ubuntu5 (pool creation and force-import recovery) | 96 | all passed |
+
+State counts differ by kernel because the recorded write log has a
+different barrier set. They are not the same 761 states replayed twice.
+
+On `nyx`, a separate live-queue check on the host btrfs RAID1 volume
+put 15 jobs, SIGKILL'd a leasing consumer that left one in-flight lease,
+reaped that lease after expiry, and drained the rest. Final stats:
+15 receipts, 0 ready, 0 leased, 0 dead, 0 quarantine. That is process-crash
+evidence on real storage, not a tier1 replay.
+
+Tier 0 (SIGKILL): 84 runs across five seeds on the first host, all passed.
+
+Scope: one workload shape and seed per profile, two kernels, no hardware
 power-cut testing, no second-crash-after-resolution lane. State verdicts
 gate on durable obligations only: damage to objects whose completion is
 not in the durable operation prefix is recorded, not failed.

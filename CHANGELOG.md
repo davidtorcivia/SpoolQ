@@ -63,5 +63,5 @@
 - Reproducible toolchain pinning (Rust 1.97.1, x86_64-unknown-linux-gnu)
 - Compatibility policy for independent versioning of disk format, Rust API, C ABI, and ticket schema
 - Crash lab (`cargo xtask crashlab`): SIGKILL lane and dm-log-writes replay lane with device-safety guards, run registry, and per-state manifests (docs/crash-lab.md)
-- Crash replay passes for all five profiles: 761 states across ext4, XFS, btrfs, f2fs, and ZFS, all passing
+- Crash replay passes for all five profiles on two hosts: 761 states on kernel 6.8.0-137 and 793 states on kernel 7.0.0-28 (nyx), all passing
 - ZFS supported: named-fallback publication, pool force-import crash recovery, and both f2fs statfs magic constants accepted

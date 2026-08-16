@@ -31,7 +31,8 @@ SteadQ runs on local Linux filesystems that provide the following guarantees:
 ## Crash testing
 
 Block-level crash replay (dm-log-writes) passes for all five profiles
-(761 crash states; see [crash-lab.md](crash-lab.md) for per-profile
-results and manifests). No filesystem has been tested with real power-cut
-hardware. Durability claims additionally rest on POSIX and Linux kernel
-documentation guarantees for each filesystem.
+on two kernels: 761 states on 6.8.0-137 and 793 states on 7.0.0-28
+(see [crash-lab.md](crash-lab.md) for per-profile results and manifests).
+No filesystem has been tested with real power-cut hardware. Durability
+claims additionally rest on POSIX and Linux kernel documentation
+guarantees for each filesystem.
