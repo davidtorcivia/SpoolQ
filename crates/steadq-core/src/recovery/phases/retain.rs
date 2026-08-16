@@ -547,20 +547,20 @@ impl Queue {
                         continue;
                     }
 
-                    // C-35: Open with write-capable mode for OFD write lock
-                    let receipt_fd = match fs::openat(
-                        shard_fd.as_fd(),
-                        entry,
-                        crate::queue::verified::receipt_write_open_flags(),
-                        0,
-                    ) {
-                        Ok(fd) => fd,
-                        Err(_) => continue,
+                    let receipt_fd = match open_locked_receipt(shard_fd.as_fd(), entry) {
+                        Ok(Some(fd)) => fd,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let operation = error.operation("receipt_compact");
+                            Self::record_error(
+                                stats,
+                                &operation,
+                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                                &error.to_string(),
+                            );
+                            continue;
+                        }
                     };
-
-                    if !fs::try_ofd_write_lock(receipt_fd.as_fd()).unwrap_or(false) {
-                        continue; // busy, skip
-                    }
 
                     let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
                         receipt_fd.as_fd(),
@@ -1017,20 +1017,20 @@ impl Queue {
                         continue;
                     }
 
-                    // C-35: Open with write-capable mode for lock
-                    let receipt_fd = match fs::openat(
-                        shard_fd.as_fd(),
-                        entry,
-                        crate::queue::verified::receipt_write_open_flags(),
-                        0,
-                    ) {
-                        Ok(fd) => fd,
-                        Err(_) => continue,
+                    let receipt_fd = match open_locked_receipt(shard_fd.as_fd(), entry) {
+                        Ok(Some(fd)) => fd,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let operation = error.operation("receipt_delete");
+                            Self::record_error(
+                                stats,
+                                &operation,
+                                &format!("receipts/{bucket_name}/{shard_name}/{entry}"),
+                                &error.to_string(),
+                            );
+                            continue;
+                        }
                     };
-
-                    if !fs::try_ofd_write_lock(receipt_fd.as_fd()).unwrap_or(false) {
-                        continue;
-                    }
 
                     let verified_receipt = match crate::queue::verified::verify_receipt_on_fd(
                         receipt_fd.as_fd(),
@@ -1155,5 +1155,50 @@ impl Queue {
 
         // R4-RES: All buckets processed, reset cursor for next full pass.
         self.recovery_cursor.delete_receipts = None;
+    }
+}
+
+enum ReceiptPrepareError {
+    Open(io::Error),
+    Lock(io::Error),
+}
+
+impl ReceiptPrepareError {
+    fn operation(&self, prefix: &str) -> String {
+        match self {
+            Self::Open(_) => format!("{prefix}_open"),
+            Self::Lock(_) => format!("{prefix}_lock"),
+        }
+    }
+}
+
+impl std::fmt::Display for ReceiptPrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(error) | Self::Lock(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Open a receipt and take an OFD write lock. Missing files and busy locks skip.
+/// Open or lock I/O errors are returned so the caller can record them.
+fn open_locked_receipt(
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+) -> Result<Option<OwnedFd>, ReceiptPrepareError> {
+    let fd = match fs::openat(
+        dir_fd,
+        name,
+        crate::queue::verified::receipt_write_open_flags(),
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ReceiptPrepareError::Open(error)),
+    };
+    match fs::try_ofd_write_lock(fd.as_fd()) {
+        Ok(true) => Ok(Some(fd)),
+        Ok(false) => Ok(None),
+        Err(error) => Err(ReceiptPrepareError::Lock(error)),
     }
 }

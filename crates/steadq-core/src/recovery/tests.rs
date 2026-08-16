@@ -3925,6 +3925,22 @@ fn recovery_compaction_fault_matrix_preserves_receipt_and_replays() {
             "phase=DestinationFsync",
             true,
         ),
+        (
+            "openat",
+            1,
+            libc::EIO,
+            "receipt_compact_open",
+            "os error 5",
+            false,
+        ),
+        (
+            "try_ofd_write_lock",
+            1,
+            libc::EIO,
+            "receipt_compact_lock",
+            "os error 5",
+            false,
+        ),
     ] {
         let (tmp, mut queue) = create_test_queue();
         enqueue_and_ack(&mut queue);
@@ -4466,6 +4482,66 @@ fn receipt_deletion_records_unlink_phase_without_counting_commit() {
         let replay_floor = reopened.authenticated_wall_floor().unwrap();
         let replay = delete_receipts_with_budget(&mut reopened, replay_floor);
         assert_eq!(replay.receipts_expired, u32::from(file_remains));
+        assert!(!receipt.exists());
+    }
+}
+
+#[test]
+fn receipt_deletion_records_open_and_lock_io() {
+    for (fault, expected_operation) in [
+        ("openat", "receipt_delete_open"),
+        ("try_ofd_write_lock", "receipt_delete_lock"),
+    ] {
+        let (tmp, mut queue) = create_test_queue();
+        enqueue_and_ack(&mut queue);
+        let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+        let receipt_bucket = receipt
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .and_then(steadq_names::bucket_from_hex)
+            .unwrap();
+        let expiration_floor = receipt_bucket
+            .checked_add(1)
+            .and_then(|bucket| bucket.checked_mul(queue.format.terminal_bucket_width_ns()))
+            .unwrap();
+        let watermark_bucket =
+            steadq_math::ceiling_bucket(expiration_floor, queue.format.delayed_bucket_width_ns())
+                .unwrap();
+        write_wall_watermark(&tmp, watermark_bucket);
+        let wall_floor = queue.authenticated_wall_floor().unwrap();
+
+        fs::fault::reset();
+        fs::fault::inject_errno(fault, 1, libc::EIO);
+        let stats = delete_receipts_with_budget(&mut queue, wall_floor);
+        fs::fault::reset();
+        assert_eq!(stats.receipts_expired, 0);
+        assert!(receipt.exists());
+        assert!(
+            stats
+                .errors
+                .iter()
+                .any(|error| error.operation == expected_operation),
+            "missing {expected_operation}: {:?}",
+            stats.errors
+        );
+        queue.persist_recovery_cursor().unwrap();
+        drop(queue);
+        let mut reopened = Queue::open(
+            tmp.path(),
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let replay_floor = reopened.authenticated_wall_floor().unwrap();
+        let replay = delete_receipts_with_budget(&mut reopened, replay_floor);
+        assert_eq!(replay.receipts_expired, 1, "errors: {:?}", replay.errors);
         assert!(!receipt.exists());
     }
 }

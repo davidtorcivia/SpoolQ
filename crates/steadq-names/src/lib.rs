@@ -142,10 +142,6 @@ fn compute_name_tag_parts(queue_id: &[u8; 16], context_parts: &[&str]) -> [u8; 8
     out
 }
 
-pub fn name_tag_hex(tag: &[u8; 8]) -> String {
-    hex_encode(tag)
-}
-
 // ---------- Shard derivation ----------
 
 /// shard_hash = SHA256("SteadQ-1-shard\0" || queue_id || job_id)
@@ -952,41 +948,6 @@ pub fn parse_quarantine(filename: &str) -> Result<QuarantineName, ParseError> {
     })
 }
 
-// ---------- Name tag verification helpers ----------
-
-/// Get the filename part without the .k<tag> field and extension.
-/// This is used to build the canonical context for tag verification.
-pub fn filename_without_tag_and_ext(filename: &str, ext: &str) -> String {
-    let stripped = filename.strip_suffix(ext).unwrap_or(filename);
-    // Remove the .k<16hex> suffix
-    if let Some(pos) = stripped.rfind(".k") {
-        stripped[..pos].to_string()
-    } else {
-        stripped.to_string()
-    }
-}
-
-/// Compute and verify a name tag for a ready filename.
-/// Uses the canonical context builder from parsed fields, consistent with the
-/// queue path. (C-45: runtime tag verification must match helper behavior.)
-pub fn verify_ready_tag(queue_id: &[u8; 16], shard: u32, filename: &str) -> bool {
-    let parsed = match parse_ready(filename) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let sh = shard_hex(shard);
-    let base = format!(
-        "{}.g{:016x}.a{:08x}.m{:08x}",
-        hex_encode(&parsed.common.job_id),
-        parsed.common.generation,
-        parsed.common.attempt,
-        parsed.common.maximum_attempts,
-    );
-    let ctx = ready_context(&sh, &base);
-    let expected = compute_name_tag(queue_id, &ctx);
-    expected == parsed.tag
-}
-
 pub fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -1176,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_ready_tag_works() {
+    fn ready_filename_tag_authenticates() {
         let qid = test_queue_id();
         let jid = test_job_id();
         let shard = compute_shard(&qid, &jid, 64);
@@ -1186,19 +1147,11 @@ mod tests {
             attempt: 0,
             maximum_attempts: 3,
         };
-        // Build the context and compute the real tag
         let sh = shard_hex(shard);
-        let base = format!(
-            "{}.g{:016x}.a{:08x}.m{:08x}",
-            hex_encode(&jid),
-            0u64,
-            0u32,
-            3u32
-        );
-        let ctx = ready_context(&sh, &base);
-        let tag = compute_name_tag(&qid, &ctx);
-        let filename = ready_filename(&common, &tag);
-        assert!(verify_ready_tag(&qid, shard, &filename));
+        let filename = make_ready_name(&qid, &sh, &common);
+        let parsed = parse_ready(&filename).unwrap();
+        assert!(parsed.authenticate_tag(&qid, &sh));
+        assert!(!parsed.authenticate_tag(&qid, "0000"));
     }
 
     #[test]
