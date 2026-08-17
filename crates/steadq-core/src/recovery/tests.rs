@@ -1264,6 +1264,9 @@ fn delayed_shard_open_failure_is_counted_and_does_not_starve_later_shard() {
     let parts = ticket.expected_relative_path.split('/').collect::<Vec<_>>();
     let bucket = parts[1];
     let blocked = tmp.path().join(format!("delayed/{bucket}/0000"));
+    if blocked.exists() {
+        std::fs::remove_dir(&blocked).unwrap();
+    }
     symlink(tmp.path(), &blocked).unwrap();
     write_wall_watermark(&tmp, steadq_names::bucket_from_hex(bucket).unwrap());
 
@@ -4431,6 +4434,15 @@ fn receipt_deletion_records_unlink_phase_without_counting_commit() {
         let (tmp, mut queue) = create_test_queue();
         enqueue_and_ack(&mut queue);
         let receipt = find_file(&tmp.path().join("receipts"), "rct").unwrap();
+        let shard_dir = receipt.parent().unwrap().to_path_buf();
+        if let Some(bucket_dir) = shard_dir.parent() {
+            for entry in std::fs::read_dir(bucket_dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() && path != shard_dir {
+                    let _ = std::fs::remove_dir(&path);
+                }
+            }
+        }
         let receipt_bucket = receipt
             .parent()
             .unwrap()

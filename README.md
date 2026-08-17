@@ -138,7 +138,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 
 ## Testing
 
-SteadQ has 693 tests across unit, integration, conformance, and formal model checking:
+SteadQ has 697 tests across unit, integration, conformance, and formal model checking:
 
 - Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
 - Fault injection tests inject I/O errors at every syscall boundary and verify error classification
@@ -176,16 +176,15 @@ sample Criterion settings):
 | Deferred, `sync()` after 10 jobs | 3,527 |
 | Deferred, `sync()` after 50 jobs | 3,520 |
 
-`strace` of one subsequent completed job on a warm 64-shard queue: 8 `fsync`,
-2 `renameat2`, 1 successful `linkat` (`AT_EMPTY_PATH` then `/proc/self/fd`),
-5 `getrandom`. The eight syncs are one file `fsync`, five required directory
-barriers (enqueue dest, lease dest and source, ack dest and source), and two
-parent `fsync`s for a newly created leased shard and receipt shard. A 1-shard
-warm job is 6 `fsync` (tmpfile) or 7 (named fallback, dest plus tmp). A
-deferred batch of 10 issued 77 `fsync` (7.7 per job). Deferring directory
-`fsync` does not remove the per-job file `fsync` or most of the directory
-barriers on this path, so completed-job throughput stays on the same side of
-4,000/s.
+`strace` of one subsequent completed job on a warm 64-shard queue: 8 `fsync`
+before sibling pre-create (two of those were first-touch parent syncs for a
+new leased shard and receipt shard). After the first `ensure_dir` of a shard
+leaf creates every sibling and `fsync`s the bucket once, a later job in those
+buckets is 6 `fsync` (tmpfile) or 7 (named fallback, dest plus tmp): file,
+enqueue dest, lease dest and source, ack dest and source. A deferred batch of
+10 issued 77 `fsync` (7.7 per job). Deferring directory `fsync` does not
+remove the per-job file `fsync` or most of the directory barriers on this
+path, so completed-job throughput stays on the same side of 4,000/s.
 
 ## Documentation
 

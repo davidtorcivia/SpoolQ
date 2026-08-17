@@ -555,6 +555,9 @@ impl Queue {
         if self.known_dirs.borrow().contains(relative) {
             return Ok(());
         }
+        if let Some(bucket) = sharded_bucket_parent(relative, self.format.shard_count()) {
+            return self.ensure_sharded_bucket_with_dirty(bucket, dirty);
+        }
         let components: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
         let mut current = None::<OwnedFd>;
 
@@ -573,6 +576,28 @@ impl Queue {
             current = Some(child);
         }
         self.known_dirs.borrow_mut().insert(relative.to_string());
+        Ok(())
+    }
+
+    fn ensure_sharded_bucket_with_dirty(
+        &self,
+        bucket: &str,
+        mut dirty: Option<&mut engine::DirtySet>,
+    ) -> io::Result<()> {
+        self.ensure_dir_with_dirty(bucket, dirty.as_deref_mut())?;
+        let bucket_fd = open_relative(self.root_fd.as_fd(), bucket)?;
+        let shard_count = self.format.shard_count();
+        for shard in 0..shard_count {
+            fs::mkdirat_eexist_ok(bucket_fd.as_fd(), &shard_hex(shard), 0o700)?;
+        }
+        match dirty {
+            Some(set) => set.record(bucket_fd.as_fd())?,
+            None => fs::fsync_dir_fd(bucket_fd.as_fd())?,
+        }
+        let mut known = self.known_dirs.borrow_mut();
+        for shard in 0..shard_count {
+            known.insert(format!("{bucket}/{}", shard_hex(shard)));
+        }
         Ok(())
     }
 
@@ -1255,4 +1280,10 @@ impl PublishError {
     pub(super) fn classify_pre_pub_fsync(e: io::Error) -> Self {
         PublishError::NotCommitted(Error::IoFailure(e.to_string()))
     }
+}
+
+pub(super) fn sharded_bucket_parent(relative: &str, shard_count: u32) -> Option<&str> {
+    let (bucket, shard_name) = relative.rsplit_once('/')?;
+    let shard = steadq_names::shard_from_hex(shard_name)?;
+    (shard < shard_count).then_some(bucket)
 }
