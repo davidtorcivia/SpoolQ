@@ -5747,6 +5747,17 @@ fn dead_letter_move_preserves_each_failure_phase() {
         let (ready_dir, ready_name) = ticket.expected_relative_path.rsplit_once('/').unwrap();
         let parsed = steadq_names::parse_ready(ready_name).unwrap();
         let wall_floor = queue.wall_floor_for_mutation().unwrap();
+        let dead_bucket = steadq_math::bucket_number(
+            wall_floor.unix_ns(),
+            queue.format.terminal_bucket_width_ns(),
+        )
+        .unwrap();
+        queue
+            .ensure_dir(&format!(
+                "dead/{}/0000",
+                steadq_names::bucket_hex(dead_bucket)
+            ))
+            .unwrap();
 
         fs::fault::inject_errno(fault, 1, libc::EIO);
         let result = queue.move_to_dead(
@@ -5760,13 +5771,17 @@ fn dead_letter_move_preserves_each_failure_phase() {
 
         assert!(result.is_err(), "expected error for fault {fault}");
         if phase_unknown {
-            // The object may or may not be in dead after post-rename failure.
+            let err = result.unwrap_err();
+            let message = format!("{err}");
+            assert!(
+                message.contains("indeterminate") && message.contains("DestFsync"),
+                "expected dest-dir fsync after rename, got {err:?}"
+            );
             assert!(
                 tmp.path().join("dead").exists()
                     || tmp.path().join(&ticket.expected_relative_path).exists()
             );
         } else {
-            // Pre-rename failure: object stays in ready.
             assert!(tmp.path().join(&ticket.expected_relative_path).exists());
         }
     }
