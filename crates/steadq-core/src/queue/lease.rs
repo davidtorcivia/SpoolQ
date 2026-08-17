@@ -93,16 +93,23 @@ impl Queue {
                 }
             };
 
-            // List entries
-            let entries = match fs::read_dir_entries(shard_fd.as_fd()) {
-                Ok(e) => e,
+            let mut entries = match fs::DirectoryStream::open(shard_fd.as_fd()) {
+                Ok(entries) => entries,
                 Err(_) => {
                     scan_had_error = true;
                     continue;
                 }
             };
 
-            for entry in &entries {
+            loop {
+                let entry = match entries.next_entry() {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(_) => {
+                        scan_had_error = true;
+                        break;
+                    }
+                };
                 let Some(entry) = entry.as_ascii_str() else {
                     scan_had_error = true;
                     continue;
@@ -397,7 +404,16 @@ impl Queue {
                             );
                         }
                         let expected_claim_size =
-                            (128 + ext_len_h + header.payload_length as usize) as u64;
+                            match verified::checked_total_size(ext_len_h, header.payload_length) {
+                                Ok(size) => size,
+                                Err(_) => {
+                                    self.poison();
+                                    return LeaseOutcome::OutcomeUnknown(
+                                        claim_ticket
+                                            .with_phase(TransitionPhase::SourceDirectoryDurable),
+                                    );
+                                }
+                            };
                         if leased_object.size() != expected_claim_size {
                             self.poison();
                             return LeaseOutcome::OutcomeUnknown(
