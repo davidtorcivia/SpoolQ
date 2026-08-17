@@ -36,7 +36,7 @@
 
 ### Performance
 
-- Measured strict vs deferred completed-job throughput on the README NVMe: 3,065/s strict, 3,520/s deferred batch-50. After same-directory lease, a warm completed job is 5 `fsync` on the tmpfile path once destination buckets exist. The first `ensure_dir` of a shard leaf creates every sibling and syncs the bucket once. A deferred batch of 10 still issues 7.7 `fsync` per job.
+- Re-measured completed-job throughput on the README Intel ext4 NVMe after same-directory lease: strict 2,679/s, deferred sync-every-job 3,463/s, deferred batch-10 3,229/s, deferred batch-50 3,453/s. Concurrent 64 B is 2,816/5,633/8,177 jobs/s at 1/4/8 threads. A warm job that does not advance the watermark issues 6 `fsync`; lease still dest-syncs and source-syncs the ready shard.
 
 ### Core
 
