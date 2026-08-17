@@ -170,8 +170,9 @@ second across five 10-second runs.
 
 The Criterion results use a release build, a 64-shard queue, 64 B payloads,
 strict durability, a 2-second warm-up, a 10-second measurement, and 30 samples.
-The reference system has an Intel Core i5-13500 CPU and an Intel
-SSDPEK1A118GA NVMe drive formatted as ext4.
+They run in-process against local storage and exclude network latency. The
+reference system has an Intel Core i5-13500 CPU and an Intel SSDPEK1A118GA
+NVMe drive formatted as ext4.
 
 Batch operations remain pending until `commit()` completes. Larger batches
 increase throughput but also increase latency and the number of operations
