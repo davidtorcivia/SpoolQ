@@ -251,6 +251,21 @@ impl Queue {
             .map_err(|e| WatermarkReadError::Io(e.to_string()))?;
 
         for _ in 0..attempts {
+            let cached = {
+                let cached = self.cached_watermark_fd.borrow();
+                cached
+                    .as_ref()
+                    .map(|data| Self::read_opened_wall_watermark(control_fd.as_fd(), data.as_fd()))
+            };
+            if let Some(snapshot) = cached {
+                match snapshot? {
+                    WatermarkSnapshot::Current(watermark) => return Ok(Some(watermark)),
+                    WatermarkSnapshot::Replaced => {
+                        self.cached_watermark_fd.borrow_mut().take();
+                    }
+                }
+            }
+
             let data = match fs::openat(
                 control_fd.as_fd(),
                 "wall-watermark",
@@ -267,7 +282,10 @@ impl Queue {
             };
 
             match Self::read_opened_wall_watermark(control_fd.as_fd(), data.as_fd())? {
-                WatermarkSnapshot::Current(watermark) => return Ok(Some(watermark)),
+                WatermarkSnapshot::Current(watermark) => {
+                    self.cached_watermark_fd.borrow_mut().replace(data);
+                    return Ok(Some(watermark));
+                }
                 WatermarkSnapshot::Replaced => continue,
             }
         }

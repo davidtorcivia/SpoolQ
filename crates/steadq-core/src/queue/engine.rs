@@ -195,7 +195,6 @@ pub(super) enum TmpfilePublishPhase {
     SourceIdentity,
     FileFsync,
     Link,
-    DestinationIdentity,
     DestinationFsync,
 }
 
@@ -606,19 +605,6 @@ fn unnamed_file_identity(stat: &libc::stat) -> std::io::Result<MoveIdentity> {
     }
 }
 
-fn authenticate_published_identity(
-    source: MoveIdentity,
-    destination: &libc::stat,
-) -> std::io::Result<()> {
-    if source.matches(destination) {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "destination identity changed after temporary-file publication",
-        ))
-    }
-}
-
 enum LinkStrategyAttempt {
     Published(fs::PublicationMode),
     TryNext,
@@ -725,11 +711,9 @@ fn publish_tmpfile_noreplace_impl(
             phase: TmpfilePublishPhase::SourceIdentity,
             source,
         })?;
-    let source_identity = unnamed_file_identity(&source_stat).map_err(|source| {
-        TmpfilePublishFailure::NotCommitted {
-            phase: TmpfilePublishPhase::SourceIdentity,
-            source,
-        }
+    unnamed_file_identity(&source_stat).map_err(|source| TmpfilePublishFailure::NotCommitted {
+        phase: TmpfilePublishPhase::SourceIdentity,
+        source,
     })?;
 
     fs::fsync(tmpfile_fd).map_err(|source| TmpfilePublishFailure::NotCommitted {
@@ -747,20 +731,8 @@ fn publish_tmpfile_noreplace_impl(
         return Ok(TmpfilePublishOutcome::Unsupported);
     };
 
-    let destination =
-        fs::fstatat(destination_directory_fd, destination_name).map_err(|source| {
-            TmpfilePublishFailure::OutcomeUnknown {
-                phase: TmpfilePublishPhase::DestinationIdentity,
-                source,
-            }
-        })?;
-    authenticate_published_identity(source_identity, &destination).map_err(|source| {
-        TmpfilePublishFailure::OutcomeUnknown {
-            phase: TmpfilePublishPhase::DestinationIdentity,
-            source,
-        }
-    })?;
-
+    // linkat publishes the held inode atomically. Reopening its name here
+    // would race a consumer that immediately claims the new job.
     if sync_destination {
         fs::fsync_dir_fd(destination_directory_fd).map_err(|source| {
             TmpfilePublishFailure::OutcomeUnknown {
@@ -1069,21 +1041,6 @@ mod tests {
     }
 
     #[test]
-    fn published_identity_requires_the_exact_linked_regular_file() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("published.raw");
-        std::fs::write(&path, b"published").unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        let valid = fs::fstat(file.as_fd()).unwrap();
-        let identity = MoveIdentity::new(valid.st_dev, valid.st_ino);
-        authenticate_published_identity(identity, &valid).unwrap();
-
-        let mut wrong_inode = valid;
-        wrong_inode.st_ino = wrong_inode.st_ino.wrapping_add(1);
-        assert!(authenticate_published_identity(identity, &wrong_inode).is_err());
-    }
-
-    #[test]
     fn tmpfile_publication_uses_each_supported_link_strategy() {
         for force_proc in [false, true] {
             fs::fault::reset();
@@ -1244,12 +1201,6 @@ mod tests {
                 Some(("linkat_proc_self_fd", libc::ENOSPC)),
                 TmpfilePublishPhase::Link,
                 false,
-            ),
-            (
-                ("fstatat", libc::EIO),
-                None,
-                TmpfilePublishPhase::DestinationIdentity,
-                true,
             ),
             (
                 ("fsync_dir_fd", libc::EIO),

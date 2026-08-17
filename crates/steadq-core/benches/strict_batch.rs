@@ -49,18 +49,10 @@ fn ack_pending(batch: &mut steadq_core::Batch<'_>, lease: &steadq_core::LeaseInf
     }
 }
 
-fn complete_lifecycles(path: &std::path::Path, payload: &[u8], jobs: usize) -> u64 {
+fn complete_lifecycles(queue: &mut Queue, payload: &[u8], jobs: usize) -> u64 {
     if jobs == 0 {
         return 0;
     }
-    let mut queue = Queue::open(
-        path,
-        &OpenOptions {
-            allow_unsupported_fs: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
     let mut enqueue_batch = queue.batch();
     for _ in 0..jobs {
         enqueue_pending(
@@ -100,9 +92,12 @@ fn complete_lifecycles(path: &std::path::Path, payload: &[u8], jobs: usize) -> u
 
 fn bench_strict_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("strict_batch_completed");
+    group.warm_up_time(std::time::Duration::from_secs(2));
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.sample_size(30);
 
     for payload_size in [64usize, 16384] {
-        for batch_size in [1usize, 8, 32, 64] {
+        for batch_size in [1usize, 8, 32, 64, 128, 256] {
             for n_workers in [1usize, 4, 8] {
                 let label = format!("{payload_size}B_batch{batch_size}_{n_workers}w");
                 group.throughput(Throughput::Elements(batch_size as u64));
@@ -115,45 +110,50 @@ fn bench_strict_batch(c: &mut Criterion) {
                             Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
                             let payload = vec![0xABu8; payload_size];
                             let mut total_jobs = 0u64;
-                            let mut latencies = Vec::with_capacity(iters as usize);
                             let start = Instant::now();
-                            for _ in 0..iters {
-                                let batch_start = Instant::now();
-                                if n_workers == 1 {
-                                    let completed =
-                                        complete_lifecycles(tmp.path(), &payload, batch_size);
-                                    assert_eq!(completed, batch_size as u64);
-                                    total_jobs += completed;
-                                } else {
-                                    let handles: Vec<_> = (0..n_workers)
-                                        .map(|worker| {
-                                            let p = tmp.path().to_path_buf();
-                                            let payload = payload.clone();
-                                            let jobs = batch_size / n_workers
-                                                + usize::from(worker < batch_size % n_workers);
-                                            std::thread::spawn(move || {
-                                                complete_lifecycles(&p, &payload, jobs)
-                                            })
-                                        })
-                                        .collect();
-                                    let completed: u64 = handles
-                                        .into_iter()
-                                        .map(|handle| handle.join().unwrap())
-                                        .sum();
-                                    assert_eq!(completed, batch_size as u64);
-                                    total_jobs += completed;
-                                }
-                                let elapsed = batch_start.elapsed();
-                                latencies.push(elapsed.as_nanos() as u64);
+                            let handles: Vec<_> = (0..n_workers)
+                                .filter_map(|worker| {
+                                    let jobs = batch_size / n_workers
+                                        + usize::from(worker < batch_size % n_workers);
+                                    if jobs == 0 {
+                                        return None;
+                                    }
+                                    let p = tmp.path().to_path_buf();
+                                    let payload = payload.clone();
+                                    Some(std::thread::spawn(move || {
+                                        let mut queue = Queue::open(
+                                            &p,
+                                            &OpenOptions {
+                                                allow_unsupported_fs: true,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .unwrap();
+                                        let mut latencies = Vec::with_capacity(iters as usize);
+                                        let mut completed = 0;
+                                        for _ in 0..iters {
+                                            let batch_start = Instant::now();
+                                            completed +=
+                                                complete_lifecycles(&mut queue, &payload, jobs);
+                                            latencies.push(batch_start.elapsed().as_nanos() as u64);
+                                        }
+                                        (completed, latencies)
+                                    }))
+                                })
+                                .collect();
+                            let mut latencies = Vec::with_capacity(iters as usize * handles.len());
+                            for handle in handles {
+                                let (completed, mut worker_latencies) = handle.join().unwrap();
+                                total_jobs += completed;
+                                latencies.append(&mut worker_latencies);
                             }
                             let total_elapsed = start.elapsed();
                             assert_eq!(total_jobs, iters * batch_size as u64);
-                            // Compute p99
                             latencies.sort_unstable();
                             let p99_idx = (latencies.len() as f64 * 0.99) as usize;
                             let p99 = latencies.get(p99_idx).copied().unwrap_or(0);
                             eprintln!(
-                                "strict_batch {}: jobs={} batch_size={} workers={} payload={}B total={:?} p99_batch={}ns jobs/sec={:.0}",
+                                "strict_batch {}: jobs={} batch_size={} workers={} payload={}B total={:?} p99_worker_batch={}ns jobs/sec={:.0}",
                                 label,
                                 total_jobs,
                                 batch_size,

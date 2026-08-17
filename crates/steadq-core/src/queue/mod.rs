@@ -51,6 +51,7 @@ pub struct Queue {
     _maint_lock_fd: Option<OwnedFd>,
     pub(crate) recovery_cursor: RecoveryCursor,
     pub(crate) cached_wall_floor: Option<WallFloor>,
+    pub(crate) cached_watermark_fd: std::cell::RefCell<Option<OwnedFd>>,
     pub(crate) known_dirs: std::cell::RefCell<std::collections::HashSet<String>>,
     pub(crate) cached_dest_fd: Option<(String, std::os::fd::OwnedFd)>,
     pub(crate) publication_mode: Option<fs::PublicationMode>,
@@ -656,6 +657,7 @@ impl Queue {
             _maint_lock_fd: Some(maint_fd),
             recovery_cursor,
             cached_wall_floor: None,
+            cached_watermark_fd: std::cell::RefCell::new(None),
             known_dirs: std::cell::RefCell::new(std::collections::HashSet::new()),
             cached_dest_fd: None,
             publication_mode,
@@ -710,14 +712,7 @@ impl Queue {
 /// Open a relative path from a directory fd.
 pub(crate) fn open_relative(root_fd: BorrowedFd<'_>, relative: &str) -> io::Result<OwnedFd> {
     let relative = fs::ValidatedRelativePath::new(relative)?;
-    let mut current = None::<OwnedFd>;
-    for component in relative.components() {
-        let parent_fd = current
-            .as_ref()
-            .map_or(root_fd, |directory| directory.as_fd());
-        current = Some(fs::open_directory(parent_fd, component)?);
-    }
-    current.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty relative path"))
+    fs::open_directory_beneath(root_fd, relative)
 }
 
 /// Input for an enqueue operation.

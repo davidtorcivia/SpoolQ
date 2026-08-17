@@ -138,7 +138,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 
 ## Testing
 
-SteadQ has 706 tests across unit, integration, conformance, and formal model checking:
+SteadQ has 707 tests across unit, integration, conformance, and formal model checking:
 
 - Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
 - Fault injection tests inject I/O errors at every syscall boundary and verify error classification
@@ -154,9 +154,9 @@ Aggregate completed-job throughput using concurrent `Queue` handles:
 
 | Threads | 64 B payload | 1 KiB payload | 16 KiB payload |
 | ---: | ---: | ---: | ---: |
-| 1 | 2,876 jobs/sec | 2,507 jobs/sec | 2,554 jobs/sec |
-| 4 | 5,644 jobs/sec | 5,835 jobs/sec | 5,410 jobs/sec |
-| 8 | 7,995 jobs/sec | 8,047 jobs/sec | 7,179 jobs/sec |
+| 1 | 2,730 jobs/sec | 2,507 jobs/sec | 2,554 jobs/sec |
+| 4 | 5,795 jobs/sec | 5,835 jobs/sec | 5,410 jobs/sec |
+| 8 | 8,212 jobs/sec | 8,047 jobs/sec | 7,179 jobs/sec |
 
 A completed job includes enqueue, lease, explicit payload verification, and
 acknowledgment. These Criterion point estimates use a release build, a 64-shard
@@ -172,18 +172,38 @@ sample Criterion settings):
 
 | Mode | Completed jobs/sec |
 |---|---:|
-| Strict (fsync every directory) | 2,679 |
+| Strict (fsync every directory) | 2,988 |
 | Deferred, `sync()` after every job | 3,463 |
 | Deferred, `sync()` after 10 jobs | 3,229 |
 | Deferred, `sync()` after 50 jobs | 3,453 |
 
 `strace` of one subsequent completed job on a warm 64-shard queue, when the
-wall watermark does not advance: 6 `fsync` (file, enqueue dest, lease dest,
-lease source, ack dest, ack source). The lease rename stays in `ready/<shard>/`
-but the source directory is still synced. A later job that also advances the
-watermark adds the watermark file and `control/` syncs. Same-directory lease
-did not move completed-job throughput off the same 3,000/s band as the
-pre-change measurement (strict 3,065/s, deferred batch-50 3,520/s).
+wall watermark does not advance: 5 `fsync` calls (file, enqueue directory,
+same-directory lease, acknowledgment destination, and acknowledgment source).
+A later job that also advances the watermark adds the watermark file and
+`control/` syncs. Single-handle throughput remains in the same 3,000/s band;
+the durability barriers dominate the remaining cost.
+
+Strict group commit amortizes directory barriers without weakening the commit
+contract. With 8 persistent workers and 64 B jobs on the same reference system:
+
+| Batch size | Completed jobs/sec |
+|---:|---:|
+| 64 | 9,321 |
+| 128 | 9,958 |
+| 256 | 10,116 |
+
+Each point includes a committed enqueue batch followed by a committed batch of
+lease, explicit payload verification, and acknowledgment operations. Batch-256
+crossed 10,000 jobs/sec at the point estimate; its 95% interval was
+9,973–10,212 jobs/sec, so 10,000 is achievable but not yet a reliable floor on
+this system. One persistent worker at batch-256 completed 5,479 jobs/sec.
+
+For a continuously pipelined workload, 9 producers and 15 consumers completed
+a median 11,619 acknowledgments/sec across five fresh 10-second runs (range:
+11,164–12,118). This path retains strict durability and the mandatory payload
+checks in both lease and acknowledgment; unlike the tables above, it does not
+insert a third explicit verification call between them.
 
 ## Documentation
 

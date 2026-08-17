@@ -8,8 +8,8 @@ pub struct Batch<'a> {
     pub(super) queue: &'a mut Queue,
     dirty: engine::DirtySet,
     pending_enqueues: Vec<EnqueueTicket>,
-    pending_leases: Vec<LeaseInfo>,
-    pending_acks: Vec<LeaseInfo>,
+    pending_leases: usize,
+    pending_acks: usize,
 }
 
 impl<'a> Batch<'a> {
@@ -18,8 +18,8 @@ impl<'a> Batch<'a> {
             queue,
             dirty: engine::DirtySet::new(),
             pending_enqueues: Vec::new(),
-            pending_leases: Vec::new(),
-            pending_acks: Vec::new(),
+            pending_leases: 0,
+            pending_acks: 0,
         }
     }
 }
@@ -96,7 +96,7 @@ impl<'a> Batch<'a> {
             .lease_batched(max_wait_ns, lease_duration_ns, &mut self.dirty)
         {
             LeaseOutcome::Leased(info) => {
-                self.pending_leases.push(info.clone());
+                self.pending_leases += 1;
                 BatchLeaseOutcome::Pending(info)
             }
             LeaseOutcome::Empty => BatchLeaseOutcome::Empty,
@@ -114,7 +114,7 @@ impl<'a> Batch<'a> {
     pub fn ack(&mut self, lease: &LeaseInfo) -> BatchAckOutcome {
         match self.queue.ack_batched(lease, &mut self.dirty) {
             AckOutcome::Acked => {
-                self.pending_acks.push(lease.clone());
+                self.pending_acks += 1;
                 BatchAckOutcome::Pending
             }
             AckOutcome::AlreadyAcked => BatchAckOutcome::Pending,
@@ -148,13 +148,11 @@ impl<'a> Batch<'a> {
                     .map(|t| (t, Error::IoFailure(e.to_string())))
                     .collect(),
                 committed_leases: 0,
-                outcome_unknown_leases: pending_leases
-                    .into_iter()
+                outcome_unknown_leases: (0..pending_leases)
                     .map(|_| Error::IoFailure(e.to_string()))
                     .collect(),
                 committed_acks: 0,
-                outcome_unknown_acks: pending_acks
-                    .into_iter()
+                outcome_unknown_acks: (0..pending_acks)
                     .map(|_| Error::IoFailure(e.to_string()))
                     .collect(),
             };
@@ -164,9 +162,9 @@ impl<'a> Batch<'a> {
         Ok(BatchCommitOutcome {
             committed_enqueues: pending_enqueues,
             outcome_unknown_enqueues: Vec::new(),
-            committed_leases: pending_leases.len(),
+            committed_leases: pending_leases,
             outcome_unknown_leases: Vec::new(),
-            committed_acks: pending_acks.len(),
+            committed_acks: pending_acks,
             outcome_unknown_acks: Vec::new(),
         })
     }
