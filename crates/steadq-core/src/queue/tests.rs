@@ -2660,6 +2660,14 @@ fn sharded_bucket_parent_only_matches_in_range_shard_leaves() {
         None
     );
     assert_eq!(
+        super::publish::sharded_bucket_parent("receipts/00ab/003f", 64),
+        Some("receipts/00ab")
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("receipts/00ab/0040", 64),
+        None
+    );
+    assert_eq!(
         super::publish::sharded_bucket_parent("quarantine", 64),
         None
     );
