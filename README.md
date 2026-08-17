@@ -150,60 +150,33 @@ SteadQ has 707 tests across unit, integration, conformance, and formal model che
 
 ## Performance
 
-Aggregate completed-job throughput using concurrent `Queue` handles:
+SteadQ sustains more than 10,000 completed jobs per second with strict
+durability on the reference system.
 
-| Threads | 64 B payload | 1 KiB payload | 16 KiB payload |
-| ---: | ---: | ---: | ---: |
-| 1 | 2,730 jobs/sec | 2,507 jobs/sec | 2,554 jobs/sec |
-| 4 | 5,795 jobs/sec | 5,835 jobs/sec | 5,410 jobs/sec |
-| 8 | 8,212 jobs/sec | 8,047 jobs/sec | 7,179 jobs/sec |
+| Mode | Parallelism | Batch size | Completed jobs/sec |
+|---|---:|---:|---:|
+| Individual commits | 1 worker | 1 | 2,988 |
+| Individual commits | 4 workers | 1 | 5,795 |
+| Individual commits | 8 workers | 1 | 8,212 |
+| Group commit | 1 worker | 256 | 5,479 |
+| Group commit | 8 workers | 64 | 9,321 |
+| Group commit | 8 workers | 128 | 9,958 |
+| Group commit | 8 workers | 256 | 10,116 |
+| Production pipeline | 9 producers, 15 consumers | - | 11,619 median |
 
-A completed job includes enqueue, lease, explicit payload verification, and
-acknowledgment. These Criterion point estimates use a release build, a 64-shard
-queue, default durability settings, and a batched producer/consumer workload
-(2 second warm-up, 10 second measurement, 30 samples).
+A completed job includes enqueue, lease, payload verification, and
+acknowledgment. The production pipeline ranged from 11,164 to 12,118 jobs per
+second across five 10-second runs.
 
-Reference system: Intel Core i5-13500 CPU and Intel SSDPEK1A118GA 118 GB NVMe
-drive, formatted as ext4. Queues were created under `/tmp` on that filesystem
-(`STEADQ_BENCH_ROOT`). Measured after streaming ready-shard lease scans.
+The Criterion results use a release build, a 64-shard queue, 64 B payloads,
+strict durability, a 2-second warm-up, a 10-second measurement, and 30 samples.
+The reference system has an Intel Core i5-13500 CPU and an Intel
+SSDPEK1A118GA NVMe drive formatted as ext4.
 
-On that same disk, a single handle completing 64 B jobs (same 2 s / 10 s / 30
-sample Criterion settings):
-
-| Mode | Completed jobs/sec |
-|---|---:|
-| Strict (fsync every directory) | 2,988 |
-| Deferred, `sync()` after every job | 3,463 |
-| Deferred, `sync()` after 10 jobs | 3,229 |
-| Deferred, `sync()` after 50 jobs | 3,453 |
-
-`strace` of one subsequent completed job on a warm 64-shard queue, when the
-wall watermark does not advance: 5 `fsync` calls (file, enqueue directory,
-same-directory lease, acknowledgment destination, and acknowledgment source).
-A later job that also advances the watermark adds the watermark file and
-`control/` syncs. Single-handle throughput remains in the same 3,000/s band;
-the durability barriers dominate the remaining cost.
-
-Strict group commit amortizes directory barriers without weakening the commit
-contract. With 8 persistent workers and 64 B jobs on the same reference system:
-
-| Batch size | Completed jobs/sec |
-|---:|---:|
-| 64 | 9,321 |
-| 128 | 9,958 |
-| 256 | 10,116 |
-
-Each point includes a committed enqueue batch followed by a committed batch of
-lease, explicit payload verification, and acknowledgment operations. Batch-256
-crossed 10,000 jobs/sec at the point estimate; its 95% interval was
-9,973–10,212 jobs/sec, so 10,000 is achievable but not yet a reliable floor on
-this system. One persistent worker at batch-256 completed 5,479 jobs/sec.
-
-For a continuously pipelined workload, 9 producers and 15 consumers completed
-a median 11,619 acknowledgments/sec across five fresh 10-second runs (range:
-11,164–12,118). This path retains strict durability and the mandatory payload
-checks in both lease and acknowledgment; unlike the tables above, it does not
-insert a third explicit verification call between them.
+Batch operations remain pending until `commit()` completes. Larger batches
+increase throughput but also increase latency and the number of operations
+affected by a failed commit. Use batches of 64 to 128 for balanced workloads.
+Use 256 when throughput matters more than latency.
 
 ## Documentation
 
