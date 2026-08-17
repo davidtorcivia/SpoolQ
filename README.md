@@ -154,9 +154,9 @@ Aggregate completed-job throughput using concurrent `Queue` handles:
 
 | Threads | 64 B payload | 1 KiB payload | 16 KiB payload |
 | ---: | ---: | ---: | ---: |
-| 1 | 2,900 jobs/sec | 3,082 jobs/sec | 2,585 jobs/sec |
-| 4 | 5,651 jobs/sec | 5,426 jobs/sec | 5,294 jobs/sec |
-| 8 | 7,508 jobs/sec | 7,474 jobs/sec | 6,792 jobs/sec |
+| 1 | 2,816 jobs/sec | 2,869 jobs/sec | 2,359 jobs/sec |
+| 4 | 5,633 jobs/sec | 5,975 jobs/sec | 5,292 jobs/sec |
+| 8 | 8,177 jobs/sec | 7,855 jobs/sec | 7,363 jobs/sec |
 
 A completed job includes enqueue, lease, explicit payload verification, and
 acknowledgment. These Criterion point estimates use a release build, a 64-shard
@@ -164,28 +164,26 @@ queue, default durability settings, and a batched producer/consumer workload
 (2 second warm-up, 10 second measurement, 30 samples).
 
 Reference system: Intel Core i5-13500 CPU and Intel SSDPEK1A118GA 118 GB NVMe
-drive, formatted as ext4.
+drive, formatted as ext4. Queues were created under `/tmp` on that filesystem
+(`STEADQ_BENCH_ROOT`). Measured after same-directory lease (#244).
 
 On that same disk, a single handle completing 64 B jobs (same 2 s / 10 s / 30
 sample Criterion settings):
 
 | Mode | Completed jobs/sec |
 |---|---:|
-| Strict (fsync every directory) | 3,065 |
-| Deferred, `sync()` after every job | 3,278 |
-| Deferred, `sync()` after 10 jobs | 3,527 |
-| Deferred, `sync()` after 50 jobs | 3,520 |
+| Strict (fsync every directory) | 2,679 |
+| Deferred, `sync()` after every job | 3,463 |
+| Deferred, `sync()` after 10 jobs | 3,229 |
+| Deferred, `sync()` after 50 jobs | 3,453 |
 
-`strace` of one subsequent completed job on a warm 64-shard queue, before
-same-directory lease: 8 `fsync` (two of those were first-touch parent syncs
-for a new leased shard and receipt shard). After sibling pre-create and
-same-directory lease, a later job in those buckets is 5 `fsync` (tmpfile) or
-6 (named fallback, dest plus tmp): file, enqueue dest, lease dest, ack dest
-and source. The Criterion rates above were measured before same-directory
-lease. A deferred batch of 10 issued 77 `fsync` (7.7 per job). Deferring
-directory `fsync` does not remove the per-job file `fsync` or most of the
-directory barriers on this path, so completed-job throughput stays on the
-same side of 4,000/s.
+`strace` of one subsequent completed job on a warm 64-shard queue, when the
+wall watermark does not advance: 6 `fsync` (file, enqueue dest, lease dest,
+lease source, ack dest, ack source). The lease rename stays in `ready/<shard>/`
+but the source directory is still synced. A later job that also advances the
+watermark adds the watermark file and `control/` syncs. Same-directory lease
+did not move completed-job throughput off the same 3,000/s band as the
+pre-change measurement (strict 3,065/s, deferred batch-50 3,520/s).
 
 ## Documentation
 
