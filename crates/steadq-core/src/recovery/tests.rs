@@ -4146,7 +4146,10 @@ fn recovery_deletes_receipt_after_authenticated_retention_floor() {
             .unwrap();
     write_wall_watermark(&tmp, watermark_bucket);
 
-    let stats = queue.recover(&WorkBudget::default());
+    let stats = queue.recover(&WorkBudget {
+        max_duration_ms: 5_000,
+        ..WorkBudget::default()
+    });
     assert_eq!(stats.receipts_expired, 1, "errors: {:?}", stats.errors);
     assert!(!receipt.exists());
 }
