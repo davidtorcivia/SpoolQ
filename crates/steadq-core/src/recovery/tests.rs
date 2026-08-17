@@ -3335,6 +3335,88 @@ fn previous_boot_colocated_lease_is_reaped_before_deadline() {
 }
 
 #[test]
+fn colocated_ready_shard_open_failure_counts_scan_skip() {
+    let (tmp, mut queue) = create_test_queue_with_shards(1);
+    std::fs::remove_dir_all(tmp.path().join("ready/0000")).unwrap();
+    std::fs::write(tmp.path().join("ready/0000"), b"not a directory").unwrap();
+    let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
+    assert_eq!(stats.scan_skips, 1);
+}
+
+#[test]
+fn colocated_ready_read_budget_counts_scan_skip() {
+    let (_tmp, mut queue) = create_test_queue();
+    let scan_budget = RecoveryScanBudget {
+        max_directories_read: 1,
+        max_entries_read: u64::MAX,
+        max_name_bytes_read: u64::MAX,
+    };
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: &scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    queue.reap_expired_leases(
+        u64::MAX,
+        Some(queue.authenticated_wall_floor().unwrap()),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    assert_eq!(stats.scan_skips, 1);
+}
+
+#[test]
+fn colocated_current_boot_skips_future_deadline() {
+    fs::fault::set_clock_boottime_ns(1_000_000_000);
+    let (_tmp, mut queue) = create_test_queue();
+    let _ = lease_recovery_job(&mut queue, 3);
+    let scan_budget = RecoveryScanBudget::default();
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: &scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    queue.reap_expired_leases(
+        1_000_000_000,
+        Some(queue.authenticated_wall_floor().unwrap()),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    fs::fault::reset();
+    assert_eq!(stats.leases_reaped, 0, "errors: {:?}", stats.errors);
+}
+
+#[test]
+fn colocated_current_boot_reaps_at_deadline() {
+    fs::fault::set_clock_boottime_ns(1_000_000_000);
+    let (_tmp, mut queue) = create_test_queue();
+    let lease = lease_recovery_job(&mut queue, 3);
+    let scan_budget = RecoveryScanBudget::default();
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: &scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    queue.reap_expired_leases(
+        lease.expires_boottime_ns,
+        Some(queue.authenticated_wall_floor().unwrap()),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    fs::fault::reset();
+    assert_eq!(stats.leases_reaped, 1, "errors: {:?}", stats.errors);
+}
+
+#[test]
 fn recovery_empty_queue() {
     let (_tmp, mut queue) = create_test_queue();
     let report =

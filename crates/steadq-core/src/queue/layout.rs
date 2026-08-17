@@ -369,6 +369,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_leased_path_rejects_three_part_non_ready_prefix() {
+        let layout = test_layout();
+        let common = CommonFields {
+            job_id: [1; 16],
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let target = layout
+            .leased(&common, 1_000_000_000, 2_000_000_000, &[2; 16])
+            .unwrap();
+        let path = format!("leased/{}/{}", shard_hex(target.shard()), target.filename);
+        assert!(layout.parse_leased_path(&path).is_err());
+    }
+
+    #[test]
     fn parse_leased_path_valid() {
         let layout = test_layout();
         let path = "leased/12345678-1234-1234-1234-123456789abc/000000000000000a/0001/file.sqj";

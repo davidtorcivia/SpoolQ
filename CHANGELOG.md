@@ -5,7 +5,7 @@
 ### Structure
 
 - Claim keeps the leased file in `ready/<shard>/`. The leased filename includes boot id (`.o` + 32 hex). Recovery still walks `leased/` for the previous layout and reaps colocated leased names from `ready/`
-- README test count matches `cargo test --workspace --all-features -- --list` (701)
+- README test count matches `cargo test --workspace --all-features -- --list` (706)
 - Removed leftover `dead_code`/`unused_imports` allows on live items and the unused power-loss `is_durable` helper
 - Split `queue/mod.rs` into publish, lease, consumer, and inspect modules; init and open stay in the parent
 - Split recovery phases into reap, promote, and retain
@@ -58,7 +58,7 @@
 
 ### Testing
 
-- 701 tests: unit, fault injection, differential, and formal model checking
+- 706 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request
