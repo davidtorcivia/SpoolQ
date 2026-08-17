@@ -118,7 +118,7 @@ fn enqueue_and_lease(queue: &mut Queue) -> LeaseInfo {
     }
 }
 
-fn precreate_claim_destination_buckets(tmp: &TempDir, queue: &Queue, lease_duration_ns: u64) {
+fn precreate_claim_destination_buckets(_tmp: &TempDir, queue: &Queue, lease_duration_ns: u64) {
     let deadline = fs::clock_boottime_ns()
         .unwrap()
         .checked_add(lease_duration_ns)
@@ -126,25 +126,21 @@ fn precreate_claim_destination_buckets(tmp: &TempDir, queue: &Queue, lease_durat
     let bucket = steadq_math::lease_bucket(deadline, queue.format.lease_bucket_width_ns())
         .expect("test lease deadline has a bucket");
     for bucket in bucket.saturating_sub(1)..=bucket.saturating_add(1) {
-        for shard in 0..queue.format.shard_count() {
-            std::fs::create_dir_all(tmp.path().join(format!(
-                "leased/{}/{}/{shard:04x}",
+        queue
+            .ensure_dir(&format!(
+                "leased/{}/{}/0000",
                 queue.boot_id,
                 bucket_hex(bucket)
-            )))
+            ))
             .unwrap();
-        }
     }
 }
 
-fn precreate_named_temp_shards(tmp: &TempDir, queue: &Queue) {
-    for shard in 0..queue.format.shard_count() {
-        std::fs::create_dir_all(
-            tmp.path()
-                .join(format!("tmp/{}/{shard:04x}", queue.boot_id)),
-        )
+fn precreate_named_temp_shards(_tmp: &TempDir, queue: &Queue) {
+    queue.ensure_dir("ready/0000").unwrap();
+    queue
+        .ensure_dir(&format!("tmp/{}/0000", queue.boot_id))
         .unwrap();
-    }
 }
 
 fn tmpfile_supported(queue: &Queue) -> bool {
@@ -1435,6 +1431,7 @@ fn tmpfile_publication_preserves_postlinearization_failures() {
         if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
             return;
         }
+        queue.ensure_dir("ready/0000").unwrap();
         fs::fault::reset();
         fs::fault::set_clock_realtime_ns(1_000_000_000);
         let fault_call = if fault == "fstatat" {
@@ -2642,6 +2639,144 @@ fn warm_completed_job_fsyncs_required_directories_once() {
     assert_eq!(lease_counts, (2, 2), "lease dest + source");
     assert_eq!(verify, (0, 0), "verify is read-only");
     assert_eq!(ack, (2, 2), "ack dest + source");
+}
+
+#[test]
+fn sharded_bucket_parent_only_matches_in_range_shard_leaves() {
+    assert_eq!(
+        super::publish::sharded_bucket_parent("receipts/00ab/0001", 64),
+        Some("receipts/00ab")
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("leased/boot/bucket/003f", 64),
+        Some("leased/boot/bucket")
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("ready/0000", 64),
+        None
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("ready/0040", 64),
+        None
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("receipts/00ab/003f", 64),
+        Some("receipts/00ab")
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("receipts/00ab/0040", 64),
+        None
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("quarantine", 64),
+        None
+    );
+    assert_eq!(
+        super::publish::sharded_bucket_parent("receipts/00ab/job.sqj", 64),
+        None
+    );
+}
+
+#[test]
+fn ensuring_one_shard_creates_every_sibling_and_syncs_the_bucket_once() {
+    let (tmp, queue) = create_test_queue_shards(4);
+    let bucket = format!(
+        "receipts/{}",
+        steadq_names::bucket_hex(
+            steadq_math::bucket_number(
+                queue.effective_wall_floor_ns_checked().unwrap(),
+                queue.format.terminal_bucket_width_ns(),
+            )
+            .unwrap()
+        )
+    );
+    let bucket_fd = {
+        queue.ensure_dir(&bucket).unwrap();
+        open_relative(queue.root_fd().as_fd(), &bucket).unwrap()
+    };
+    let bucket_stat = fs::fstat(bucket_fd.as_fd()).unwrap();
+    let bucket_id = (bucket_stat.st_dev as u64, bucket_stat.st_ino as u64);
+
+    fs::fault::reset();
+    fs::fault::inject("fsync", u64::MAX);
+    queue.ensure_dir(&format!("{bucket}/0002")).unwrap();
+    let identities = fs::fault::fd_identities("fsync_dir_fd");
+    fs::fault::reset();
+
+    let shard_dirs: Vec<_> = std::fs::read_dir(tmp.path().join(&bucket))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert_eq!(shard_dirs.len(), 4);
+    assert_eq!(
+        identities.iter().filter(|id| **id == bucket_id).count(),
+        1,
+        "sibling creation syncs the bucket once, got {identities:?}"
+    );
+
+    fs::fault::reset();
+    fs::fault::inject("fsync", u64::MAX);
+    queue.ensure_dir(&format!("{bucket}/0003")).unwrap();
+    assert_eq!(fs::fault::call_count("fsync_dir_fd"), 0);
+    fs::fault::reset();
+}
+
+#[test]
+fn first_lease_creates_every_leased_shard_in_the_bucket() {
+    let (tmp, mut queue) = create_test_queue_shards(4);
+    match queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "text/plain".into(),
+        payload: vec![0xAB; 64],
+        ..Default::default()
+    }) {
+        EnqueueOutcome::Committed(_) => {}
+        other => panic!("enqueue: {other:?}"),
+    }
+    match queue.lease(0, 30_000_000_000) {
+        LeaseOutcome::Leased(_) => {}
+        other => panic!("lease: {other:?}"),
+    }
+    let leased = tmp.path().join("leased").join(&queue.boot_id);
+    let mut shard_dirs = Vec::new();
+    for bucket in std::fs::read_dir(&leased).unwrap().filter_map(|e| e.ok()) {
+        if !bucket.path().is_dir() {
+            continue;
+        }
+        for shard in std::fs::read_dir(bucket.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
+            if shard.path().is_dir() {
+                shard_dirs.push(shard.file_name());
+            }
+        }
+    }
+    assert_eq!(shard_dirs.len(), 4);
+}
+
+#[test]
+fn warm_four_shard_completed_job_has_no_per_shard_mkdir_fsync() {
+    let (_tmp, mut queue) = create_test_queue_shards(4);
+    complete_one_job(&mut queue);
+
+    fs::fault::reset();
+    fs::fault::inject("fsync", u64::MAX);
+    let start = sync_call_counts();
+    complete_one_job(&mut queue);
+    let total = sync_call_delta(start);
+    fs::fault::reset();
+
+    let named_fallback = matches!(
+        queue.publication_mode,
+        Some(fs::PublicationMode::NamedFallback)
+    );
+    if named_fallback {
+        assert_eq!(total, (7, 6), "named fallback warm completed job");
+    } else {
+        assert_eq!(total, (6, 5), "tmpfile warm completed job");
+    }
 }
 
 #[test]
