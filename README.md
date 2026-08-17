@@ -154,9 +154,9 @@ Aggregate completed-job throughput using concurrent `Queue` handles:
 
 | Threads | 64 B payload | 1 KiB payload | 16 KiB payload |
 | ---: | ---: | ---: | ---: |
-| 1 | 2,816 jobs/sec | 2,869 jobs/sec | 2,359 jobs/sec |
-| 4 | 5,633 jobs/sec | 5,975 jobs/sec | 5,292 jobs/sec |
-| 8 | 8,177 jobs/sec | 7,855 jobs/sec | 7,363 jobs/sec |
+| 1 | 2,876 jobs/sec | 2,507 jobs/sec | 2,554 jobs/sec |
+| 4 | 5,644 jobs/sec | 5,835 jobs/sec | 5,410 jobs/sec |
+| 8 | 7,995 jobs/sec | 8,047 jobs/sec | 7,179 jobs/sec |
 
 A completed job includes enqueue, lease, explicit payload verification, and
 acknowledgment. These Criterion point estimates use a release build, a 64-shard
@@ -165,7 +165,7 @@ queue, default durability settings, and a batched producer/consumer workload
 
 Reference system: Intel Core i5-13500 CPU and Intel SSDPEK1A118GA 118 GB NVMe
 drive, formatted as ext4. Queues were created under `/tmp` on that filesystem
-(`STEADQ_BENCH_ROOT`). Measured after same-directory lease (#244).
+(`STEADQ_BENCH_ROOT`). Measured after streaming ready-shard lease scans.
 
 On that same disk, a single handle completing 64 B jobs (same 2 s / 10 s / 30
 sample Criterion settings):

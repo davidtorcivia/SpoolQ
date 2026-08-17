@@ -1140,10 +1140,11 @@ impl DirectoryEnumerationProgressError {
     }
 }
 
-struct DirectoryStream(NonNull<libc::DIR>);
+/// Streaming, byte-preserving directory enumeration.
+pub struct DirectoryStream(NonNull<libc::DIR>);
 
 impl DirectoryStream {
-    fn open(fd: OwnedFd) -> io::Result<Self> {
+    fn from_owned(fd: OwnedFd) -> io::Result<Self> {
         let raw_fd = fd.into_raw_fd();
         // SAFETY: `raw_fd` is a live directory descriptor. `fdopendir`
         // takes ownership on success and leaves ownership with the caller on failure.
@@ -1159,7 +1160,23 @@ impl DirectoryStream {
         }
     }
 
-    fn next(&mut self) -> io::Result<Option<DirEntryName>> {
+    pub fn open(dir_fd: BorrowedFd<'_>) -> io::Result<Self> {
+        Self::from_owned(reopen_directory(dir_fd)?)
+    }
+
+    pub fn next_entry(&mut self) -> io::Result<Option<DirEntryName>> {
+        fault_check!("directory_stream_next");
+        loop {
+            let Some(name) = self.next_raw()? else {
+                return Ok(None);
+            };
+            if name.as_bytes() != b"." && name.as_bytes() != b".." {
+                return Ok(Some(name));
+            }
+        }
+    }
+
+    fn next_raw(&mut self) -> io::Result<Option<DirEntryName>> {
         // SAFETY: the thread-local errno location is writable for this thread.
         unsafe { *libc::__errno_location() = 0 };
         // SAFETY: `self.0` is a live DIR stream owned by this value.
@@ -1210,7 +1227,7 @@ where
     let mut entries = Vec::new();
     let mut name_bytes_read = 0usize;
     let mut progress = DirectoryEnumerationProgress::default();
-    let mut dir = DirectoryStream::open(dir_fd)
+    let mut dir = DirectoryStream::from_owned(dir_fd)
         .map_err(|error| DirectoryEnumerationProgressError::Io { error, progress })?;
 
     loop {
@@ -1227,7 +1244,7 @@ where
             }
         }
         let Some(name) = dir
-            .next()
+            .next_raw()
             .map_err(|error| DirectoryEnumerationProgressError::Io { error, progress })?
         else {
             break;
@@ -1271,21 +1288,19 @@ fn read_dir_entries_impl(dir_fd: OwnedFd) -> io::Result<Vec<DirEntryName>> {
         .map(|enumeration| enumeration.entries)
 }
 
-/// R4-PERF: Iterate directory entries with a callback, avoiding full
-/// materialization. The callback returns true to continue, false to stop.
+/// Iterate directory entries with a callback. The callback returns true to
+/// continue and false to stop.
 /// Returns the number of entries processed.
 pub fn read_dir_for_each<F: FnMut(&DirEntryName) -> bool>(
     dir_fd: BorrowedFd<'_>,
     mut f: F,
 ) -> io::Result<usize> {
-    let mut dir = DirectoryStream::open(reopen_directory(dir_fd)?)?;
+    let mut dir = DirectoryStream::open(dir_fd)?;
     let mut count = 0usize;
-    while let Some(name) = dir.next()? {
-        if name.as_bytes() != b"." && name.as_bytes() != b".." {
-            count += 1;
-            if !f(&name) {
-                break;
-            }
+    while let Some(name) = dir.next_entry()? {
+        count += 1;
+        if !f(&name) {
+            break;
         }
     }
     Ok(count)
@@ -2069,7 +2084,7 @@ mod tests {
         let directory: OwnedFd = std::fs::File::open(dir_path).unwrap().into();
         let directory_fd = directory.as_raw_fd();
         let directory_stat = fstat(directory.as_fd()).unwrap();
-        let stream = DirectoryStream::open(directory).unwrap();
+        let stream = DirectoryStream::from_owned(directory).unwrap();
         drop(stream);
         assert_fd_released(directory_fd, directory_stat.st_dev, directory_stat.st_ino);
 
@@ -2078,7 +2093,7 @@ mod tests {
         let file: OwnedFd = std::fs::File::open(file_path).unwrap().into();
         let file_fd = file.as_raw_fd();
         let file_stat = fstat(file.as_fd()).unwrap();
-        let error = match DirectoryStream::open(file) {
+        let error = match DirectoryStream::from_owned(file) {
             Ok(_) => panic!("fdopendir accepted a regular file"),
             Err(error) => error,
         };

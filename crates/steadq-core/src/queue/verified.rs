@@ -26,7 +26,10 @@ fn file_size(stat: &libc::stat) -> Result<u64, VerificationError> {
 }
 
 /// Checked total size: 128 + ext_len + payload_length without overflow.
-fn checked_total_size(ext_len: usize, payload_length: u64) -> Result<u64, VerificationError> {
+pub(crate) fn checked_total_size(
+    ext_len: usize,
+    payload_length: u64,
+) -> Result<u64, VerificationError> {
     let header_ext = 128u64
         .checked_add(ext_len as u64)
         .ok_or_else(|| VerificationError::Corrupt("size overflow".into()))?;

@@ -1987,6 +1987,37 @@ fn lease_empty_queue() {
 }
 
 #[test]
+fn lease_reports_readdir_failure_after_partial_scan() {
+    let tmp = TempDir::new().unwrap();
+    Queue::init(
+        tmp.path(),
+        &CreateOptions {
+            shard_count: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("ready/0000/ignored"), b"").unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    fs::fault::inject("directory_stream_next", 2);
+    let outcome = queue.lease(0, 30_000_000_000);
+    fs::fault::reset();
+
+    assert!(matches!(
+        outcome,
+        LeaseOutcome::NotCommitted(Error::IoFailure(_))
+    ));
+}
+
+#[test]
 fn retry_after_lease() {
     let (_tmp, mut queue) = create_test_queue();
     let input = EnqueueInput {
