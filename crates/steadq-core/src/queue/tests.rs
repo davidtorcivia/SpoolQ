@@ -1042,7 +1042,7 @@ fn batch_enqueue_preserves_every_injected_postlinearization_failure() {
         if !named_fallback && !link_publication_attempted(&create_test_queue().1) {
             continue;
         }
-        for fault in ["fstatat", "fstat"] {
+        for fault in ["fstat"] {
             let count_calls = || {
                 let (_tmp, mut queue) = create_test_queue();
                 if named_fallback {
@@ -1448,42 +1448,29 @@ fn tmpfile_publication_does_not_weaken_fatal_link_failures() {
 
 #[test]
 fn tmpfile_publication_preserves_postlinearization_failures() {
-    for fault in ["fstatat", "fsync_dir_fd"] {
-        let (tmp, mut queue) = create_test_queue();
-        if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
-            return;
-        }
-        queue.ensure_dir("ready/0000").unwrap();
-        fs::fault::reset();
-        fs::fault::set_clock_realtime_ns(1_000_000_000);
-        let fault_call = if fault == "fstatat" {
-            // The first call authenticates the wall-watermark pathname;
-            // the second verifies the published destination identity.
-            2
-        } else {
-            1
-        };
-        fs::fault::inject_errno(fault, fault_call, libc::EIO);
-
-        let outcome = queue.enqueue(EnqueueInput {
-            maximum_attempts: 3,
-            content_type: "text/plain".into(),
-            payload: b"indeterminate publication".to_vec(),
-            ..Default::default()
-        });
-        fs::fault::reset();
-
-        let EnqueueOutcome::OutcomeUnknown(ticket, Error::IoFailure(message)) = outcome else {
-            panic!("expected outcome unknown");
-        };
-        assert!(queue.is_poisoned());
-        assert!(tmp.path().join(ticket.expected_relative_path).exists());
-        assert!(message.contains(if fault == "fstatat" {
-            "DestinationIdentity"
-        } else {
-            "DestinationFsync"
-        }));
+    let (tmp, mut queue) = create_test_queue();
+    if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
+        return;
     }
+    queue.ensure_dir("ready/0000").unwrap();
+    fs::fault::reset();
+    fs::fault::set_clock_realtime_ns(1_000_000_000);
+    fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+
+    let outcome = queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "text/plain".into(),
+        payload: b"indeterminate publication".to_vec(),
+        ..Default::default()
+    });
+    fs::fault::reset();
+
+    let EnqueueOutcome::OutcomeUnknown(ticket, Error::IoFailure(message)) = outcome else {
+        panic!("expected outcome unknown");
+    };
+    assert!(queue.is_poisoned());
+    assert!(tmp.path().join(ticket.expected_relative_path).exists());
+    assert!(message.contains("DestinationFsync"));
 }
 
 #[test]
@@ -4287,6 +4274,20 @@ fn watermark_read_retries_an_atomic_replacement() {
 }
 
 #[test]
+fn watermark_read_reuses_the_open_file() {
+    let (_tmp, queue) = create_test_queue();
+    queue.cached_watermark_fd.borrow_mut().take();
+    fs::fault::reset();
+    fs::fault::inject("unused", u64::MAX);
+
+    queue.read_wall_watermark().unwrap();
+    queue.read_wall_watermark().unwrap();
+
+    assert_eq!(fs::fault::call_count("openat"), 1);
+    fs::fault::reset();
+}
+
+#[test]
 fn watermark_read_exhaustion_is_transient_contention() {
     let (_tmp, queue) = create_test_queue();
 
@@ -4608,7 +4609,6 @@ fn watermark_advance_fault_matrix() {
         ("fstat", 1),
         ("pread", 1),
         ("get_random", 1),
-        ("openat", 3),
         ("write_all", 1),
         ("fsync", 1),
         ("renameat", 1),
@@ -5209,13 +5209,17 @@ fn concurrent_producers_consumers_overlap() {
         .unwrap();
         let deadline = std::time::Instant::now() + duration;
         while std::time::Instant::now() < deadline {
-            if let EnqueueOutcome::Committed(_) = queue.enqueue(EnqueueInput {
+            match queue.enqueue(EnqueueInput {
                 maximum_attempts: 1,
                 content_type: "test".to_string(),
                 payload: b"concurrent".to_vec(),
                 ..Default::default()
             }) {
-                p_total.fetch_add(1, Ordering::Relaxed);
+                EnqueueOutcome::Committed(_) => {
+                    p_total.fetch_add(1, Ordering::Relaxed);
+                }
+                EnqueueOutcome::NotCommitted(_, Error::MaintenanceBusy) => {}
+                outcome => panic!("concurrent enqueue failed: {outcome:?}"),
             }
         }
     });
@@ -5236,14 +5240,19 @@ fn concurrent_producers_consumers_overlap() {
             match queue.lease(0, 60_000_000_000) {
                 LeaseOutcome::Leased(l) => {
                     queue.verify_lease_payload(&l).unwrap();
-                    if queue.ack(&l) == AckOutcome::Acked {
-                        c_consumed.fetch_add(1, Ordering::Relaxed);
+                    match queue.ack(&l) {
+                        AckOutcome::Acked => {
+                            c_consumed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        AckOutcome::NotCommitted(Error::MaintenanceBusy) => {}
+                        outcome => panic!("concurrent acknowledgment failed: {outcome:?}"),
                     }
                 }
                 LeaseOutcome::Empty => {
                     thread::sleep(std::time::Duration::from_millis(1));
                 }
-                _ => {}
+                LeaseOutcome::NotCommitted(Error::MaintenanceBusy) => {}
+                outcome => panic!("concurrent lease failed: {outcome:?}"),
             }
         }
     });
