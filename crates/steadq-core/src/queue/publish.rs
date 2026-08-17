@@ -1284,6 +1284,10 @@ impl PublishError {
 
 pub(super) fn sharded_bucket_parent(relative: &str, shard_count: u32) -> Option<&str> {
     let (bucket, shard_name) = relative.rsplit_once('/')?;
+    // ready/<shard> is created and parent-synced at init.
+    if bucket == "ready" {
+        return None;
+    }
     let shard = steadq_names::shard_from_hex(shard_name)?;
     (shard < shard_count).then_some(bucket)
 }

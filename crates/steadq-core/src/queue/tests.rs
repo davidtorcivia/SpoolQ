@@ -2653,7 +2653,7 @@ fn sharded_bucket_parent_only_matches_in_range_shard_leaves() {
     );
     assert_eq!(
         super::publish::sharded_bucket_parent("ready/0000", 64),
-        Some("ready")
+        None
     );
     assert_eq!(
         super::publish::sharded_bucket_parent("ready/0040", 64),
