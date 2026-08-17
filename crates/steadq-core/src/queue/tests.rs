@@ -1082,9 +1082,10 @@ fn batch_enqueue_preserves_every_injected_postlinearization_failure() {
                     payload: b"batch enqueue fault matrix".to_vec(),
                     ..Default::default()
                 });
+                let reached = fs::fault::call_count(fault) >= target;
                 fs::fault::reset();
                 let linearized = find_file_with_suffix(&tmp.path().join("ready"), ".sqj").is_some();
-                if linearized {
+                if linearized && reached {
                     exercised += 1;
                     assert!(
                         matches!(outcome, BatchEnqueueOutcome::OutcomeUnknown(_, _)),
@@ -1138,9 +1139,10 @@ fn batch_lease_preserves_every_injected_postlinearization_failure() {
             fs::fault::reset();
             fs::fault::inject_errno(fault, target, libc::EIO);
             let outcome = queue.batch().lease(0, 30_000_000_000);
+            let reached = fs::fault::call_count(fault) >= target;
             fs::fault::reset();
             let linearized = find_leased_job(&tmp.path().join("ready")).is_some();
-            if linearized {
+            if linearized && reached {
                 match outcome {
                     BatchLeaseOutcome::OutcomeUnknown(_) => exercised += 1,
                     BatchLeaseOutcome::Pending(_) => {}
@@ -1189,9 +1191,10 @@ fn batch_ack_preserves_every_injected_postlinearization_failure() {
             fs::fault::reset();
             fs::fault::inject_errno(fault, target, libc::EIO);
             let outcome = queue.batch().ack(&lease);
+            let reached = fs::fault::call_count(fault) >= target;
             fs::fault::reset();
             let linearized = find_file_with_suffix(&tmp.path().join("receipts"), ".rct").is_some();
-            if linearized {
+            if linearized && reached {
                 match outcome {
                     BatchAckOutcome::OutcomeUnknown(_) => exercised += 1,
                     BatchAckOutcome::Pending => {}
