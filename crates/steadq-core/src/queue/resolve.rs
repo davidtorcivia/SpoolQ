@@ -349,22 +349,42 @@ impl Queue {
         // the path prefix, not trusted from the ticket.
         match state {
             "ready" => {
-                // ready/<shard>/<file> = 3 parts
                 if parts.len() != 3 {
                     return ResolveObj::Conflict;
                 }
-                let p = match steadq_names::parse_ready(name) {
-                    Ok(p) => p,
-                    Err(_) => return ResolveObj::Conflict,
-                };
-                if &p.common != expected_common {
-                    return ResolveObj::Conflict;
-                }
                 let shard_hex = parts[1];
-                if !p.authenticate_tag(self.format.queue_id(), shard_hex) {
-                    return ResolveObj::Conflict;
-                }
-                if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
+                if let Ok(p) = steadq_names::parse_ready(name) {
+                    if &p.common != expected_common {
+                        return ResolveObj::Conflict;
+                    }
+                    if !p.authenticate_tag(self.format.queue_id(), shard_hex) {
+                        return ResolveObj::Conflict;
+                    }
+                    if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
+                        return ResolveObj::Conflict;
+                    }
+                } else if let Ok(p) = steadq_names::parse_leased(name) {
+                    if &p.common != expected_common {
+                        return ResolveObj::Conflict;
+                    }
+                    if p.token != ticket.lease_token() {
+                        return ResolveObj::Conflict;
+                    }
+                    let boot = steadq_names::format_boot_id(&p.boot_id);
+                    let Some(bucket) = steadq_math::lease_bucket(
+                        p.boottime_deadline_ns,
+                        self.format.lease_bucket_width_ns(),
+                    ) else {
+                        return ResolveObj::Conflict;
+                    };
+                    let bucket_hex = steadq_names::bucket_hex(bucket);
+                    if !p.authenticate_tag(self.format.queue_id(), &boot, &bucket_hex, shard_hex) {
+                        return ResolveObj::Conflict;
+                    }
+                    if !self.verify_shard_placement(shard_hex, &ticket.job_id()) {
+                        return ResolveObj::Conflict;
+                    }
+                } else {
                     return ResolveObj::Conflict;
                 }
             }

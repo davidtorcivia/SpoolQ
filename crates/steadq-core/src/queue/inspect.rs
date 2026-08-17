@@ -269,6 +269,19 @@ impl Queue {
                                 size: 0,
                             });
                         }
+                    } else if let Ok(parsed) = steadq_names::parse_leased(entry) {
+                        if parsed.common.job_id == *job_id {
+                            results.push(Snapshot {
+                                job_id: *job_id,
+                                state: "leased".into(),
+                                generation: parsed.common.generation,
+                                attempt: parsed.common.attempt,
+                                maximum_attempts: parsed.common.maximum_attempts,
+                                shard,
+                                relative_path: format!("{ready_dir}/{entry}"),
+                                size: 0,
+                            });
+                        }
                     }
                 }
             }

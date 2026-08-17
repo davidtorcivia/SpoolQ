@@ -113,8 +113,8 @@ A queue lives in a directory on a local Linux filesystem (ext4, XFS, btrfs, f2fs
         maintenance.lock      OFD write lock for recovery
         recovery.lock         OFD write lock for exclusive recovery
         wall-watermark        Authenticated wall-time floor
-      ready/<shard>/          Jobs available for lease
-      leased/<boot>/<bucket>/<shard>/   Jobs held by consumers
+      ready/<shard>/          Ready jobs; leased jobs stay here with boot id in the filename
+      leased/<boot>/<bucket>/<shard>/   Previous-layout leases, still scanned on recovery
       delayed/<bucket>/<shard>/         Jobs waiting for scheduled delivery
       dead/<bucket>/<shard>/            Jobs that exhausted retries
       receipts/<bucket>/<shard>/        Acknowledgment records
@@ -138,7 +138,7 @@ Every job filename encodes its identity: queue ID, job ID, generation, attempt c
 
 ## Testing
 
-SteadQ has 697 tests across unit, integration, conformance, and formal model checking:
+SteadQ has 706 tests across unit, integration, conformance, and formal model checking:
 
 - Unit tests cover every binary format, filename, shard computation, retry policy, and syscall wrapper
 - Fault injection tests inject I/O errors at every syscall boundary and verify error classification
@@ -176,15 +176,16 @@ sample Criterion settings):
 | Deferred, `sync()` after 10 jobs | 3,527 |
 | Deferred, `sync()` after 50 jobs | 3,520 |
 
-`strace` of one subsequent completed job on a warm 64-shard queue: 8 `fsync`
-before sibling pre-create (two of those were first-touch parent syncs for a
-new leased shard and receipt shard). After the first `ensure_dir` of a shard
-leaf creates every sibling and `fsync`s the bucket once, a later job in those
-buckets is 6 `fsync` (tmpfile) or 7 (named fallback, dest plus tmp): file,
-enqueue dest, lease dest and source, ack dest and source. A deferred batch of
-10 issued 77 `fsync` (7.7 per job). Deferring directory `fsync` does not
-remove the per-job file `fsync` or most of the directory barriers on this
-path, so completed-job throughput stays on the same side of 4,000/s.
+`strace` of one subsequent completed job on a warm 64-shard queue, before
+same-directory lease: 8 `fsync` (two of those were first-touch parent syncs
+for a new leased shard and receipt shard). After sibling pre-create and
+same-directory lease, a later job in those buckets is 5 `fsync` (tmpfile) or
+6 (named fallback, dest plus tmp): file, enqueue dest, lease dest, ack dest
+and source. The Criterion rates above were measured before same-directory
+lease. A deferred batch of 10 issued 77 `fsync` (7.7 per job). Deferring
+directory `fsync` does not remove the per-job file `fsync` or most of the
+directory barriers on this path, so completed-job throughput stays on the
+same side of 4,000/s.
 
 ## Documentation
 

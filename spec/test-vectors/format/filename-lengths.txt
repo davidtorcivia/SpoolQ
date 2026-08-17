@@ -8,9 +8,9 @@ All lengths verified against NAME_MAX >= 255.
 | delayed    |   110 |             145 |
 | dead       |    98 |             157 |
 | receipt    |   126 |             129 |
-| leased     |   162 |              93 |
+| leased     |   196 |              59 |
 | temporary  |    53 |             202 |
 | quarantine |    43 |             212 |
 
-Longest active filename: leased at 162 bytes.
-Remaining budget: 255 - 162 = 93 bytes.
+Longest active filename: leased at 196 bytes.
+Remaining budget: 255 - 196 = 59 bytes.

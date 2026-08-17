@@ -501,21 +501,11 @@ impl Queue {
             )));
         }
 
-        let src_dir = match loc {
-            layout::Location::Leased {
-                boot_id,
-                bucket,
-                shard,
-            } => {
-                format!(
-                    "leased/{}/{}/{}",
-                    boot_id,
-                    bucket_hex(bucket),
-                    shard_hex(shard)
-                )
-            }
-            _ => unreachable!(),
-        };
+        let src_dir = lease
+            .exact_source_path
+            .rsplit_once('/')
+            .map(|(directory, _)| directory.to_string())
+            .ok_or_else(|| Error::QueueCorrupt("invalid leased path".into()))?;
 
         // R2-H02: Only ENOENT means "source gone". Other errors are real failures.
         let src_dir_fd = match open_relative(self.root_fd.as_fd(), &src_dir) {

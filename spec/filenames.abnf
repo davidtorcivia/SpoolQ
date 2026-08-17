@@ -17,7 +17,7 @@ ready-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts
              ".k" name-tag ".sqj"
 
 leased-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts
-              ".b" time-ns ".w" time-ns ".t" lease-token
+              ".o" 32hex-digit ".b" time-ns ".w" time-ns ".t" lease-token
               ".k" name-tag ".sqj"
 
 delayed-name = job-id ".g" generation ".a" attempt ".m" maximum-attempts

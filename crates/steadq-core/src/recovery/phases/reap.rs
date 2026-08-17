@@ -543,6 +543,225 @@ impl Queue {
             }
         }
         self.recovery_cursor.reap_leases = None;
+        self.reap_colocated_ready_leases(
+            boottime_now,
+            wall_floor,
+            budget,
+            scan,
+            stats,
+            deadline_mono,
+        );
+    }
+
+    fn reap_colocated_ready_leases(
+        &mut self,
+        boottime_now: u64,
+        wall_floor: Option<WallFloor>,
+        budget: &WorkBudget,
+        scan: &mut RecoveryScanContext<'_>,
+        stats: &mut RecoveryStats,
+        deadline_mono: u64,
+    ) {
+        for shard in 0..self.format.shard_count() {
+            if Self::work_budget_exhausted(stats, budget, deadline_mono) {
+                stats.budget_exhausted = true;
+                return;
+            }
+            let ready_dir = self.layout().ready_shard_dir(shard);
+            let shard_fd = match open_relative(self.root_fd(), &ready_dir) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    stats.scan_skips += 1;
+                    continue;
+                }
+            };
+            let mut entries = match read_recovery_directory(
+                shard_fd.as_fd(),
+                deadline_mono,
+                scan.budget,
+                scan.stats,
+            ) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    stats.scan_skips += 1;
+                    if Self::record_directory_error(stats, "reap_entry_read", &ready_dir, &error) {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            entries.sort();
+            let shard_name = steadq_names::shard_hex(shard);
+            for raw_entry in entries {
+                let Some(entry) = raw_entry.as_ascii_str() else {
+                    continue;
+                };
+                let Ok(parsed) = steadq_names::parse_leased(entry) else {
+                    continue;
+                };
+                let relative_path = format!("{ready_dir}/{entry}");
+                let boot_id = steadq_names::format_boot_id(&parsed.boot_id);
+                let Some(bucket) = steadq_math::lease_bucket(
+                    parsed.boottime_deadline_ns,
+                    self.format.lease_bucket_width_ns(),
+                ) else {
+                    Self::record_error(
+                        stats,
+                        "reap_bucket_check",
+                        &relative_path,
+                        "invalid lease bucket width",
+                    );
+                    continue;
+                };
+                let bucket_name = steadq_names::bucket_hex(bucket);
+                if !parsed.authenticate_tag(
+                    self.format.queue_id(),
+                    &boot_id,
+                    &bucket_name,
+                    &shard_name,
+                ) {
+                    Self::record_error(stats, "reap_parse", &relative_path, "name tag mismatch");
+                    continue;
+                }
+                let current_boot = boot_id == self.boot_id;
+                if current_boot && parsed.boottime_deadline_ns > boottime_now {
+                    continue;
+                }
+                let leased_ctx = crate::ActivePathContext::Leased {
+                    boot_id: boot_id.clone(),
+                    bucket: bucket_name.clone(),
+                    shard: shard_name.clone(),
+                };
+                if let Err(error) =
+                    self.validate_active_object(shard_fd.as_fd(), entry, &leased_ctx)
+                {
+                    Self::record_error(stats, "reap_validate", &relative_path, &format!("{error}"));
+                    continue;
+                }
+                if Self::work_budget_exhausted(stats, budget, deadline_mono) {
+                    stats.budget_exhausted = true;
+                    return;
+                }
+                stats.operations_attempted += 1;
+                if parsed.common.attempt >= parsed.common.maximum_attempts {
+                    let Some(wall_floor) = wall_floor else {
+                        Self::record_error(
+                            stats,
+                            "reap_to_dead",
+                            &relative_path,
+                            "authenticated wall floor unavailable",
+                        );
+                        continue;
+                    };
+                    match self.reap_colocated_to_dead(
+                        shard,
+                        entry,
+                        &parsed.common,
+                        DeadReason::AttemptsExhausted,
+                        wall_floor,
+                    ) {
+                        Ok(()) => stats.leases_to_dead += 1,
+                        Err(failure) => Self::record_move_failure(
+                            stats,
+                            "reap_to_dead",
+                            &relative_path,
+                            failure,
+                        ),
+                    }
+                } else {
+                    match self.reap_colocated_to_ready(shard, entry, &parsed.common) {
+                        Ok(()) => stats.leases_reaped += 1,
+                        Err(failure) => Self::record_move_failure(
+                            stats,
+                            "reap_to_ready",
+                            &relative_path,
+                            failure,
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reap_colocated_to_ready(
+        &self,
+        shard: u32,
+        leased_name: &str,
+        common: &steadq_names::CommonFields,
+    ) -> Result<(), MoveFailure> {
+        let dest_dir = self.layout().ready_shard_dir(shard);
+        let ready_common =
+            crate::next_common_fields(crate::state_machine::Operation::ReapExpiredToReady, common)
+                .map_err(|_| MoveFailure::NotCommitted {
+                    phase: MovePhase::PreRename,
+                    source: std::io::Error::other("generation or attempt overflow"),
+                })?;
+        let ready_name = self.layout().ready(&ready_common).filename;
+        let dir_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
+            MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: error,
+            }
+        })?;
+        move_verified_noreplace(
+            dir_fd.as_fd(),
+            leased_name,
+            dir_fd.as_fd(),
+            &ready_name,
+            MoveActor::Recovery,
+        )
+    }
+
+    pub(crate) fn reap_colocated_to_dead(
+        &self,
+        shard: u32,
+        leased_name: &str,
+        common: &steadq_names::CommonFields,
+        reason: DeadReason,
+        wall_floor: WallFloor,
+    ) -> Result<(), MoveFailure> {
+        let src_dir = self.layout().ready_shard_dir(shard);
+        let terminal_bucket = steadq_math::bucket_number(
+            wall_floor.unix_ns(),
+            self.format.terminal_bucket_width_ns(),
+        )
+        .ok_or_else(|| MoveFailure::NotCommitted {
+            phase: MovePhase::PreRename,
+            source: std::io::Error::other("terminal bucket overflow"),
+        })?;
+        let dead_common =
+            crate::next_common_fields(crate::state_machine::Operation::ReapExpiredToDead, common)
+                .map_err(|_| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: std::io::Error::other("generation or attempt overflow"),
+            })?;
+        let dead_target =
+            self.layout()
+                .dead_in_bucket(&dead_common, reason as u16, terminal_bucket);
+        let dest_dir = dead_target.directory();
+        self.ensure_dir(&dest_dir)
+            .map_err(|error| MoveFailure::NotCommitted {
+                phase: MovePhase::EnsureDest,
+                source: error,
+            })?;
+        let src_fd =
+            open_relative(self.root_fd(), &src_dir).map_err(|error| MoveFailure::NotCommitted {
+                phase: MovePhase::PreRename,
+                source: error,
+            })?;
+        let dest_fd = open_relative(self.root_fd(), &dest_dir).map_err(|error| {
+            MoveFailure::NotCommitted {
+                phase: MovePhase::EnsureDest,
+                source: error,
+            }
+        })?;
+        move_verified_noreplace(
+            src_fd.as_fd(),
+            leased_name,
+            dest_fd.as_fd(),
+            &dead_target.filename,
+            MoveActor::Recovery,
+        )
     }
 
     pub(crate) fn reap_to_ready(
