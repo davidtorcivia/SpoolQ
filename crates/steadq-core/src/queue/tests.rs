@@ -1431,6 +1431,7 @@ fn tmpfile_publication_preserves_postlinearization_failures() {
         if !tmpfile_supported(&queue) || !link_publication_attempted(&queue) {
             return;
         }
+        queue.ensure_dir("ready/0000").unwrap();
         fs::fault::reset();
         fs::fault::set_clock_realtime_ns(1_000_000_000);
         let fault_call = if fault == "fstatat" {
