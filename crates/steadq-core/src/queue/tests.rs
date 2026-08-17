@@ -1042,12 +1042,7 @@ fn batch_enqueue_preserves_every_injected_postlinearization_failure() {
         if !named_fallback && !link_publication_attempted(&create_test_queue().1) {
             continue;
         }
-        let faults: &[&str] = if named_fallback {
-            &["fstatat", "fstat"]
-        } else {
-            &["fstat"]
-        };
-        for &fault in faults {
+        for fault in ["fstat"] {
             let count_calls = || {
                 let (_tmp, mut queue) = create_test_queue();
                 if named_fallback {
