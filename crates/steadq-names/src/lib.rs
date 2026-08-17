@@ -227,6 +227,28 @@ pub fn boot_id_string(raw: &str) -> String {
     raw.trim().to_string()
 }
 
+pub fn format_boot_id(bytes: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 pub fn boot_id_bytes(s: &str) -> Option<[u8; 16]> {
     // canonical 36-char lowercase uuid: 8-4-4-4-12 hex digits
     if s.len() != 36 {
@@ -302,7 +324,9 @@ impl ReadyName {
 impl LeasedName {
     fn leased_base(&self) -> String {
         let mut base = self.common.base_name();
-        base.reserve(70);
+        base.reserve(104);
+        base.push_str(".o");
+        push_hex(&mut base, &self.boot_id);
         write!(
             base,
             ".b{:016x}.w{:016x}.t",
@@ -444,15 +468,18 @@ pub fn receipt_filename(fields: &CommonFields, token: &[u8; 16], tag: &[u8; 8]) 
     tagged_filename(base, tag, ".rct")
 }
 
-// Leased: <job-id>.g<gen>.a<att>.m<max>.b<boottime_dl>.w<wall_dl>.t<token>.k<tag>.sqj
+// Leased: <job-id>.g<gen>.a<att>.m<max>.o<boot>.b<boottime_dl>.w<wall_dl>.t<token>.k<tag>.sqj
 pub fn leased_filename(
     fields: &CommonFields,
+    boot_id: &[u8; 16],
     boottime_deadline_ns: u64,
     wall_deadline_ns: u64,
     token: &[u8; 16],
     tag: &[u8; 8],
 ) -> String {
     let mut base = fields.base_name();
+    base.push_str(".o");
+    push_hex(&mut base, boot_id);
     write!(
         base,
         ".b{boottime_deadline_ns:016x}.w{wall_deadline_ns:016x}.t"
@@ -524,7 +551,10 @@ pub fn make_leased_name(
     wall_deadline_ns: u64,
     token: &[u8; 16],
 ) -> String {
+    let boot_bytes = boot_id_bytes(boot_id).unwrap_or([0; 16]);
     let mut base = common.base_name();
+    base.push_str(".o");
+    push_hex(&mut base, &boot_bytes);
     write!(
         base,
         ".b{boottime_deadline_ns:016x}.w{wall_deadline_ns:016x}.t"
@@ -657,6 +687,7 @@ pub struct ReceiptName {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeasedName {
     pub common: CommonFields,
+    pub boot_id: [u8; 16],
     pub boottime_deadline_ns: u64,
     pub wall_deadline_ns: u64,
     pub token: [u8; 16],
@@ -875,27 +906,29 @@ pub fn parse_receipt(filename: &str) -> Result<ReceiptName, ParseError> {
     Ok(ReceiptName { common, token, tag })
 }
 
-/// Leased: job_id.g{gen}.a{att}.m{max}.b{boot_dl}.w{wall_dl}.t{token}.k{tag}.sqj
-/// Exactly 8 dot-separated parts before .sqj.
+/// Leased: job_id.g{gen}.a{att}.m{max}.o{boot}.b{boot_dl}.w{wall_dl}.t{token}.k{tag}.sqj
+/// Exactly 9 dot-separated parts before .sqj.
 pub fn parse_leased(filename: &str) -> Result<LeasedName, ParseError> {
     assert_ascii(filename)?;
     let filename = filename
         .strip_suffix(".sqj")
         .ok_or(ParseError::BadExtension)?;
     let parts: Vec<&str> = filename.split('.').collect();
-    if parts.len() != 8 {
+    if parts.len() != 9 {
         return Err(ParseError::Malformed);
     }
     let (common, rest) = parse_common_strict(&parts)?;
-    if rest.len() != 4 {
+    if rest.len() != 5 {
         return Err(ParseError::Malformed);
     }
-    let boottime_deadline_ns = parse_tagged_hex_u64(rest[0], b'b')?;
-    let wall_deadline_ns = parse_tagged_hex_u64(rest[1], b'w')?;
-    let token = parse_tagged_hex_16(rest[2], b't')?;
-    let tag = parse_tag(rest[3])?;
+    let boot_id = parse_tagged_hex_16(rest[0], b'o')?;
+    let boottime_deadline_ns = parse_tagged_hex_u64(rest[1], b'b')?;
+    let wall_deadline_ns = parse_tagged_hex_u64(rest[2], b'w')?;
+    let token = parse_tagged_hex_16(rest[3], b't')?;
+    let tag = parse_tag(rest[4])?;
     Ok(LeasedName {
         common,
+        boot_id,
         boottime_deadline_ns,
         wall_deadline_ns,
         token,
@@ -996,9 +1029,11 @@ mod tests {
         };
         let tag = [0x22; 8];
         let token = [0x33; 16];
-        let filename = leased_filename(&common, 999_999_999, 1_000_000_000, &token, &tag);
+        let boot = [0x11; 16];
+        let filename = leased_filename(&common, &boot, 999_999_999, 1_000_000_000, &token, &tag);
         let parsed = parse_leased(&filename).unwrap();
         assert_eq!(parsed.common, common);
+        assert_eq!(parsed.boot_id, boot);
         assert_eq!(parsed.boottime_deadline_ns, 999_999_999);
         assert_eq!(parsed.wall_deadline_ns, 1_000_000_000);
         assert_eq!(parsed.token, token);
@@ -1113,6 +1148,17 @@ mod tests {
         let s = "12345678-1234-1234-1234-123456789ABC";
         // spec requires lowercase
         assert!(boot_id_bytes(s).is_none());
+    }
+
+    #[test]
+    fn format_boot_id_round_trips_canonical_uuid() {
+        let bytes = [
+            0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc,
+        ];
+        let formatted = format_boot_id(&bytes);
+        assert_eq!(formatted, "12345678-1234-1234-1234-123456789abc");
+        assert_eq!(boot_id_bytes(&formatted), Some(bytes));
     }
 
     #[test]
@@ -1243,16 +1289,18 @@ mod tests {
         };
         let tag = [0x11; 8];
         let token = [0x22; 16];
-        let fname = leased_filename(&common, 1_000_000_000, 2_000_000_000, &token, &tag);
+        let boot = [0x44; 16];
+        let fname = leased_filename(&common, &boot, 1_000_000_000, 2_000_000_000, &token, &tag);
         let parsed = parse_leased(&fname).unwrap();
         assert_eq!(parsed.common, common);
         assert_eq!(parsed.tag, tag);
         assert_eq!(parsed.token, token);
+        assert_eq!(parsed.boot_id, boot);
         assert_eq!(parsed.boottime_deadline_ns, 1_000_000_000);
         assert_eq!(parsed.wall_deadline_ns, 2_000_000_000);
-        // Round-trip
         let re_formatted = leased_filename(
             &parsed.common,
+            &parsed.boot_id,
             parsed.boottime_deadline_ns,
             parsed.wall_deadline_ns,
             &parsed.token,
@@ -1271,7 +1319,14 @@ mod tests {
         };
         let tag = [0xFF; 8];
         let token = [0xEE; 16];
-        let leased_name = leased_filename(&common, 1_000_000_000, 2_000_000_000, &token, &tag);
+        let leased_name = leased_filename(
+            &common,
+            &[0x01; 16],
+            1_000_000_000,
+            2_000_000_000,
+            &token,
+            &tag,
+        );
         assert!(
             parse_ready(&leased_name).is_err(),
             "should reject leased name as ready"
@@ -1398,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn leased_name_length_is_162() {
+    fn leased_name_length_is_196() {
         let common = CommonFields {
             job_id: [0xAB; 16],
             generation: u64::MAX,
@@ -1407,11 +1462,11 @@ mod tests {
         };
         let tag = [0xFF; 8];
         let token = [0xFF; 16];
-        let name = leased_filename(&common, u64::MAX, u64::MAX, &token, &tag);
+        let name = leased_filename(&common, &[0xFF; 16], u64::MAX, u64::MAX, &token, &tag);
         assert_eq!(
             name.len(),
-            162,
-            "leased name must be exactly 162 bytes, got {}",
+            196,
+            "leased name must be exactly 196 bytes, got {}",
             name.len()
         );
     }
@@ -1442,9 +1497,9 @@ mod tests {
 
     #[test]
     fn all_names_fit_within_255() {
-        let max = 162; // leased is longest
+        let max = 196; // leased is longest
         assert!(max <= 255, "longest name {max} exceeds NAME_MAX 255");
-        assert_eq!(255 - max, 93, "remaining budget must be 93");
+        assert_eq!(255 - max, 59, "remaining budget must be 59");
     }
 
     // ===== Canonical authenticate_tag tests (P1-25 mutation coverage) =====
@@ -1484,6 +1539,7 @@ mod tests {
         let token = [0xCD; 16];
         let name = LeasedName {
             common: common.clone(),
+            boot_id: [0; 16],
             boottime_deadline_ns: 30000000000,
             wall_deadline_ns: 1234567890,
             token,
@@ -1493,6 +1549,7 @@ mod tests {
         let tag = compute_name_tag(&qid, &ctx);
         let name = LeasedName {
             common: common.clone(),
+            boot_id: [0; 16],
             boottime_deadline_ns: 30000000000,
             wall_deadline_ns: 1234567890,
             token,
@@ -1593,6 +1650,7 @@ mod tests {
         let common = make_common();
         let name = LeasedName {
             common: common.clone(),
+            boot_id: [0; 16],
             boottime_deadline_ns: 30000000000,
             wall_deadline_ns: 1234567890,
             token: [0xCD; 16],
@@ -1696,6 +1754,7 @@ mod tests {
         assert_eq!(parsed.boottime_deadline_ns, 3_000_000_000);
         assert_eq!(parsed.wall_deadline_ns, 4_000_000_000);
         assert_eq!(parsed.token, token);
+        assert_eq!(parsed.boot_id, boot_id_bytes(boot).unwrap());
         assert!(parsed.authenticate_tag(&qid, boot, bucket, shard));
     }
 

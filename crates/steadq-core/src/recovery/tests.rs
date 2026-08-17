@@ -343,6 +343,35 @@ fn find_file(root: &Path, extension: &str) -> Option<PathBuf> {
     None
 }
 
+fn relocate_colocated_leases_into_legacy_tree(root: &Path, queue: &Queue) {
+    let width = queue.format.lease_bucket_width_ns();
+    for shard in 0..queue.format.shard_count() {
+        let ready_dir = root.join(format!("ready/{}", steadq_names::shard_hex(shard)));
+        let Ok(entries) = std::fs::read_dir(&ready_dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Ok(parsed) = steadq_names::parse_leased(name) else {
+                continue;
+            };
+            let boot = steadq_names::format_boot_id(&parsed.boot_id);
+            let bucket = steadq_math::lease_bucket(parsed.boottime_deadline_ns, width).unwrap();
+            let dest_dir = root.join(format!(
+                "leased/{}/{}/{}",
+                boot,
+                steadq_names::bucket_hex(bucket),
+                steadq_names::shard_hex(shard)
+            ));
+            std::fs::create_dir_all(&dest_dir).unwrap();
+            std::fs::rename(&path, dest_dir.join(name)).unwrap();
+        }
+    }
+}
+
 fn find_files(root: &Path, extension: &str, found: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
@@ -425,8 +454,8 @@ fn lease_common(lease: &crate::LeaseInfo) -> steadq_names::CommonFields {
 
 fn lease_path_parts(lease: &crate::LeaseInfo) -> Vec<&str> {
     let parts = lease.exact_source_path.split('/').collect::<Vec<_>>();
-    assert_eq!(parts.len(), 5);
-    assert_eq!(parts[0], "leased");
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0], "ready");
     parts
 }
 
@@ -1108,6 +1137,7 @@ fn persistent_hierarchy_open_failure_does_not_starve_later_sibling_across_reopen
         queue.lease(0, 30_000_000_000),
         LeaseOutcome::Leased(_)
     ));
+    relocate_colocated_leases_into_legacy_tree(tmp.path(), &queue);
     let blocked = tmp
         .path()
         .join("leased/00000000-0000-0000-0000-000000000000");
@@ -1315,6 +1345,7 @@ fn readdir_permutations_preserve_reap_budget_boundaries() {
         enqueue_for_shard(&mut queue, &tmp, shard, None, payload);
         assert!(matches!(queue.lease(0, duration), LeaseOutcome::Leased(_)));
     }
+    relocate_colocated_leases_into_legacy_tree(tmp.path(), &queue);
     let mut leased = Vec::new();
     find_files(&tmp.path().join("leased"), "sqj", &mut leased);
     leased.sort();
@@ -3255,12 +3286,64 @@ fn recovery_quarantines_malformed_leased_filename() {
 }
 
 #[test]
+fn colocated_ready_leases_respect_operation_budget() {
+    let (_tmp, mut queue) = create_test_queue_with_shards(1);
+    let _ = lease_recovery_job(&mut queue, 3);
+    let _ = lease_recovery_job(&mut queue, 3);
+    let first = reap_expired_with_budget(
+        &mut queue,
+        &WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        },
+    );
+    assert_eq!(first.operations_attempted, 1);
+    assert_eq!(first.leases_reaped, 1, "errors: {:?}", first.errors);
+    assert!(first.budget_exhausted);
+    let second = reap_expired_with_budget(
+        &mut queue,
+        &WorkBudget {
+            max_operations: 1,
+            max_duration_ms: 5_000,
+        },
+    );
+    assert_eq!(second.operations_attempted, 1);
+    assert_eq!(second.leases_reaped, 1, "errors: {:?}", second.errors);
+}
+
+#[test]
+fn previous_boot_colocated_lease_is_reaped_before_deadline() {
+    let (_tmp, mut queue) = create_test_queue();
+    let _ = lease_recovery_job(&mut queue, 3);
+    queue.boot_id = "00000000-0000-0000-0000-000000000099".into();
+    let scan_budget = RecoveryScanBudget::default();
+    let mut scan_stats = RecoveryScanStats::default();
+    let mut scan = RecoveryScanContext {
+        budget: &scan_budget,
+        stats: &mut scan_stats,
+    };
+    let mut stats = RecoveryStats::default();
+    queue.reap_expired_leases(
+        0,
+        Some(queue.authenticated_wall_floor().unwrap()),
+        &WorkBudget::default(),
+        &mut scan,
+        &mut stats,
+        u64::MAX,
+    );
+    assert_eq!(stats.leases_reaped, 1, "errors: {:?}", stats.errors);
+}
+
+#[test]
 fn recovery_empty_queue() {
     let (_tmp, mut queue) = create_test_queue();
     let report =
         queue.recover_with_scan_budget(&WorkBudget::default(), &RecoveryScanBudget::default());
     assert_eq!(report.stats.operations_attempted, 0);
-    assert_eq!(report.scan.directories_read, 5);
+    assert_eq!(
+        report.scan.directories_read,
+        5 + u64::from(queue.format.shard_count())
+    );
     assert_eq!(report.scan.entries_read, 0);
     assert_eq!(report.scan.name_bytes_read, 0);
 
@@ -3334,7 +3417,6 @@ fn reap_to_ready_uses_phase_aware_move_executor() {
     for (fault, count, phase, outcome_unknown) in [
         ("renameat2_noreplace", 1, MovePhase::Rename, false),
         ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
-        ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
     ] {
         let (_tmp, mut queue) = create_test_queue();
         let lease = lease_recovery_job(&mut queue, 3);
@@ -3342,7 +3424,8 @@ fn reap_to_ready_uses_phase_aware_move_executor() {
         let parts = lease_path_parts(&lease);
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
-        let result = queue.reap_to_ready(parts[1], parts[2], parts[3], parts[4], &common);
+        let shard = u32::from_str_radix(parts[1], 16).unwrap();
+        let result = queue.reap_colocated_to_ready(shard, parts[2], &common);
         fs::fault::reset();
         assert_injected_move_phase(result, phase, outcome_unknown);
     }
@@ -3369,16 +3452,15 @@ fn reap_to_dead_uses_phase_aware_move_executor() {
             .ensure_dir(&format!(
                 "dead/{}/{}",
                 steadq_names::bucket_hex(terminal_bucket),
-                parts[3]
+                parts[1]
             ))
             .unwrap();
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
-        let result = queue.reap_to_dead(
-            parts[1],
+        let shard = u32::from_str_radix(parts[1], 16).unwrap();
+        let result = queue.reap_colocated_to_dead(
+            shard,
             parts[2],
-            parts[3],
-            parts[4],
             &common,
             DeadReason::AttemptsExhausted,
             wall_floor,
@@ -3429,7 +3511,6 @@ fn reap_to_ready_records_executor_failure_without_counting_commit() {
     for (fault, count, phase, outcome_unknown) in [
         ("renameat2_noreplace", 1, MovePhase::Rename, false),
         ("fsync_dir_fd", 1, MovePhase::DestFsync, true),
-        ("fsync_dir_fd", 2, MovePhase::SourceFsync, true),
     ] {
         let (tmp, mut queue) = create_test_queue();
         let lease = lease_recovery_job(&mut queue, 3);
@@ -3438,7 +3519,7 @@ fn reap_to_ready_records_executor_failure_without_counting_commit() {
         let source = tmp.path().join(&lease.exact_source_path);
         let destination = tmp
             .path()
-            .join(ready_destination(&queue, parts[3], &common));
+            .join(ready_destination(&queue, parts[1], &common));
         fs::fault::reset();
         fs::fault::inject_errno(fault, count, libc::EIO);
         let stats = reap_expired_with_budget(&mut queue, &WorkBudget::default());
@@ -3479,7 +3560,7 @@ fn reap_to_dead_records_executor_failure_without_counting_commit() {
     ] {
         let (tmp, mut queue) = create_test_queue();
         let lease = lease_recovery_job(&mut queue, 1);
-        let shard = lease.exact_source_path.split('/').nth(3).unwrap();
+        let shard = lease.exact_source_path.split('/').nth(1).unwrap();
         let common = lease_common(&lease);
         let wall_floor = queue.authenticated_wall_floor().unwrap();
         let source = tmp.path().join(&lease.exact_source_path);
@@ -3607,7 +3688,7 @@ fn reap_to_ready_scanner_handles_collision_and_missing_source() {
         let source = tmp.path().join(&lease.exact_source_path);
         let destination =
             tmp.path()
-                .join(ready_destination(&queue, parts[3], &lease_common(&lease)));
+                .join(ready_destination(&queue, parts[1], &lease_common(&lease)));
         if collision {
             std::fs::copy(&source, &destination).unwrap();
         } else {
@@ -3658,7 +3739,7 @@ fn reap_to_dead_scanner_handles_collision_and_missing_source() {
         let source = tmp.path().join(&lease.exact_source_path);
         let destination = tmp
             .path()
-            .join(dead_destination(&queue, parts[3], &common, wall_floor));
+            .join(dead_destination(&queue, parts[1], &common, wall_floor));
         queue
             .ensure_dir(
                 destination

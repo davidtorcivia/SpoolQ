@@ -4,6 +4,7 @@ use super::resolve::*;
 use super::*;
 use crate::FsckOptions;
 use std::os::unix::fs::{FileExt, MetadataExt};
+use std::path::{Path, PathBuf};
 
 trait CommitOrPanic {
     fn commit_or_panic(&self);
@@ -56,6 +57,24 @@ fn replace_wall_watermark(tmp: &TempDir, highest_observed_bucket: u64, sequence:
     };
     std::fs::write(&replacement, watermark.encode()).unwrap();
     std::fs::rename(replacement, control.join("wall-watermark")).unwrap();
+}
+
+fn find_leased_job(root: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            if let Some(found) = find_leased_job(&path) {
+                return Some(found);
+            }
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| steadq_names::parse_leased(name).is_ok())
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn find_file_with_suffix(root: &Path, suffix: &str) -> Option<PathBuf> {
@@ -1120,7 +1139,7 @@ fn batch_lease_preserves_every_injected_postlinearization_failure() {
             fs::fault::inject_errno(fault, target, libc::EIO);
             let outcome = queue.batch().lease(0, 30_000_000_000);
             fs::fault::reset();
-            let linearized = find_file_with_suffix(&tmp.path().join("leased"), ".sqj").is_some();
+            let linearized = find_leased_job(&tmp.path().join("ready")).is_some();
             if linearized {
                 match outcome {
                     BatchLeaseOutcome::OutcomeUnknown(_) => exercised += 1,
@@ -2636,7 +2655,7 @@ fn warm_completed_job_fsyncs_required_directories_once() {
     } else {
         assert_eq!(enqueue, (2, 1), "tmpfile: file + dest");
     }
-    assert_eq!(lease_counts, (2, 2), "lease dest + source");
+    assert_eq!(lease_counts, (1, 1), "lease same-directory dest");
     assert_eq!(verify, (0, 0), "verify is read-only");
     assert_eq!(ack, (2, 2), "ack dest + source");
 }
@@ -2723,7 +2742,7 @@ fn ensuring_one_shard_creates_every_sibling_and_syncs_the_bucket_once() {
 }
 
 #[test]
-fn first_lease_creates_every_leased_shard_in_the_bucket() {
+fn first_lease_stays_in_the_ready_shard() {
     let (tmp, mut queue) = create_test_queue_shards(4);
     match queue.enqueue(EnqueueInput {
         maximum_attempts: 3,
@@ -2734,26 +2753,17 @@ fn first_lease_creates_every_leased_shard_in_the_bucket() {
         EnqueueOutcome::Committed(_) => {}
         other => panic!("enqueue: {other:?}"),
     }
-    match queue.lease(0, 30_000_000_000) {
-        LeaseOutcome::Leased(_) => {}
+    let lease = match queue.lease(0, 30_000_000_000) {
+        LeaseOutcome::Leased(lease) => lease,
         other => panic!("lease: {other:?}"),
-    }
-    let leased = tmp.path().join("leased").join(&queue.boot_id);
-    let mut shard_dirs = Vec::new();
-    for bucket in std::fs::read_dir(&leased).unwrap().filter_map(|e| e.ok()) {
-        if !bucket.path().is_dir() {
-            continue;
-        }
-        for shard in std::fs::read_dir(bucket.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-        {
-            if shard.path().is_dir() {
-                shard_dirs.push(shard.file_name());
-            }
-        }
-    }
-    assert_eq!(shard_dirs.len(), 4);
+    };
+    assert!(
+        lease.exact_source_path.starts_with("ready/"),
+        "leased file must stay in ready/: {}",
+        lease.exact_source_path
+    );
+    assert!(tmp.path().join(&lease.exact_source_path).exists());
+    assert!(!tmp.path().join("leased").join(&queue.boot_id).exists());
 }
 
 #[test]
@@ -2773,9 +2783,9 @@ fn warm_four_shard_completed_job_has_no_per_shard_mkdir_fsync() {
         Some(fs::PublicationMode::NamedFallback)
     );
     if named_fallback {
-        assert_eq!(total, (7, 6), "named fallback warm completed job");
+        assert_eq!(total, (6, 5), "named fallback warm completed job");
     } else {
-        assert_eq!(total, (6, 5), "tmpfile warm completed job");
+        assert_eq!(total, (5, 4), "tmpfile warm completed job");
     }
 }
 
@@ -5041,8 +5051,7 @@ fn bounded_wait_survives_transient_watermark_lock_contention() {
 fn ack_preserves_error_categories() {
     let (_tmp, mut queue) = create_test_queue();
     // Use a nonexistent source path - should get LeaseLost
-    // Use a path that matches leased/<boot>/<bucket>/<shard>/<name> structure
-    // but with a source that doesn't exist.
+    // Use a path that matches the legacy leased tree and does not exist.
     let boot_id = queue.boot_id.clone();
     let fake_lease = LeaseInfo {
         job_id: [0x42; 16],
@@ -6286,12 +6295,14 @@ fn enotdir_in_lease_path_is_corruption() {
         LeaseOutcome::Leased(l) => l,
         _ => panic!("lease failed"),
     };
-    // Replace an intermediate directory with a regular file.
-    let boot_dir = _tmp.path().join("leased").join(&lease.boot_id);
-    let bucket_dir = boot_dir.join(lease.exact_source_path.split('/').nth(2).unwrap());
-    // Remove the bucket dir and replace with a file
-    let _ = std::fs::remove_dir_all(&bucket_dir);
-    std::fs::write(&bucket_dir, b"notadir").unwrap();
+    let shard_dir = _tmp
+        .path()
+        .join(&lease.exact_source_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(&shard_dir);
+    std::fs::write(&shard_dir, b"notadir").unwrap();
     // Ack should report corruption, not LeaseLost.
     let result = queue.ack(&lease);
     assert!(
@@ -6714,30 +6725,25 @@ fn fault_ack_post_rename_fsync_is_outcome_unknown() {
 #[test]
 fn claim_move_records_each_directory_barrier() {
     const LEASE_DURATION_NS: u64 = 30_000_000_000;
-    for (fsync_call, expected_phase) in [
-        (1, TransitionPhase::Linearized),
-        (2, TransitionPhase::DestinationDirectoryDurable),
-    ] {
-        let (tmp, mut queue) = create_test_queue();
-        let enqueue = queue.enqueue(EnqueueInput {
-            maximum_attempts: 3,
-            content_type: "text/plain".into(),
-            payload: b"claim barrier".to_vec(),
-            ..Default::default()
-        });
-        assert!(matches!(enqueue, EnqueueOutcome::Committed(_)));
-        precreate_claim_destination_buckets(&tmp, &queue, LEASE_DURATION_NS);
+    let (tmp, mut queue) = create_test_queue();
+    let enqueue = queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "text/plain".into(),
+        payload: b"claim barrier".to_vec(),
+        ..Default::default()
+    });
+    assert!(matches!(enqueue, EnqueueOutcome::Committed(_)));
+    precreate_claim_destination_buckets(&tmp, &queue, LEASE_DURATION_NS);
 
-        fs::fault::reset();
-        fs::fault::inject_errno("fsync_dir_fd", fsync_call, libc::EIO);
-        let outcome = queue.lease(0, LEASE_DURATION_NS);
-        fs::fault::reset();
+    fs::fault::reset();
+    fs::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
+    let outcome = queue.lease(0, LEASE_DURATION_NS);
+    fs::fault::reset();
 
-        let LeaseOutcome::OutcomeUnknown(ticket) = outcome else {
-            panic!("expected outcome unknown");
-        };
-        assert_eq!(ticket.phase(), expected_phase);
-    }
+    let LeaseOutcome::OutcomeUnknown(ticket) = outcome else {
+        panic!("expected outcome unknown");
+    };
+    assert_eq!(ticket.phase(), TransitionPhase::Linearized);
 }
 
 #[test]
@@ -6843,13 +6849,13 @@ fn fault_retry_source_fsync_records_destination_durability() {
         other => panic!("lease failed: {other:?}"),
     };
 
-    steadq_fs_linux::fault::inject_errno("fsync_dir_fd", 2, libc::EIO);
+    steadq_fs_linux::fault::inject_errno("fsync_dir_fd", 1, libc::EIO);
     let result = queue.retry_now(&lease);
     steadq_fs_linux::fault::reset();
     let TransitionOutcome::OutcomeUnknown(ticket) = result else {
         panic!("expected OutcomeUnknown");
     };
-    assert_eq!(ticket.phase(), TransitionPhase::DestinationDirectoryDurable);
+    assert_eq!(ticket.phase(), TransitionPhase::Linearized);
 }
 
 #[test]

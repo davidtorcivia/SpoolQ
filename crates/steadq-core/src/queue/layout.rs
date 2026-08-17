@@ -1,5 +1,6 @@
 // Typed physical locations for queue objects.
 
+use steadq_math;
 use steadq_names::{self, bucket_hex, shard_hex, CommonFields};
 
 use crate::errors::Error;
@@ -40,18 +41,7 @@ impl Target {
     pub fn directory(&self) -> String {
         match &self.location {
             Location::Ready { shard } => format!("ready/{}", shard_hex(*shard)),
-            Location::Leased {
-                boot_id,
-                bucket,
-                shard,
-            } => {
-                format!(
-                    "leased/{}/{}/{}",
-                    boot_id,
-                    bucket_hex(*bucket),
-                    shard_hex(*shard)
-                )
-            }
+            Location::Leased { shard, .. } => format!("ready/{}", shard_hex(*shard)),
             Location::Delayed { bucket, shard } => {
                 format!("delayed/{}/{}", bucket_hex(*bucket), shard_hex(*shard))
             }
@@ -287,9 +277,31 @@ impl<'a> Layout<'a> {
     }
 
     /// Parse a leased relative path into typed location and filename.
-    /// Validates leased/<boot>/<bucket>/<shard>/<name> with canonical hex.
+    /// Accepts ready/<shard>/<leased-name> and the legacy
+    /// leased/<boot>/<bucket>/<shard>/<name> form.
     pub fn parse_leased_path(&self, relative: &str) -> Result<(Location, String), Error> {
         let parts: Vec<&str> = relative.split('/').collect();
+        if parts.len() == 3 && parts[0] == "ready" {
+            let shard = steadq_names::shard_from_hex(parts[1])
+                .ok_or_else(|| Error::QueueCorrupt("invalid shard hex".into()))?;
+            if !Self::is_shard_in_range(shard, self.shard_count) {
+                return Err(Error::QueueCorrupt("shard out of range".into()));
+            }
+            let filename = parts[2].to_string();
+            let parsed = steadq_names::parse_leased(&filename)
+                .map_err(|_| Error::QueueCorrupt("invalid leased path".into()))?;
+            let bucket =
+                steadq_math::lease_bucket(parsed.boottime_deadline_ns, self.lease_bucket_width_ns)
+                    .ok_or_else(|| Error::QueueCorrupt("invalid lease bucket".into()))?;
+            return Ok((
+                Location::Leased {
+                    boot_id: steadq_names::format_boot_id(&parsed.boot_id),
+                    bucket,
+                    shard,
+                },
+                filename,
+            ));
+        }
         if !Self::is_valid_leased_path_parts(parts.len(), parts[0]) {
             return Err(Error::QueueCorrupt("invalid leased path".into()));
         }
@@ -329,6 +341,31 @@ mod tests {
             3_600_000_000_000,
             BOOT,
         )
+    }
+
+    #[test]
+    fn parse_leased_path_ready_shape() {
+        let layout = test_layout();
+        let common = CommonFields {
+            job_id: [1; 16],
+            generation: 1,
+            attempt: 1,
+            maximum_attempts: 3,
+        };
+        let target = layout
+            .leased(&common, 1_000_000_000, 2_000_000_000, &[2; 16])
+            .unwrap();
+        let path = target.relative_path();
+        assert!(path.starts_with("ready/"));
+        let (loc, name) = layout.parse_leased_path(&path).expect("ready leased path");
+        match loc {
+            Location::Leased { boot_id, shard, .. } => {
+                assert_eq!(boot_id, "12345678-1234-1234-1234-123456789abc");
+                assert_eq!(shard, target.shard());
+            }
+            _ => panic!("expected Leased"),
+        }
+        assert_eq!(name, target.filename);
     }
 
     #[test]
@@ -427,6 +464,11 @@ mod tests {
             layout.receipt_shard_dir(42, receipt.shard()),
             receipt.directory()
         );
+
+        let leased = layout
+            .leased(&common, 1_000_000_000, 2_000_000_000, &[2; 16])
+            .unwrap();
+        assert_eq!(layout.ready_shard_dir(leased.shard()), leased.directory());
     }
 
     #[test]

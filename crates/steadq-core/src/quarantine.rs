@@ -455,7 +455,10 @@ impl Queue {
         let parsed = match state_name {
             "ready" => match steadq_names::parse_ready(filename) {
                 Ok(p) => Some((p.common, p.tag, None)),
-                Err(_) => None,
+                Err(_) => match steadq_names::parse_leased(filename) {
+                    Ok(p) => Some((p.common, p.tag, Some(p.token))),
+                    Err(_) => None,
+                },
             },
             "leased" => match steadq_names::parse_leased(filename) {
                 Ok(p) => Some((p.common, p.tag, Some(p.token))),
@@ -991,7 +994,7 @@ impl Queue {
         path_parts: &[&str],
         common: &steadq_names::CommonFields,
         parsed_tag: [u8; 8],
-        token: Option<[u8; 16]>,
+        _token: Option<[u8; 16]>,
         queue_id: &[u8; 16],
     ) -> bool {
         // P0-03: Use canonical authentication from steadq-names instead of
@@ -1003,6 +1006,22 @@ impl Queue {
                     return false;
                 }
                 let shard_hex = path_parts[1];
+                let filename = path_parts[2];
+                if let Ok(parsed) = steadq_names::parse_leased(filename) {
+                    let boot = steadq_names::format_boot_id(&parsed.boot_id);
+                    let Some(bucket) = steadq_math::lease_bucket(
+                        parsed.boottime_deadline_ns,
+                        self.format.lease_bucket_width_ns(),
+                    ) else {
+                        return false;
+                    };
+                    return parsed.authenticate_tag(
+                        queue_id,
+                        &boot,
+                        &steadq_names::bucket_hex(bucket),
+                        shard_hex,
+                    );
+                }
                 let name = steadq_names::ReadyName {
                     common: common.clone(),
                     tag: parsed_tag,
@@ -1016,15 +1035,6 @@ impl Queue {
                 let boot = path_parts[1];
                 let bucket = path_parts[2];
                 let shard_hex = path_parts[3];
-                let _tok = match token {
-                    Some(t) => t,
-                    None => return false,
-                };
-                // Reconstruct the leased name with deadlines from the parsed fields.
-                // We don't have the deadline values here, but the tag was computed
-                // over them. We need to re-parse the filename to get all fields.
-                // Since the caller already parsed and extracted common + tag + token,
-                // we need the full parse result. Fall back to re-parsing.
                 let filename = path_parts[4];
                 match steadq_names::parse_leased(filename) {
                     Ok(p) => p.authenticate_tag(queue_id, boot, bucket, shard_hex),

@@ -4,7 +4,8 @@
 
 ### Structure
 
-- README test count matches `cargo test --workspace --all-features -- --list` (697)
+- Claim keeps the leased file in `ready/<shard>/`. The leased filename includes boot id (`.o` + 32 hex). Recovery still walks `leased/` for the previous layout and reaps colocated leased names from `ready/`
+- README test count matches `cargo test --workspace --all-features -- --list` (701)
 - Removed leftover `dead_code`/`unused_imports` allows on live items and the unused power-loss `is_durable` helper
 - Split `queue/mod.rs` into publish, lease, consumer, and inspect modules; init and open stay in the parent
 - Split recovery phases into reap, promote, and retain
@@ -35,7 +36,7 @@
 
 ### Performance
 
-- Measured strict vs deferred completed-job throughput on the README NVMe: 3,065/s strict, 3,520/s deferred batch-50. A warm completed job is 6 `fsync` on the tmpfile path once destination buckets exist. The first `ensure_dir` of a shard leaf creates every sibling and syncs the bucket once. A deferred batch of 10 still issues 7.7 `fsync` per job.
+- Measured strict vs deferred completed-job throughput on the README NVMe: 3,065/s strict, 3,520/s deferred batch-50. After same-directory lease, a warm completed job is 5 `fsync` on the tmpfile path once destination buckets exist. The first `ensure_dir` of a shard leaf creates every sibling and syncs the bucket once. A deferred batch of 10 still issues 7.7 `fsync` per job.
 
 ### Core
 
@@ -57,7 +58,7 @@
 
 ### Testing
 
-- 697 tests: unit, fault injection, differential, and formal model checking
+- 701 tests: unit, fault injection, differential, and formal model checking
 - Stateful differential driver verifies production API against logical oracle
 - Six TLA+ model configurations with drift-checked generated metadata
 - Diff-scoped mutation testing on every pull request
