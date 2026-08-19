@@ -290,8 +290,8 @@ impl Queue {
         } else {
             root.parent().unwrap_or(root)
         };
-        let magic = fs::statfs(check_path).map_err(|e| io::Error::other(format!("statfs: {e}")))?;
-        let ft = magic.f_type as i64;
+        let ft =
+            fs::fs_type_magic(check_path).map_err(|e| io::Error::other(format!("statfs: {e}")))?;
         if fs::supported_filesystem_name(ft).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -587,10 +587,10 @@ impl Queue {
 
         // Check filesystem type. Keep the observation even when validation is
         // relaxed because publication performance differs materially by backend.
-        let filesystem_type = classify_filesystem_type(
-            fs::statfs(root).map(|stat| stat.f_type),
-            opts.allow_unsupported_fs,
-        )?;
+        // fs_type_magic normalizes f_type, which is signed on glibc and
+        // unsigned on musl.
+        let filesystem_type =
+            classify_filesystem_type(fs::fs_type_magic(root), opts.allow_unsupported_fs)?;
 
         // Require all state directories to exist and be on the same device.
         for state_dir in &[

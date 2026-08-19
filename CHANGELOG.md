@@ -2,7 +2,15 @@
 
 ## Unreleased
 
+### Features
+
+- `steadq work PATH -- COMMAND` leases jobs, streams each payload to the command's stdin, renews the lease at half its duration, acks on exit 0, and requeues on nonzero; `--concurrency N` runs N workers, `--once` runs one job and exits with its code for cron glue. A payload read failure requeues instead of acking a truncated delivery
+- `steadq fsck PATH [--deep] [--repair]` re-verifies name tags, digests, and shard placement, hashes payloads with `--deep`, and quarantines corrupt objects with `--repair`; exit is 3 whenever an Error-severity finding exists, including after repair
+- `steadq stats --prometheus` emits per-state `steadq_<state>_objects` and `steadq_<state>_oldest_age_seconds` gauges; plain and `--json` stats outputs gain oldest-object age. The oldest age is the global minimum across subtrees, and an unreadable state directory exits with the io code instead of reporting zero objects
+
 ### Structure
+
+- Supported targets are now 64-bit x86_64 or aarch64 Linux with the gnu or musl environment; CI cross-checks `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` and still rejects 32-bit and out-of-set targets. `x86_64-unknown-linux-gnu` remains the certified release target
 
 - Claim keeps the leased file in `ready/<shard>/`. The leased filename includes boot id (`.o` + 32 hex). Recovery still walks `leased/` for the previous layout and reaps colocated leased names from `ready/`
 - README test count matches `cargo test --workspace --all-features -- --list` (706)

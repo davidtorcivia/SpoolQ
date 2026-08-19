@@ -21,7 +21,10 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
-          targets: aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-linux-gnux32
+          targets: >-
+            aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+            x86_64-unknown-linux-musl x86_64-unknown-linux-gnux32
+            riscv64gc-unknown-linux-gnu
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Baseline and generated-artifact checks
@@ -30,13 +33,23 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Reject unsupported targets
         run: |
-          for target in aarch64-unknown-linux-gnu x86_64-unknown-linux-musl x86_64-unknown-linux-gnux32; do
-            if cargo check -p steadq-core --target "$target" 2>"/tmp/steadq-target-error-$target"; then
+          # gnux32 and riscv64gc reach the compile gate; 32-bit arm/i686
+          # targets fail earlier in fs-linux libc type mismatches, so the
+          # pointer-width and arch dimensions are covered by these two.
+          for target in x86_64-unknown-linux-gnux32 riscv64gc-unknown-linux-gnu; do
+            if CARGO_TERM_COLOR=never cargo check -p steadq-core --target "$target" 2>"/tmp/steadq-target-error-$target"; then
               echo "steadq-core accepted unsupported target $target"
               exit 1
             fi
-            grep -F "steadq-core supports only 64-bit x86_64 Linux targets with the GNU environment" "/tmp/steadq-target-error-$target"
+            grep -F "steadq-core supports only 64-bit x86_64 or aarch64 Linux targets with the gnu or musl environment" "/tmp/steadq-target-error-$target"
           done
+      - name: Cross-check supported targets
+        run: |
+          cargo check -p steadq-core --target aarch64-unknown-linux-gnu
+      - name: Static musl binaries
+        run: |
+          cargo build --release -p steadq-cli --target x86_64-unknown-linux-musl
+          RUSTFLAGS="-C linker=rust-lld" cargo build --release -p steadq-cli --target aarch64-unknown-linux-musl
       - name: Build (debug)
         run: cargo build --all
       - name: Build (release)

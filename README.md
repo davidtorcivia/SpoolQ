@@ -154,7 +154,7 @@ SteadQ sustains more than 10,000 completed jobs per second with strict
 durability on the reference system.
 
 | Mode | Parallelism | Batch size | Completed jobs/sec |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | Individual commits | 1 worker | 1 | 2,988 |
 | Individual commits | 4 workers | 1 | 5,795 |
 | Individual commits | 8 workers | 1 | 8,212 |
@@ -192,7 +192,7 @@ Use 256 when throughput matters more than latency.
 
 ## Requirements
 
-- Linux x86_64 (glibc)
+- Linux x86_64 or aarch64, glibc or musl
 - Rust 1.97.1
 - ext4, XFS, btrfs, f2fs, or ZFS filesystem
 

@@ -582,9 +582,8 @@ fn main() -> ExitCode {
 
             if path.exists() {
                 // filesystem type
-                match steadq_fs_linux::statfs(&path) {
-                    Ok(stat) => {
-                        let ft = stat.f_type;
+                match steadq_fs_linux::fs_type_magic(&path) {
+                    Ok(ft) => {
                         let (fs_name, fs_ok) = doctor_filesystem(ft);
                         results.push(("filesystem", format!("{fs_name} (magic {ft:#x})"), fs_ok));
                     }
