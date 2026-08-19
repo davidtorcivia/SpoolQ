@@ -9,6 +9,12 @@ use std::time::Duration;
 
 use crate::cstr_from_bytes;
 
+/// True when ppoll reports a readable event on the watched descriptor.
+/// Pure so its operator logic is exhaustively table-tested.
+fn ppoll_woke(rc: i32, revents: i16) -> bool {
+    rc > 0 && revents & libc::POLLIN != 0
+}
+
 /// Create a nonblocking close-on-exec inotify descriptor.
 pub fn init() -> io::Result<OwnedFd> {
     fault_check!("inotify_init");
@@ -60,17 +66,20 @@ pub fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> 
     // retains neither pointer after returning.
     let rc = unsafe { libc::ppoll(&mut pfd, 1, &ts, std::ptr::null()) };
     if rc < 0 {
-        let e = io::Error::last_os_error();
-        if e.kind() == io::ErrorKind::Interrupted {
+        if is_interrupted(&io::Error::last_os_error()) {
             return Ok(false);
         }
-        return Err(e);
+        return Err(io::Error::last_os_error());
     }
-    if rc == 0 || pfd.revents & libc::POLLIN == 0 {
+    if !ppoll_woke(rc, pfd.revents) {
         return Ok(false);
     }
     drain(fd);
     Ok(true)
+}
+
+fn is_interrupted(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted
 }
 
 /// Read and discard pending events so the descriptor stops reading ready.
@@ -94,6 +103,24 @@ mod tests {
     use std::os::fd::AsFd;
 
     #[test]
+    fn ppoll_woke_table() {
+        let pollin: i16 = libc::POLLIN;
+        let pollerr: i16 = libc::POLLERR;
+        // Timeout: no descriptors ready.
+        assert!(!ppoll_woke(0, 0));
+        // Spurious or error-only wake without POLLIN.
+        assert!(!ppoll_woke(1, 0));
+        assert!(!ppoll_woke(1, pollerr));
+        // Real wake.
+        assert!(ppoll_woke(1, pollin));
+        assert!(ppoll_woke(1, pollin | pollerr));
+        // Error return never reports a wake.
+        assert!(!ppoll_woke(-1, pollin));
+        // A timeout with stale revents never reports a wake.
+        assert!(!ppoll_woke(0, pollin));
+    }
+
+    #[test]
     fn moved_to_event_wakes_wait() {
         let dir = tempfile::tempdir().unwrap();
         let fd = init().unwrap();
@@ -108,6 +135,37 @@ mod tests {
         assert!(wait_readable(fd.as_fd(), Duration::from_millis(1000)).unwrap());
         // Drained: the next wait times out again.
         assert!(!wait_readable(fd.as_fd(), Duration::from_millis(10)).unwrap());
+    }
+
+    #[test]
+    fn drain_spans_multiple_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let fd = init().unwrap();
+        add_moved_to_watch(fd.as_fd(), dir.path()).unwrap();
+
+        // Enough renames that the pending events exceed one 4096-byte read.
+        for i in 0..300u32 {
+            let name = format!("f{i}");
+            std::fs::write(dir.path().join(&name), b"x").unwrap();
+            std::fs::rename(dir.path().join(&name), dir.path().join(format!("g{i}"))).unwrap();
+        }
+        assert!(wait_readable(fd.as_fd(), Duration::from_millis(1000)).unwrap());
+        // One wait must drain every buffered event, not just the first read.
+        assert!(
+            !wait_readable(fd.as_fd(), Duration::from_millis(50)).unwrap(),
+            "events survived the drain"
+        );
+    }
+
+    #[test]
+    fn is_interrupted_table() {
+        assert!(is_interrupted(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "eintr",
+        )));
+        assert!(is_interrupted(&io::Error::from_raw_os_error(libc::EINTR)));
+        assert!(!is_interrupted(&io::Error::from_raw_os_error(libc::EBADF)));
+        assert!(!is_interrupted(&io::Error::from_raw_os_error(libc::EIO)));
     }
 
     #[test]

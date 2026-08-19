@@ -49,4 +49,17 @@ exclude_re = [
     # Init post-commit cleanup: unlink .initializing ENOENT guard
     # is defense-in-depth; the marker is always present at this point.
     "Queue::init",
+    # inotify hint plumbing. The flag-OR mutants (IN_NONBLOCK|IN_CLOEXEC,
+    # IN_MOVED_TO|IN_Q_OVERFLOW) are equivalent on disjoint constants; the
+    # fd<0 / wd<0 guards only differ from their mutants at value 0, which
+    # the kernel never returns (fd 0 stays open in every test process;
+    # watch descriptors start at 1). The |->& init mutant is caught by
+    # timeout (blocking fd hangs drain), which cargo-mutants counts as
+    # caught; see docs/mutation-exclusions.md.
+    # inotify hint plumbing, equivalent mutants only: flag-ORs are
+    # equivalent on disjoint constants (IN_NONBLOCK|IN_CLOEXEC,
+    # IN_MOVED_TO|IN_Q_OVERFLOW); fd/wd guards differ from their mutants
+    # only at 0, which the kernel never returns here. The |->& init mutant
+    # is caught by timeout (blocking fd hangs drain).
+    "inotify\\.rs.*in (init|add_moved_to_watch)$",
 ]
