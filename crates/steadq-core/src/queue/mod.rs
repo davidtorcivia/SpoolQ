@@ -57,6 +57,9 @@ pub struct Queue {
     pub(crate) publication_mode: Option<fs::PublicationMode>,
     pub(crate) deferred_dir_sync: bool,
     pub(crate) dirty: std::cell::RefCell<engine::DirtySet>,
+    // inotify hint for the lease wait; None means poll-only. Advisory only.
+    pub(crate) ready_watch: Option<std::os::fd::OwnedFd>,
+    pub(crate) ready_watch_attempted: bool,
 }
 
 pub(super) struct ClaimSourceWitness {
@@ -663,6 +666,8 @@ impl Queue {
             publication_mode,
             deferred_dir_sync: opts.deferred_dir_sync,
             dirty: std::cell::RefCell::new(engine::DirtySet::new()),
+            ready_watch: None,
+            ready_watch_attempted: false,
         })
     }
 
