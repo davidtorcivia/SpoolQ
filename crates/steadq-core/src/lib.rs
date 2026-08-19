@@ -1,11 +1,11 @@
 #[cfg(not(all(
     target_os = "linux",
-    target_arch = "x86_64",
-    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_env = "gnu", target_env = "musl"),
     target_pointer_width = "64"
 )))]
 compile_error!(
-    "steadq-core supports only 64-bit x86_64 Linux targets with the GNU environment; the certified release target is x86_64-unknown-linux-gnu"
+    "steadq-core supports only 64-bit x86_64 or aarch64 Linux targets with the gnu or musl environment"
 );
 
 pub mod errors;
