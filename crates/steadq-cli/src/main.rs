@@ -450,7 +450,14 @@ fn main() -> ExitCode {
                 ] {
                     let state_path = root.join(state);
                     if state_path.exists() {
-                        stats_map.insert(state.to_string(), state_stats(&state_path));
+                        let stats = match state_stats(&state_path) {
+                            Ok(stats) => stats,
+                            Err(e) => {
+                                eprintln!("stats: {}: {e}", state_path.display());
+                                return exit_io(&e);
+                            }
+                        };
+                        stats_map.insert(state.to_string(), stats);
                     }
                 }
                 if prometheus {
@@ -1391,38 +1398,37 @@ fn main() -> ExitCode {
     }
 }
 
-/// Per-state object count and oldest mtime in one walk.
+/// Per-state object count and oldest mtime in one walk. Returns Err when a
+/// directory cannot be listed: "unreadable" must not read as "empty" on a
+/// monitoring surface.
 struct StateStats {
     count: usize,
     oldest: Option<std::time::SystemTime>,
 }
 
-fn state_stats(path: &std::path::Path) -> StateStats {
+fn state_stats(path: &std::path::Path) -> std::io::Result<StateStats> {
     let mut stats = StateStats {
         count: 0,
         oldest: None,
     };
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                let sub = state_stats(&p);
-                stats.count += sub.count;
-                stats.oldest = stats.oldest.or(sub.oldest);
-            } else {
-                stats.count += 1;
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        stats.oldest = Some(match stats.oldest {
-                            Some(current) => current.min(modified),
-                            None => modified,
-                        });
-                    }
-                }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_dir() {
+            let sub = state_stats(&p)?;
+            stats.count += sub.count;
+            stats.oldest = [stats.oldest, sub.oldest].into_iter().flatten().min();
+        } else {
+            stats.count += 1;
+            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                stats.oldest = Some(match stats.oldest {
+                    Some(current) => current.min(modified),
+                    None => modified,
+                });
             }
         }
     }
-    stats
+    Ok(stats)
 }
 
 fn age_seconds(since: std::time::SystemTime) -> u64 {
@@ -1713,5 +1719,26 @@ mod tests {
         assert_eq!(loaded.content_type, "text/plain");
         assert_eq!(loaded.envelope_digest, [0x33; 32]);
         assert_eq!(loaded.job_id, [0x22; 16]);
+    }
+
+    #[test]
+    fn state_stats_oldest_is_global_min_across_sibling_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (dir, name, age) in [("a", "f1", 3600), ("a", "f2", 60), ("b", "f3", 7200)] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let f = d.join(name);
+            std::fs::write(&f, b"x").unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            let ft = std::fs::File::options().write(true).open(&f).unwrap();
+            ft.set_modified(old).unwrap();
+        }
+        let stats = state_stats(root).unwrap();
+        assert_eq!(stats.count, 3);
+        // The oldest file lives in dir b, not the first-listed dir a: the
+        // merge must be a min across siblings, not first-wins.
+        let age = age_seconds(stats.oldest.unwrap());
+        assert!((7100..=7300).contains(&age), "age: {age}");
     }
 }
