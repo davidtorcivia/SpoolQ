@@ -24,8 +24,9 @@ fn exit(code: u8) -> ExitCode {
     ExitCode::from(code)
 }
 
-fn exit_core(error: &Error) -> ExitCode {
-    exit(match error {
+/// Map a core error to its stable CLI exit code.
+pub(crate) fn core_exit_code(error: &Error) -> u8 {
+    match error {
         Error::QueueCorrupt(_) | Error::PayloadCorrupt | Error::QueuePoisoned(_) => EXIT_CORRUPTION,
         Error::UnsupportedFilesystem | Error::UnsupportedFormat => EXIT_UNSUPPORTED,
         Error::PermissionDenied => EXIT_PERMISSION,
@@ -36,7 +37,11 @@ fn exit_core(error: &Error) -> ExitCode {
         | Error::NotCommitted(_)
         | Error::MaintenanceBusy
         | Error::IdentityCollision => EXIT_ORDINARY,
-    })
+    }
+}
+
+fn exit_core(error: &Error) -> ExitCode {
+    exit(core_exit_code(error))
 }
 
 fn exit_io(error: &std::io::Error) -> ExitCode {
@@ -129,6 +134,22 @@ enum Commands {
         handle_file: PathBuf,
         #[arg(long, default_value = "0")]
         reason: u16,
+    },
+    /// Run a command for each leased job: payload on stdin, lease renewed
+    /// while it runs, ack on exit 0, requeue on nonzero
+    Work {
+        path: PathBuf,
+        /// Worker threads, each with its own queue handle
+        #[arg(long, default_value = "1")]
+        concurrency: u32,
+        /// Lease duration; renewed at half this interval
+        #[arg(long, default_value = "60")]
+        lease_seconds: u64,
+        /// Run one job, then exit with the job's exit code
+        #[arg(long)]
+        once: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
     },
     /// Run a recovery pass
     Recover {
@@ -231,6 +252,8 @@ fn doctor_filesystem(magic: i64) -> (&'static str, bool) {
         _ => ("unknown_refused", false),
     }
 }
+
+mod work;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -819,6 +842,20 @@ fn main() -> ExitCode {
                 eprintln!("unrecognized format");
                 exit(EXIT_ORDINARY)
             }
+        }
+
+        Commands::Work {
+            path,
+            concurrency,
+            lease_seconds,
+            once,
+            command,
+        } => {
+            let Some(lease_ns) = parse_duration_seconds(lease_seconds) else {
+                eprintln!("lease seconds out of range");
+                return exit(EXIT_ORDINARY);
+            };
+            exit(work::run(&path, concurrency, lease_ns, once, &command))
         }
 
         Commands::Recover {

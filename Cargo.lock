@@ -666,6 +666,7 @@ dependencies = [
  "steadq-format",
  "steadq-fs-linux",
  "steadq-names",
+ "tempfile",
 ]
 
 [[package]]
