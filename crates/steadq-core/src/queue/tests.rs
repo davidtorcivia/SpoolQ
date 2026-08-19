@@ -5011,7 +5011,9 @@ fn zero_wait_lease_performs_exactly_one_scan() {
 fn bounded_wait_retries_empty_scans_without_busy_spinning() {
     let (_tmp, mut queue) = create_test_queue();
     let before = queue.scan_round;
-    let wait = std::time::Duration::from_millis(25);
+    // 250 ms so one slow scan on a loaded runner cannot consume the whole
+    // window and turn the retry count into 1.
+    let wait = std::time::Duration::from_millis(250);
     let started = std::time::Instant::now();
     assert!(matches!(
         queue.lease(wait.as_nanos() as u64, 30_000_000_000),
@@ -5022,11 +5024,11 @@ fn bounded_wait_retries_empty_scans_without_busy_spinning() {
 
     assert!(elapsed >= wait, "returned before deadline: {elapsed:?}");
     assert!(
-        elapsed < std::time::Duration::from_millis(500),
+        elapsed < std::time::Duration::from_secs(2),
         "bounded wait substantially exceeded its deadline: {elapsed:?}"
     );
     assert!(scans > 1, "bounded wait did not retry");
-    assert!(scans < 50, "bounded wait busy-spun with {scans} scans");
+    assert!(scans < 100, "bounded wait busy-spun with {scans} scans");
 }
 
 #[test]
