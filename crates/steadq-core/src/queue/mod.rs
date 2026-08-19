@@ -290,8 +290,8 @@ impl Queue {
         } else {
             root.parent().unwrap_or(root)
         };
-        let magic = fs::statfs(check_path).map_err(|e| io::Error::other(format!("statfs: {e}")))?;
-        let ft = magic.f_type as i64;
+        let ft =
+            fs::fs_type_magic(check_path).map_err(|e| io::Error::other(format!("statfs: {e}")))?;
         if fs::supported_filesystem_name(ft).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
