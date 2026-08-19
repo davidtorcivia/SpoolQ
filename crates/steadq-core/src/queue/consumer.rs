@@ -365,6 +365,25 @@ impl Queue {
 
     /// Renew a lease with a new deadline.
     pub fn renew(&mut self, lease: &LeaseInfo, lease_duration_ns: u64) -> RenewOutcome {
+        if self.deferred_dir_sync {
+            let mut tmp = self.dirty.replace(engine::DirtySet::new());
+            let outcome = self.renew_with_dirty(lease, lease_duration_ns, Some(&mut tmp));
+            let prev = self.dirty.replace(tmp);
+            drop(prev);
+            return match outcome {
+                RenewOutcome::Renewed(info) => RenewOutcome::Deferred(info),
+                outcome => outcome,
+            };
+        }
+        self.renew_with_dirty(lease, lease_duration_ns, None)
+    }
+
+    fn renew_with_dirty(
+        &mut self,
+        lease: &LeaseInfo,
+        lease_duration_ns: u64,
+        dirty: Option<&mut engine::DirtySet>,
+    ) -> RenewOutcome {
         if let Err(e) = self.check_not_poisoned() {
             return RenewOutcome::NotCommitted(e);
         }
@@ -424,7 +443,7 @@ impl Queue {
             Err(error) => return RenewOutcome::NotCommitted(error),
         };
 
-        match self.move_leased(lease, &dest_dir, &fname, &ticket) {
+        match self.move_leased_with_dirty(lease, &dest_dir, &fname, &ticket, dirty) {
             TransitionOutcome::Committed => RenewOutcome::Renewed(LeaseInfo {
                 generation: new_gen,
                 expires_boottime_ns: new_boottime_dl,
@@ -686,19 +705,6 @@ impl Queue {
         )
     }
 
-    pub(super) fn execute_leased_move(
-        source: &LeasedSourceWitness,
-        destination_directory_fd: BorrowedFd<'_>,
-        destination_name: &str,
-    ) -> LeasedMoveOutcome {
-        Self::execute_leased_move_with_dirty(
-            source,
-            destination_directory_fd,
-            destination_name,
-            None,
-        )
-    }
-
     pub(super) fn execute_leased_move_with_dirty(
         source: &LeasedSourceWitness,
         destination_directory_fd: BorrowedFd<'_>,
@@ -770,7 +776,18 @@ impl Queue {
         dest_name: &str,
         ticket: &TransitionTicket,
     ) -> TransitionOutcome {
-        if let Err(e) = self.ensure_dir(dest_dir) {
+        self.move_leased_with_dirty(lease, dest_dir, dest_name, ticket, None)
+    }
+
+    pub(super) fn move_leased_with_dirty(
+        &mut self,
+        lease: &LeaseInfo,
+        dest_dir: &str,
+        dest_name: &str,
+        ticket: &TransitionTicket,
+        mut dirty: Option<&mut engine::DirtySet>,
+    ) -> TransitionOutcome {
+        if let Err(e) = self.ensure_dir_with_dirty(dest_dir, dirty.as_deref_mut()) {
             return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string()));
         }
 
@@ -790,7 +807,7 @@ impl Queue {
             Err(e) => return TransitionOutcome::NotCommitted(e),
         };
 
-        match Self::execute_leased_move(&source, dest_dir_fd.as_fd(), dest_name) {
+        match Self::execute_leased_move_with_dirty(&source, dest_dir_fd.as_fd(), dest_name, dirty) {
             LeasedMoveOutcome::Committed => TransitionOutcome::Committed,
             LeasedMoveOutcome::OutcomeUnknown(phase) => {
                 self.poison();

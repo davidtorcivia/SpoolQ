@@ -52,7 +52,15 @@ fn worker(
     once: bool,
     command: Vec<String>,
 ) -> u8 {
-    let mut queue = match Queue::open(&path, &OpenOptions::default()) {
+    let mut queue = match Queue::open(
+        &path,
+        &OpenOptions {
+            // Renewal barriers defer: ack and requeue sync the directory
+            // themselves, so renewals cost a rename with no fsync.
+            deferred_dir_sync: true,
+            ..Default::default()
+        },
+    ) {
         Ok(q) => q,
         Err(e) => {
             eprintln!("open failed: {e}");
@@ -180,7 +188,7 @@ fn babysit(
         }
         if renewing && Instant::now() >= next_renew {
             match queue.renew(lease, lease_duration_ns) {
-                RenewOutcome::Renewed(fresh) => {
+                RenewOutcome::Renewed(fresh) | RenewOutcome::Deferred(fresh) => {
                     *lease = fresh;
                     next_renew = Instant::now() + renew_every;
                 }

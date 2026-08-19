@@ -72,6 +72,13 @@ pub enum LeaseOutcome {
 #[derive(Debug, Clone)]
 pub enum RenewOutcome {
     Renewed(LeaseInfo),
+    /// The renewal linearized (rename completed) but its directory barrier
+    /// is deferred to `Queue::sync()`. The returned lease info is current:
+    /// later acks, retries, and renews use it. A crash before `sync()`
+    /// loses the renewal; the lease then expires and the job re-runs, which
+    /// at-least-once execution permits. An ack of the lease makes the
+    /// renewal durable because the ack's own barriers sync the directory.
+    Deferred(LeaseInfo),
     LeaseLost,
     NotCommitted(Error),
     OutcomeUnknown(TransitionTicket),
