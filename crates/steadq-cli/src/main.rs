@@ -17,7 +17,8 @@ const EXIT_PERMISSION: u8 = 5;
 const EXIT_IO_FAILURE: u8 = 6;
 const EXIT_UNSUPPORTED: u8 = 64;
 use steadq_core::{
-    CreateOptions, EnqueueInput, EnqueueOutcome, Error, LeaseOutcome, OpenOptions, Queue,
+    CreateOptions, EnqueueInput, EnqueueOutcome, Error, FindingSeverity, FsckDepth, FsckMode,
+    FsckOptions, LeaseOutcome, OpenOptions, Queue,
 };
 
 fn exit(code: u8) -> ExitCode {
@@ -109,10 +110,25 @@ enum Commands {
         #[arg(long)]
         ticket_out: Option<PathBuf>,
     },
-    /// Stats
-    Stats { path: PathBuf },
+    /// Per-state object counts and oldest-object age
+    Stats {
+        path: PathBuf,
+        /// Emit Prometheus textfile format instead of plain lines
+        #[arg(long)]
+        prometheus: bool,
+    },
     /// Doctor: check environment
     Doctor { path: PathBuf },
+    /// Check queue integrity: name tags, digests, shard placement
+    Fsck {
+        path: PathBuf,
+        /// Also hash and verify payload digests
+        #[arg(long)]
+        deep: bool,
+        /// Quarantine corrupt objects instead of only reporting
+        #[arg(long)]
+        repair: bool,
+    },
     /// Acknowledge a lease
     Ack {
         path: PathBuf,
@@ -419,10 +435,10 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Stats { path } => match Queue::open(&path, &OpenOptions::default()) {
+        Commands::Stats { path, prometheus } => match Queue::open(&path, &OpenOptions::default()) {
             Ok(_queue) => {
                 let root = &path;
-                let mut stats_map: std::collections::BTreeMap<String, usize> =
+                let mut stats_map: std::collections::BTreeMap<String, StateStats> =
                     std::collections::BTreeMap::new();
                 for state in [
                     "ready",
@@ -434,15 +450,53 @@ fn main() -> ExitCode {
                 ] {
                     let state_path = root.join(state);
                     if state_path.exists() {
-                        let count = count_files_recursive(&state_path);
-                        stats_map.insert(state.to_string(), count);
+                        let stats = match state_stats(&state_path) {
+                            Ok(stats) => stats,
+                            Err(e) => {
+                                eprintln!("stats: {}: {e}", state_path.display());
+                                return exit_io(&e);
+                            }
+                        };
+                        stats_map.insert(state.to_string(), stats);
                     }
                 }
-                if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&stats_map).unwrap());
+                if prometheus {
+                    for (state, stats) in &stats_map {
+                        println!("# TYPE steadq_{state}_objects gauge");
+                        println!("steadq_{state}_objects {}", stats.count);
+                    }
+                    for (state, stats) in &stats_map {
+                        if let Some(oldest) = stats.oldest {
+                            println!("# TYPE steadq_{state}_oldest_age_seconds gauge");
+                            println!("steadq_{state}_oldest_age_seconds {}", age_seconds(oldest));
+                        }
+                    }
+                } else if cli.json {
+                    let plain: std::collections::BTreeMap<&str, serde_json::Value> = stats_map
+                        .iter()
+                        .map(|(state, stats)| {
+                            (
+                                state.as_str(),
+                                serde_json::json!({
+                                    "objects": stats.count,
+                                    "oldest_age_seconds": stats
+                                        .oldest
+                                        .map(age_seconds),
+                                }),
+                            )
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&plain).unwrap());
                 } else {
-                    for (state, count) in &stats_map {
-                        println!("{state}: {count}");
+                    for (state, stats) in &stats_map {
+                        match stats.oldest {
+                            Some(oldest) => println!(
+                                "{state}: {} (oldest {}s)",
+                                stats.count,
+                                age_seconds(oldest)
+                            ),
+                            None => println!("{state}: {}", stats.count),
+                        }
                     }
                 }
                 exit(EXIT_SUCCESS)
@@ -452,6 +506,55 @@ fn main() -> ExitCode {
                 exit_core(&e)
             }
         },
+
+        Commands::Fsck { path, deep, repair } => {
+            let queue = match Queue::open(&path, &OpenOptions::default()) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("open failed: {e}");
+                    return exit_core(&e);
+                }
+            };
+            let opts = FsckOptions {
+                mode: if repair {
+                    FsckMode::Repair
+                } else {
+                    FsckMode::Check
+                },
+                depth: if deep {
+                    FsckDepth::Deep
+                } else {
+                    FsckDepth::Structural
+                },
+            };
+            let report = queue.fsck(&opts);
+            eprintln!(
+                "objects: {}, structurally verified: {}, payload verified: {}",
+                report.total_objects, report.structurally_verified, report.payloads_deep_verified
+            );
+            for finding in &report.findings {
+                let severity = match finding.severity {
+                    FindingSeverity::Error => "ERROR",
+                    FindingSeverity::Warning => "WARN",
+                };
+                println!(
+                    "{severity} {}: {} ({})",
+                    finding.relative_path, finding.finding_type, finding.details
+                );
+            }
+            if !report.quarantined.is_empty() {
+                eprintln!("quarantined: {}", report.quarantined.len());
+            }
+            let has_errors = report
+                .findings
+                .iter()
+                .any(|f| f.severity == FindingSeverity::Error);
+            if has_errors {
+                exit(EXIT_CORRUPTION)
+            } else {
+                exit(EXIT_SUCCESS)
+            }
+        }
 
         Commands::Doctor { path } => {
             let mut results: Vec<(&str, String, bool)> = Vec::new();
@@ -1295,19 +1398,44 @@ fn main() -> ExitCode {
     }
 }
 
-fn count_files_recursive(path: &std::path::Path) -> usize {
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                count += count_files_recursive(&p);
-            } else {
-                count += 1;
+/// Per-state object count and oldest mtime in one walk. Returns Err when a
+/// directory cannot be listed: "unreadable" must not read as "empty" on a
+/// monitoring surface.
+struct StateStats {
+    count: usize,
+    oldest: Option<std::time::SystemTime>,
+}
+
+fn state_stats(path: &std::path::Path) -> std::io::Result<StateStats> {
+    let mut stats = StateStats {
+        count: 0,
+        oldest: None,
+    };
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_dir() {
+            let sub = state_stats(&p)?;
+            stats.count += sub.count;
+            stats.oldest = [stats.oldest, sub.oldest].into_iter().flatten().min();
+        } else {
+            stats.count += 1;
+            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                stats.oldest = Some(match stats.oldest {
+                    Some(current) => current.min(modified),
+                    None => modified,
+                });
             }
         }
     }
-    count
+    Ok(stats)
+}
+
+fn age_seconds(since: std::time::SystemTime) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(since)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1591,5 +1719,26 @@ mod tests {
         assert_eq!(loaded.content_type, "text/plain");
         assert_eq!(loaded.envelope_digest, [0x33; 32]);
         assert_eq!(loaded.job_id, [0x22; 16]);
+    }
+
+    #[test]
+    fn state_stats_oldest_is_global_min_across_sibling_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (dir, name, age) in [("a", "f1", 3600), ("a", "f2", 60), ("b", "f3", 7200)] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let f = d.join(name);
+            std::fs::write(&f, b"x").unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            let ft = std::fs::File::options().write(true).open(&f).unwrap();
+            ft.set_modified(old).unwrap();
+        }
+        let stats = state_stats(root).unwrap();
+        assert_eq!(stats.count, 3);
+        // The oldest file lives in dir b, not the first-listed dir a: the
+        // merge must be a min across siblings, not first-wins.
+        let age = age_seconds(stats.oldest.unwrap());
+        assert!((7100..=7300).contains(&age), "age: {age}");
     }
 }
