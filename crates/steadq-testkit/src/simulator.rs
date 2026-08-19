@@ -395,8 +395,7 @@ mod tests {
 
     #[test]
     fn simulator_file_sync_without_dir_sync_is_lost() {
-        // P1-27: data fsync alone is not enough; the directory entry must
-        // also be durable.
+        // Data fsync alone is not enough; the directory entry must also be durable.
         let mut sim = Simulator::new(42);
         sim.create_dir("ready/0000");
         sim.write_file("ready/0000/job.sqj", vec![0xAB; 128]);

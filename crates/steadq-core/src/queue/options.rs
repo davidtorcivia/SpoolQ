@@ -23,7 +23,7 @@ impl Default for CreateOptions {
     }
 }
 
-/// Validate all CreateOptions before any filesystem mutation (C-01).
+/// Validate all CreateOptions before any filesystem mutation.
 /// Same validation used in encoding and tests.
 pub fn validate_create_options(opts: &CreateOptions) -> Result<(), Error> {
     if opts.shard_count == 0 || !opts.shard_count.is_power_of_two() || opts.shard_count > 4096 {

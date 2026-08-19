@@ -3,11 +3,10 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use steadq_names;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(s) = std::str::from_utf8(data) {
-        // P1-32: Verify round-trip for successful parses.
+        // Verify round-trip for successful parses.
         if let Ok(p) = steadq_names::parse_ready(s) {
             let base = format!(
                 "{}.g{:016x}.a{:08x}.m{:08x}",

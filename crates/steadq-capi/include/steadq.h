@@ -55,15 +55,15 @@ typedef struct SteadqJobId {
 } SteadqJobId;
 
 /**
- * C1: Get last error as a C string. Returns pointer to thread-local storage.
+ * Get last error as a C string. Returns pointer to thread-local storage.
  * The pointer is valid until the next SteadQ call on the same thread.
  * Do not free.
  */
 const char *steadq_last_error(void);
 
 /**
- * C1: No-op. steadq_last_error() returns thread-local storage that does not
- * need to be freed. Provided for ABI compatibility.
+ * No-op for ABI compatibility: steadq_last_error() returns thread-local
+ * storage that does not need to be freed.
  */
 void steadq_free_string(const char *_s);
 
@@ -105,22 +105,22 @@ int steadq_lease(struct SteadqQueue *queue,
                  struct SteadqLease **lease_out);
 
 /**
- * R4-FFI: See steadq.h for documentation.
+ * See steadq.h for documentation.
  */
 int steadq_lease_verify(struct SteadqQueue *queue, struct SteadqLease *lease);
 
 /**
- * R4-FFI: See steadq.h for documentation.
+ * See steadq.h for documentation.
  */
 int steadq_ack(struct SteadqQueue *queue, struct SteadqLease *lease);
 
 /**
- * R4-FFI: See steadq.h for documentation.
+ * See steadq.h for documentation.
  */
 int steadq_retry(struct SteadqQueue *queue, struct SteadqLease *lease);
 
 /**
- * R4-FFI: See steadq.h for documentation.
+ * See steadq.h for documentation.
  */
 int steadq_bury(struct SteadqQueue *queue, struct SteadqLease *lease, unsigned int reason);
 

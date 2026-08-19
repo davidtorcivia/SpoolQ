@@ -45,7 +45,7 @@ impl Queue {
         bucket_dirs.sort();
 
         for bucket_entry in &bucket_dirs {
-            // R4-RES: Skip buckets already processed in a prior pass.
+            // Skip buckets already processed in a prior pass.
             if let Some(cursor) = &self.recovery_cursor.promote_delayed {
                 if bucket_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
@@ -277,7 +277,7 @@ impl Queue {
                         Err(_) => continue,
                     };
 
-                    // B1: Validate object structure before promotion
+                    // Validate object structure before promotion
                     {
                         let delayed_ctx = crate::ActivePathContext::Delayed {
                             bucket: bucket_name.to_string(),
@@ -328,7 +328,7 @@ impl Queue {
             }
         }
 
-        // R4-RES: All buckets processed, reset cursor for next full pass.
+        // All buckets processed, reset cursor for next full pass.
         self.recovery_cursor.promote_delayed = None;
     }
 

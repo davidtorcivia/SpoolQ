@@ -202,7 +202,7 @@ pub fn shard_scan_params(
     (start as u32, stride as u32)
 }
 
-/// Get the i-th shard in the permutation.
+/// The i-th shard: (start + stride·i) mod shard_count.
 pub fn shard_at(start: u32, stride: u32, i: u32, shard_count: u32) -> u32 {
     let mask = shard_count - 1;
     (start.wrapping_add(stride.wrapping_mul(i))) & mask
@@ -255,7 +255,6 @@ pub fn boot_id_bytes(s: &str) -> Option<[u8; 16]> {
         return None;
     }
     let bytes = s.as_bytes();
-    // Check hyphens at positions 8, 13, 18, 23
     for &pos in &[8, 13, 18, 23] {
         if bytes[pos] != b'-' {
             return None;
@@ -304,9 +303,8 @@ impl CommonFields {
 }
 
 // ---------- Canonical context reconstruction ----------
-// P0-02/P0-03: Single source of truth for name-tag context.
-// Every consumer (resolver, fsck, recovery, duplicate-ack) calls these
-// instead of reconstructing the context independently.
+// Single source of truth for name-tag context; all consumers (resolver,
+// fsck, recovery, duplicate-ack) must use these instead of reconstructing it.
 
 impl ReadyName {
     /// Reconstruct the exact canonical context used by the writer.
@@ -490,8 +488,7 @@ pub fn leased_filename(
 }
 
 fn tagged_filename(mut base: String, tag: &[u8; 8], extension: &str) -> String {
-    // Both canonical tagged extensions are four bytes; reserve their fixed
-    // suffix in one step without making correctness depend on capacity math.
+    // ".k" + 16 tag hex chars + 4-byte extension
     base.reserve(22);
     base.push_str(".k");
     push_hex(&mut base, tag);
@@ -514,9 +511,9 @@ pub fn quarantine_filename(quarantine_id: &[u8; 16], reason: u16) -> String {
 }
 
 // ---------- High-level canonical builders ----------
-// PR1: Single source for writer side. Callers supply semantic fields only;
-// canonical text, context, and tag are derived here. Core production code
-// should use these instead of composing ready_context etc. directly.
+// Single writer-side source: callers supply semantic fields; canonical text,
+// context, and tag derive here. Production code must use these instead of
+// composing *_context directly.
 
 pub fn make_ready_name(queue_id: &[u8; 16], shard_hex: &str, common: &CommonFields) -> String {
     let base = common.base_name();
@@ -720,7 +717,7 @@ pub enum ParseError {
     NonAscii,
 }
 
-/// Check that a string is pure ASCII (C-44: filenames are ASCII protocol data).
+/// Filenames are ASCII protocol data.
 /// Rejects any byte > 127 or embedded NUL.
 fn assert_ascii(s: &str) -> Result<(), ParseError> {
     if s.is_ascii() && !s.contains('\0') {
@@ -1113,7 +1110,6 @@ mod tests {
         let jid = test_job_id();
         let shard = compute_shard(&qid, &jid, 64);
         assert!(shard < 64);
-        // Same inputs give same shard
         let shard2 = compute_shard(&qid, &jid, 64);
         assert_eq!(shard, shard2);
     }
@@ -1146,7 +1142,6 @@ mod tests {
     #[test]
     fn boot_id_rejects_uppercase() {
         let s = "12345678-1234-1234-1234-123456789ABC";
-        // spec requires lowercase
         assert!(boot_id_bytes(s).is_none());
     }
 
@@ -1168,7 +1163,6 @@ mod tests {
         assert!(hex_decode_u64("000000000000000F").is_none());
         assert!(hex_decode_u32("0000000F").is_none());
         assert!(hex_decode_u16("000F").is_none());
-        // Lowercase still works
         assert!(hex_decode_16("abcdef0123456789abcdef0123456789").is_some());
         assert!(hex_decode_u64("000000000000000f").is_some());
     }
@@ -1205,7 +1199,7 @@ mod tests {
         assert!(parse_ready("foo.bar").is_err());
     }
 
-    // C-43: Canonical parser tests - reject unknown, duplicate, reordered fields
+    // Canonical parser tests: reject unknown, duplicate, reordered fields.
     #[test]
     fn ready_rejects_extra_field() {
         let common = CommonFields {
@@ -1216,8 +1210,6 @@ mod tests {
         };
         let tag = [0xFF; 8];
         let fname = ready_filename(&common, &tag);
-        // Insert an extra field before .k
-        // Insert extra dot-separated field after .m
         let bad = fname.replace(".k", ".e00.k");
         assert!(parse_ready(&bad).is_err(), "should reject extra field");
     }
@@ -1232,7 +1224,6 @@ mod tests {
         };
         let tag = [0xFF; 8];
         let fname = ready_filename(&common, &tag);
-        // Swap g and a fields
         let parts: Vec<&str> = fname.split('.').collect();
         // parts: [jobid, g..., a..., m..., k..., "sqj"]
         let swapped = format!(
@@ -1253,7 +1244,6 @@ mod tests {
         let tag = [0xFF; 8];
         let fname = ready_filename(&common, &tag);
         let parts: Vec<&str> = fname.split('.').collect();
-        // Insert duplicate g field
         let duped = format!(
             "{}.{}.{}.{}.{}.{}.{}",
             parts[0], parts[1], parts[1], parts[2], parts[3], parts[4], parts[5]
@@ -1274,7 +1264,6 @@ mod tests {
         let parsed = parse_ready(&fname).unwrap();
         assert_eq!(parsed.common, common);
         assert_eq!(parsed.tag, tag);
-        // Round-trip: format(parse(name)) == name
         let re_formatted = ready_filename(&parsed.common, &parsed.tag);
         assert_eq!(fname, re_formatted, "round trip must produce same name");
     }
@@ -1349,19 +1338,16 @@ mod tests {
         );
     }
 
-    // C-44: non-ASCII must not panic
     #[test]
     fn non_ascii_filename_does_not_panic() {
-        // Multibyte UTF-8 character at the start of a field
+        // Too many fields: fails, but must not panic.
         let bad = "abababababababababababababababab.g0000000000000000.a00000000.m00000003.kffffffffffffffff.test.sqj";
-        // This has too many fields, so should fail - but must not panic
         assert!(parse_ready(bad).is_err());
         // Byte with high bit set
         let bad2 = "\u{80}bababababababababababababababab.g0000000000000000.a00000000.m00000003.kffffffffffffffff.sqj";
         let _ = parse_ready(bad2);
     }
 
-    // C-43: uppercase hex should be rejected by hex decoders
     #[test]
     fn parsers_reject_uppercase_hex() {
         let common = CommonFields {
@@ -1372,10 +1358,8 @@ mod tests {
         };
         let tag = [0xFF; 8];
         let fname = ready_filename(&common, &tag);
-        // The hex_encode function produces lowercase, so this should work
         let parsed = parse_ready(&fname).unwrap();
         assert_eq!(parsed.common, common);
-        // Manually uppercase the job_id hex and verify rejection
         let bad = fname.to_uppercase().replace(".SQJ", ".sqj");
         assert!(parse_ready(&bad).is_err(), "uppercase hex must be rejected");
     }
@@ -1502,7 +1486,7 @@ mod tests {
         assert_eq!(255 - max, 59, "remaining budget must be 59");
     }
 
-    // ===== Canonical authenticate_tag tests (P1-25 mutation coverage) =====
+    // ===== authenticate_tag tests =====
 
     fn make_common() -> CommonFields {
         CommonFields {
@@ -1629,7 +1613,7 @@ mod tests {
         assert!(!name.authenticate_tag(&[0xFF; 16], bucket, shard));
     }
 
-    // ===== canonical_context output verification (mutation coverage) =====
+    // ===== canonical_context output tests =====
 
     #[test]
     fn ready_canonical_context_format() {
@@ -1789,7 +1773,7 @@ mod tests {
     fn compute_shard_known_value() {
         let qid = [0x42; 16];
         let jid = [0xAB; 16];
-        // Pinned to catch mutations of the domain string or hash extraction.
+        // Pinned value; catches changes to the domain string or hash extraction.
         assert_eq!(compute_shard(&qid, &jid, 64), 36);
     }
 
@@ -1798,7 +1782,7 @@ mod tests {
         let qid = [0x42; 16];
         let boot = [0u8; 16];
         let nonce = [0u8; 16];
-        // Pinned to catch mutations of the domain string or hash extraction.
+        // Pinned value; catches changes to the domain string or hash extraction.
         let (start, stride) = shard_scan_params(&qid, &boot, &nonce, 0, 64);
         assert_eq!(start, 46);
         assert_eq!(stride, 23);

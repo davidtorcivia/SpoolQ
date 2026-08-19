@@ -262,7 +262,7 @@ impl Queue {
             return ResolveObj::Conflict;
         }
 
-        // R4-B07: Read the 128-byte header buffer.
+        // Read the 128-byte header buffer.
         let mut header_buf = [0u8; 128];
         if let Err(error) = fs::pread_exact(file_fd.as_fd(), &mut header_buf, 0) {
             return if error.kind() == io::ErrorKind::UnexpectedEof {
@@ -329,7 +329,7 @@ impl Queue {
         };
         let header = verified.header();
 
-        // R4-B07: Verify header job_id matches the ticket.
+        // Verify header job_id matches the ticket.
         if header.job_id != ticket.job_id() {
             return ResolveObj::Conflict;
         }
@@ -344,7 +344,7 @@ impl Queue {
             return ResolveObj::Conflict;
         }
 
-        // R4-B07: Parse the filename using the state-appropriate parser and
+        // Parse the filename using the state-appropriate parser and
         // verify identity fields against the ticket. The state is derived from
         // the path prefix, not trusted from the ticket.
         match state {

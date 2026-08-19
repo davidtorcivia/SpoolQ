@@ -278,11 +278,11 @@ pub enum ActivePathContext {
 impl Queue {
     /// Initialize a new queue at the given path.
     pub fn init(root: &Path, opts: &CreateOptions) -> io::Result<FormatRecord> {
-        // C-01: Validate all options before any filesystem mutation
+        // Validate all options before any filesystem mutation
         validate_create_options(opts)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        // P1-23: Preflight filesystem check before any mutation.
+        // Preflight filesystem check before any mutation.
         // If the root already exists, check its filesystem. If creating,
         // check the parent's filesystem.
         let check_path = if root.exists() {
@@ -313,7 +313,7 @@ impl Queue {
 
         let root_fd = fs::open_dir_absolute(root)?;
 
-        // R2-B01: Refuse to overwrite an existing queue.
+        // Refuse to overwrite an existing queue.
         let format_exists = fs::fstatat(root_fd.as_fd(), "FORMAT").is_ok();
         if format_exists {
             return Err(io::Error::new(
@@ -322,8 +322,8 @@ impl Queue {
             ));
         }
 
-        // R2-B01/P1-08: Create an exclusive initialization marker BEFORE any other state.
-        // P1-08: If .initializing already exists but FORMAT is absent, the previous
+        // Create an exclusive initialization marker BEFORE any other state.
+        // If .initializing already exists but FORMAT is absent, the previous
         // init was interrupted by a crash. Safe to clean up and retry since no FORMAT
         // means no queue identity was committed.
         let _init_marker = match fs::create_exclusive(root_fd.as_fd(), ".initializing", 0o600) {
@@ -342,7 +342,7 @@ impl Queue {
             Err(e) => return Err(e),
         };
 
-        // R2-B01: Use RAII guard to clean up the init marker on any failure.
+        // Use RAII guard to clean up the init marker on any failure.
         struct InitGuard<'fd> {
             root_fd: BorrowedFd<'fd>,
             armed: bool,
@@ -360,7 +360,7 @@ impl Queue {
             armed: true,
         };
 
-        // R2-B01: Create control/ early so we can hold the maintenance lock
+        // Create control/ early so we can hold the maintenance lock
         // with RAII (no mem::forget leak).
         fs::mkdirat_eexist_ok(root_fd.as_fd(), "control", 0o700)?;
         let control_fd = fs::open_directory(root_fd.as_fd(), "control")?;
@@ -379,7 +379,7 @@ impl Queue {
                 "another initializer or maintenance process holds the lock",
             ));
         }
-        // H1: Hold the maintenance lock for the duration of init by binding it.
+        // Hold the maintenance lock for the duration of init by binding it.
         // It will be released when _init_lock goes out of scope at function end.
         let _init_lock = lock_fd;
 
@@ -452,7 +452,7 @@ impl Queue {
         };
         let wm_bytes = wm.encode();
         // Write via temp file then rename
-        // C-03: Use unique temp name to avoid collision on partial init rerun
+        // Use unique temp name to avoid collision on partial init rerun
         let wm_tmp_name = format!(
             ".wm.tmp.{}",
             steadq_names::hex_encode(&fs::random_128bit()?)
@@ -470,7 +470,7 @@ impl Queue {
 
         // Write FORMAT file
         let format_bytes = format_rec.encode();
-        // C-03: Unique temp name for partial init recovery
+        // Unique temp name for partial init recovery
         let fmt_tmp_name = format!(
             ".format.tmp.{}",
             steadq_names::hex_encode(&fs::random_128bit()?)
@@ -478,7 +478,7 @@ impl Queue {
         let fmt_tmp = fs::create_exclusive(root_fd.as_fd(), &fmt_tmp_name, 0o600)?;
         fs::write_all(fmt_tmp.as_fd(), &format_bytes)?;
         fs::fsync(fmt_tmp.as_fd())?;
-        // C-02: Set FORMAT temp file to read-only before publication so the
+        // Set FORMAT temp file to read-only before publication so the
         // published FORMAT is read-only even if the post-rename chmod is
         // skipped by an OutcomeUnknown return.
         fs::fchmodat(root_fd.as_fd(), &fmt_tmp_name, 0o400)?;
@@ -532,16 +532,16 @@ impl Queue {
 
     /// Open an existing queue.
     pub fn open(root: &Path, opts: &OpenOptions) -> Result<Self, Error> {
-        // B-11: Open root first using descriptor-relative, no-symlink semantics
+        // Open root first using descriptor-relative, no-symlink semantics
         let root_fd = fs::open_dir_absolute(root).map_err(|e| Error::IoFailure(e.to_string()))?;
 
-        // B-11: Validate root is a directory
+        // Validate root is a directory
         let root_stat = fs::fstat(root_fd.as_fd()).map_err(|e| Error::IoFailure(e.to_string()))?;
         if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(Error::QueueCorrupt("root path is not a directory".into()));
         }
 
-        // B-11: Read FORMAT through descriptor-relative open, not pathname.
+        // Read FORMAT through descriptor-relative open, not pathname.
         // If FORMAT is absent, check whether an initialization was interrupted.
         let format_fd = match fs::openat(root_fd.as_fd(), "FORMAT", libc::O_RDONLY, 0) {
             Ok(fd) => fd,
@@ -592,7 +592,7 @@ impl Queue {
             opts.allow_unsupported_fs,
         )?;
 
-        // B-11: Require all state directories to exist and be on the same device.
+        // Require all state directories to exist and be on the same device.
         for state_dir in &[
             "control",
             "ready",

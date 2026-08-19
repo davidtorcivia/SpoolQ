@@ -15,7 +15,7 @@ pub fn checked_mul_u64(a: u64, b: u64) -> Option<u64> {
 // ---------- Bucket arithmetic ----------
 
 /// floor(timestamp_ns / bucket_width_ns).
-/// Returns None if bucket_width_ns is zero (C-50).
+/// Returns None if bucket_width_ns is zero.
 pub fn bucket_number(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
     if bucket_width_ns == 0 {
         return None;
@@ -24,7 +24,7 @@ pub fn bucket_number(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
 }
 
 /// ceiling(timestamp_ns / bucket_width_ns).
-/// Returns None if bucket_width_ns is zero (C-50).
+/// Returns None if bucket_width_ns is zero.
 pub fn ceiling_bucket(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
     if bucket_width_ns == 0 {
         return None;
@@ -156,7 +156,6 @@ fn saturating_double(base: u64, exp: u32) -> u64 {
     if exp == 0 || base == 0 {
         return base;
     }
-    // base * 2^(exp-1)
     if exp > 64 {
         return u64::MAX;
     }
@@ -216,8 +215,7 @@ pub fn retry_delay_ms(
             return Ok(lower + offset);
         }
         counter += 1;
-        // B4: Cap iterations to prevent theoretical infinite loop.
-        // Fallback to the midpoint of the span, which is unbiased.
+        // Cap iterations; fall back to the span midpoint, which is unbiased.
         if counter >= 64 {
             return Ok(lower + span / 2);
         }
@@ -237,7 +235,7 @@ pub fn retry_wall_deadline(effective_wall_floor_ns: u64, delay_ns: u64) -> Optio
 // ---------- Wall watermark floor ----------
 
 /// effective_wall_floor_ns = max(clock_realtime_ns, stored_bucket * bucket_width_ns).
-/// Returns None if the watermark computation overflows (C-51).
+/// Returns None on overflow.
 pub fn effective_wall_floor(
     clock_realtime_ns: u64,
     stored_bucket: u64,
@@ -374,27 +372,22 @@ mod tests {
 
     #[test]
     fn bucket_arithmetic_zero_width_is_error() {
-        // C-50: zero bucket width must return None, not panic
         assert_eq!(bucket_number(100, 0), None);
         assert_eq!(ceiling_bucket(100, 0), None);
     }
 
     #[test]
     fn effective_wall_floor_zero_width_is_error() {
-        // C-50/C-51: zero width must return None
         assert_eq!(effective_wall_floor(100, 5, 0), None);
     }
 
     #[test]
     fn saturating_double_test() {
-        assert_eq!(saturating_double(1000, 1), 1000); // 1000 * 2^0
-        assert_eq!(saturating_double(1000, 2), 2000); // 1000 * 2^1
-        assert_eq!(saturating_double(1000, 3), 4000); // 1000 * 2^2
-        assert_eq!(saturating_double(1000, 4), 8000); // 1000 * 2^3
-                                                      // Large shift saturates
-                                                      // 1 << 63 is still valid
+        assert_eq!(saturating_double(1000, 1), 1000);
+        assert_eq!(saturating_double(1000, 2), 2000);
+        assert_eq!(saturating_double(1000, 3), 4000);
+        assert_eq!(saturating_double(1000, 4), 8000);
         assert_eq!(saturating_double(1, 64), 1u64 << 63);
-        // exp > 64 saturates
         assert_eq!(saturating_double(1, 65), u64::MAX);
         assert_eq!(saturating_double(u64::MAX, 2), u64::MAX);
         assert_eq!(saturating_double(0, 5), 0);

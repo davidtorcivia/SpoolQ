@@ -1,0 +1,5 @@
+# Workflow files use long pinned action refs and single-line run commands.
+extends: default
+rules:
+  line-length:
+    max: 160

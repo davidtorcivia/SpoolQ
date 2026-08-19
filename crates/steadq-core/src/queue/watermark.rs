@@ -92,7 +92,7 @@ pub(crate) fn watermark_should_advance(observed_bucket: u64, stored_bucket: u64)
 
 impl Queue {
     /// Compute the effective wall floor: max(CLOCK_REALTIME, stored watermark bucket * width)
-    /// Wall floor for mutating operations. P0-01: Returns Err and poisons on
+    /// Wall floor for mutating operations. Returns Err and poisons on
     /// non-transient failure so callers abort before computing destination paths.
     pub(crate) fn wall_floor_for_mutation(&mut self) -> Result<WallFloor, Error> {
         self.wall_floor_for_mutation_with_attempts(WATERMARK_READ_ATTEMPTS)
@@ -147,7 +147,7 @@ impl Queue {
         }
     }
 
-    /// R2-B05: Fallible version of effective_wall_floor_ns.
+    /// Fallible version of effective_wall_floor_ns.
     pub fn effective_wall_floor_ns_checked(&self) -> Result<u64, Error> {
         self.authenticated_wall_floor().map(WallFloor::unix_ns)
     }

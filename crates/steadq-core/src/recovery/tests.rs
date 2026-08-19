@@ -3243,16 +3243,14 @@ fn recovery_reaps_expired_lease() {
         _ => panic!("lease failed"),
     };
 
-    // Manually expire the lease by modifying the deadline in the filename
-    // We can't easily do that, so instead we'll just verify that recovery
-    // with a future boottime reaps it. For testing, we'll sleep briefly.
+    // Cannot rewrite the deadline in the filename; instead let a future
+    // boottime reap it. Sleep briefly so the lease expires.
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let stats = queue.recover(&WorkBudget::default());
-    // The lease should have been reaped to ready (attempt < max)
+    // Reaped to ready (attempt < max) or dead
     assert!(stats.leases_reaped >= 1 || stats.leases_to_dead >= 1);
 
-    // Should be able to lease again
     let result = queue.lease(0, 30_000_000_000);
     assert!(matches!(result, LeaseOutcome::Leased(_)));
 }

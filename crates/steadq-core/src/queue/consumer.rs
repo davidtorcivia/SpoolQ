@@ -29,7 +29,7 @@ impl Queue {
             return AckOutcome::NotCommitted(e);
         }
 
-        // C-25/B-05: Use effective wall floor for terminal transitions
+        // Use effective wall floor for terminal transitions
         let wall_floor = match self.wall_floor_for_mutation() {
             Ok(floor) => floor,
             Err(e) => return AckOutcome::NotCommitted(e),
@@ -67,11 +67,11 @@ impl Queue {
             Err(e) => return AckOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
 
-        // B-04: Validate the current lease source before acknowledging
+        // Validate the current lease source before acknowledging
         let source = match self.open_and_validate_current_lease(lease) {
             Ok(Some(source)) => source,
             Ok(None) => {
-                // R2-H01: Source is gone. Before returning LeaseLost,
+                // Source is gone. Before returning LeaseLost,
                 // check if this was a duplicate ack by probing receipts.
                 if self.check_duplicate_ack_bounded(lease, wall_floor) {
                     return AckOutcome::AlreadyAcked;
@@ -102,7 +102,7 @@ impl Queue {
                 AckOutcome::OutcomeUnknown(transition_ticket.with_phase(phase))
             }
             LeasedMoveOutcome::Collision => {
-                // P0-04: Authenticate the existing receipt instead of blindly
+                // Authenticate the existing receipt instead of blindly
                 // reporting AlreadyAcked. A conflicting object at the
                 // deterministic path must not be treated as idempotent success.
                 if self.receipt_is_authentic(lease, &receipt_dir, &receipt_name) {
@@ -121,9 +121,9 @@ impl Queue {
                 }
             }
             LeasedMoveOutcome::SourceGone => {
-                // C-22: On source absence, do a bounded receipt probe.
+                // On source absence, do a bounded receipt probe.
                 // Construct the finite set of exact retained receipt paths
-                // and check them directly (C-23: bounded, not full scan).
+                // and check them directly (bounded, not full scan).
                 if self.check_duplicate_ack_bounded(lease, wall_floor) {
                     AckOutcome::AlreadyAcked
                 } else {
@@ -438,7 +438,7 @@ impl Queue {
         }
     }
 
-    /// B-04: Open and validate the current leased source object.
+    /// Open and validate the current leased source object.
     /// Validates the source path, filename, header, and identity against the handle.
     pub(super) fn is_expected_dev_zero(dev: u64) -> bool {
         dev == 0
@@ -507,7 +507,7 @@ impl Queue {
             .map(|(directory, _)| directory.to_string())
             .ok_or_else(|| Error::QueueCorrupt("invalid leased path".into()))?;
 
-        // R2-H02: Only ENOENT means "source gone". Other errors are real failures.
+        // Only ENOENT means "source gone". Other errors are real failures.
         let src_dir_fd = match open_relative(self.root_fd.as_fd(), &src_dir) {
             Ok(fd) => fd,
             Err(error) => match classify_lease_directory_open_failure(&error) {
@@ -611,7 +611,7 @@ impl Queue {
             ));
         }
 
-        // H5: Verify header maximum_attempts matches filename/handle
+        // Verify header maximum_attempts matches filename/handle
         if header.maximum_attempts != lease.maximum_attempts {
             return Err(Error::QueueCorrupt(format!(
                 "header maximum_attempts {} does not match handle {}",
@@ -619,7 +619,7 @@ impl Queue {
             )));
         }
 
-        // R4-H04: Verify envelope digest matches the handle
+        // Verify envelope digest matches the handle
         if header.envelope_digest != lease.envelope_digest {
             return Err(Error::QueueCorrupt(
                 "envelope digest does not match handle".into(),
@@ -636,12 +636,12 @@ impl Queue {
             ));
         }
 
-        // R2-H03: Extension read failure is a real error, not a silent pass.
+        // Extension read failure is a real error, not a silent pass.
         let ext_len = header.extension_header_length as usize;
         if verified::is_extension_too_large(ext_len) {
             return Err(Error::QueueCorrupt("extension header too large".into()));
         }
-        // R4-H05: Always verify envelope digest (even when extension is empty).
+        // Always verify envelope digest (even when extension is empty).
         let mut ext_buf = vec![0u8; ext_len];
         if verified::is_extension_present(ext_len) {
             fs::pread_exact(file_fd.as_fd(), &mut ext_buf, 128)
@@ -651,7 +651,7 @@ impl Queue {
             return Err(Error::QueueCorrupt("envelope digest mismatch".into()));
         }
 
-        // R2-B02: Verify exact file size (no trailing data)
+        // Verify exact file size (no trailing data)
         if opened_stat.st_size < 0 {
             return Err(Error::QueueCorrupt("negative file size".into()));
         }
@@ -779,7 +779,7 @@ impl Queue {
             Err(e) => return TransitionOutcome::NotCommitted(Error::IoFailure(e.to_string())),
         };
 
-        // B-04: Validate the current lease source before transitioning
+        // Validate the current lease source before transitioning
         let source = match self.open_and_validate_current_lease(lease) {
             Ok(Some(source)) => source,
             Ok(None) => return TransitionOutcome::LeaseLost,

@@ -49,12 +49,9 @@ fuzz_target!(|data: &[u8]| {
             }
             1 => {
                 // Lease
-                match queue.lease(0, 30_000_000_000) {
-                    steadq_core::LeaseOutcome::Leased(info) => {
-                        leases.insert(next_lease_key, info);
-                        next_lease_key += 1;
-                    }
-                    _ => {}
+                if let steadq_core::LeaseOutcome::Leased(info) = queue.lease(0, 30_000_000_000) {
+                    leases.insert(next_lease_key, info);
+                    next_lease_key += 1;
                 }
             }
             2 => {

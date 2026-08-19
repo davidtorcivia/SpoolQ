@@ -4,7 +4,6 @@ use crate::oracle::{Oracle, OracleState};
 use crate::simulator::{Rng, Simulator};
 
 /// Run a seeded scenario: enqueue, claim, ack with optional crash points.
-/// T-05: Actually performs enqueue, claim, and ack as described.
 pub fn run_scenario(seed: u64) -> ScenarioResult {
     let mut rng = Rng::new(seed);
     let mut sim = Simulator::new(seed);
@@ -79,8 +78,7 @@ pub struct ScenarioResult {
     pub sim_files: usize,
 }
 
-/// Mutation test: verify that removing a guard produces a failing test.
-/// Each mutation removes one safety check and verifies the scenario breaks.
+/// Verify that removing a guard produces a detectable difference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mutation {
     RemoveFileSyncBeforePublish,
@@ -119,7 +117,6 @@ impl Mutation {
 }
 
 /// Run a mutation test: verify that the mutation causes a detectable difference.
-/// P1-26: Each mutation now actually alters the modeled behavior.
 pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
     let mut sim = Simulator::new(seed);
     let mut oracle = Oracle::new();
@@ -188,10 +185,10 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
             }
         }
         Mutation::RemoveSourceDirSyncAfterRename => {
-            // P1-27: Model directory-entry durability. Without source dir
-            // fsync after rename, the removal of the old name is not durable.
-            // After crash the durable namespace still has the source entry
-            // (and may also lack the dest entry if dest was not synced).
+            // Model directory-entry durability: without source dir fsync after
+            // rename, the removal of the old name is not durable, so after crash
+            // the durable namespace still has the source entry (and may also lack
+            // the dest entry if dest was not synced).
             sim.fsync_file("ready/0000/job.sqj");
             oracle.record_file_sync(&job);
             sim.fsync_dir("ready");
@@ -206,12 +203,8 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
             sim.fsync_dir("leased/boot/0/0000");
             oracle.record_claim(&job, [0xAA; 16]);
             oracle.record_dest_sync(&job);
-            // Source dir intentionally not synced.
             sim.crash();
-            // After crash with only dest synced: dest entry durable, but
-            // source removal not durable. Both names can appear depending
-            // on model; our model keeps durable entries per parent snapshot.
-            // Source parent still has the old durable entry.
+            // With only dest synced, the source parent still has the old durable entry.
             let src_survived = sim.exists("ready/0000/job.sqj");
             let dest_survived = sim.exists("leased/boot/0/0000/job.sqj");
             MutationResult {
@@ -236,9 +229,9 @@ pub fn run_mutation_test(mutation: Mutation, seed: u64) -> MutationResult {
             sim.fsync_dir("ready");
             sim.fsync_dir("ready/0000");
             oracle.record_publish(&job, true);
-            // The "mutation" is that we accept the evil file.
-            // In a correct system, evil.sqj would fail tag/shard/link/digest checks.
-            // Here we detect it by counting files: correct system has 1, mutated has 2.
+            // The "mutation" accepts the evil file, which a correct system
+            // would fail on tag/shard/link/digest checks; detected by counting
+            // files (1 correct, 2 mutated).
             let file_count = if sim.exists("ready/0000/job.sqj") {
                 1
             } else {
@@ -304,7 +297,6 @@ mod tests {
 
     #[test]
     fn all_mutations_have_negative_tests() {
-        // P1-26: Each mutation must actually alter behavior and be detected.
         for mutation in Mutation::all() {
             let result = run_mutation_test(*mutation, 42);
             assert!(
@@ -359,7 +351,6 @@ mod tests {
 
     #[test]
     fn directory_entry_durability_detected_on_source_skip() {
-        // P1-27: skipping source dir fsync after rename is observable.
         let result = run_mutation_test(Mutation::RemoveSourceDirSyncAfterRename, 7);
         assert!(
             result.detected,
@@ -404,8 +395,7 @@ mod tests {
 
     #[test]
     fn boolean_encoding_scenario() {
-        // Verify that CBOR boolean encoding uses simple values 20/21, not integers 0/1
-        // This is tested in steadq-format but verify the testkit is aware
+        // CBOR booleans use simple values 20/21, not integers 0/1.
         let true_byte: u8 = 0xf5;
         let false_byte: u8 = 0xf4;
         assert_ne!(true_byte, 0x01);

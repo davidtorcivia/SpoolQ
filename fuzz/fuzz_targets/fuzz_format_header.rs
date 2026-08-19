@@ -7,7 +7,7 @@ use steadq_format::FixedHeader;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(header) = FixedHeader::decode(data) {
-        // P1-32: Verify encode round-trip for inputs with extension data.
+        // Verify encode round-trip for inputs with extension data.
         if data.len() >= 128 {
             let ext = &data[128..];
             if let Ok(encoded) = header.encode(ext) {

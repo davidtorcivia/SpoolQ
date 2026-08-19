@@ -323,7 +323,7 @@ impl Queue {
         bucket_dirs.sort();
 
         for bucket_entry in &bucket_dirs {
-            // R4-RES: Skip buckets already processed in a prior pass.
+            // Skip buckets already processed in a prior pass.
             if let Some(cursor) = &self.recovery_cursor.compact_receipts {
                 if bucket_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
@@ -721,7 +721,7 @@ impl Queue {
             }
         }
 
-        // R4-RES: All buckets processed, reset cursor for next full pass.
+        // All buckets processed, reset cursor for next full pass.
         self.recovery_cursor.compact_receipts = None;
     }
 
@@ -772,7 +772,7 @@ impl Queue {
         bucket_dirs.sort();
 
         for bucket_entry in &bucket_dirs {
-            // R4-RES: Skip buckets already processed in a prior pass.
+            // Skip buckets already processed in a prior pass.
             if let Some(cursor) = &self.recovery_cursor.delete_receipts {
                 if bucket_entry.as_bytes() < cursor.first.as_slice() {
                     continue;
@@ -1002,11 +1002,11 @@ impl Queue {
                         );
                         continue;
                     };
-                    // R4-H08: Only process receipt files.
+                    // Only process receipt files.
                     if !entry.ends_with(".rct") {
                         continue;
                     }
-                    // R4-H08: Validate the receipt filename before operating.
+                    // Validate the receipt filename before operating.
                     if steadq_names::parse_receipt(entry).is_err() {
                         Self::record_error(
                             stats,
@@ -1153,7 +1153,7 @@ impl Queue {
             }
         }
 
-        // R4-RES: All buckets processed, reset cursor for next full pass.
+        // All buckets processed, reset cursor for next full pass.
         self.recovery_cursor.delete_receipts = None;
     }
 }

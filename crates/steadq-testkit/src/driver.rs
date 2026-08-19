@@ -1,10 +1,6 @@
-// Production-coupled driver: executes real Queue operations and verifies
-// them against the logical Oracle.
-//
-// Unlike the simulator-based scenarios, this driver calls the production
-// Queue API directly. After each operation it verifies that the actual
-// queue state (observed via inspect) matches the Oracle's expected state.
-// This catches divergences between the production code and the oracle model.
+// Production-coupled driver: runs real Queue operations and verifies the
+// actual queue state (via inspect) against the logical Oracle after each
+// operation, catching divergence between production code and the model.
 
 use crate::oracle::{Oracle, OracleState};
 use crate::simulator::TraceEvent;
@@ -16,10 +12,8 @@ use steadq_core::{
 
 /// A production-coupled driver that wraps a real Queue and an Oracle.
 ///
-/// Each operation method calls the corresponding Queue method, records the
-/// expected state transition in the Oracle, then verifies consistency.
-/// If the production code and the Oracle disagree, `verify_consistency`
-/// returns an error describing the mismatch.
+/// Each operation calls the Queue method, records the expected transition
+/// in the Oracle, then verifies consistency.
 pub struct ProductionDriver {
     queue: Queue,
     oracle: Oracle,
@@ -320,7 +314,6 @@ impl ProductionDriver {
             let expected_state = oracle_state_name(&job.state);
             let actual = snapshots.iter().find(|s| s.state == expected_state);
 
-            let expected_state = oracle_state_name(&job.state);
             match (&job.state, actual) {
                 (OracleState::Hidden, _) => {
                     // Hidden jobs should not be visible via inspect.
@@ -463,16 +456,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut driver = ProductionDriver::new(tmp.path()).unwrap();
 
-        // Enqueue
+        // Enqueue, lease, ack.
         let job_id = driver.enqueue(b"payload", 3).unwrap();
         assert!(driver.verify_consistency().is_empty());
 
-        // Lease
         let leased_id = driver.lease(30_000_000_000).unwrap().expect("should lease");
         assert_eq!(leased_id, job_id);
         assert!(driver.verify_consistency().is_empty());
 
-        // Ack
         driver.ack(&job_id).unwrap();
         // Receipts are terminal; verify_consistency doesn't flag them.
         assert!(driver.check_i1());
@@ -491,7 +482,6 @@ mod tests {
         driver.retry_now(&job_id).unwrap();
         assert!(driver.verify_consistency().is_empty());
 
-        // Should be able to lease again
         let leased2 = driver
             .lease(30_000_000_000)
             .unwrap()
@@ -509,7 +499,6 @@ mod tests {
         driver.lease(30_000_000_000).unwrap().expect("should lease");
         driver.bury(&job_id).unwrap();
 
-        // Job should be in dead state
         let snapshots = driver.queue().inspect(&job_id);
         assert!(snapshots.iter().any(|s| s.state == "dead"));
     }
@@ -519,7 +508,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut driver = ProductionDriver::new(tmp.path()).unwrap();
 
-        // Enqueue 5 jobs
         let mut job_ids = Vec::new();
         for i in 0..5 {
             let id = driver.enqueue(&[i as u8; 64], 3).unwrap();
@@ -527,7 +515,6 @@ mod tests {
         }
         assert!(driver.verify_consistency().is_empty());
 
-        // Lease and ack the first two
         let leased1 = driver.lease(30_000_000_000).unwrap().unwrap();
         driver.ack(&leased1).unwrap();
 
@@ -537,7 +524,6 @@ mod tests {
         // Remaining 3 should still be in ready
         assert!(driver.verify_consistency().is_empty());
 
-        // Trace events should cover all operations
         assert!(driver.traces().len() >= 7); // 5 enqueues + 2 leases
     }
 
@@ -563,10 +549,9 @@ mod tests {
         let mut driver = ProductionDriver::new(tmp.path()).unwrap();
 
         let job_id = driver.enqueue(b"data", 3).unwrap();
-        // Oracle says ready, actual is ready. Consistent.
         assert!(driver.verify_consistency().is_empty());
 
-        // Corrupt the oracle: say the job is leased when it's actually ready.
+        // Corrupt the oracle: claim the job is leased when it is ready.
         driver.oracle.record_claim(&job_id, [0xFF; 16]);
         let errors = driver.verify_consistency();
         assert!(
@@ -582,7 +567,7 @@ mod tests {
         let mut driver = ProductionDriver::new(tmp.path()).unwrap();
 
         let job_id = driver.enqueue(b"data", 3).unwrap();
-        // Force oracle to think the job is hidden while it's actually ready.
+        // Force the oracle to think the job is hidden while it is ready.
         if let Some(job) = driver.oracle.get_mut(&job_id) {
             job.state = crate::oracle::OracleState::Hidden;
         }
@@ -599,10 +584,9 @@ mod tests {
         let mut driver = ProductionDriver::new(tmp.path()).unwrap();
 
         let job_id = driver.enqueue(b"data", 3).unwrap();
-        // Oracle says file is synced (correct). I1 holds.
         assert!(driver.check_i1());
 
-        // Corrupt: mark file as not synced while job is visible.
+        // Corrupt: mark the file unsynced while the job is visible.
         if let Some(job) = driver.oracle.get_mut(&job_id) {
             job.file_synced = false;
         }
@@ -625,7 +609,7 @@ mod tests {
 
 /// A seeded random operation sequence runner that drives the production
 /// Queue API through the ProductionDriver and verifies oracle consistency
-/// at every step. This is the differential proving ground.
+/// at every step.
 #[cfg(test)]
 mod stateful_tests {
     use super::*;
@@ -636,9 +620,9 @@ mod stateful_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut driver = ProductionDriver::new(tmp.path()).unwrap();
 
-        // Track which jobs are in the ready state (available for lease).
+        // Jobs available for lease.
         let mut ready_jobs: Vec<[u8; 16]> = Vec::new();
-        // Track which jobs are currently leased.
+        // Jobs currently leased.
         let mut leased_jobs: Vec<[u8; 16]> = Vec::new();
 
         let mut rng = Rng::new(seed);
@@ -661,8 +645,7 @@ mod stateful_tests {
                         let _idx = rng.next_range(ready_jobs.len() as u64) as usize;
                         if let Ok(Some(job_id)) = driver.lease(30_000_000_000) {
                             // The queue may lease a different job than expected
-                            // (scan order depends on shard). Remove the leased job
-                            // from ready and add to leased.
+                            // (scan order depends on shard); find it in ready.
                             if let Some(pos) = ready_jobs.iter().position(|j| *j == job_id) {
                                 ready_jobs.swap_remove(pos);
                             }
@@ -680,7 +663,7 @@ mod stateful_tests {
                                 leased_jobs.swap_remove(idx);
                             }
                             Err(_) => {
-                                // Ack can fail (lease lost, etc.) - remove and continue
+                                // Ack can fail (lease lost, etc.); drop the job either way.
                                 leased_jobs.swap_remove(idx);
                             }
                         }
@@ -720,7 +703,6 @@ mod stateful_tests {
                 _ => unreachable!(),
             }
 
-            // After EVERY operation, verify consistency.
             let errors = driver.verify_consistency();
             assert!(
                 errors.is_empty(),
@@ -728,7 +710,6 @@ mod stateful_tests {
                 errors
             );
 
-            // Verify invariants hold.
             assert!(
                 driver.check_i1(),
                 "I1 violated at op {op_num} (seed {seed})"
@@ -756,7 +737,6 @@ mod stateful_tests {
 
     #[test]
     fn stateful_sequence_enqueue_heavy() {
-        // Mostly enqueues and leases, few acks
         let tmp = tempfile::tempdir().unwrap();
         let mut driver = ProductionDriver::new(tmp.path()).unwrap();
         let rng = Rng::new(42);
@@ -781,7 +761,6 @@ mod stateful_tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
 
-        // Enqueue some jobs
         let mut job_ids = Vec::new();
         {
             let mut driver = ProductionDriver::new(&root).unwrap();
@@ -807,9 +786,8 @@ mod stateful_tests {
         let leased = driver2.lease(30_000_000_000).unwrap();
         assert!(leased.is_some());
 
-        // Drop and reopen - queue should still be consistent
+        // Drop and reopen; the queue should still be consistent
         let mut driver3 = ProductionDriver::reopen(&root).unwrap();
-        // All original jobs should still be findable
         for job_id in &job_ids {
             let snapshots = driver3.queue().inspect(job_id);
             assert!(

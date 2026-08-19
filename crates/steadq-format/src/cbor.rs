@@ -125,12 +125,10 @@ fn validate_metadata_key(key: &str) -> Result<(), CborError> {
         return Err(CborError::InvalidKey(key.to_string()));
     }
     let bytes = key.as_bytes();
-    // First char: lowercase alpha or digit
     let first = bytes[0];
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return Err(CborError::InvalidKey(key.to_string()));
     }
-    // Rest: lowercase alpha, digit, dot, underscore, hyphen
     for &b in &bytes[1..] {
         if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'.' && b != b'_' && b != b'-' {
             return Err(CborError::InvalidKey(key.to_string()));
@@ -192,8 +190,8 @@ impl ExtensionHeader {
     pub fn encode(&self) -> Result<Vec<u8>, CborError> {
         self.validate()?;
 
-        // Count entries in top-level map
-        let mut entry_count: u64 = 1; // content_type always present
+        // content_type is always present
+        let mut entry_count: u64 = 1;
         if self.initial_not_before_unix_ns.is_some() {
             entry_count += 1;
         }
@@ -224,9 +222,8 @@ impl ExtensionHeader {
         if !self.metadata.is_empty() {
             encode_header(&mut buf, 0, KEY_METADATA as u64);
             encode_header(&mut buf, 5, self.metadata.len() as u64);
-            // C-47: Sort metadata keys by their deterministic CBOR encoded bytes,
-            // not by Rust string ordering. Encode each key to a temporary buffer,
-            // sort by those bytes, then emit.
+            // Sort metadata keys by their deterministic CBOR encoded bytes,
+            // not by Rust string ordering.
             let mut encoded_keys: Vec<(Vec<u8>, &str, &MetadataValue)> = self
                 .metadata
                 .iter()
@@ -451,7 +448,7 @@ impl<'a> CborParser<'a> {
                 25..=27 => Err(CborError::FloatNotAllowed),
                 _ => Err(CborError::InvalidSimpleValue(additional)),
             },
-            // Major types 4 (array), 6 (tag), and others fall through here.
+            // Arrays (major type 4) reach this arm.
             _ => Err(CborError::InvalidMajorType(major)),
         }
     }
@@ -475,7 +472,7 @@ impl<'a> CborParser<'a> {
             if !seen_keys.insert(key) {
                 return Err(CborError::DuplicateKey(key));
             }
-            // C-46: Enforce canonical ascending key order
+            // Enforce canonical ascending key order
             if let Some(pk) = prev_key {
                 if key < pk {
                     return Err(CborError::DuplicateKey(key));
@@ -515,7 +512,6 @@ impl<'a> CborParser<'a> {
                             _ => return Err(CborError::InvalidKey("non-string".into())),
                         };
                         validate_metadata_key(mk)?;
-                        // R2-M03: Reject duplicate metadata keys
                         if !seen_meta_keys.insert(mk.to_string()) {
                             return Err(CborError::InvalidKey(format!(
                                 "duplicate metadata key: {mk}"
@@ -523,7 +519,7 @@ impl<'a> CborParser<'a> {
                         }
                         meta_items.push((mk, mv_item));
                     }
-                    // R2-M04: Verify metadata keys arrive in deterministic encoded-byte order
+                    // Metadata keys must arrive in deterministic encoded-byte order.
                     let mut prev_key_bytes: Option<Vec<u8>> = None;
                     for (mk, _) in &meta_items {
                         let mut key_buf = Vec::new();
@@ -678,8 +674,7 @@ mod tests {
 
     #[test]
     fn rejects_null() {
-        // Construct raw CBOR with null value
-        // Map with 1 entry: key 2 (content_type) -> null (0xF6)
+        // Map {2 (content_type) -> null}
         let raw = vec![0xA1, 0x02, 0xF6];
         assert!(ExtensionHeader::decode(&raw).is_err());
     }
@@ -699,9 +694,7 @@ mod tests {
 
     #[test]
     fn rejects_integer_as_bool() {
-        // Map with metadata containing integer 0 where bool expected
-        // We can't put integer as bool, but we can verify the decoder accepts
-        // integer values in metadata
+        // Integer 0 in metadata must stay U64(0), not coerce to bool.
         let mut metadata = BTreeMap::new();
         metadata.insert("flag".to_string(), MetadataValue::U64(0));
         let ext = ExtensionHeader {
@@ -711,7 +704,6 @@ mod tests {
         };
         let encoded = ext.encode().unwrap();
         let decoded = ExtensionHeader::decode(&encoded).unwrap();
-        // Integer 0 should be preserved as U64(0), not converted to bool
         assert_eq!(decoded.metadata.get("flag"), Some(&MetadataValue::U64(0)));
     }
 
@@ -726,24 +718,20 @@ mod tests {
             ..Default::default()
         };
         let encoded = ext.encode().unwrap();
-        // Find the bool values: true = 0xF5, false = 0xF4
+        // true = 0xF5, false = 0xF4
         assert!(encoded.contains(&0xF5));
         assert!(encoded.contains(&0xF4));
-        // Should NOT contain integer encoding for bools
-        // (uint 0 = 0x00, uint 1 = 0x01 would be wrong for bools)
     }
 
     #[test]
     fn rejects_unknown_key() {
-        // Map with key 99
         let raw = vec![0xA1, 0x18, 0x63, 0x62, 0x78, 0x74]; // key 99 -> text "bxt"
         assert!(ExtensionHeader::decode(&raw).is_err());
     }
 
     #[test]
     fn rejects_duplicate_key() {
-        // Map with key 2 appearing twice
-        let raw = vec![0xA2, 0x02, 0x61, 0x78, 0x02, 0x61, 0x79];
+        let raw = vec![0xA2, 0x02, 0x61, 0x78, 0x02, 0x61, 0x79]; // key 2 twice
         assert!(ExtensionHeader::decode(&raw).is_err());
     }
 
@@ -769,12 +757,9 @@ mod tests {
             ..Default::default()
         };
         let encoded = ext.encode().unwrap();
-        // First byte is map header (0xA4 = 4 entries)
-        assert_eq!(encoded[0], 0xA4);
-        // Keys should be in order: 1, 2, 4, 5
+        assert_eq!(encoded[0], 0xA4); // map, 4 entries
         assert_eq!(encoded[1], 0x01); // key 1
         assert_eq!(encoded[4], 0x02); // key 2 (content_type)
-                                      // ... etc
     }
 
     #[test]
@@ -847,25 +832,22 @@ mod tests {
             ..Default::default()
         };
         let encoded = ext.encode().unwrap();
-        // C-47: deterministic CBOR sorts by encoded key bytes.
+        // Deterministic CBOR sorts by encoded key bytes:
         // "done" (text(4) = 0x64...) sorts before "active" (text(6) = 0x66...)
         let expected = hex_to_bytes("a202617803a264646f6e65f466616374697665f5");
-        assert_eq!(
-            encoded, expected,
-            "boolean metadata mismatch (C-47 ordering)"
-        );
+        assert_eq!(encoded, expected, "boolean metadata ordering mismatch");
     }
 
     #[test]
     fn cbor_rejects_non_canonical_top_level_key_order() {
-        // C-46: keys must be in ascending order
+        // Keys must be in ascending order
         let raw = vec![0xA2, 0x02, 0x61, 0x78, 0x01, 0x18, 0x2A];
         assert!(ExtensionHeader::decode(&raw).is_err());
     }
 
     #[test]
     fn cbor_metadata_key_order_is_deterministic() {
-        // C-47: keys of different lengths sort by encoded bytes
+        // Keys of different lengths sort by encoded bytes
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("abc".to_string(), MetadataValue::U64(1));
         metadata.insert("ab".to_string(), MetadataValue::U64(2));
@@ -884,22 +866,21 @@ mod tests {
 
     #[test]
     fn cbor_rejects_huge_map_length() {
-        // C-48: huge declared length should not cause huge allocation
+        // A huge declared length must not cause a huge allocation.
         let raw = vec![0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x61, 0x78];
         assert!(ExtensionHeader::decode(&raw).is_err());
     }
 
     #[test]
     fn cbor_rejects_decoded_bad_content_type() {
-        // C-49: decoded content type must pass validation
+        // Decoded content type must pass validation
         let raw = vec![0xA1, 0x02, 0x41, 0x01];
         assert!(ExtensionHeader::decode(&raw).is_err());
     }
 
     #[test]
     fn cbor_rejects_array_at_top_level() {
-        // Major type 4 (array) is not allowed in SteadQ metadata.
-        // 0x80 = empty array. Should error, not silently accept.
+        // 0x80 = empty array; arrays are not allowed.
         let raw = vec![0x80];
         assert!(ExtensionHeader::decode(&raw).is_err());
     }

@@ -2,8 +2,8 @@
 use super::*;
 
 impl Queue {
-    /// B-09: Read and verify the payload of a leased job.
-    /// Validates source identity (B-04), then verifies envelope digest,
+    // Read and verify the payload of a leased job.
+    /// Validates source identity, then verifies envelope digest,
     /// then hashes the payload and compares to the header digest.
     /// Returns Ok(()) on success, Err(PayloadCorrupt) if the digest does not match.
     pub fn verify_lease_payload(&self, lease: &LeaseInfo) -> Result<(), Error> {
@@ -14,7 +14,7 @@ impl Queue {
         self.verify_payload_on_fd(source.file_fd.as_fd())
     }
 
-    /// R4-H22/H23: Verify the payload digest on an already-open file descriptor.
+    /// Verify the payload digest on an already-open file descriptor.
     /// Central verifier is the single source of truth; this wrapper preserves
     /// the existing Error mapping for callers that have not yet adopted
     /// VerificationError directly.
@@ -81,9 +81,9 @@ impl Queue {
             engine::MoveActor::Consumer,
         )
     }
-    /// R4-PERF: Read a chunk of a leased job's payload at the given offset.
+    /// Read a chunk of a leased job's payload at the given offset.
     /// Returns the number of bytes read (0 at EOF).
-    /// Validates source identity before reading (B-04).
+    /// Validates source identity before reading.
     pub fn read_lease_payload_chunk(
         &self,
         lease: &LeaseInfo,
@@ -94,7 +94,7 @@ impl Queue {
             Some(source) => source,
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
-        // P0-01: Verify payload before delivering any bytes.
+        // Verify payload before delivering any bytes.
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 if let Err(engine::MoveFailure::OutcomeUnknown {
@@ -133,7 +133,7 @@ impl Queue {
         Ok(n)
     }
 
-    /// P1-14: Stream a leased job's payload with O(1) validation/open.
+    /// Stream a leased job's payload with O(1) validation/open.
     /// Opens the file once, validates identity once, reads header once,
     /// then performs pread calls on the held fd.
     pub fn stream_lease_payload<F: FnMut(&[u8]) -> Result<(), Error>>(
@@ -146,7 +146,7 @@ impl Queue {
             Some(source) => source,
             None => return Err(Error::QueueCorrupt("lease source not found".into())),
         };
-        // P0-01: Verify payload before streaming any bytes.
+        // Verify payload before streaming any bytes.
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 if let Err(engine::MoveFailure::OutcomeUnknown {
@@ -210,7 +210,7 @@ impl Queue {
             Some(source) => source,
             None => return Ok(None),
         };
-        // P0-01: Verify payload before allowing reads.
+        // Verify payload before allowing reads.
         if let Err(e) = self.verify_payload_on_fd(source.file_fd.as_fd()) {
             if matches!(e, Error::PayloadCorrupt) {
                 if let Err(engine::MoveFailure::OutcomeUnknown {
@@ -566,7 +566,7 @@ impl Queue {
         }
     }
 
-    /// B1: Authenticate an active-state object structurally.
+    /// Authenticate an active-state object structurally.
     /// Validates: file type, link count, header, envelope digest, file size,
     /// name tag, shard placement, and header/name consistency with typed path context.
     /// Returns the validated header on success.
@@ -600,7 +600,7 @@ impl Queue {
         let verified = self.verify_envelope_on_fd(file_fd.as_fd())?;
         let header = verified.header();
 
-        // R4-H06: Check queue-configured payload limit
+        // Check queue-configured payload limit
         if !payload_length_is_valid(header.payload_length, self.format.max_payload_length()) {
             return Err(Error::QueueCorrupt(format!(
                 "payload length {} exceeds queue limit {}",
@@ -688,10 +688,10 @@ impl Queue {
         Ok(header.clone())
     }
 
-    /// C-23: Bounded duplicate-ack check.
+    /// Bounded duplicate-ack check.
     /// Constructs at most the finite set of exact retained receipt paths
     /// and checks them via fstatat, not by listing receipt contents.
-    /// P0-04: Authenticate a receipt at a specific path.
+    /// Authenticate a receipt at a specific path.
     pub(super) fn receipt_is_authentic(&self, lease: &LeaseInfo, dir: &str, name: &str) -> bool {
         let Ok(common) = next_identity(ProtocolOperation::Acknowledge, &lease_common(lease)) else {
             return false;
@@ -806,7 +806,7 @@ impl Queue {
     }
 
     /// Resolve an indeterminate operation by probing exact paths.
-    /// R2-B03: Resolve an indeterminate operation by authenticating objects.
+    /// Resolve an indeterminate operation by authenticating objects.
     /// Validates source/destination by opening them, reading headers, and
     /// comparing job_id and generation against the ticket.
     /// Helper: verify shard placement from a shard hex string.

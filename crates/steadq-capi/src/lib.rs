@@ -1,6 +1,6 @@
 // SteadQ/1 C ABI.
-// R2-B07: Queue handle is wrapped in a Mutex for thread safety.
-// R2-B07: All FFI functions catch panics to prevent process termination.
+// The queue handle is wrapped in a Mutex for thread safety; all FFI
+// functions catch panics to prevent process termination.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::unnecessary_cast)]
 
@@ -42,7 +42,7 @@ fn classify_init_error(e: std::io::Error) -> Error {
     }
 }
 
-/// R2-H17: Centralized error-to-code mapping.
+/// Centralized error-to-code mapping.
 fn error_to_code(e: &Error) -> c_int {
     match e {
         Error::QueueCorrupt(_) => STEADQ_CORRUPTION,
@@ -91,7 +91,7 @@ pub struct SteadqJobId {
     pub bytes: [u8; 16],
 }
 
-/// C1: Get last error as a C string. Returns pointer to thread-local storage.
+/// Get last error as a C string. Returns pointer to thread-local storage.
 /// The pointer is valid until the next SteadQ call on the same thread.
 /// Do not free.
 #[no_mangle]
@@ -102,12 +102,10 @@ pub extern "C" fn steadq_last_error() -> *const c_char {
     })
 }
 
-/// C1: No-op. steadq_last_error() returns thread-local storage that does not
-/// need to be freed. Provided for ABI compatibility.
+/// No-op for ABI compatibility: steadq_last_error() returns thread-local
+/// storage that does not need to be freed.
 #[no_mangle]
-pub extern "C" fn steadq_free_string(_s: *const c_char) {
-    // No-op: last error uses thread-local storage, not heap allocation.
-}
+pub extern "C" fn steadq_free_string(_s: *const c_char) {}
 
 /// Query the ABI version.
 #[no_mangle]
@@ -327,7 +325,7 @@ pub extern "C" fn steadq_lease(
     }
 }
 
-/// R4-FFI: See steadq.h for documentation.
+/// See steadq.h for documentation.
 #[no_mangle]
 pub extern "C" fn steadq_lease_verify(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
@@ -363,7 +361,7 @@ pub extern "C" fn steadq_lease_verify(queue: *mut SteadqQueue, lease: *mut Stead
     }
 }
 
-/// R4-FFI: See steadq.h for documentation.
+/// See steadq.h for documentation.
 #[no_mangle]
 pub extern "C" fn steadq_ack(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
@@ -405,7 +403,7 @@ pub extern "C" fn steadq_ack(queue: *mut SteadqQueue, lease: *mut SteadqLease) -
     }
 }
 
-/// R4-FFI: See steadq.h for documentation.
+/// See steadq.h for documentation.
 #[no_mangle]
 pub extern "C" fn steadq_retry(queue: *mut SteadqQueue, lease: *mut SteadqLease) -> c_int {
     clear_last_error();
@@ -446,7 +444,7 @@ pub extern "C" fn steadq_retry(queue: *mut SteadqQueue, lease: *mut SteadqLease)
     }
 }
 
-/// R4-FFI: See steadq.h for documentation.
+/// See steadq.h for documentation.
 #[no_mangle]
 pub extern "C" fn steadq_bury(
     queue: *mut SteadqQueue,

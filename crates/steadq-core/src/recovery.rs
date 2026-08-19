@@ -660,7 +660,7 @@ impl Queue {
                 };
             }
         };
-        // P1-12: Use checked wall floor. If unavailable, record error and
+        // Use checked wall floor. If unavailable, record error and
         // skip wall-sensitive phases (delayed promotion, receipt retention).
         let wall_floor = self.stabilized_wall_floor();
         if let Err(error) = &wall_floor {
@@ -673,7 +673,7 @@ impl Queue {
             });
         }
         let wall_floor = wall_floor.ok();
-        // C-31: Use CLOCK_MONOTONIC for budget enforcement
+        // Use CLOCK_MONOTONIC for budget enforcement
         let start_mono = match fs::clock_monotonic_ns() {
             Ok(t) => t,
             Err(e) => {
@@ -782,7 +782,7 @@ impl Queue {
         }
     }
 
-    /// B1: Quarantine an object during recovery.
+    /// Quarantine an object during recovery.
     fn quarantine_recovery_object(
         &self,
         candidate: RecoveryQuarantineCandidate<'_>,
@@ -854,7 +854,7 @@ impl Queue {
         }
     }
 
-    /// R2-H05: Check if the monotonic deadline has been exceeded.
+    /// Check if the monotonic deadline has been exceeded.
     fn budget_time_exceeded(deadline_mono: u64) -> io::Result<bool> {
         fs::clock_monotonic_ns().map(|now| now >= deadline_mono)
     }
