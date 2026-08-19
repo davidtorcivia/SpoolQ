@@ -167,6 +167,12 @@ fn saturating_double(base: u64, exp: u32) -> u64 {
     }
 }
 
+/// Midpoint of the jitter span, used when rejection sampling exhausts its
+/// iteration budget; midpoint is unbiased over the span.
+fn span_midpoint(lower: u64, span: u64) -> u64 {
+    lower + span / 2
+}
+
 /// Compute retry delay in milliseconds for a given attempt.
 /// For attempt >= 1:
 ///   ceiling = min(cap, saturating(base * 2^(attempt-1)))
@@ -214,7 +220,7 @@ pub fn retry_delay_ms(
             return Ok(lower + offset);
         }
     }
-    Ok(lower + span / 2)
+    Ok(span_midpoint(lower, span))
 }
 
 /// Compute the absolute wall deadline for retry.
@@ -442,6 +448,14 @@ mod tests {
                 "attempt {attempt}: {d} not in [{lower},{ceiling}]"
             );
         }
+    }
+
+    #[test]
+    fn span_midpoint_table() {
+        assert_eq!(span_midpoint(10, 5), 12);
+        assert_eq!(span_midpoint(0, 4), 2);
+        assert_eq!(span_midpoint(7, 0), 7);
+        assert_eq!(span_midpoint(1 << 62, (1 << 62) + 1), (1 << 62) + (1 << 61));
     }
 
     #[test]
