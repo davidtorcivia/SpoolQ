@@ -245,6 +245,8 @@ macro_rules! fault_check {
     };
 }
 
+pub mod inotify;
+
 /// Open or create a file with O_TMPFILE.
 pub fn open_tmpfile(dir_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     fault_check!("open_tmpfile");
@@ -305,7 +307,7 @@ fn cstr_from_name(name: &str) -> io::Result<CPath> {
 }
 
 /// Convert a byte slice (OsStr on Linux) to a NUL-terminated syscall path.
-fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CPath> {
+pub(crate) fn cstr_from_bytes(bytes: &[u8]) -> io::Result<CPath> {
     CPath::from_bytes(bytes, "path contains NUL byte")
 }
 

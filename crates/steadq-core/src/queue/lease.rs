@@ -42,9 +42,42 @@ impl Queue {
             if elapsed >= wait {
                 return outcome;
             }
-            std::thread::sleep(backoff.min(wait.saturating_sub(elapsed)));
+            let nap = backoff.min(wait.saturating_sub(elapsed));
+            // An event in a ready shard cuts the nap short; the scan is
+            // still the only source of truth, and the backoff schedule
+            // grows identically so the scan-rate bound is unchanged.
+            if let Some(fd) = self.ready_watch.as_ref() {
+                if fs::inotify::wait_readable(fd.as_fd(), nap).is_err() {
+                    self.ready_watch = None;
+                    std::thread::sleep(nap);
+                }
+            } else {
+                self.ensure_ready_watch();
+                std::thread::sleep(nap);
+            }
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
+    }
+
+    /// Establish the ready-shard watch once. Any failure is permanent for
+    /// this handle: the wait loop falls back to plain sleeps.
+    pub(super) fn ensure_ready_watch(&mut self) {
+        if self.ready_watch_attempted {
+            return;
+        }
+        self.ready_watch_attempted = true;
+        let Ok(fd) = fs::inotify::init() else {
+            return;
+        };
+        let ready = self.root_path.join("ready");
+        let count = self.format.shard_count();
+        for shard in 0..count {
+            let dir = ready.join(steadq_names::shard_hex(shard));
+            if fs::inotify::add_appear_watch(fd.as_fd(), &dir).is_err() {
+                return;
+            }
+        }
+        self.ready_watch = Some(fd);
     }
 
     fn lease_once_with_dirty(

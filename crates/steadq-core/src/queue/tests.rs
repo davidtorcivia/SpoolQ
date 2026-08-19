@@ -4997,6 +4997,122 @@ fn empty_queue_returns_empty_not_error() {
 }
 
 #[test]
+#[ignore = "manual latency measurement; run with --release --ignored --nocapture"]
+fn measure_dispatch_latency_watch_vs_poll() {
+    let mut with_watch = Vec::new();
+    let mut poll_only = Vec::new();
+    for round in 0..2 {
+        let (tmp, mut queue) = create_test_queue();
+        if round == 1 {
+            // Simulate watch failure: permanent poll fallback.
+            queue.ready_watch_attempted = true;
+        }
+        let path = tmp.path().to_path_buf();
+        for i in 0..50u32 {
+            let p = path.clone();
+            let delay = 20 + (i % 180);
+            let producer = std::thread::spawn(move || {
+                let mut producer = Queue::open(
+                    &p,
+                    &OpenOptions {
+                        allow_unsupported_fs: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+                let outcome = producer.enqueue(EnqueueInput {
+                    maximum_attempts: 1,
+                    content_type: "x".to_string(),
+                    payload: b"m".to_vec(),
+                    ..Default::default()
+                });
+                (outcome, std::time::Instant::now())
+            });
+            let lease_info = match queue.lease(2_000_000_000, 30_000_000_000) {
+                LeaseOutcome::Leased(li) => li,
+                other => panic!("lease failed: {other:?}"),
+            };
+            let (outcome, enqueued_at) = producer.join().unwrap();
+            assert!(matches!(outcome, EnqueueOutcome::Committed(_)));
+            let latency = enqueued_at.elapsed();
+            // Drain for the next iteration.
+            assert!(matches!(queue.ack(&lease_info), AckOutcome::Acked));
+            (if round == 0 {
+                &mut with_watch
+            } else {
+                &mut poll_only
+            })
+            .push(latency);
+        }
+    }
+    let ms = |v: &Vec<std::time::Duration>| {
+        let mut v: Vec<_> = v.iter().map(|d| d.as_micros() as f64).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        format!(
+            "median {:.0}us p90 {:.0}us max {:.0}us",
+            v[v.len() / 2],
+            v[(v.len() * 9) / 10],
+            v[v.len() - 1]
+        )
+    };
+    println!("dispatch latency with watch: {}", ms(&with_watch));
+    println!("dispatch latency poll only: {}", ms(&poll_only));
+}
+
+#[test]
+fn bounded_wait_establishes_ready_watch() {
+    let (_tmp, mut queue) = create_test_queue();
+    // A bounded empty wait attempts the watch once.
+    assert!(matches!(
+        queue.lease(20_000_000, 30_000_000_000),
+        LeaseOutcome::Empty
+    ));
+    assert!(
+        queue.ready_watch.is_some(),
+        "watch must be established over the real shard layout"
+    );
+}
+
+#[test]
+fn bounded_wait_returns_job_enqueued_during_wait() {
+    let (tmp, mut queue) = create_test_queue();
+    let path = tmp.path().to_path_buf();
+    let producer = std::thread::spawn(move || {
+        let mut producer = Queue::open(
+            &path,
+            &OpenOptions {
+                allow_unsupported_fs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        match producer.enqueue(EnqueueInput {
+            maximum_attempts: 3,
+            content_type: "x".to_string(),
+            payload: b"wake".to_vec(),
+            ..Default::default()
+        }) {
+            EnqueueOutcome::Committed(_) => {}
+            other => panic!("enqueue failed: {other:?}"),
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = queue.lease(2_000_000_000, 30_000_000_000);
+    let elapsed = started.elapsed();
+    producer.join().unwrap();
+    assert!(matches!(outcome, LeaseOutcome::Leased(_)), "{outcome:?}");
+    // Dispatched after the enqueue (100ms) with margin, well inside the 2s
+    // window: the event wake and the scan both return promptly.
+    assert!(
+        elapsed < std::time::Duration::from_millis(1_500),
+        "dispatch took {elapsed:?}"
+    );
+}
+
+#[test]
 fn zero_wait_lease_performs_exactly_one_scan() {
     let (_tmp, mut queue) = create_test_queue();
     let before = queue.scan_round;

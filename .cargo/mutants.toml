@@ -49,4 +49,10 @@ exclude_re = [
     # Init post-commit cleanup: unlink .initializing ENOENT guard
     # is defense-in-depth; the marker is always present at this point.
     "Queue::init",
+    # inotify hint plumbing, equivalent mutants only: flag-ORs are
+    # equivalent on disjoint constants (IN_NONBLOCK|IN_CLOEXEC,
+    # IN_CREATE|IN_MOVED_TO|IN_Q_OVERFLOW); fd/wd guards differ from their
+    # mutants only at 0, which the kernel never returns here. The |->& init
+    # mutant is caught by timeout (blocking fd hangs drain).
+    "inotify\\.rs.*in (init|add_appear_watch)$",
 ]
