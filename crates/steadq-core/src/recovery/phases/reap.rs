@@ -400,7 +400,7 @@ impl Queue {
                             continue;
                         }
 
-                        // B1: Validate object structure before recovery transition
+                        // Validate object structure before recovery transition
                         let leased_ctx = crate::ActivePathContext::Leased {
                             boot_id: boot_dir_name.to_string(),
                             bucket: bucket_name.to_string(),
@@ -417,7 +417,7 @@ impl Queue {
                                 ),
                                 &format!("{e}"),
                             );
-                            // B1: Quarantine corrupt objects
+                            // Quarantine corrupt objects
                             if matches!(e, Error::QueueCorrupt(_))
                                 && !self.quarantine_recovery_object(
                                     RecoveryQuarantineCandidate {
@@ -438,7 +438,7 @@ impl Queue {
                             continue;
                         }
 
-                        // R4-B02: Verify bucket placement matches deadline-derived bucket
+                        // Verify bucket placement matches deadline-derived bucket
                         let Some(expected_lease_bucket) = steadq_math::lease_bucket(
                             parsed.boottime_deadline_ns,
                             self.format.lease_bucket_width_ns(),

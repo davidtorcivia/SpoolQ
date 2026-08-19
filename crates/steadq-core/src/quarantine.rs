@@ -259,7 +259,7 @@ impl Queue {
                     continue;
                 };
                 if sub_entry.ends_with(".sqj") || sub_entry.ends_with(".rct") {
-                    // C-41: Carry full root-relative path
+                    // Carry full root-relative path
                     report.total_objects += 1;
                     let full_path = format!("{state_name}/{entry}/{sub_entry}");
                     self.fsck_file(
@@ -433,7 +433,7 @@ impl Queue {
         }
     }
 
-    /// R4-H16/H17/H18: Deep structural verification of a single object.
+    /// Deep structural verification of a single object.
     /// Validates filename grammar, file type, link count, header decode,
     /// header/filename consistency, envelope digest, file size, name tag,
     /// and shard placement. In Deep mode, also hashes the payload.
@@ -450,7 +450,7 @@ impl Queue {
     ) {
         let queue_id = self.format.queue_id();
 
-        // C-40: Parse the filename using the state-appropriate parser.
+        // Parse the filename using the state-appropriate parser.
         // Extract job_id, generation, attempt, max_attempts, tag from the parsed result.
         let parsed = match state_name {
             "ready" => match steadq_names::parse_ready(filename) {
@@ -558,7 +558,7 @@ impl Queue {
             return;
         }
 
-        // R4-H16: Read and decode the header.
+        // Read and decode the header.
         // Receipts may be compact (128 bytes with RECEIPT_MAGIC).
         let open_flags = if state_name == "receipts" && opts.mode == FsckMode::Repair {
             crate::queue::verified::receipt_write_open_flags()
@@ -714,7 +714,7 @@ impl Queue {
             }
         };
 
-        // R4-H16: Verify header job_id matches filename.
+        // Verify header job_id matches filename.
         if header.job_id != common.job_id {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
@@ -734,7 +734,7 @@ impl Queue {
             return;
         }
 
-        // R4-H16: Verify header maximum_attempts matches filename.
+        // Verify header maximum_attempts matches filename.
         if header.maximum_attempts != common.maximum_attempts {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
@@ -754,7 +754,7 @@ impl Queue {
             return;
         }
 
-        // R4-H16: Read extension and verify envelope digest.
+        // Read extension and verify envelope digest.
         let ext_len = header.extension_header_length as usize;
         if ext_len > 65536 {
             report.findings.push(CorruptionFinding {
@@ -812,7 +812,7 @@ impl Queue {
             return;
         }
 
-        // R4-H16: Verify file size matches expected.
+        // Verify file size matches expected.
         if stat.st_size < 0 {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
@@ -848,7 +848,7 @@ impl Queue {
             return;
         }
 
-        // R4-H16: Verify payload limit.
+        // Verify payload limit.
         if header.payload_length > self.format.max_payload_length() {
             report.findings.push(CorruptionFinding {
                 relative_path: full_path.to_string(),
@@ -872,7 +872,7 @@ impl Queue {
             return;
         }
 
-        // R4-H17: Verify name tag using path-derived context.
+        // Verify name tag using path-derived context.
         let path_parts: Vec<&str> = full_path.split('/').collect();
         let tag_ok = self.fsck_verify_name_tag(
             state_name,
@@ -901,7 +901,7 @@ impl Queue {
             return;
         }
 
-        // R4-H16: Verify shard placement.
+        // Verify shard placement.
         let computed_shard =
             steadq_names::compute_shard(queue_id, &common.job_id, self.format.shard_count());
         let shard_hex_in_path = self.fsck_extract_shard_hex(state_name, &path_parts);
@@ -932,7 +932,7 @@ impl Queue {
 
         report.structurally_verified += 1;
 
-        // R4-H18: Deep verification - hash the payload.
+        // Deep verification - hash the payload.
         if opts.depth == FsckDepth::Deep && state_name != "receipts" {
             let payload_offset = (128 + ext_len) as u64;
             let mut hasher = sha2::Sha256::new();
@@ -986,7 +986,7 @@ impl Queue {
         }
     }
 
-    /// R4-H17: Verify the name tag by reconstructing the canonical context
+    /// Verify the name tag by reconstructing the canonical context
     /// from the path components and the parsed filename fields.
     fn fsck_verify_name_tag(
         &self,
@@ -997,7 +997,7 @@ impl Queue {
         _token: Option<[u8; 16]>,
         queue_id: &[u8; 16],
     ) -> bool {
-        // P0-03: Use canonical authentication from steadq-names instead of
+        // Use canonical authentication from steadq-names instead of
         // reconstructing tag contexts independently. Wrong path shapes fail
         // closed (return false) instead of returning true.
         match state_name {
@@ -1195,7 +1195,7 @@ impl Queue {
         unreachable!("quarantine attempt bound is nonzero")
     }
 
-    /// B-10: Move a corrupt object to quarantine via durable no-overwrite transition.
+    /// Move a corrupt object to quarantine via durable no-overwrite transition.
     fn quarantine_object(
         &self,
         src_dir_fd: BorrowedFd<'_>,

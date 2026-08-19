@@ -134,21 +134,16 @@ impl FormatRecord {
         buf[0..8].copy_from_slice(FORMAT_MAGIC);
         buf[8..10].copy_from_slice(&FORMAT_MAJOR.to_be_bytes());
         buf[10..12].copy_from_slice(&FORMAT_MINOR.to_be_bytes());
-        // flags = 0 at [12..16]
         buf[16..32].copy_from_slice(&self.queue_id);
         buf[32..40].copy_from_slice(&self.created_at_unix_ns.to_be_bytes());
         buf[40..44].copy_from_slice(&self.shard_count.to_be_bytes());
-        // reserved [44..48] = 0
         buf[48..56].copy_from_slice(&self.lease_bucket_width_ns.to_be_bytes());
         buf[56..64].copy_from_slice(&self.delayed_bucket_width_ns.to_be_bytes());
         buf[64..72].copy_from_slice(&self.terminal_bucket_width_ns.to_be_bytes());
         buf[72..80].copy_from_slice(&self.max_payload_length.to_be_bytes());
         buf[80] = DIGEST_ALGORITHM_SHA256;
         buf[81] = NAME_TAG_BITS;
-        // reserved [82..88] = 0
-        // required_feature_bits [88..96] = 0
-        // optional_feature_bits [96..104] = 0
-        // reserved [104..128] = 0
+        // [88..96] required_feature_bits and [96..104] optional_feature_bits stay 0
 
         let digest = format_digest(&buf[0..128]);
         buf[128..160].copy_from_slice(&digest);
@@ -201,12 +196,12 @@ impl FormatRecord {
             return Err(FormatError::InvalidNameTagBits(name_tag_bits));
         }
 
-        // Check all reserved bytes are zero
+        // Zeroed fields (flags, reserved) are checked implicitly by the digest.
         if buf[82..88].iter().any(|&b| b != 0) || buf[104..128].iter().any(|&b| b != 0) {
             return Err(FormatError::NonzeroReserved);
         }
 
-        // Check feature bits
+        // Feature bits must be zero
         let req_features = u64::from_be_bytes(buf[88..96].try_into().unwrap());
         let opt_features = u64::from_be_bytes(buf[96..104].try_into().unwrap());
         if req_features != 0 || opt_features != 0 {
@@ -305,8 +300,8 @@ pub enum HeaderError {
 }
 
 impl FixedHeader {
-    /// Encode the fixed header. Validates that extension_header_length matches
-    /// the actual extension bytes length (C-52).
+    /// Encode the fixed header; extension_header_length must match the
+    /// actual extension bytes length.
     pub fn encode(&self, extension: &[u8]) -> Result<[u8; FIXED_HEADER_SIZE], HeaderError> {
         if extension.len() as u32 != self.extension_header_length {
             return Err(HeaderError::ExtensionLengthMismatch);
@@ -399,10 +394,10 @@ pub fn payload_digest(payload: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// R2-M01: Fallible envelope digest. Returns None on extension length mismatch.
+/// Fallible envelope digest. Returns None on extension length mismatch.
 pub fn envelope_digest(fixed_header: &FixedHeader, extension: &[u8]) -> Option<[u8; 32]> {
     let mut header_with_zero_digest = fixed_header.encode(extension).ok()?;
-    // Zero out bytes 96..128 (envelope_digest field)
+    // Zero bytes 96..128 (the envelope_digest field) before hashing
     header_with_zero_digest[96..128].fill(0);
 
     let mut hasher = Sha256::new();
@@ -590,7 +585,7 @@ pub enum WatermarkError {
     WrongSize { expected: usize, actual: usize },
 }
 
-// ---------- Job envelope reader/validator (C-53) ----------
+// ---------- Job envelope reader/validator ----------
 
 /// Errors from envelope validation.
 #[derive(Debug, thiserror::Error)]
@@ -729,8 +724,7 @@ mod tests {
             max_payload_length: MAX_PAYLOAD_LENGTH,
         };
         let encoded = rec.encode();
-        // The digest is computed over bytes including shard_count=3,
-        // so decode will pass digest check but fail shard validation.
+        // shard_count=3 passes the digest check but fails shard validation.
         assert!(FormatRecord::decode(&encoded).is_err());
     }
 
@@ -1035,7 +1029,6 @@ mod tests {
 
     #[test]
     fn fixed_header_encode_validates_extension_length() {
-        // C-52: encode must reject mismatched extension_header_length
         let header = FixedHeader {
             format_minor: FORMAT_MINOR,
             extension_header_length: 10, // claims 10 but ext is empty

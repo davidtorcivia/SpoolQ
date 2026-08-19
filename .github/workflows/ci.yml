@@ -41,15 +41,10 @@ jobs:
         run: cargo build --all
       - name: Build (release)
         run: cargo build --all --release
+      - name: C ABI build check
+        run: cargo build -p steadq-capi
       - name: Test
         run: cargo test --all
-      - name: C ABI build check (C-66)
-        run: cargo build -p steadq-capi
-      - name: C ABI integration test (R4-B10)
-        run: |
-          cargo build -p steadq-capi
-          cc crates/steadq-capi/tests/test_capi.c             -I crates/steadq-capi/include             -L target/debug -lsteadq_capi             -o target/capi_test -Wl,-rpath,target/debug
-          ./target/capi_test
       - name: Generated file drift check
         run: cargo xtask check-generated
       - name: Generated C header drift check

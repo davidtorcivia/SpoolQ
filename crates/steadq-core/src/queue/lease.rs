@@ -63,11 +63,11 @@ impl Queue {
             ));
         }
 
-        // C-19: Track scan completeness to distinguish Empty from I/O error
+        // Track scan completeness to distinguish Empty from I/O error
         let mut scan_had_error = false;
         let mut wall_floor = None;
 
-        // C-15: Use and advance the per-worker scan round
+        // Use and advance the per-worker scan round
         let scan_round = self.scan_round;
         self.scan_round = self.scan_round.wrapping_add(1);
         let (scheduled_start, stride) = steadq_names::shard_scan_params(
@@ -166,7 +166,7 @@ impl Queue {
                     }
                 }
 
-                // C-16: Re-capture clocks immediately before the claim
+                // Re-capture clocks immediately before the claim
                 let boottime_claim = match fs::clock_boottime_ns() {
                     Ok(t) => t,
                     Err(e) => return LeaseOutcome::NotCommitted(Error::IoFailure(e.to_string())),
@@ -217,7 +217,7 @@ impl Queue {
                 };
                 let leased_dir = lease_target.directory();
                 if let Err(e) = self.ensure_dir_with_dirty(&leased_dir, _dirty.as_deref_mut()) {
-                    // R4-B04: Propagate real errors, don't mask as scan miss
+                    // Propagate real errors, don't mask as scan miss
                     scan_had_error = true;
                     let _ = e;
                     continue;
@@ -350,7 +350,7 @@ impl Queue {
                 };
                 match move_result {
                     Ok((leased_object, ())) => {
-                        // B-03: Post-rename validation failures must NOT continue as Empty.
+                        // Post-rename validation failures must NOT continue as Empty.
                         // The claim is committed; failures here are corruption or indeterminate.
                         let leased_file = claim_source.file_fd;
 
@@ -381,7 +381,7 @@ impl Queue {
                             );
                         }
 
-                        // R4-B05: Full structural validation of the claimed object before return.
+                        // Full structural validation of the claimed object before return.
                         // Verify envelope digest, exact size, and payload limit.
                         let ext_len_h = header.extension_header_length as usize;
                         if verified::is_extension_too_large(ext_len_h) {
@@ -436,7 +436,7 @@ impl Queue {
                             );
                         }
 
-                        // B2: Extension decode failure after claim is a post-linearization
+                        // Extension decode failure after claim is a post-linearization
                         // corruption. Do not return an ordinary lease with empty content_type.
                         let content_type = if verified::is_extension_present(ext_len_h) {
                             match steadq_format::cbor::ExtensionHeader::decode(&ext_buf_claim) {
@@ -453,7 +453,7 @@ impl Queue {
                             String::new()
                         };
 
-                        // P0-01: Verify payload digest on held fd before delivery.
+                        // Verify payload digest on held fd before delivery.
                         // Deterministic PayloadCorrupt is quarantined, not delivered.
                         // Indeterminate I/O poisons and yields OutcomeUnknown.
                         if let Err(e) = self.verify_payload_on_fd(leased_file.as_fd()) {
@@ -528,7 +528,7 @@ impl Queue {
             }
         }
 
-        // C-19: If the scan had I/O errors, report them rather than returning Empty
+        // If the scan had I/O errors, report them rather than returning Empty
         if scan_had_error {
             LeaseOutcome::NotCommitted(Error::IoFailure("scan completed with errors".into()))
         } else {

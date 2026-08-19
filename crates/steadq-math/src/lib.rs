@@ -15,7 +15,7 @@ pub fn checked_mul_u64(a: u64, b: u64) -> Option<u64> {
 // ---------- Bucket arithmetic ----------
 
 /// floor(timestamp_ns / bucket_width_ns).
-/// Returns None if bucket_width_ns is zero (C-50).
+/// Returns None if bucket_width_ns is zero.
 pub fn bucket_number(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
     if bucket_width_ns == 0 {
         return None;
@@ -24,7 +24,7 @@ pub fn bucket_number(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
 }
 
 /// ceiling(timestamp_ns / bucket_width_ns).
-/// Returns None if bucket_width_ns is zero (C-50).
+/// Returns None if bucket_width_ns is zero.
 pub fn ceiling_bucket(timestamp_ns: u64, bucket_width_ns: u64) -> Option<u64> {
     if bucket_width_ns == 0 {
         return None;
@@ -156,7 +156,6 @@ fn saturating_double(base: u64, exp: u32) -> u64 {
     if exp == 0 || base == 0 {
         return base;
     }
-    // base * 2^(exp-1)
     if exp > 64 {
         return u64::MAX;
     }
@@ -168,6 +167,11 @@ fn saturating_double(base: u64, exp: u32) -> u64 {
     }
 }
 
+/// Midpoint of the jitter span, used when rejection sampling exhausts its
+/// iteration budget; midpoint is unbiased over the span.
+fn span_midpoint(lower: u64, span: u64) -> u64 {
+    lower + span / 2
+}
 /// Compute retry delay in milliseconds for a given attempt.
 /// For attempt >= 1:
 ///   ceiling = min(cap, saturating(base * 2^(attempt-1)))
@@ -198,10 +202,9 @@ pub fn retry_delay_ms(
     let lower = ceiling.div_ceil(2);
     let span = ceiling - lower + 1;
 
-    // Rejection sampling
+    // Rejection sampling; fall back to the span midpoint, which is unbiased.
     let threshold = span.wrapping_neg() % span;
-    let mut counter = 0u32;
-    loop {
+    for counter in 0..64u32 {
         let mut hasher = Sha256::new();
         hasher.update(b"SteadQ-1-jitter\0");
         hasher.update(queue_id);
@@ -215,13 +218,8 @@ pub fn retry_delay_ms(
             let offset = x % span;
             return Ok(lower + offset);
         }
-        counter += 1;
-        // B4: Cap iterations to prevent theoretical infinite loop.
-        // Fallback to the midpoint of the span, which is unbiased.
-        if counter >= 64 {
-            return Ok(lower + span / 2);
-        }
     }
+    Ok(span_midpoint(lower, span))
 }
 
 /// Compute the absolute wall deadline for retry.
@@ -237,7 +235,7 @@ pub fn retry_wall_deadline(effective_wall_floor_ns: u64, delay_ns: u64) -> Optio
 // ---------- Wall watermark floor ----------
 
 /// effective_wall_floor_ns = max(clock_realtime_ns, stored_bucket * bucket_width_ns).
-/// Returns None if the watermark computation overflows (C-51).
+/// Returns None on overflow.
 pub fn effective_wall_floor(
     clock_realtime_ns: u64,
     stored_bucket: u64,
@@ -374,27 +372,22 @@ mod tests {
 
     #[test]
     fn bucket_arithmetic_zero_width_is_error() {
-        // C-50: zero bucket width must return None, not panic
         assert_eq!(bucket_number(100, 0), None);
         assert_eq!(ceiling_bucket(100, 0), None);
     }
 
     #[test]
     fn effective_wall_floor_zero_width_is_error() {
-        // C-50/C-51: zero width must return None
         assert_eq!(effective_wall_floor(100, 5, 0), None);
     }
 
     #[test]
     fn saturating_double_test() {
-        assert_eq!(saturating_double(1000, 1), 1000); // 1000 * 2^0
-        assert_eq!(saturating_double(1000, 2), 2000); // 1000 * 2^1
-        assert_eq!(saturating_double(1000, 3), 4000); // 1000 * 2^2
-        assert_eq!(saturating_double(1000, 4), 8000); // 1000 * 2^3
-                                                      // Large shift saturates
-                                                      // 1 << 63 is still valid
+        assert_eq!(saturating_double(1000, 1), 1000);
+        assert_eq!(saturating_double(1000, 2), 2000);
+        assert_eq!(saturating_double(1000, 3), 4000);
+        assert_eq!(saturating_double(1000, 4), 8000);
         assert_eq!(saturating_double(1, 64), 1u64 << 63);
-        // exp > 64 saturates
         assert_eq!(saturating_double(1, 65), u64::MAX);
         assert_eq!(saturating_double(u64::MAX, 2), u64::MAX);
         assert_eq!(saturating_double(0, 5), 0);
@@ -454,6 +447,30 @@ mod tests {
                 "attempt {attempt}: {d} not in [{lower},{ceiling}]"
             );
         }
+    }
+
+    #[test]
+    fn span_midpoint_table() {
+        assert_eq!(span_midpoint(10, 5), 12);
+        assert_eq!(span_midpoint(0, 4), 2);
+        assert_eq!(span_midpoint(7, 0), 7);
+        assert_eq!(span_midpoint(1 << 62, (1 << 62) + 1), (1 << 62) + (1 << 61));
+    }
+
+    #[test]
+    fn retry_jitter_rejection_resamples_with_counter() {
+        // base 2^62, cap 2^63, attempt 2 => lower 2^62, span 2^62+1,
+        // threshold 2^62-3. For this (queue, job) pair the counter=0 sample
+        // falls below the threshold (rejected) and the counter=1 sample is
+        // accepted, so the pinned delay proves the counter advances between
+        // samples.
+        let policy = RetryPolicy::new(1 << 62, 1 << 63, true, None).unwrap();
+        let qid = [0u8; 16];
+        let jid = [0x0b, 0x05, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            retry_delay_ms(&qid, &jid, 2, &policy).unwrap(),
+            6775448086808226869
+        );
     }
 
     #[test]

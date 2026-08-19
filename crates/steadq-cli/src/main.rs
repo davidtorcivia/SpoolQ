@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-/// Stable exit codes per spec section 11.5
+/// Stable exit codes (spec: exit-code table)
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_ORDINARY: u8 = 1;
 const EXIT_INDETERMINATE: u8 = 2;
@@ -268,7 +268,7 @@ fn main() -> ExitCode {
             not_before,
             producer_id,
         } => {
-            // C-54: Fail on read error instead of silently enqueueing empty payload
+            // Fail on read error rather than enqueueing an empty payload
             let payload = match file.as_deref() {
                 Some("-") | None => {
                     use std::io::Read;
@@ -384,7 +384,7 @@ fn main() -> ExitCode {
                 LeaseOutcome::OutcomeUnknown(ticket) => {
                     eprintln!("outcome unknown");
                     eprintln!("job_id: {}", steadq_names::hex_encode(&ticket.job_id()));
-                    // P1-19: Persist ticket for later resolution.
+                    // Persist the ticket for later resolution.
                     if let Some(ref tf) = ticket_out {
                         match write_ticket_file(tf, &ticket) {
                             Ok(()) => eprintln!("ticket written to: {}", tf.display()),
@@ -396,42 +396,39 @@ fn main() -> ExitCode {
             }
         }
 
-        Commands::Stats { path } => {
-            match Queue::open(&path, &OpenOptions::default()) {
-                Ok(_queue) => {
-                    let root = &path;
-                    let mut stats_map: std::collections::BTreeMap<String, usize> =
-                        std::collections::BTreeMap::new();
-                    for state in [
-                        "ready",
-                        "leased",
-                        "delayed",
-                        "receipts",
-                        "dead",
-                        "quarantine",
-                    ] {
-                        let state_path = root.join(state);
-                        if state_path.exists() {
-                            let count = count_files_recursive(&state_path);
-                            stats_map.insert(state.to_string(), count);
-                        }
+        Commands::Stats { path } => match Queue::open(&path, &OpenOptions::default()) {
+            Ok(_queue) => {
+                let root = &path;
+                let mut stats_map: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                for state in [
+                    "ready",
+                    "leased",
+                    "delayed",
+                    "receipts",
+                    "dead",
+                    "quarantine",
+                ] {
+                    let state_path = root.join(state);
+                    if state_path.exists() {
+                        let count = count_files_recursive(&state_path);
+                        stats_map.insert(state.to_string(), count);
                     }
-                    // C-59: Support global --json
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&stats_map).unwrap());
-                    } else {
-                        for (state, count) in &stats_map {
-                            println!("{state}: {count}");
-                        }
+                }
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&stats_map).unwrap());
+                } else {
+                    for (state, count) in &stats_map {
+                        println!("{state}: {count}");
                     }
-                    exit(EXIT_SUCCESS)
                 }
-                Err(e) => {
-                    eprintln!("open failed: {e}");
-                    exit_core(&e)
-                }
+                exit(EXIT_SUCCESS)
             }
-        }
+            Err(e) => {
+                eprintln!("open failed: {e}");
+                exit_core(&e)
+            }
+        },
 
         Commands::Doctor { path } => {
             let mut results: Vec<(&str, String, bool)> = Vec::new();
@@ -536,7 +533,6 @@ fn main() -> ExitCode {
                     eprintln!("  {}: {}{}", k, v, if *ok { "" } else { " [FAIL]" });
                 }
             }
-            // R2-H22: Exit failure if any check failed.
             let all_ok = results.iter().all(|(_, _, ok)| *ok);
             if all_ok {
                 exit(EXIT_SUCCESS)
@@ -560,9 +556,8 @@ fn main() -> ExitCode {
                     return exit_io(&e);
                 }
             };
-            // R2-H19: CLI uses strict ack path: verify payload first.
-            // P1-17: ack() already performs strict payload verification.
-            // Don't call verify_lease_payload() separately to avoid double hashing.
+            // ack() performs strict payload verification; no separate
+            // verify_lease_payload() call (avoids double hashing).
             match queue.ack(&lease) {
                 steadq_core::AckOutcome::Acked => {
                     eprintln!("acked");
@@ -606,8 +601,7 @@ fn main() -> ExitCode {
                     return exit_io(&e);
                 }
             };
-            // R2-H20: Use Queue::retry_after() which uses the rollback-safe
-            // effective wall clock.
+            // retry_after() uses the rollback-safe effective wall clock.
             let outcome = match after_seconds {
                 Some(s) => {
                     let duration_ns = s.saturating_mul(1_000_000_000);
@@ -731,7 +725,6 @@ fn main() -> ExitCode {
                             );
                             return exit(EXIT_CORRUPTION);
                         }
-                        // C-58: Verify envelope digest
                         let ext_bytes = &data[128..128 + header.extension_header_length as usize];
                         if !steadq_format::verify_envelope_digest(&header, ext_bytes) {
                             eprintln!("CORRUPT: envelope digest mismatch");
@@ -966,14 +959,13 @@ fn main() -> ExitCode {
 
             let mut handles = Vec::new();
 
-            // Producers - P-05: reuse one queue handle per worker
+            // Producers: reuse one queue handle per worker
             for _ in 0..producers {
                 let p = path.clone();
                 let payload = payload.clone();
                 let enqueued = enqueued.clone();
                 let dl = deadline;
                 handles.push(thread::spawn(move || {
-                    // P-05: Open once per worker, not per operation
                     let mut queue = Queue::open(
                         &p,
                         &OpenOptions {
@@ -997,7 +989,7 @@ fn main() -> ExitCode {
                 }));
             }
 
-            // Consumers - P-05: reuse one queue handle per worker
+            // Consumers: reuse one queue handle per worker
             let lease_ns = lease_duration_seconds * 1_000_000_000;
             for _ in 0..consumers {
                 let p = path.clone();
@@ -1005,7 +997,6 @@ fn main() -> ExitCode {
                 let acked = acked.clone();
                 let dl = deadline;
                 handles.push(thread::spawn(move || {
-                    // P-05: Open once per worker
                     let mut queue = Queue::open(
                         &p,
                         &OpenOptions {
@@ -1364,7 +1355,7 @@ fn save_handle_to_file(
     };
     let json = serde_json::to_string_pretty(&handle)?;
 
-    // R2-M14: Atomic write with unique temp name (not deterministic)
+    // Atomic write: unique temp name, then rename.
     let rand_bytes = steadq_fs_linux::random_128bit()
         .map(|b| steadq_names::hex_encode(&b))
         .unwrap_or_else(|_| format!("{}", std::process::id()));
@@ -1383,7 +1374,7 @@ fn save_handle_to_file(
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, handle_path)?;
-    // C-55: Sync parent directory
+    // Sync parent directory
     if let Some(parent) = handle_path.parent() {
         if let Ok(parent_dir) = std::fs::File::open(parent) {
             let _ = parent_dir.sync_all();
@@ -1416,7 +1407,7 @@ fn load_handle(
         )
     })?;
 
-    // P1-21: Verify queue binding. Queue id must be present and must match.
+    // Verify queue binding: queue_id must be present and match.
     match handle.queue_id.as_ref() {
         Some(hqid) => match steadq_names::hex_decode_16(hqid) {
             Some(handle_qid) if handle_qid == *queue_id => {}

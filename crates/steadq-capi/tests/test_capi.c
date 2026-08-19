@@ -1,5 +1,5 @@
 /* SteadQ/1 C ABI test program - hermetic with unique temp dir */
-#include "steadq.h"
+#include "../include/steadq.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

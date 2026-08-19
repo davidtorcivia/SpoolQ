@@ -23,7 +23,6 @@ exclude_re = [
     "fault::reset",
     "fault::inject",
     "fault::inject_errno",
-    "fault::inject_at",
     "fault::call_count",
     # writev_all partial-write loop only triggers on non-regular files.
     "writev_all",
