@@ -140,7 +140,7 @@ enum Commands {
     Work {
         path: PathBuf,
         /// Worker threads, each with its own queue handle
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
         concurrency: u32,
         /// Lease duration; renewed at half this interval
         #[arg(long, default_value = "60")]

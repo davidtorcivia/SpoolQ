@@ -119,10 +119,16 @@ fn run_one(
     let stdin = child.stdin.take();
     let feeder = std::thread::spawn(move || feed(reader, stdin));
     let status = babysit(queue, &mut lease, &mut child, lease_duration_ns);
-    let _ = feeder.join();
+    // true when the payload was fully delivered (or the child stopped
+    // reading); false on a read failure, which must not ack.
+    let fed = feeder.join().unwrap_or(false);
 
     match status {
-        Ok(status) if status.success() => finish(queue, &lease),
+        Ok(status) if status.success() && fed => finish(queue, &lease),
+        Ok(status) if status.success() => {
+            eprintln!("payload read failed; job requeued");
+            requeue(queue, &lease).max(1)
+        }
         Ok(status) => {
             let code = status.code().unwrap_or(1).max(1) as u8;
             requeue(queue, &lease).max(code)
@@ -134,22 +140,24 @@ fn run_one(
     }
 }
 
-/// Stream the verified payload into the child's stdin. A write error means
-/// the child stopped reading (EPIPE after early exit); drop the rest.
-fn feed(reader: VerifiedPayloadReader, stdin: Option<std::process::ChildStdin>) {
-    let Some(mut stdin) = stdin else { return };
+/// Stream the verified payload into the child's stdin. Returns true when
+/// the whole payload was delivered or the child stopped reading (EPIPE
+/// after an early exit); false on a read failure, which leaves the payload
+/// truncated and must not be acked.
+fn feed(reader: VerifiedPayloadReader, stdin: Option<std::process::ChildStdin>) -> bool {
+    let Some(mut stdin) = stdin else { return true };
     let mut buf = vec![0u8; CHUNK];
     let mut offset = 0u64;
     loop {
         match reader.read_at(&mut buf, offset) {
-            Ok(0) => break,
+            Ok(0) => return true,
             Ok(n) => {
                 if stdin.write_all(&buf[..n]).is_err() {
-                    break;
+                    return true;
                 }
                 offset += n as u64;
             }
-            Err(_) => break,
+            Err(_) => return false,
         }
     }
 }
