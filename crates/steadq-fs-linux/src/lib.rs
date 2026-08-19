@@ -691,6 +691,10 @@ fn is_eagain(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EAGAIN)
 }
 
+fn is_interrupted(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted
+}
+
 pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
     fault_check!("get_random");
     if bytes == 0 {
@@ -710,7 +714,7 @@ pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
         };
         if rc < 0 {
             let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
+            if is_interrupted(&e) {
                 continue;
             }
             // Defensive: EAGAIN does not occur with flags=0.
@@ -1743,6 +1747,16 @@ mod tests {
         assert!(is_eagain(&io::Error::from_raw_os_error(libc::EAGAIN)));
         assert!(!is_eagain(&io::Error::from_raw_os_error(libc::EIO)));
         assert!(!is_eagain(&io::Error::new(io::ErrorKind::Interrupted, "x")));
+    }
+
+    #[test]
+    fn is_interrupted_classifies_kind() {
+        assert!(is_interrupted(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "x"
+        )));
+        assert!(is_interrupted(&io::Error::from_raw_os_error(libc::EINTR)));
+        assert!(!is_interrupted(&io::Error::from_raw_os_error(libc::EIO)));
     }
 
     #[test]

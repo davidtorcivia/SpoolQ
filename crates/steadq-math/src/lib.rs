@@ -172,7 +172,6 @@ fn saturating_double(base: u64, exp: u32) -> u64 {
 fn span_midpoint(lower: u64, span: u64) -> u64 {
     lower + span / 2
 }
-
 /// Compute retry delay in milliseconds for a given attempt.
 /// For attempt >= 1:
 ///   ceiling = min(cap, saturating(base * 2^(attempt-1)))
