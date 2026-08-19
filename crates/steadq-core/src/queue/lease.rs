@@ -43,8 +43,8 @@ impl Queue {
                 return outcome;
             }
             let nap = backoff.min(wait.saturating_sub(elapsed));
-            // A move event into a ready shard cuts the nap short; the scan
-            // is still the only source of truth, and the backoff schedule
+            // An event in a ready shard cuts the nap short; the scan is
+            // still the only source of truth, and the backoff schedule
             // grows identically so the scan-rate bound is unchanged.
             if let Some(fd) = self.ready_watch.as_ref() {
                 if fs::inotify::wait_readable(fd.as_fd(), nap).is_err() {
@@ -73,7 +73,7 @@ impl Queue {
         let count = self.format.shard_count();
         for shard in 0..count {
             let dir = ready.join(steadq_names::shard_hex(shard));
-            if fs::inotify::add_moved_to_watch(fd.as_fd(), &dir).is_err() {
+            if fs::inotify::add_appear_watch(fd.as_fd(), &dir).is_err() {
                 return;
             }
         }

@@ -27,10 +27,12 @@ pub fn init() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Watch `path` for renames into it (IN_MOVED_TO). Events also fire for
-/// moves within the directory, such as colocated lease claims; the scan
-/// sorts truth from noise, so no name filtering is done here.
-pub fn add_moved_to_watch(fd: BorrowedFd<'_>, path: &Path) -> io::Result<()> {
+/// Watch `path` for objects appearing in it: IN_CREATE covers linkat
+/// publication (the primary path on tmpfile-capable filesystems),
+/// IN_MOVED_TO covers rename publication (named fallback, ZFS) and
+/// delayed-to-ready promotion. The scan sorts truth from noise, so no
+/// name filtering is done here.
+pub fn add_appear_watch(fd: BorrowedFd<'_>, path: &Path) -> io::Result<()> {
     fault_check!("inotify_add_watch");
     use std::os::unix::ffi::OsStrExt;
     let c_path = cstr_from_bytes(path.as_os_str().as_bytes())?;
@@ -39,7 +41,7 @@ pub fn add_moved_to_watch(fd: BorrowedFd<'_>, path: &Path) -> io::Result<()> {
         libc::inotify_add_watch(
             fd.as_raw_fd(),
             c_path.as_ptr(),
-            libc::IN_MOVED_TO | libc::IN_Q_OVERFLOW,
+            libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_Q_OVERFLOW,
         )
     };
     if wd < 0 {
@@ -121,10 +123,23 @@ mod tests {
     }
 
     #[test]
+    fn link_create_event_wakes_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let fd = init().unwrap();
+        add_appear_watch(fd.as_fd(), dir.path()).unwrap();
+
+        // A plain file creation (the linkat-publication signal) wakes the
+        // wait without any rename.
+        std::fs::write(dir.path().join("linked"), b"x").unwrap();
+        assert!(wait_readable(fd.as_fd(), Duration::from_millis(1000)).unwrap());
+        assert!(!wait_readable(fd.as_fd(), Duration::from_millis(10)).unwrap());
+    }
+
+    #[test]
     fn moved_to_event_wakes_wait() {
         let dir = tempfile::tempdir().unwrap();
         let fd = init().unwrap();
-        add_moved_to_watch(fd.as_fd(), dir.path()).unwrap();
+        add_appear_watch(fd.as_fd(), dir.path()).unwrap();
 
         // No events: a short wait times out.
         assert!(!wait_readable(fd.as_fd(), Duration::from_millis(10)).unwrap());
@@ -141,7 +156,7 @@ mod tests {
     fn drain_spans_multiple_reads() {
         let dir = tempfile::tempdir().unwrap();
         let fd = init().unwrap();
-        add_moved_to_watch(fd.as_fd(), dir.path()).unwrap();
+        add_appear_watch(fd.as_fd(), dir.path()).unwrap();
 
         // Enough renames that the pending events exceed one 4096-byte read.
         for i in 0..300u32 {
@@ -172,6 +187,6 @@ mod tests {
     fn add_watch_missing_dir_fails() {
         let dir = tempfile::tempdir().unwrap();
         let fd = init().unwrap();
-        assert!(add_moved_to_watch(fd.as_fd(), &dir.path().join("nope")).is_err());
+        assert!(add_appear_watch(fd.as_fd(), &dir.path().join("nope")).is_err());
     }
 }
