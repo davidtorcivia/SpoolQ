@@ -1451,7 +1451,7 @@ pub fn durable_move_replace(
     let src_stat = fstat(src_dir_fd)?;
     let dest_stat = fstat(dest_dir_fd)?;
 
-    if src_stat.st_dev == dest_stat.st_dev && src_stat.st_ino == dest_stat.st_ino {
+    if same_dir(&src_stat, &dest_stat) {
         fsync_dir_fd(dest_dir_fd)?;
     } else {
         fsync_dir_fd(dest_dir_fd)?;
