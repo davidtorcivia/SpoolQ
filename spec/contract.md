@@ -24,6 +24,16 @@ Receipt compaction is permitted only after strict verification of the complete f
 
 Corrupt, malformed, or structurally ambiguous objects are never delivered automatically, and recovery may be interrupted after any filesystem operation and safely rerun without data loss.
 
+### Disk-full classification
+
+The queue shares its filesystem with the payloads it stores, so space exhaustion during an operation is a normal operating condition, not an environment fault. Storage exhaustion (`ENOSPC`, `EDQUOT`) is classified as resource exhaustion: it never poisons the handle and never causes quarantine.
+
+An operation that hits storage exhaustion before its linearizing rename or link reports NotCommitted with the resource-exhausted error: the caller knows the job was not enqueued or the transition did not happen, and may retry once space is available.
+
+Storage exhaustion after the linearizing rename but before the durability barrier completes reports OutcomeUnknown. This is the same indeterminate class as any barrier failure: the object may or may not become durable, and the ticket resolves it through the standard resolution and recovery paths. The linearization ordering is unchanged by disk state.
+
+Partially written temporary files never appear in active state directories because publication writes and syncs the temp file before the name appears. A full disk can leave orphaned files under `tmp/`; the recovery retention pass removes them (temp files from dead boots immediately, and current-boot temps past their creation window), bounded by its work budget, and rerunning the pass is safe. An orphaned temp file holds space but is never delivered, acknowledged, or mistaken for a job. When space is needed to make progress, removing quarantined objects and dead jobs via the administrative commands reclaims it before recovery work must allocate.
+
 No transition overwrites a distinct active job.
 
 `maximum_attempts` bounds the number of committed claim returns, not internal rename attempts and not external side effects.

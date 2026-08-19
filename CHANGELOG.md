@@ -9,6 +9,11 @@
 - The bounded lease wait wakes on ready-shard inotify events (`IN_CREATE` for linkat publication, `IN_MOVED_TO` for rename publication and delayed promotion); the scan remains the sole source of truth, the backoff schedule is unchanged, and any watch failure degrades the handle permanently to plain sleeps. Idle dispatch latency on the measurement host drops from the 10 ms backoff ceiling to a 377 µs median
 - `steadq stats --prometheus` emits per-state `steadq_<state>_objects` and `steadq_<state>_oldest_age_seconds` gauges; plain and `--json` stats outputs gain oldest-object age. The oldest age is the global minimum across subtrees, and an unreadable state directory exits with the io code instead of reporting zero objects
 
+### Documentation
+
+- `docs/name-grammar-policy.md` states how the 59-byte filename headroom may be spent: fields append with fixed widths and unused prefix letters, the name-tag context version and FORMAT minor bump together with any grammar revision, and old readers treat unrecognized names as inert warnings rather than corruption
+- The contract gains a disk-full classification section: storage exhaustion before linearization is NotCommitted (resource exhausted), after linearization it is OutcomeUnknown, orphaned `tmp/` files are never delivered and are swept by the recovery retention pass, and handle poisoning or quarantine never results from `ENOSPC` or `EDQUOT`
+
 ### Structure
 
 - Supported targets are now 64-bit x86_64 or aarch64 Linux with the gnu or musl environment; CI cross-checks `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` and still rejects 32-bit and out-of-set targets. `x86_64-unknown-linux-gnu` remains the certified release target
