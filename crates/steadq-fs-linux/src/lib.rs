@@ -656,7 +656,13 @@ pub fn clock_realtime_ns() -> io::Result<u64> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    if ts.tv_sec < 0 {
+    timespec_to_unix_ns(&ts)
+}
+
+/// Convert a CLOCK_REALTIME reading to Unix nanoseconds, rejecting any
+/// time before the Unix epoch.
+fn timespec_to_unix_ns(ts: &libc::timespec) -> io::Result<u64> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "clock before epoch",
@@ -681,6 +687,10 @@ pub fn clock_monotonic_ns() -> io::Result<u64> {
 /// Generate random bytes from the OS crypto source.
 /// Loops until the entire buffer is filled. Handles short reads, EINTR,
 /// and EAGAIN. Returns an error (not zero data) on any failure.
+fn is_eagain(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EAGAIN)
+}
+
 pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
     fault_check!("get_random");
     if bytes == 0 {
@@ -704,7 +714,7 @@ pub fn get_random(bytes: usize) -> io::Result<Vec<u8>> {
                 continue;
             }
             // Defensive: EAGAIN does not occur with flags=0.
-            if e.raw_os_error() == Some(libc::EAGAIN) {
+            if is_eagain(&e) {
                 continue;
             }
             return Err(e);
@@ -1395,6 +1405,11 @@ pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// True when both stats describe the same directory (device and inode).
+fn same_dir(a: &libc::stat, b: &libc::stat) -> bool {
+    a.st_dev == b.st_dev && a.st_ino == b.st_ino
+}
+
 /// Durable no-overwrite move: renameat2 with RENAME_NOREPLACE, then sync directories.
 /// If source and destination are the same directory, sync once.
 pub fn durable_move_noreplace(
@@ -1409,7 +1424,7 @@ pub fn durable_move_noreplace(
     let src_stat = fstat(src_dir_fd)?;
     let dest_stat = fstat(dest_dir_fd)?;
 
-    if src_stat.st_dev == dest_stat.st_dev && src_stat.st_ino == dest_stat.st_ino {
+    if same_dir(&src_stat, &dest_stat) {
         fsync_dir_fd(dest_dir_fd)?;
     } else {
         fsync_dir_fd(dest_dir_fd)?;
@@ -1709,6 +1724,54 @@ mod tests {
     fn clock_boottime_positive() {
         let now = clock_boottime_ns().unwrap();
         assert!(now > 0);
+    }
+
+    #[test]
+    fn timespec_to_unix_ns_rejects_pre_epoch() {
+        let ts = |sec, nsec| libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec,
+        };
+        assert!(timespec_to_unix_ns(&ts(-1, 0)).is_err());
+        assert!(timespec_to_unix_ns(&ts(0, -1)).is_err());
+        assert_eq!(timespec_to_unix_ns(&ts(0, 0)).unwrap(), 0);
+        assert_eq!(timespec_to_unix_ns(&ts(2, 5)).unwrap(), 2_000_000_005);
+    }
+
+    #[test]
+    fn is_eagain_classifies_errno() {
+        assert!(is_eagain(&io::Error::from_raw_os_error(libc::EAGAIN)));
+        assert!(!is_eagain(&io::Error::from_raw_os_error(libc::EIO)));
+        assert!(!is_eagain(&io::Error::new(io::ErrorKind::Interrupted, "x")));
+    }
+
+    #[test]
+    fn same_dir_compares_device_and_inode() {
+        let dir = test_dir("samedir");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        mkdirat(fd.as_fd(), "x", 0o700).unwrap();
+        let x = open_directory(fd.as_fd(), "x").unwrap();
+        let x_stat = fstat(x.as_fd()).unwrap();
+        let root_stat = fstat(fd.as_fd()).unwrap();
+        assert!(same_dir(&x_stat, &x_stat));
+        // Same device, different inode: not the same directory.
+        assert!(!same_dir(&x_stat, &root_stat));
+    }
+
+    #[test]
+    fn probe_rename_noreplace_classifies_by_errno() {
+        let dir = test_dir("rnprobe");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+
+        // EEXIST from the no-replace rename proves support.
+        fault::inject_errno("renameat2_noreplace", 1, libc::EEXIST);
+        assert!(probe_rename_noreplace(fd.as_fd()).unwrap());
+        fault::reset();
+
+        // Any other errno means the kernel lacks RENAME_NOREPLACE.
+        fault::inject_errno("renameat2_noreplace", 1, libc::ENOSYS);
+        assert!(!probe_rename_noreplace(fd.as_fd()).unwrap());
+        fault::reset();
     }
 
     #[test]
@@ -2733,6 +2796,43 @@ mod tests {
         durable_move_noreplace(src.as_fd(), "f", dst.as_fd(), "f").unwrap();
         assert!(fstatat(src.as_fd(), "f").is_err());
         assert!(fstatat(dst.as_fd(), "f").is_ok());
+    }
+
+    #[test]
+    fn durable_move_noreplace_syncs_same_dir_once_and_cross_dir_twice() {
+        let dir = test_dir("dmnr-sync");
+        let fd = open_dir_absolute(dir.path()).unwrap();
+        mkdirat(fd.as_fd(), "a", 0o700).unwrap();
+        mkdirat(fd.as_fd(), "b", 0o700).unwrap();
+        let a = open_directory(fd.as_fd(), "a").unwrap();
+        let b = open_directory(fd.as_fd(), "b").unwrap();
+        std::fs::write(dir.path().join("a/f"), b"payload").unwrap();
+        let a_id = fstat(a.as_fd()).unwrap();
+        let b_id = fstat(b.as_fd()).unwrap();
+
+        // Arm a never-firing fault so the counters and fd identities record.
+        fault::inject("fsync_dir_fd", u64::MAX);
+        durable_move_noreplace(a.as_fd(), "f", a.as_fd(), "g").unwrap();
+        assert_eq!(
+            fault::call_count("fsync_dir_fd"),
+            1,
+            "same dir must sync once"
+        );
+        durable_move_noreplace(a.as_fd(), "g", b.as_fd(), "h").unwrap();
+        assert_eq!(
+            fault::call_count("fsync_dir_fd"),
+            3,
+            "cross dir must sync twice"
+        );
+        assert_eq!(
+            fault::fd_identities("fsync_dir_fd"),
+            vec![
+                (a_id.st_dev as u64, a_id.st_ino as u64),
+                (b_id.st_dev as u64, b_id.st_ino as u64),
+                (a_id.st_dev as u64, a_id.st_ino as u64),
+            ]
+        );
+        fault::reset();
     }
 
     #[test]

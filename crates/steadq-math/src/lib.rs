@@ -197,10 +197,9 @@ pub fn retry_delay_ms(
     let lower = ceiling.div_ceil(2);
     let span = ceiling - lower + 1;
 
-    // Rejection sampling
+    // Rejection sampling; fall back to the span midpoint, which is unbiased.
     let threshold = span.wrapping_neg() % span;
-    let mut counter = 0u32;
-    loop {
+    for counter in 0..64u32 {
         let mut hasher = Sha256::new();
         hasher.update(b"SteadQ-1-jitter\0");
         hasher.update(queue_id);
@@ -214,12 +213,8 @@ pub fn retry_delay_ms(
             let offset = x % span;
             return Ok(lower + offset);
         }
-        counter += 1;
-        // Cap iterations; fall back to the span midpoint, which is unbiased.
-        if counter >= 64 {
-            return Ok(lower + span / 2);
-        }
     }
+    Ok(lower + span / 2)
 }
 
 /// Compute the absolute wall deadline for retry.
@@ -447,6 +442,22 @@ mod tests {
                 "attempt {attempt}: {d} not in [{lower},{ceiling}]"
             );
         }
+    }
+
+    #[test]
+    fn retry_jitter_rejection_resamples_with_counter() {
+        // base 2^62, cap 2^63, attempt 2 => lower 2^62, span 2^62+1,
+        // threshold 2^62-3. For this (queue, job) pair the counter=0 sample
+        // falls below the threshold (rejected) and the counter=1 sample is
+        // accepted, so the pinned delay proves the counter advances between
+        // samples.
+        let policy = RetryPolicy::new(1 << 62, 1 << 63, true, None).unwrap();
+        let qid = [0u8; 16];
+        let jid = [0x0b, 0x05, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            retry_delay_ms(&qid, &jid, 2, &policy).unwrap(),
+            6775448086808226869
+        );
     }
 
     #[test]
