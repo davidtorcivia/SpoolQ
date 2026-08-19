@@ -1668,7 +1668,12 @@ fn leased_source_witness_rejects_replacement_after_validation() {
     });
     let destination_directory = open_relative(queue.root_fd(), &ready.directory()).unwrap();
     assert!(matches!(
-        Queue::execute_leased_move(&source, destination_directory.as_fd(), &ready.filename,),
+        Queue::execute_leased_move_with_dirty(
+            &source,
+            destination_directory.as_fd(),
+            &ready.filename,
+            None,
+        ),
         LeasedMoveOutcome::SourceChanged
     ));
     assert!(!tmp.path().join(ready.relative_path()).exists());
@@ -1739,8 +1744,12 @@ fn witnessed_rename_preserves_failure_categories() {
         let destination_directory = open_relative(queue.root_fd(), &ready.directory()).unwrap();
         fs::fault::reset();
         fs::fault::inject_errno("renameat2_noreplace", 1, errno);
-        let outcome =
-            Queue::execute_leased_move(&source, destination_directory.as_fd(), &ready.filename);
+        let outcome = Queue::execute_leased_move_with_dirty(
+            &source,
+            destination_directory.as_fd(),
+            &ready.filename,
+            None,
+        );
         match expected {
             "gone" => assert!(matches!(outcome, LeasedMoveOutcome::SourceGone)),
             "collision" => assert!(matches!(outcome, LeasedMoveOutcome::Collision)),
@@ -1769,7 +1778,12 @@ fn witnessed_rename_reports_post_linearization_identity_error() {
     fs::fault::reset();
     fs::fault::inject_errno("fstatat", 2, libc::EIO);
     assert!(matches!(
-        Queue::execute_leased_move(&source, destination_directory.as_fd(), &ready.filename,),
+        Queue::execute_leased_move_with_dirty(
+            &source,
+            destination_directory.as_fd(),
+            &ready.filename,
+            None,
+        ),
         LeasedMoveOutcome::OutcomeUnknown(TransitionPhase::Linearized)
     ));
     fs::fault::reset();
@@ -2103,6 +2117,121 @@ fn renew_extends_lease() {
     assert!(_tmp.path().join(&renewed.exact_source_path).exists());
     assert_eq!(renewed.attempt, lease.attempt);
     assert_eq!(renewed.token, lease.token);
+}
+
+#[test]
+fn deferred_renew_defers_barrier_until_sync() {
+    let tmp = TempDir::new().unwrap();
+    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            deferred_dir_sync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _ = queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: b"data".to_vec(),
+        ..Default::default()
+    });
+    let lease = match queue.lease(0, 10_000_000_000) {
+        LeaseOutcome::Leased(l) => l,
+        other => panic!("lease failed: {other:?}"),
+    };
+
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", u64::MAX);
+    let renewed = match queue.renew(&lease, 60_000_000_000) {
+        RenewOutcome::Deferred(l) => l,
+        other => panic!("deferred renew failed: {other:?}"),
+    };
+    // The renewal linearized but performed no directory fsync.
+    assert_eq!(fs::fault::call_count("fsync_dir_fd"), 0);
+    assert!(!tmp.path().join(&lease.exact_source_path).exists());
+    assert!(tmp.path().join(&renewed.exact_source_path).exists());
+
+    queue.sync().unwrap();
+    assert!(
+        fs::fault::call_count("fsync_dir_fd") >= 1,
+        "sync must flush the deferred barrier"
+    );
+    fs::fault::reset();
+}
+
+#[test]
+fn plain_renew_still_syncs_inline() {
+    let tmp = TempDir::new().unwrap();
+    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _ = queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: b"data".to_vec(),
+        ..Default::default()
+    });
+    let lease = match queue.lease(0, 10_000_000_000) {
+        LeaseOutcome::Leased(l) => l,
+        other => panic!("lease failed: {other:?}"),
+    };
+
+    fs::fault::reset();
+    fs::fault::inject("fsync_dir_fd", u64::MAX);
+    match queue.renew(&lease, 60_000_000_000) {
+        RenewOutcome::Renewed(_) => {}
+        other => panic!("plain renew failed: {other:?}"),
+    }
+    assert!(
+        fs::fault::call_count("fsync_dir_fd") >= 1,
+        "non-deferred renew must sync inline"
+    );
+    fs::fault::reset();
+}
+
+#[test]
+fn ack_after_deferred_renew_uses_the_returned_lease() {
+    let tmp = TempDir::new().unwrap();
+    Queue::init(tmp.path(), &CreateOptions::default()).unwrap();
+    let mut queue = Queue::open(
+        tmp.path(),
+        &OpenOptions {
+            allow_unsupported_fs: true,
+            deferred_dir_sync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _ = queue.enqueue(EnqueueInput {
+        maximum_attempts: 3,
+        content_type: "x".to_string(),
+        payload: b"data".to_vec(),
+        ..Default::default()
+    });
+    let lease = match queue.lease(0, 10_000_000_000) {
+        LeaseOutcome::Leased(l) => l,
+        other => panic!("lease failed: {other:?}"),
+    };
+
+    let renewed = match queue.renew(&lease, 60_000_000_000) {
+        RenewOutcome::Deferred(l) => l,
+        other => panic!("deferred renew failed: {other:?}"),
+    };
+    // Ack with the deferred renewal's lease info and no intervening sync():
+    // the ack's own barriers carry the renewal's directory.
+    match queue.ack(&renewed) {
+        AckOutcome::Acked => {}
+        other => panic!("ack after deferred renew failed: {other:?}"),
+    }
 }
 
 #[test]
