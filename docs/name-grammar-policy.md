@@ -28,9 +28,15 @@ Cost accounting: one prefix letter + one dot + fixed-width lowercase hex, chosen
 
 The name tag authenticates the exact canonical name: `tag = SHA256(domain || queue_id || canonical_context)` where the context includes the full filename without tag or extension. A new field changes the hashed bytes, so a grammar revision MUST bump the tag context version together with the field: the domain string (`"SteadQ-1-name\0"`) gains a version suffix (for example `"SteadQ-1-name.v2\0"`), and the FORMAT record's minor version increments. Old tags never validate under the new context and vice versa, which is the desired fail-closed property: an old reader rejects v2 names as unauthenticated rather than misreading them.
 
-### Old-reader behavior
+### Reader and writer versioning
 
-Readers are versioned by FORMAT minor version and are required to check it on open. A reader that does not know a field treats the object as foreign, not corrupt: it leaves the file in place and reports it through fsck as a warning-class finding (`unrecognized_name_version`), never quarantining it. Producers must not write a newer grammar onto a queue whose FORMAT minor version predates it; `init`/`open` enforce this by refusing the write class outright. Mixed-version operation therefore has a defined, testable shape: old readers see inert warnings, new readers see old names as canonical v1.
+This section is policy for revisions after SteadQ/1; the mechanisms it names are required behavior for any grammar revision, and parts are not yet present in the prototype. Today the FORMAT record's major version is checked on decode (mismatch refuses the format) and the minor version is carried but not yet consulted; an unrecognized filename component currently surfaces as an fsck parse failure. A grammar revision MUST land with these changes, not after:
+
+- Format decode rejects a minor version newer than the reader knows, so old readers fail closed at open instead of misreading a newer queue.
+- A reader that does not know a field treats the object as foreign, not corrupt: it leaves the file in place and reports it through fsck as a warning-class finding (`unrecognized_name_version`), never quarantining it.
+- Producers must not write a newer grammar onto a queue whose FORMAT minor version predates it; `init`/`open` refuse the write class outright.
+
+Mixed-version operation therefore has a defined, testable shape once shipped: old readers see inert warnings, new readers see old names as canonical v1.
 
 ## Directory layout changes
 
